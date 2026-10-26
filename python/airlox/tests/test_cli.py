@@ -4,6 +4,7 @@ and runner, interoperating with the Python SDK."""
 import io
 import json
 import os
+import re
 import subprocess
 import time
 import zipfile
@@ -106,7 +107,27 @@ def test_cli_output_is_safe(relay, caches, tmp_path):
         cli("items", "--save", save, invite=owner_link, cache=caches("cli"))
     assert (save / "CLAUDE.md").read_text() == "mine\n"
     saved = sorted(f.name for f in save.iterdir() if f.name != "CLAUDE.md")
-    assert len(saved) == 2 and all(n.startswith(saved[0][:9]) and "CLAUDE" in n for n in saved)
+    assert len(saved) == 2 and all(re.fullmatch(r"airlox-[0-9a-f]{8}-CLAUDE\.md", n) for n in saved), saved
+
+    # The prefix is chosen locally, whatever item id the sender picked, and
+    # Python is saved so test runners never collect it.
+    py = tmp_path / "x_test.py"
+    py.write_text("raise SystemExit('ran')\n")
+    agent.send_file(py)
+    pysave = tmp_path / "pysave"
+    cli("items", "--save", pysave, invite=owner_link, cache=caches("cli"))
+    [name] = [f.name for f in pysave.iterdir() if "x_test" in f.name]
+    assert re.fullmatch(r"airlox-[0-9a-f]{8}-x_test\.py\.txt", name), name
+
+    # An invite rewritten to point at another relay does not get the token
+    # cached for this session (it is refused before any request).
+    other = re.sub(r"127\.0\.0\.1:\d+", "127.0.0.1:9", owner_link)
+    p = cli("items", invite=other, cache=caches("cli"), check=False)
+    assert p.returncode != 0 and "refusing to send your token" in p.stderr, p.stderr
+
+    # Job ids are checked before they go into a URL.
+    p = cli("result", "../../x", invite=owner_link, cache=caches("cli"), check=False)
+    assert p.returncode != 0 and "not a job id" in p.stderr
 
     # A participant who joins while `watch` streams: its signed join (with a
     # non-ASCII name) arrives over SSE and must verify, or its items would be
@@ -173,8 +194,8 @@ def test_cli_runs_jobs(relay, caches, tmp_path, start_runner):
 class Mcp:
     """An `airlox mcp` process spoken to over JSON-RPC on stdio."""
 
-    def __init__(self, relay_url, cache, allow, invite=None):
-        args = [BIN, "mcp", "--relay", relay_url, "--cache-dir", str(cache), "--allow-dir", str(allow)]
+    def __init__(self, relay_url, cache, allow, invite=None, extra=()):
+        args = [BIN, "mcp", "--relay", relay_url, "--cache-dir", str(cache), "--allow-dir", str(allow), *extra]
         if invite:
             args += ["--invite", invite]
         env = {k: v for k, v in os.environ.items() if k != "AIRLOX_INVITE"}
@@ -227,7 +248,8 @@ def test_mcp_server(relay, caches, tmp_path, start_runner):
     work.mkdir()
     (work / "data.zip").write_bytes(dataset())
     (tmp_path / "secret.md").write_text("not for the session")
-    mcp = Mcp(relay.url, caches("mcp"), work)
+    links = tmp_path / "owner-links"
+    mcp = Mcp(relay.url, caches("mcp"), work, extra=("--owner-invite-dir", str(links)))
     try:
         tools = {t["name"] for t in mcp.rpc("tools/list")["tools"]}
         assert {"create_session", "join_session", "send_text", "send_file", "list_items", "list_runners",
@@ -238,8 +260,13 @@ def test_mcp_server(relay, caches, tmp_path, start_runner):
         # The owner link stays out of the model's context.
         assert set(invites) == {"sender", "observer", "runner"}
         owner_file = s["owner_invite_file"]
+        assert os.path.dirname(owner_file) == str(links)
         assert open(owner_file).read().startswith(relay.url) and os.stat(owner_file).st_mode & 0o077 == 0
         assert "owner" not in mcp.call("get_invites")["invites"]
+        # The cache never holds an invite link.
+        for root, _, files in os.walk(caches("mcp")):
+            for f in files:
+                assert b"r=owner" not in open(os.path.join(root, f), "rb").read()
         agent = Session.join(invites["sender"], display_name="sdk-agent", description="Has the sales data",
                              cache_dir=caches("sdk"))
         agent.send_text("please summarize the data")
@@ -283,6 +310,14 @@ def test_mcp_server(relay, caches, tmp_path, start_runner):
         assert res["signed"] and res["exit_code"] == 0 and "2 orders, total 42" in res["stdout"]
         saved = mcp.call("get_result", job=res["job"], save_dir="out")["saved"]
         assert sorted(os.path.basename(p) for p in saved) == ["chart.png", "out.zip"]
+
+        # Joining another session does not redirect the default one.
+        other = Session.create(relay.url, cache_dir=caches("other"))
+        joined = mcp.call("join_session", invite=other.invites["sender"])
+        assert joined["default_session"] == s["session"]
+        sent = mcp.call("send_text", text="still to the first session")["sent"]
+        agent.sync()
+        assert any(i.id == sent for i in agent.items())
 
         mcp.call("close_session")
         agent.sync()

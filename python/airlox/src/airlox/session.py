@@ -202,6 +202,15 @@ class Session:
         Cache.sweep_expired(root)
         cache = Cache(root, sid)
         identity = cache.load_identity(role)
+        # The cached token belongs to the relay that issued it: an invite with
+        # this session's keys but another relay (an altered link) must not
+        # receive it.
+        bound = (identity or {}).get("base_url")
+        if bound and bound != relay.rstrip("/"):
+            raise ValueError(
+                f"this invite names relay {relay!r} but you joined session {sid} on {bound!r}; "
+                "refusing to send your token to another relay (the link may have been altered)"
+            )
         offline = False
         try:
             signed = _check(http.get(f"{relay}/v1/sessions/{sid}")).json()["signed_manifest"]
@@ -229,7 +238,10 @@ class Session:
             }
             signed_join = ac.sign_join(seed, json.dumps(join))
             resp = _check(http.post(f"{relay}/v1/sessions/{sid}/participants", content=signed_join)).json()
-            identity = {"participant_seed": seed.hex(), "token": resp["token"], "role": role}
+            identity = {"participant_seed": seed.hex(), "token": resp["token"], "role": role, "base_url": relay.rstrip("/")}
+            cache.save_identity(role, identity)
+        elif not bound:
+            identity = {**identity, "base_url": relay.rstrip("/")}
             cache.save_identity(role, identity)
         session = cls(
             relay=relay,

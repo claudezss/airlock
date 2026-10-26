@@ -16,7 +16,7 @@ use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 
 use crate::client;
-use crate::files::{clean_line, clean_text, out_file_name, safe_name, save_new};
+use crate::files::{clean_line, clean_text, out_file_name, received_name, save_new};
 use crate::session::{
     default_cache_root, file_type, Item, JobSpec, NewSession, NoRunnerAvailable, Outcome, Profile, Session,
     Status, Target, DEFAULT_TYPES, FILE_TYPES_HELP,
@@ -133,8 +133,24 @@ pub struct CreateArgs {
     pub description: Option<String>,
     #[arg(long, env = "AIRLOX_CACHE_DIR")]
     pub cache_dir: Option<PathBuf>,
+    /// Write the owner invite to this new file (mode 0600) instead of
+    /// printing it. Agents should use this, so the link that controls the
+    /// session never enters their context: `AIRLOX_INVITE="$(cat FILE)"`.
+    #[arg(long)]
+    pub owner_invite_file: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
+}
+
+/// Write an invite to a new private file; never over an existing one.
+fn write_private(path: &Path, link: &str) -> Result<()> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    let mut f = o.open(path).with_context(|| format!("creating {}", path.display()))?;
+    std::io::Write::write_all(&mut f, format!("{link}\n").as_bytes())?;
+    Ok(())
 }
 
 pub async fn session(cmd: SessionCmd) -> Result<()> {
@@ -162,9 +178,9 @@ pub async fn session(cmd: SessionCmd) -> Result<()> {
             let root = a.cache_dir.clone().unwrap_or_else(default_cache_root);
             let me = Profile { display_name: a.display_name.clone(), description: a.description.clone() };
             let s = Session::create(&client::http()?, &a.relay, new, &me, &root).await?;
-            print_invites(&s, a.json, true)
+            print_invites(&s, a.json, true, a.owner_invite_file.as_deref())
         }
-        SessionCmd::Invites(c) => print_invites(&c.join().await?, c.json, false),
+        SessionCmd::Invites(c) => print_invites(&c.join().await?, c.json, false, None),
         SessionCmd::Info(c) => {
             let mut s = c.join().await?;
             s.sync().await?;
@@ -230,12 +246,18 @@ pub async fn session(cmd: SessionCmd) -> Result<()> {
     }
 }
 
-fn print_invites(s: &Session, json_out: bool, created: bool) -> Result<()> {
-    let inv = s.invites()?;
+fn print_invites(s: &Session, json_out: bool, created: bool, owner_file: Option<&Path>) -> Result<()> {
+    let mut inv = s.invites()?;
+    if let Some(path) = owner_file {
+        write_private(path, &inv.remove("owner").unwrap_or_default())?;
+    }
     if json_out {
-        print_json(
-            &json!({"session_id": s.session_id, "expires_at_ms": s.manifest.expires_at_ms, "invites": inv}),
-        );
+        let mut v =
+            json!({"session_id": s.session_id, "expires_at_ms": s.manifest.expires_at_ms, "invites": inv});
+        if let Some(path) = owner_file {
+            v["owner_invite_file"] = json!(path);
+        }
+        print_json(&v);
         return Ok(());
     }
     if created {
@@ -246,6 +268,9 @@ fn print_invites(s: &Session, json_out: bool, created: bool) -> Result<()> {
         if let Some(url) = inv.get(role) {
             println!("{role:<9} {url}");
         }
+    }
+    if let Some(path) = owner_file {
+        println!("owner     (written to {})", path.display());
     }
     println!();
     println!("Each link carries its role's keys: share it only over a channel you trust.");
@@ -600,7 +625,14 @@ pub fn item_json(s: &Session, i: &Item, max_content: Option<usize>) -> Value {
     }
     let Some(m) = &i.meta else { return v };
     match i.kind.as_str() {
-        "text" => v["text"] = m["text"].clone(),
+        "text" => match (max_content, m["text"].as_str()) {
+            (Some(max), Some(t)) if t.len() > max => {
+                let cut = (0..=max).rev().find(|&i| t.is_char_boundary(i)).unwrap_or(0);
+                v["text"] = json!(&t[..cut]);
+                v["text_truncated"] = json!(format!("{} bytes in all; the rest is not shown", t.len()));
+            }
+            _ => v["text"] = m["text"].clone(),
+        },
         "file" => {
             v["name"] = m["name"].clone();
             v["mime"] = m["mime"].clone();
@@ -683,13 +715,12 @@ fn item_line(s: &Session, i: &Item) -> String {
     format!("#{:<4} {who}: {what}", i.seq)
 }
 
-/// Save a received file as `<id prefix>-<name>` in `dir`, so a participant
-/// cannot pick the name of a file that matters (`CLAUDE.md`, `conftest.py`),
-/// and never over an existing file.
+/// Save a received file in `dir` under [`received_name`] (never a name the
+/// sender picked, Python as `.py.txt`), and never over an existing file.
 pub fn save_item(i: &Item, dir: &Path) -> Result<PathBuf> {
     let name = i.name().filter(|_| i.status == Status::Ok).context("the item is not an available file")?;
-    let name = safe_name(name).context("the file's name is not safe to save")?;
-    save_new(dir, &format!("{}-{name}", &i.id[..i.id.len().min(8)]), &i.body)
+    let name = received_name(name).context("the file's name is not safe to save")?;
+    save_new(dir, &name, &i.body)
 }
 
 fn emit(s: &Session, i: &Item, a: &ItemsArgs) -> Result<()> {

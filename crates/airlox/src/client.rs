@@ -52,9 +52,25 @@ pub struct RelayError {
     pub message: String,
 }
 
+/// Text from the relay, made safe to print or hand to a model: control and
+/// invisible characters escaped, and at most 300 characters.
+pub fn relay_text(s: &str) -> String {
+    let mut t = crate::files::clean_line(s);
+    if t.chars().count() > 300 {
+        t = t.chars().take(300).collect::<String>() + "…";
+    }
+    t
+}
+
 impl std::fmt::Display for RelayError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "relay answered {} {}: {}", self.status, self.code, self.message)
+        write!(
+            f,
+            "relay answered {} {}: {:?}",
+            self.status,
+            relay_text(&self.code),
+            relay_text(&self.message)
+        )
     }
 }
 
@@ -229,5 +245,21 @@ impl Relay {
             req = req.header("Last-Event-ID", s.to_string());
         }
         check(send_stream(req).await?).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_errors_print_safely() {
+        let e = RelayError {
+            status: 400,
+            code: "bad".into(),
+            message: format!("\u{1b}[2J\u{1b}]52;c;eA==\u{7}{}", "x".repeat(500)),
+        };
+        let s = e.to_string();
+        assert!(!s.contains('\u{1b}') && !s.contains('\u{7}') && s.len() < 400, "{s}");
     }
 }

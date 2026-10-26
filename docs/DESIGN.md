@@ -719,9 +719,16 @@ produced none (timeout, out of memory, cancelled, failed on the relay; the
 JSON `status` and `reason` tell these apart) and 75 when no result arrived
 before `--wait` ran out. Text output escapes control and bidi characters, so
 participant-chosen names, messages and job output cannot forge lines or
-drive the terminal. Received files are saved as `<id prefix>-<name>` and job
-out files under their names, but only images and `out.zip`; nothing is ever
-written over an existing file or through a link. The CLI is a port of the SDK's session logic
+drive the terminal; so does error text from the relay. Received files are
+saved as `airlox-<random>-<name>`, with a prefix chosen locally (an item id
+is the sender's choice) and Python saved as `.py.txt`, so no received file
+can be `conftest.py`, `CLAUDE.md` or anything a test runner collects; job out
+files keep their names, but only images and `out.zip`. Nothing is ever
+written over an existing file or through a link. `session create
+--owner-invite-file` writes the owner link to a new 0600 file instead of
+printing it, for agents that should hold it without seeing it. A cached
+identity records its relay, and an invite naming another relay for the same
+session is refused rather than handed the token. The CLI is a port of the SDK's session logic
 (`crates/airlox/src/session.rs`) over the same core, with the same cache, so
 the SDK, the CLI and the MCP server act as one participant per invite.
 
@@ -747,8 +754,10 @@ the official Rust SDK `rmcp`): tools `create_session`, `join_session`,
 model, it reads and writes files only inside `--allow-dir` directories
 (default: its working directory, unless that is `/` or the home directory),
 never in hidden directories or the session cache, saves received files as the
-CLI does, labels everything participants wrote as data, and keeps the owner
-invite out of the conversation (it goes to a 0600 file for the user). Each
+CLI does, labels everything participants wrote as data, and never returns the
+owner invite (with `--owner-invite-dir` it is saved to a 0600 file for the
+user). Joining a session does not change the default session, so a
+prompt-injected join cannot redirect later messages. Each
 session has its own lock, so a tool waiting for a job or new items does not
 block the others. There is deliberately no hosted (remote) MCP endpoint: it would
 need the session keys, which would give the relay operator plaintext. The MCP
