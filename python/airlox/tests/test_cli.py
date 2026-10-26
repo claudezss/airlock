@@ -153,7 +153,7 @@ def test_cli_output_is_safe(relay, caches, tmp_path):
         ("Zoë² ✓ " + "é" * 40, "ok", "later")], err
 
 
-def test_cli_runs_jobs(relay, caches, tmp_path, start_runner):
+def test_cli_runs_jobs(relay, caches, tmp_path, start_runner, runner_cache):
     owner = Session.create(relay.url, mode="execute", job_limits=LIMITS, cache_dir=caches("owner"))
     sender = owner.invites["sender"]
     owner_link = owner.invites["owner"]
@@ -191,12 +191,26 @@ def test_cli_runs_jobs(relay, caches, tmp_path, start_runner):
     failing.write_text("import sys\nprint('bad input', file=sys.stderr)\nsys.exit(7)\n")
     job = json.loads(cli("run", "--no-wait", "--json", failing, invite=sender, cache=caches("cli")).stdout)["job"]
     p = cli("result", job, "--wait", "60s", "--json", invite=sender, cache=caches("cli"), check=False)
+    assert p.stdout, p.stderr
     res = json.loads(p.stdout)
     assert p.returncode == 7 and res["exit_code"] == 7 and res["signed"] and "bad input" in res["stderr"]
 
     # The SDK sees the same signed result.
     owner.sync()
     assert any(i.kind == "result" and i.meta["job"]["id"] == job for i in owner.items())
+
+    # Job ids are base64url, so one in 64 starts with "-": it is still an id.
+    p = cli("result", "-AAAAAAAAAAAAAAAAAAAAA", "--json", invite=sender, cache=caches("cli"), check=False)
+    assert "unexpected argument" not in p.stderr and "not a job id" not in p.stderr, p.stderr
+
+    # A runner link altered to name another relay does not get the approved
+    # runner's saved token: refused before any request.
+    runner.stop()
+    altered = re.sub(r"127\.0\.0\.1:\d+", "127.0.0.1:9", owner.invites["runner"])
+    env = dict(os.environ, AIRLOX_INVITE=altered)
+    p = subprocess.run([BIN, "runner", "join", "--name", "runner-01", "--sandbox", "local", "--cache-dir",
+                        str(runner_cache)], env=env, capture_output=True, text=True, timeout=60)
+    assert p.returncode != 0 and "refusing to send its token" in p.stderr, p.stderr
 
 
 class Mcp:
@@ -325,11 +339,19 @@ def test_mcp_server(relay, caches, tmp_path, start_runner):
         other = Session.create(relay.url, cache_dir=caches("other"))
         joined = mcp.call("join_session", invite=other.invites["sender"])
         assert joined["default_session"] == s["session"]
-        sent = mcp.call("send_text", text="still to the first session")["sent"]
+        sent = mcp.call("send_text", text="still to the first session")
+        assert sent["session"] == s["session"]
         agent.sync()
-        assert any(i.id == sent for i in agent.items())
+        assert any(i.id == sent["sent"] for i in agent.items())
+        # A session already held is not replaced by a link for another role.
+        with pytest.raises(McpToolError, match="already in session"):
+            mcp.call("join_session", invite=invites["observer"])
+        # A session this server creates becomes the default.
+        newer = mcp.call("create_session")
+        assert mcp.call("send_text", text="to the newest")["session"] == newer["session"]
+        mcp.call("close_session", session=newer["session"])
 
-        mcp.call("close_session")
+        mcp.call("close_session", session=s["session"])
         agent.sync()
         assert agent.closed
     finally:

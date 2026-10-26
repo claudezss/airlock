@@ -30,7 +30,10 @@ airlox session create --execute --package pandas --owner-invite-file ./owner.lin
 
 Always pass `--owner-invite-file`: the owner link controls the session, so it
 goes to that file (mode 0600) instead of your output, and you use it without
-reading it, as `AIRLOX_INVITE="$(cat ./owner.link)" airlox …`. The output
+printing it, as `AIRLOX_INVITE="$(cat ./owner.link)" airlox …`. This keeps it
+out of logs and transcripts, not out of reach: never `cat` it on its own,
+keep it out of version control (put it outside the repository, or in a
+git-ignored path), and delete it when the session is done. The output
 holds `invites.sender` (post messages and files, submit jobs),
 `invites.observer` (read only) and, for execute sessions, `invites.runner`
 (for `airlox runner join` on the machine that runs the code). Give each link
@@ -62,8 +65,8 @@ AIRLOX_INVITE="$(cat ./owner.link)" airlox runner list --json        # who has j
 AIRLOX_INVITE="$(cat ./owner.link)" airlox runner approve runner-01  # owner only; approve only runners the user expects
 airlox run --input data.zip --out-dir ./out analysis.py
 airlox run --label gpu --no-wait --json analysis.py      # returns {"job": …}
-airlox result <job> --wait 5m --out-dir ./out --json
-airlox cancel <job>
+airlox result --wait 5m --out-dir ./out --json -- <job>   # `--`: job ids may start with "-"
+airlox cancel -- <job>
 ```
 
 `airlox run` prints the job's stdout and stderr and exits with the job's exit

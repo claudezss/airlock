@@ -82,6 +82,9 @@ pub struct JoinArgs {
 struct Identity {
     participant_seed: String,
     token: String,
+    /// The relay that issued `token`; it is only ever sent there.
+    #[serde(default)]
+    base_url: Option<String>,
 }
 
 fn now_ms() -> u64 {
@@ -167,6 +170,27 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         bail!("this is a {} invite; runners need the runner invite", invite.role.as_str());
     }
     let sid = invite.session_id.clone();
+    let root = args.cache_dir.clone().unwrap_or_else(default_cache_root);
+    let dir = root.join(&sid);
+    // Rejoin as the same participant if this cache has an identity for this name.
+    let id_path = dir.join(format!("identity-runner-{}.json", args.name));
+    let saved: Option<Identity> = std::fs::read(&id_path).ok().and_then(|b| serde_json::from_slice(&b).ok());
+    let base = invite.base_url.trim_end_matches('/').to_string();
+    // The saved token belongs to the relay that issued it. An invite with
+    // this session's keys but another relay (an altered link) must not get
+    // it: that relay could take jobs as this approved runner. A token saved
+    // before the relay was recorded is not reused at all.
+    let saved = match saved {
+        Some(i) if i.base_url.as_deref() == Some(base.as_str()) => Some(i),
+        Some(Identity { base_url: Some(bound), .. }) => bail!(
+            "this runner invite names relay {} but runner {} joined session {sid} on {}; refusing to send its \
+             token to another relay (the link may have been altered)",
+            crate::client::relay_text(&base),
+            args.name,
+            crate::client::relay_text(&bound)
+        ),
+        _ => None,
+    };
     let http = client::http()?;
     let signed = client::get_manifest(&http, &invite.base_url, &sid).await?;
     let manifest = SignedManifest::from_json(&signed)?.manifest;
@@ -176,8 +200,6 @@ pub async fn run(args: JoinArgs) -> Result<()> {
     }
     let limits = manifest.job_limits.clone().context("execute session without job limits")?;
 
-    let root = args.cache_dir.clone().unwrap_or_else(default_cache_root);
-    let dir = root.join(&sid);
     std::fs::create_dir_all(&dir)?;
     #[cfg(unix)]
     {
@@ -210,9 +232,6 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         );
     }
 
-    // Rejoin as the same participant if this cache has an identity for this name.
-    let id_path = dir.join(format!("identity-runner-{}.json", args.name));
-    let saved: Option<Identity> = std::fs::read(&id_path).ok().and_then(|b| serde_json::from_slice(&b).ok());
     let (kp, token) = match saved {
         Some(i) => (Keypair::from_seed(&seed_from_hex(&i.participant_seed)?), i.token),
         None => join(&http, &invite, &args, &backend).await?,
@@ -223,12 +242,12 @@ pub async fn run(args: JoinArgs) -> Result<()> {
             tracing::info!("saved identity is no longer valid; joining again");
             let (kp, token) = join(&http, &invite, &args, &backend).await?;
             relay = Relay::new(http.clone(), &invite.base_url, &sid, &token);
-            save_identity(&id_path, &kp, &token)?;
+            save_identity(&id_path, &kp, &token, &base)?;
             (kp, relay)
         }
         Err(e) => return Err(e),
         Ok(_) => {
-            save_identity(&id_path, &kp, &token)?;
+            save_identity(&id_path, &kp, &token, &base)?;
             (kp, relay)
         }
     };
@@ -260,9 +279,10 @@ pub async fn run(args: JoinArgs) -> Result<()> {
     outcome
 }
 
-fn save_identity(path: &std::path::Path, kp: &Keypair, token: &str) -> Result<()> {
+fn save_identity(path: &std::path::Path, kp: &Keypair, token: &str, base_url: &str) -> Result<()> {
     let seed: String = kp.seed().iter().map(|b| format!("{b:02x}")).collect();
-    let id = Identity { participant_seed: seed, token: token.to_string() };
+    let id =
+        Identity { participant_seed: seed, token: token.to_string(), base_url: Some(base_url.to_string()) };
     write_atomic(path, &serde_json::to_vec(&id)?, 0o600)
 }
 

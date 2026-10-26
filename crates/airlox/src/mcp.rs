@@ -332,8 +332,8 @@ impl Airlox {
         Profile::new(&self.me.display_name, d.as_deref())
     }
 
-    /// The session a tool call means: its `session` argument, or the last
-    /// one created or joined.
+    /// The session a tool call means: its `session` argument, or the
+    /// default (the last one created, else the first joined).
     async fn slot(&self, session: &Option<String>) -> anyhow::Result<(String, SlotRef)> {
         let st = self.state.lock().await;
         match session.as_ref().or(st.current.as_ref()) {
@@ -345,21 +345,31 @@ impl Airlox {
         }
     }
 
-    async fn add(&self, s: Session) -> (String, Option<String>) {
+    /// Hold a session. A session this server created becomes the default;
+    /// a joined one only if there is none yet, so a prompt-injected join
+    /// cannot redirect later messages. A session already held is never
+    /// replaced by a link for another relay or role.
+    async fn add(&self, s: Session, created: bool) -> anyhow::Result<String> {
         let sid = s.session_id.clone();
-        let role = s.role.as_str().to_string();
         let mut st = self.state.lock().await;
-        let replaced = match st.sessions.get(&sid) {
-            Some(old) => Some(old.lock().await.s.role.as_str().to_string()).filter(|r| *r != role),
-            None => None,
-        };
+        if let Some(old) = st.sessions.get(&sid) {
+            let old = old.lock().await;
+            if old.s.base_url != s.base_url || old.s.role != s.role {
+                anyhow::bail!(
+                    "already in session {sid} as {} on {}; this link is for {} on {}, so it was not used",
+                    old.s.role.as_str(),
+                    client::relay_text(&old.s.base_url),
+                    s.role.as_str(),
+                    client::relay_text(&s.base_url)
+                );
+            }
+            return Ok(sid);
+        }
         st.sessions.insert(sid.clone(), Arc::new(Mutex::new(Slot { s, shown_pending: HashSet::new() })));
-        // The first session becomes the default; later ones are used only
-        // when named, so joining one cannot quietly redirect what follows.
-        if st.current.as_ref().is_none_or(|c| !st.sessions.contains_key(c)) {
+        if created || st.current.as_ref().is_none_or(|c| !st.sessions.contains_key(c)) {
             st.current = Some(sid.clone());
         }
-        (sid, replaced)
+        Ok(sid)
     }
 
     /// Wait for a job's outcome, taking the session's lock only per poll.
@@ -407,7 +417,7 @@ should have that role. The owner link is never returned.")]
         let me = self.profile(p.description.clone());
         let s = tool_try!(Session::create(&self.http, &self.relay, new, &me, &self.cache_root).await);
         let mut out = tool_try!(shareable_invites(&s, self.owner_invite_dir.as_deref()));
-        let (sid, _) = self.add(s).await;
+        let sid = tool_try!(self.add(s, true).await);
         out["session"] = json!(sid);
         ok(out)
     }
@@ -420,17 +430,13 @@ observer) decides what you can do.")]
         let kept =
             !s.joined_now && me.description.is_some() && s.my_description() != me.description.as_deref();
         let mut info = json!({"role": s.role.as_str(), "mode": s.manifest.mode, "closed": s.closed});
-        let (sid, replaced) = self.add(s).await;
+        let sid = tool_try!(self.add(s, false).await);
         info["session"] = json!(sid);
         let current = self.state.lock().await.current.clone();
         if current.as_deref() != Some(sid.as_str()) {
             info["default_session"] = json!(current);
             info["hint"] =
                 json!("Other tools still default to default_session; pass session to use this one.");
-        }
-        if let Some(old) = replaced {
-            info["note"] =
-                json!(format!("you were in this session as {old}; you now act as {}", info["role"]));
         }
         if kept {
             info["description_note"] =
@@ -482,18 +488,18 @@ returned.",
 
     #[tool(description = "Send a text message to the session.")]
     async fn send_text(&self, Parameters(p): Parameters<TextParams>) -> Result<CallToolResult, ErrorData> {
-        let (_, slot) = tool_try!(self.slot(&p.session).await);
+        let (sid, slot) = tool_try!(self.slot(&p.session).await);
         let r = tool_try!(slot.lock().await.s.send_text(&p.text).await);
-        ok(json!({"sent": r["id"]}))
+        ok(json!({"sent": r["id"], "session": sid}))
     }
 
     #[tool(description = "Send a local file (.py, .md, .zip, .png, .jpg, .webp) to the session. Images \
 are re-encoded to strip metadata. The path must be inside an allowed directory.")]
     async fn send_file(&self, Parameters(p): Parameters<FileParams>) -> Result<CallToolResult, ErrorData> {
         let path = tool_try!(self.allowed(&p.path, true));
-        let (_, slot) = tool_try!(self.slot(&p.session).await);
+        let (sid, slot) = tool_try!(self.slot(&p.session).await);
         let r = tool_try!(crate::cli::send_path(&mut slot.lock().await.s, &path).await);
-        ok(json!({"sent": r["id"], "path": path}))
+        ok(json!({"sent": r["id"], "path": path, "session": sid}))
     }
 
     #[tool(
@@ -737,7 +743,7 @@ pub async fn serve(a: McpArgs) -> anyhow::Result<()> {
     };
     if let Some(inv) = &a.invite {
         let s = Session::join(&server.http, inv, &server.me, &server.cache_root).await?;
-        server.add(s).await;
+        server.add(s, true).await?;
     }
     let running = server.serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;

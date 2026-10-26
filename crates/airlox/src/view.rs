@@ -154,7 +154,8 @@ impl View {
                 // The id names a cache file and goes into URLs: only a
                 // well-formed one, before anything touches the disk.
                 if !airlox_core::item::is_item_id(&h.id) {
-                    bail!("item with a malformed id");
+                    tracing::warn!("ignoring an item with a malformed id");
+                    return Ok(());
                 }
                 self.envelopes.insert(h.id.clone(), env_json);
                 if h.author == self.me {
@@ -185,7 +186,8 @@ impl View {
                 // Unless it is ours to run, we will not need the job's blob.
                 let job = data["job"].as_str().unwrap_or_default().to_string();
                 if !airlox_core::item::is_item_id(&job) {
-                    bail!("job event with a malformed id");
+                    tracing::warn!("ignoring a job event with a malformed id");
+                    return Ok(());
                 }
                 let ours = data["runner"].as_str() == Some(self.me.to_b64().as_str());
                 let active = matches!(data["state"].as_str(), Some("assigned" | "running"));

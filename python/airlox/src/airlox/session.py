@@ -101,6 +101,9 @@ class Item:
         return self.meta.get("mime") if self.meta and self.kind == "file" else None
 
 
+#: Largest believable gap between consecutive event sequence numbers.
+MAX_SEQ_JUMP = 10_000
+
 class Session:
     """A participant's view of one session."""
 
@@ -551,6 +554,10 @@ class Session:
 
     def _apply(self, ev: dict, *, fetch: bool = True, record: bool = True) -> Optional[Item]:
         seq = ev["seq"]
+        # A wild jump would make every later event look old, and the cache
+        # would keep it (as the Rust client does: drop it unrecorded).
+        if seq > max(self._last_seq, 0) + MAX_SEQ_JUMP:
+            return None
         if record and seq <= self._last_seq:
             return None
         kind, data = ev["kind"], ev["data"]

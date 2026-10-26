@@ -182,6 +182,17 @@ pub async fn session(cmd: SessionCmd) -> Result<()> {
                     .context("--max-item-mb is too large")?,
                 job_limits,
             };
+            // Check the owner-invite file can be written before the session
+            // exists, so a bad path cannot leave a session nobody can use.
+            if let Some(f) = &a.owner_invite_file {
+                if f.exists() {
+                    bail!("{} already exists; pass a new file for the owner invite", f.display());
+                }
+                let parent = f.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+                if !parent.is_dir() {
+                    bail!("{} is not a directory", parent.display());
+                }
+            }
             let root = a.cache_dir.clone().unwrap_or_else(default_cache_root);
             let me = Profile::new(&a.display_name, a.description.as_deref());
             let s = Session::create(&client::http()?, &a.relay, new, &me, &root).await?;
@@ -256,7 +267,12 @@ pub async fn session(cmd: SessionCmd) -> Result<()> {
 fn print_invites(s: &Session, json_out: bool, created: bool, owner_file: Option<&Path>) -> Result<()> {
     let mut inv = s.invites()?;
     if let Some(path) = owner_file {
-        write_private(path, &inv.remove("owner").unwrap_or_default())?;
+        let owner = inv.remove("owner").unwrap_or_default();
+        if let Err(e) = write_private(path, &owner) {
+            // The session exists now: hand out the owner link rather than lose it.
+            eprintln!("could not write the owner invite file ({e:#}); printing it instead");
+            inv.insert("owner".into(), owner);
+        }
     }
     if json_out {
         let mut v =
@@ -438,7 +454,7 @@ pub async fn run(a: RunArgs) -> Result<i32> {
             if let Some(n) = e.downcast_ref::<NoRunnerAvailable>() {
                 if a.conn.json {
                     print_json(
-                        &json!({"job": n.job, "status": "failed", "reason": "no_runner_available", "message": n.message}),
+                        &json!({"job": n.job, "status": "failed", "reason": "no_runner_available", "message": client::relay_text(&n.message)}),
                     );
                     return Ok(1);
                 }
@@ -450,7 +466,7 @@ pub async fn run(a: RunArgs) -> Result<i32> {
         if a.conn.json {
             print_json(&json!({"job": job, "runner": runner}));
         } else {
-            println!("submitted job {job}; get its result with: airlox result {job}");
+            println!("submitted job {job}; get its result with: airlox result -- {job}");
         }
         return Ok(0);
     }
@@ -465,6 +481,8 @@ pub struct ResultArgs {
     #[command(flatten)]
     pub conn: Conn,
     /// The job's id (from `airlox run`).
+    // Ids are base64url and may start with '-'.
+    #[arg(allow_hyphen_values = true)]
     pub job: String,
     /// Save the job's out files here.
     #[arg(long)]
@@ -490,7 +508,7 @@ async fn finish(
         if json_out {
             print_json(&json!({"job": job, "status": "running"}));
         } else {
-            println!("no result yet for job {job}; check later with: airlox result {job} --wait 5m");
+            println!("no result yet for job {job}; check later with: airlox result --wait 5m -- {job}");
         }
         return Ok(75); // EX_TEMPFAIL
     };
@@ -572,6 +590,8 @@ pub struct CancelArgs {
     #[command(flatten)]
     pub conn: Conn,
     /// The job's id.
+    // Ids are base64url and may start with '-'.
+    #[arg(allow_hyphen_values = true)]
     pub job: String,
 }
 
@@ -726,7 +746,13 @@ fn item_line(s: &Session, i: &Item) -> String {
 /// sender picked, Python as `.py.txt`), and never over an existing file.
 pub fn save_item(i: &Item, dir: &Path) -> Result<PathBuf> {
     let name = i.name().filter(|_| i.status == Status::Ok).context("the item is not an available file")?;
-    let name = received_name(name).context("the file's name is not safe to save")?;
+    let meta = i.meta.as_ref().context("the item is not an available file")?;
+    let name = received_name(
+        name,
+        i.subkind.as_deref().unwrap_or_default(),
+        meta["mime"].as_str().unwrap_or_default(),
+    )
+    .context("the file's name is not safe to save")?;
     save_new(dir, &name, &i.body)
 }
 

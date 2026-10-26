@@ -24,8 +24,10 @@ use crate::client::{self, is_transient, status_of, Relay, RelayError};
 use crate::sse::SseParser;
 use crate::view::write_atomic;
 
-/// Largest believable gap between consecutive event sequence numbers.
-const MAX_SEQ_JUMP: u64 = 1_000_000;
+/// Largest believable gap between consecutive event sequence numbers a
+/// participant sees (gaps are only events meant for others, such as job
+/// routing). Small, so one forged event cannot hide the session's future.
+const MAX_SEQ_JUMP: u64 = 10_000;
 
 /// Content types a new session allows unless told otherwise.
 pub const DEFAULT_TYPES: &[&str] = &["text", "py", "md", "zip", "image"];

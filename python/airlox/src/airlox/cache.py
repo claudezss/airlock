@@ -11,11 +11,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
 from pathlib import Path
 from typing import Iterator, Optional
+
+# Session ids as the core defines them: "ax_" and 26 base32 characters.
+_SESSION_ID = re.compile(r"ax_[a-z2-7]{26}")
 
 
 def default_root() -> Path:
@@ -98,6 +102,9 @@ class Cache:
         if not Path(root).exists():
             return
         for d in Path(root).iterdir():
+            # Only session caches, never another directory with a manifest.json.
+            if not _SESSION_ID.fullmatch(d.name):
+                continue
             m = d / "manifest.json"
             try:
                 expires = json.loads(m.read_text())["manifest"]["expires_at_ms"]
