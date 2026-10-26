@@ -9,3 +9,4 @@ __pycache__/
 /bindings/python/dist/
 node_modules/
 .DS_Store
+*.tgz

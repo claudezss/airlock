@@ -1,7 +1,8 @@
 name: release
 
-# Push a tag `vX.Y.Z` (matching the workspace version) to build every wheel and
-# publish `airlox-core` and `airlox` to PyPI.
+# Push a tag `vX.Y.Z` (matching the workspace version) to build every package,
+# then publish `airlox-core` and `airlox` to PyPI and `airlox-core` to npm.
+# Nothing is published unless every build succeeds.
 on:
   push:
     tags: ["v*"]
@@ -14,16 +15,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      # The tag, the Rust workspace, the SDK and its airlox-core pin must agree.
+      # The tag, the Rust workspace, the SDK and its airlox-core pin, and the
+      # npm package must agree.
       - run: |
           python3 - <<'EOF'
-          import os, sys, tomllib
+          import json, os, sys, tomllib
           tag = os.environ["GITHUB_REF_NAME"].removeprefix("v")
           rust = tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"]
           sdk = tomllib.load(open("python/airlox/pyproject.toml", "rb"))["project"]
           pin = [d for d in sdk["dependencies"] if d.startswith("airlox-core")]
-          print(f"tag={tag} rust={rust} sdk={sdk['version']} pin={pin}")
-          if not (tag == rust == sdk["version"] and pin == [f"airlox-core=={tag}"]):
+          npm = json.load(open("bindings/wasm/package.json"))["version"]
+          print(f"tag={tag} rust={rust} sdk={sdk['version']} pin={pin} npm={npm}")
+          if not (tag == rust == sdk["version"] == npm and pin == [f"airlox-core=={tag}"]):
               sys.exit("version mismatch")
           EOF
 
@@ -78,8 +81,25 @@ jobs:
           name: dist-sdk
           path: dist
 
+  npm-build:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - run: cargo install wasm-bindgen-cli --version 0.2.100 --locked
+      - run: npm run build && npm test && npm pack
+        working-directory: bindings/wasm
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: npm
+          path: bindings/wasm/airlox-core-*.tgz
+
   publish:
-    needs: [core-wheels, core-sdist, sdk]
+    needs: [core-wheels, core-sdist, sdk, npm-build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -91,3 +111,21 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           password: ${{ secrets.PYPI_TOKEN }}
+
+  npm-publish:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm provenance
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: npm
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: npm publish airlox-core-*.tgz --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
