@@ -145,3 +145,78 @@ def test_owner_close_ends_streams(relay, caches):
     threading.Timer(0.3, owner.close).start()
     list(agent.stream(timeout=5))
     assert agent.closed == "closed by owner"
+
+
+def test_failed_download_stays_pending_and_is_retried(relay, caches):
+    owner = Session.create(relay.url, cache_dir=caches("owner"))
+    agent = Session.join(owner.invites["sender"], cache_dir=caches("agent"))
+    ref = agent.send_text("first")
+
+    real_get = owner._http.get
+    calls = {"n": 0}
+
+    def flaky_get(url, **kw):
+        if "/blob" in url and calls["n"] == 0:
+            calls["n"] += 1
+            raise httpx.ReadError("connection reset")
+        return real_get(url, **kw)
+
+    owner._http.get = flaky_get
+    first = owner.sync()
+    assert first == []
+    pending = [i for i in owner.items() if i.id == ref["id"]]
+    assert pending and pending[0].status == "ok"  # items() synced again and retried
+    owner._http.get = real_get
+    # The retried download was acked, so the relay evicts the blob.
+    assert wait_for(lambda: relay_blob_status(relay, owner, ref["id"]) == 410)
+
+
+def test_participants_come_from_the_signed_join(relay, caches):
+    owner = Session.create(relay.url, cache_dir=caches("owner"))
+    agent = Session.join(owner.invites["sender"], display_name="planner-agent", cache_dir=caches("agent"))
+    owner.sync()
+    real = next(p for p in owner.participants() if p["participant_pub"] == agent.participant_pub)
+    assert (real["role"], real["display_name"]) == ("sender", "planner-agent")
+    # A relay that relabels the unsigned fields changes nothing.
+    events = owner._req("GET", "/events").json()["events"]
+    ev = next(e for e in events if e["kind"] == "participant" and e["data"]["participant_pub"] == agent.participant_pub)
+    forged = dict(ev, seq=10_000, data=dict(ev["data"], role="owner", display_name="Owner"))
+    owner._apply(forged, record=False)
+    again = next(p for p in owner.participants() if p["participant_pub"] == agent.participant_pub)
+    assert (again["role"], again["display_name"]) == ("sender", "planner-agent")
+
+
+def test_history_opens_after_the_relay_purged_the_session(relay, caches):
+    owner = Session.create(relay.url, cache_dir=caches("owner"))
+    invite = owner.invites["owner"]
+    agent = Session.join(owner.invites["sender"], cache_dir=caches("agent"))
+    agent.send_text("keep me")
+    assert [i.text for i in owner.items()] == ["keep me"]
+    owner.close()
+    reopened = Session.join(invite, cache_dir=caches("owner"))
+    assert reopened.closed
+    assert [i.text for i in reopened.items()] == ["keep me"]
+    assert list(reopened.stream(timeout=1)) == []
+
+
+def test_leave_releases_deliveries_and_revokes_the_token(relay, caches):
+    owner = Session.create(relay.url, cache_dir=caches("owner"))
+    stale = Session.join(owner.invites["observer"], cache_dir=caches("stale"))
+    agent = Session.join(owner.invites["sender"], cache_dir=caches("agent"))
+    ref = agent.send_text("for everyone")
+    owner.sync()  # owner fetches and acks; the stale observer never does
+    time.sleep(0.5)
+    assert relay_blob_status(relay, owner, ref["id"]) == 200
+    stale.leave(delete_cache=True)
+    assert wait_for(lambda: relay_blob_status(relay, owner, ref["id"]) == 410)
+    with pytest.raises(airlock.RelayError) as e:
+        stale._req("GET", "/events")
+    assert e.value.status == 401
+
+
+def test_one_cache_holds_an_identity_per_role(relay, caches):
+    owner = Session.create(relay.url, cache_dir=caches("shared"))
+    observer = Session.join(owner.invites["observer"], cache_dir=caches("shared"))
+    again = Session.join(owner.invites["owner"], cache_dir=caches("shared"))
+    assert again.participant_pub == owner.participant_pub
+    assert observer.participant_pub != owner.participant_pub

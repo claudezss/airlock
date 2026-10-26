@@ -39,6 +39,9 @@ impl ApiError {
     pub fn limit(m: impl Into<String>) -> Self {
         Self::new(StatusCode::TOO_MANY_REQUESTS, "limit", m)
     }
+    pub fn timeout() -> Self {
+        Self::new(StatusCode::REQUEST_TIMEOUT, "timeout", "request body stalled")
+    }
     pub fn storage_full() -> Self {
         Self::new(StatusCode::INSUFFICIENT_STORAGE, "storage_full", "relay storage is nearly full")
     }

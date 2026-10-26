@@ -1,22 +1,25 @@
 //! HTTP handlers. Every write is checked against the manifest and the
-//! author's certificate; the relay never sees plaintext.
+//! author's certificate; the relay never sees plaintext. Log writes fsync,
+//! so they run on the blocking pool, never on the async workers.
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use airlock_core::cert::SignedJoinRequest;
 use airlock_core::encoding::parse_canonical;
 use airlock_core::item::{is_item_id, ItemEnvelope};
 use airlock_core::policy;
 use airlock_core::session::{is_session_id, Mode, Role, SignedManifest};
-use axum::body::Body;
+use axum::body::{Body, BodyDataStream};
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -25,18 +28,31 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, watch};
 
 use crate::error::{ApiError, ApiResult};
-use crate::store::{Event, Rec, Session, Store, MAX_PARTICIPANTS};
+use crate::store::{
+    sync_dir, CreateError, Event, Rec, Session, Store, MAX_PARTICIPANTS, MAX_STREAMS_PER_PARTICIPANT,
+};
 use crate::util::{new_token, now_ms, random_suffix, sha256_hex};
 
 /// Largest item envelope accepted (header + signature JSON).
 pub const MAX_ENVELOPE_BYTES: usize = 64 * 1024;
+/// Largest JSON body (signed manifest or join request).
+pub const MAX_JSON_BYTES: usize = 256 * 1024;
 /// Allowed clock skew for a new session's `created_at_ms`.
 pub const MAX_CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
+/// A request body that sends nothing for this long is dropped.
+pub const BODY_IDLE: Duration = Duration::from_secs(30);
+/// Log space reserved per line beyond its payload (seq, timestamps, token hash).
+const LOG_LINE_OVERHEAD: u64 = 512;
 
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
     pub shutdown: watch::Receiver<bool>,
+}
+
+/// Run disk-bound work on the blocking pool.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> ApiResult<T> + Send + 'static) -> ApiResult<T> {
+    tokio::task::spawn_blocking(f).await.map_err(ApiError::internal)?
 }
 
 fn session(st: &AppState, id: &str) -> ApiResult<Arc<Session>> {
@@ -60,18 +76,56 @@ fn auth(s: &Session, headers: &HeaderMap) -> ApiResult<(String, Role)> {
     g.participant_by_token(&sha256_hex(token.as_bytes())).ok_or_else(ApiError::unauthorized)
 }
 
-fn client_ip(st: &AppState, headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
+/// The address bucket that per-address limits count: the peer, or with
+/// `--trust-proxy` the last `X-Forwarded-For` hop (the one the proxy added).
+/// IPv6 addresses are grouped by /64, since one host usually owns a /64.
+fn client_bucket(st: &AppState, headers: &HeaderMap, peer: SocketAddr) -> String {
+    let mut ip = peer.ip();
     if st.store.cfg.trust_proxy {
-        let forwarded = headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
-            .and_then(|v| v.trim().parse().ok());
-        if let Some(ip) = forwarded {
-            return ip;
+        let last = headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .next_back()
+            .and_then(|v| v.trim().parse::<IpAddr>().ok());
+        if let Some(fwd) = last {
+            ip = fwd;
         }
     }
-    peer.ip()
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let s = v6.segments();
+                format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+            }
+        },
+    }
+}
+
+async fn next_chunk(chunks: &mut BodyDataStream) -> ApiResult<Option<Bytes>> {
+    match tokio::time::timeout(BODY_IDLE, chunks.next()).await {
+        Err(_) => Err(ApiError::timeout()),
+        Ok(None) => Ok(None),
+        Ok(Some(c)) => {
+            c.map(Some).map_err(|e| ApiError::bad_request("body", format!("could not read body: {e}")))
+        }
+    }
+}
+
+/// Read a small UTF-8 body with a size cap and an idle timeout.
+async fn read_json_body(body: Body) -> ApiResult<String> {
+    let mut chunks = body.into_data_stream();
+    let mut buf = Vec::new();
+    while let Some(c) = next_chunk(&mut chunks).await? {
+        if buf.len() + c.len() > MAX_JSON_BYTES {
+            return Err(ApiError::too_large("request body too large"));
+        }
+        buf.extend_from_slice(&c);
+    }
+    String::from_utf8(buf).map_err(|_| ApiError::bad_request("invalid", "body is not utf-8"))
 }
 
 pub async fn health() -> Json<Value> {
@@ -83,8 +137,9 @@ pub async fn create_session(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    body: String,
+    body: Body,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
+    let body = read_json_body(body).await?;
     let signed = SignedManifest::from_json(&body)?;
     let m = &signed.manifest;
     let cfg = &st.store.cfg;
@@ -110,7 +165,7 @@ pub async fn create_session(
     if st.store.count() >= cfg.max_sessions {
         return Err(ApiError::limit("relay is at its session limit"));
     }
-    let ip_hash = sha256_hex(client_ip(&st, &headers, peer).to_string().as_bytes());
+    let ip_hash = st.store.ip_hash(&client_bucket(&st, &headers, peer));
     if st.store.count_for_ip(&ip_hash) >= cfg.max_sessions_per_ip {
         return Err(ApiError::limit("too many active sessions from this address"));
     }
@@ -118,10 +173,16 @@ pub async fn create_session(
         return Err(ApiError::storage_full());
     }
     let expires = m.expires_at_ms;
-    let s = st
-        .store
-        .create(signed, body, ip_hash)?
-        .ok_or_else(|| ApiError::conflict("session already exists"))?;
+    let store = st.store.clone();
+    let s = blocking(move || match store.create(signed, body, ip_hash) {
+        Ok(s) => Ok(s),
+        Err(CreateError::Exists) => Err(ApiError::conflict("session already exists")),
+        Err(CreateError::Closed) => {
+            Err(ApiError::gone("closed", "this session was closed and cannot be re-created"))
+        }
+        Err(CreateError::Io(e)) => Err(e.into()),
+    })
+    .await?;
     Ok((StatusCode::CREATED, Json(json!({"session_id": s.id, "expires_at_ms": expires}))))
 }
 
@@ -142,42 +203,86 @@ pub async fn close_session(
     if role != Role::Owner {
         return Err(ApiError::forbidden("only the owner may close the session"));
     }
-    st.store.purge(&id, "closed by owner");
+    let store = st.store.clone();
+    blocking(move || {
+        store.purge(&id, "closed by owner");
+        Ok(())
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /v1/sessions/:id/participants` — body: canonical signed join request.
+///
+/// Each key joins once. A signed join is public (every participant sees it),
+/// so accepting it twice would hand its token to whoever replays it.
 pub async fn join(
     State(st): State<AppState>,
     Path(id): Path<String>,
-    body: String,
+    body: Body,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let s = session(&st, &id)?;
+    let body = read_json_body(body).await?;
     let j: SignedJoinRequest = parse_canonical(&body, "join request")?;
     j.verify(&s.signed.manifest)?;
     let role = j.join.cert.role();
     if role == Role::Runner && s.signed.manifest.mode == Mode::Relay {
         return Err(ApiError::forbidden("runners can only join execute sessions"));
     }
-    let token = new_token();
-    let mut g = s.lock();
-    if g.closed {
-        return Err(ApiError::gone("closed", "session is closed"));
+    if !st.store.disk_ok() {
+        return Err(ApiError::storage_full());
     }
     let pk = j.join.cert.participant().to_b64();
-    if !g.participants.contains_key(&pk) && g.participants.len() >= MAX_PARTICIPANTS {
-        return Err(ApiError::limit("session is at its participant limit"));
-    }
-    let ev =
-        s.append(&mut g, Rec::Join { signed_join: body, token_sha256: sha256_hex(token.as_bytes()) }, true)?;
-    let seq = ev.map(|e| e.seq).unwrap_or_default();
+    let max_log = st.store.cfg.max_log_bytes;
+    let token = new_token();
+    let token_sha256 = sha256_hex(token.as_bytes());
+    let pk2 = pk.clone();
+    let seq = blocking(move || {
+        let mut g = s.lock();
+        if g.closed {
+            return Err(ApiError::gone("closed", "session is closed"));
+        }
+        if g.participants.contains_key(&pk2) {
+            return Err(ApiError::conflict(
+                "this key has already joined; a client that lost its token joins again with a new key",
+            ));
+        }
+        if g.participants.len() >= MAX_PARTICIPANTS {
+            return Err(ApiError::limit("session is at its participant limit"));
+        }
+        if g.log_len() + body.len() as u64 + LOG_LINE_OVERHEAD > max_log {
+            return Err(ApiError::too_large("session history limit reached"));
+        }
+        let ev = s.append(&mut g, Rec::Join { signed_join: body, token_sha256 })?;
+        Ok(ev.map(|e| e.seq).unwrap_or_default())
+    })
+    .await?;
     Ok((
         StatusCode::CREATED,
         Json(json!({"token": token, "participant_pub": pk, "role": role.as_str(), "seq": seq})),
     ))
 }
 
-/// `GET /v1/sessions/:id/participants`
+/// `POST /v1/sessions/:id/leave` — stop receiving; the token stops working.
+pub async fn leave(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    let s = session(&st, &id)?;
+    let (who, _) = auth(&s, &headers)?;
+    blocking(move || {
+        let mut g = s.lock();
+        if !g.closed {
+            s.append(&mut g, Rec::Leave { who })?;
+        }
+        Ok(())
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /v1/sessions/:id/participants` — current (not departed) participants.
 pub async fn participants(
     State(st): State<AppState>,
     Path(id): Path<String>,
@@ -186,7 +291,7 @@ pub async fn participants(
     let s = session(&st, &id)?;
     auth(&s, &headers)?;
     let g = s.lock();
-    let mut list: Vec<_> = g.participants.values().collect();
+    let mut list: Vec<_> = g.participants.values().filter(|p| !p.left).collect();
     list.sort_by_key(|p| p.seq);
     Ok(Json(json!({"participants": list.iter().map(|p| p.public.clone()).collect::<Vec<_>>()})))
 }
@@ -215,6 +320,24 @@ fn sse_event(e: &Event) -> SseEvent {
     SseEvent::default().id(e.seq.to_string()).event(e.kind).data(e.data.to_string())
 }
 
+/// Counts a participant's open streams.
+struct StreamSlot {
+    session: Arc<Session>,
+    who: String,
+}
+
+impl Drop for StreamSlot {
+    fn drop(&mut self) {
+        let mut g = self.session.lock();
+        if let Some(n) = g.streams.get_mut(&self.who) {
+            *n -= 1;
+            if *n == 0 {
+                g.streams.remove(&self.who);
+            }
+        }
+    }
+}
+
 /// `GET /v1/sessions/:id/stream` — SSE; resume with `Last-Event-ID`.
 pub async fn stream(
     State(st): State<AppState>,
@@ -222,24 +345,30 @@ pub async fn stream(
     headers: HeaderMap,
 ) -> ApiResult<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>> {
     let s = session(&st, &id)?;
-    auth(&s, &headers)?;
+    let (who, _) = auth(&s, &headers)?;
     let after: Option<u64> =
         headers.get("last-event-id").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse().ok());
     // Snapshot and subscribe under the session lock: events are broadcast
     // under the same lock, so nothing falls between the two.
-    let (backlog, rx) = {
-        let g = s.lock();
+    let (backlog, rx, slot) = {
+        let mut g = s.lock();
+        let n = g.streams.entry(who.clone()).or_default();
+        if *n >= MAX_STREAMS_PER_PARTICIPANT {
+            return Err(ApiError::limit("too many open streams for this participant"));
+        }
+        *n += 1;
         let backlog: VecDeque<Arc<Event>> =
             g.events.iter().filter(|e| after.is_none_or(|a| e.seq > a)).cloned().collect();
-        (backlog, s.tx.subscribe())
+        (backlog, s.tx.subscribe(), StreamSlot { session: s.clone(), who })
     };
     struct St {
         backlog: VecDeque<Arc<Event>>,
         rx: broadcast::Receiver<Arc<Event>>,
         shutdown: watch::Receiver<bool>,
         done: bool,
+        _slot: StreamSlot,
     }
-    let state = St { backlog, rx, shutdown: st.shutdown.clone(), done: false };
+    let state = St { backlog, rx, shutdown: st.shutdown.clone(), done: false, _slot: slot };
     let out = futures_util::stream::unfold(state, |mut st| async move {
         if st.done {
             return None;
@@ -264,11 +393,13 @@ pub async fn stream(
     Ok(Sse::new(out).keep_alive(KeepAlive::default()))
 }
 
-/// Releases an upload's reserved quota unless committed.
+/// An upload's claim on the session's quotas. The transfer charge for
+/// bytes actually received stays even if the upload fails.
 struct Reservation {
     session: Arc<Session>,
     id: String,
     bytes: u64,
+    received: u64,
     committed: bool,
 }
 
@@ -278,7 +409,16 @@ impl Drop for Reservation {
             let mut g = self.session.lock();
             g.pending.remove(&self.id);
             g.pending_bytes -= self.bytes;
+            g.transfer_bytes -= self.bytes - self.received.min(self.bytes);
         }
+    }
+}
+
+fn closed_if_missing(e: std::io::Error) -> ApiError {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        ApiError::gone("closed", "session is closed")
+    } else {
+        e.into()
     }
 }
 
@@ -294,11 +434,10 @@ pub async fn post_item(
     let cfg = st.store.cfg.clone();
     let mut chunks = body.into_data_stream();
     let mut buf: Vec<u8> = Vec::new();
-    let read_err = |e: axum::Error| ApiError::bad_request("body", format!("could not read body: {e}"));
 
     while buf.len() < 4 {
-        match chunks.next().await {
-            Some(c) => buf.extend_from_slice(&c.map_err(read_err)?),
+        match next_chunk(&mut chunks).await? {
+            Some(c) => buf.extend_from_slice(&c),
             None => return Err(ApiError::bad_request("body", "truncated body")),
         }
     }
@@ -307,8 +446,8 @@ pub async fn post_item(
         return Err(ApiError::too_large("envelope too large"));
     }
     while buf.len() < 4 + n {
-        match chunks.next().await {
-            Some(c) => buf.extend_from_slice(&c.map_err(read_err)?),
+        match next_chunk(&mut chunks).await? {
+            Some(c) => buf.extend_from_slice(&c),
             None => return Err(ApiError::bad_request("body", "truncated envelope")),
         }
     }
@@ -320,10 +459,19 @@ pub async fn post_item(
     if h.author.to_b64() != who {
         return Err(ApiError::forbidden("item author does not match the authenticated participant"));
     }
+    if h.size > s.signed.manifest.max_item_bytes {
+        return Err(ApiError::too_large(format!(
+            "item exceeds this session's limit of {} bytes",
+            s.signed.manifest.max_item_bytes
+        )));
+    }
     policy::check_header(&s.signed.manifest, role, h)?;
     let item_id = h.id.clone();
     let blob_len = h.blob_len()?;
 
+    if !st.store.disk_ok() {
+        return Err(ApiError::storage_full());
+    }
     let mut reservation = {
         let mut g = s.lock();
         if g.items.contains_key(&item_id) || g.pending.contains(&item_id) {
@@ -332,74 +480,107 @@ pub async fn post_item(
         if g.items.len() + g.pending.len() >= cfg.max_items {
             return Err(ApiError::limit("session is at its item limit"));
         }
+        if g.log_len() + env_json.len() as u64 + LOG_LINE_OVERHEAD > cfg.max_log_bytes {
+            return Err(ApiError::too_large("session history limit reached"));
+        }
         if g.held_bytes + g.pending_bytes + blob_len > cfg.max_session_bytes {
             return Err(ApiError::too_large("session would exceed its storage limit; wait for deliveries"));
         }
+        // Pending uploads are already charged, so concurrent uploads cannot overshoot.
         if g.transfer_bytes + blob_len > cfg.max_session_transfer {
             return Err(ApiError::limit("session transfer limit reached"));
         }
         g.pending.insert(item_id.clone());
         g.pending_bytes += blob_len;
-        Reservation { session: s.clone(), id: item_id.clone(), bytes: blob_len, committed: false }
+        g.transfer_bytes += blob_len;
+        Reservation {
+            session: s.clone(),
+            id: item_id.clone(),
+            bytes: blob_len,
+            received: 0,
+            committed: false,
+        }
     };
-    if !st.store.disk_ok() {
-        return Err(ApiError::storage_full());
-    }
 
     let final_path = s.blob_path(&item_id);
     let tmp_path = s.dir.join("blobs").join(format!(".{item_id}.{}.tmp", random_suffix()));
-    let result: ApiResult<[u8; 32]> = async {
-        let mut file = tokio::fs::OpenOptions::new().write(true).create_new(true).open(&tmp_path).await?;
+    // A steady trickle still has to finish: allow two minutes plus 16 KiB/s.
+    let deadline = Duration::from_secs(120 + blob_len / (16 * 1024));
+    let mut written: u64 = 0;
+    let upload = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .await
+            .map_err(closed_if_missing)?;
         let mut hasher = Sha256::new();
-        let mut written: u64 = 0;
-        let mut feed = |data: &[u8], written: &mut u64| -> ApiResult<()> {
-            *written += data.len() as u64;
-            if *written > blob_len {
+        let mut chunk = Bytes::copy_from_slice(&buf[4 + n..]);
+        loop {
+            written += chunk.len() as u64;
+            if written > blob_len {
                 return Err(ApiError::bad_request("body", "blob is longer than the header size allows"));
             }
-            hasher.update(data);
-            Ok(())
-        };
-        let rest = &buf[4 + n..];
-        feed(rest, &mut written)?;
-        file.write_all(rest).await?;
-        while let Some(c) = chunks.next().await {
-            let c = c.map_err(read_err)?;
-            feed(&c, &mut written)?;
-            file.write_all(&c).await?;
+            hasher.update(&chunk);
+            file.write_all(&chunk).await?;
+            match next_chunk(&mut chunks).await? {
+                Some(c) => chunk = c,
+                None => break,
+            }
         }
         if written != blob_len {
             return Err(ApiError::bad_request("body", "blob is shorter than the header size requires"));
         }
         file.sync_all().await?;
-        Ok(hasher.finalize().into())
-    }
-    .await;
-    let digest = match result {
-        Ok(d) => d,
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(e);
-        }
+        Ok::<[u8; 32], ApiError>(hasher.finalize().into())
     };
-    if let Err(e) = env.verify_blob_digest(blob_len, &digest) {
+    let result = match tokio::time::timeout(deadline, upload).await {
+        Ok(r) => r,
+        Err(_) => Err(ApiError::timeout()),
+    };
+    reservation.received = written;
+    if let Err(e) = result.and_then(|d| env.verify_blob_digest(blob_len, &d).map_err(ApiError::from)) {
         let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(e.into());
+        return Err(e);
     }
-    tokio::fs::rename(&tmp_path, &final_path).await?;
 
-    let mut g = s.lock();
-    if g.closed {
-        drop(g);
-        let _ = std::fs::remove_file(&final_path);
-        return Err(ApiError::gone("closed", "session is closed"));
-    }
-    let recipients: Vec<String> = g.participants.keys().filter(|k| **k != who).cloned().collect();
-    g.pending.remove(&item_id);
-    g.pending_bytes -= blob_len;
-    reservation.committed = true;
-    let ev = s.append(&mut g, Rec::Item { envelope: env_json, recipients, blob_len }, true)?;
-    let seq = ev.map(|e| e.seq).unwrap_or_default();
+    let s2 = s.clone();
+    let seq = blocking(move || {
+        let commit = || -> ApiResult<u64> {
+            std::fs::rename(&tmp_path, &final_path).map_err(closed_if_missing)?;
+            sync_dir(final_path.parent().expect("blob has a parent")).map_err(closed_if_missing)?;
+            let mut g = s2.lock();
+            if g.closed {
+                return Err(ApiError::gone("closed", "session is closed"));
+            }
+            let recipients: Vec<String> = g.active_participants().filter(|k| **k != who).cloned().collect();
+            g.pending.remove(&reservation.id);
+            g.pending_bytes -= blob_len;
+            // Applying the Item record charges the transfer for real.
+            g.transfer_bytes -= blob_len;
+            reservation.committed = true;
+            match s2.append(&mut g, Rec::Item { envelope: env_json, recipients, blob_len }) {
+                Ok(ev) => Ok(ev.map(|e| e.seq).unwrap_or_default()),
+                Err(e) => {
+                    g.transfer_bytes += blob_len;
+                    reservation.committed = false;
+                    // Reservation::drop releases pending; it re-locks, so drop the guard first.
+                    g.pending.insert(reservation.id.clone());
+                    g.pending_bytes += blob_len;
+                    reservation.received = blob_len;
+                    Err(e.into())
+                }
+            }
+        };
+        let r = commit();
+        if r.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+            let _ = std::fs::remove_file(&final_path);
+        }
+        drop(reservation);
+        r
+    })
+    .await?;
     Ok((StatusCode::CREATED, Json(json!({"id": item_id, "seq": seq}))))
 }
 
@@ -431,14 +612,18 @@ pub async fn get_blob(
             return Err(ApiError::limit("session transfer limit reached"));
         }
         g.transfer_bytes += len;
+        g.last_activity_ms = now_ms();
         len
     };
     let file = match tokio::fs::File::open(s.blob_path(&item)).await {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ApiError::gone("evicted", "delivered and removed from the relay"))
+        Err(e) => {
+            s.lock().transfer_bytes -= len;
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return Err(ApiError::gone("evicted", "delivered and removed from the relay"));
+            }
+            return Err(e.into());
         }
-        Err(e) => return Err(e.into()),
     };
     let body = Body::from_stream(tokio_util::io::ReaderStream::new(file));
     Ok((
@@ -460,10 +645,14 @@ pub async fn ack(
     item_path_ok(&item)?;
     let s = session(&st, &id)?;
     let (who, _) = auth(&s, &headers)?;
-    let mut g = s.lock();
-    let r = g.items.get(&item).ok_or_else(|| ApiError::not_found("no such item"))?;
-    if r.recipients.contains(&who) && !r.acked.contains(&who) {
-        s.append(&mut g, Rec::Ack { item, by: who }, false)?;
-    }
+    blocking(move || {
+        let mut g = s.lock();
+        let r = g.items.get(&item).ok_or_else(|| ApiError::not_found("no such item"))?;
+        if r.recipients.contains(&who) && !r.acked.contains(&who) && !g.closed {
+            s.append(&mut g, Rec::Ack { item, by: who })?;
+        }
+        Ok(())
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }

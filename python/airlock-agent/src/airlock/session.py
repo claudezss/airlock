@@ -76,8 +76,10 @@ class Item:
     refs: List[dict] = field(default_factory=list)
     meta: Optional[dict] = None
     body: Optional[bytes] = None
-    #: ``ok``; ``evicted`` (removed from the relay before this client fetched
-    #: it); or ``rejected`` (failed verification or policy, see ``error``).
+    #: ``ok``; ``pending`` (the blob could not be fetched yet: a network
+    #: error or a busy relay; retried on the next ``sync`` or ``stream``);
+    #: ``evicted`` (removed from the relay before this client fetched it); or
+    #: ``rejected`` (failed verification or policy, see ``error``).
     status: str = "ok"
     error: Optional[str] = None
 
@@ -130,9 +132,14 @@ class Session:
         self._participants: Dict[str, dict] = {}
         self._items: Dict[str, Item] = {}
         self._order: List[str] = []
+        self._envelopes: Dict[str, str] = {}
+        self._evicted: set = set()
+        self._unacked: set = set()
         self._last_seq = -1
         self.closed: Optional[str] = None
-        for ev in list(cache.events()):
+        cached = list(cache.events())
+        self._evicted = {ev["data"]["item"] for ev in cached if ev["kind"] == "evicted"}
+        for ev in cached:
             self._apply(ev, fetch=False, record=False)
 
     # construction -----------------------------------------------------
@@ -174,20 +181,32 @@ class Session:
         _http: Optional[httpx.Client] = None,
     ) -> "Session":
         """Join with an invite link. Rejoins as the same participant if this
-        cache already holds an identity for the session."""
+        cache already holds an identity for the session and role.
+
+        If the relay no longer has the session but this cache does, the
+        session opens read-only with its local history and ``closed`` set.
+        Two processes using one invite should use different ``cache_dir``s:
+        a cache holds one identity per role."""
         info_json, session_key, role_seed = ac.parse_invite(invite_url)
         info = json.loads(info_json)
         relay, sid, role = info["base_url"], info["session_id"], info["role"]
         http = _http or httpx.Client(timeout=httpx.Timeout(30.0, connect=10.0))
-        signed = _check(http.get(f"{relay}/v1/sessions/{sid}")).json()["signed_manifest"]
-        ac.check_invite(invite_url, signed)
-
         root = Path(cache_dir) if cache_dir else default_root()
         Cache.sweep_expired(root)
         cache = Cache(root, sid)
-        cache.save_manifest(signed)
-        identity = cache.load_identity()
-        if not identity or identity.get("role") != role:
+        identity = cache.load_identity(role)
+        offline = False
+        try:
+            signed = _check(http.get(f"{relay}/v1/sessions/{sid}")).json()["signed_manifest"]
+        except RelayError as e:
+            signed = cache.load_manifest()
+            if e.status != 404 or signed is None or identity is None:
+                raise
+            offline = True
+        ac.check_invite(invite_url, signed)
+        if not offline:
+            cache.save_manifest(signed)
+        if not identity:
             seed = ac.generate_seed()
             pub = ac.public_key(seed)
             cert = ac.issue_cert(role_seed, sid, role, pub, _now_ms())
@@ -203,8 +222,8 @@ class Session:
             signed_join = ac.sign_join(seed, json.dumps(join))
             resp = _check(http.post(f"{relay}/v1/sessions/{sid}/participants", content=signed_join)).json()
             identity = {"participant_seed": seed.hex(), "token": resp["token"], "role": role}
-            cache.save_identity(identity)
-        return cls(
+            cache.save_identity(role, identity)
+        session = cls(
             relay=relay,
             session_id=sid,
             signed_manifest=signed,
@@ -216,6 +235,19 @@ class Session:
             owner_seed=role_seed if role == "owner" else None,
             http=http,
         )
+        if offline and not session.closed:
+            session.closed = "no longer on the relay"
+        return session
+
+    def disconnect(self) -> None:
+        """Close this client's HTTP connections. The session itself is untouched."""
+        self._http.close()
+
+    def __enter__(self) -> "Session":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.disconnect()
 
     # owner ------------------------------------------------------------
     @property
@@ -232,6 +264,19 @@ class Session:
         """Close and purge the session on the relay (owner only)."""
         self._req("POST", "/close")
         self.closed = "closed by owner"
+
+    def leave(self, *, delete_cache: bool = False) -> None:
+        """Stop receiving: the relay no longer waits for this participant
+        before deleting blobs, and its token stops working."""
+        if not self.closed:
+            try:
+                self._req("POST", "/leave")
+            except RelayError as e:
+                if e.status not in (401, 404, 410):
+                    raise
+        self.closed = "left"
+        if delete_cache:
+            self._cache.delete()
 
     # sending ----------------------------------------------------------
     def send_text(self, text: str, *, refs: Iterable[dict] = ()) -> dict:
@@ -289,15 +334,25 @@ class Session:
 
     # receiving --------------------------------------------------------
     def sync(self) -> List[Item]:
-        """Fetch new events from the relay. Returns newly received items."""
+        """Fetch new events from the relay and retry pending downloads and
+        acks. Returns items that became available."""
+        if self.closed:
+            return []
+        out = self._retry()
         query = f"?after={self._last_seq}" if self._last_seq >= 0 else ""
-        evs = self._req("GET", f"/events{query}").json()["events"]
-        return [i for i in (self._apply(e) for e in evs) if i is not None]
+        try:
+            evs = self._req("GET", f"/events{query}").json()["events"]
+        except RelayError as e:
+            if e.status in (404, 410):
+                self.closed = self.closed or "no longer on the relay"
+                return out
+            raise
+        out += [i for i in (self._apply(e) for e in evs) if i is not None and i.status != "pending"]
+        return out
 
     def items(self) -> List[Item]:
         """All items, oldest first: what the relay still has plus local history."""
-        if not self.closed:
-            self.sync()
+        self.sync()
         return [self._items[i] for i in self._order]
 
     def participants(self) -> List[dict]:
@@ -315,6 +370,7 @@ class Session:
             if self._last_seq >= 0:
                 headers["Last-Event-ID"] = str(self._last_seq)
             read = 60.0 if remaining is None else max(0.1, min(60.0, remaining))
+            yield from self._retry()
             try:
                 with self._http.stream(
                     "GET",
@@ -322,18 +378,22 @@ class Session:
                     headers=headers,
                     timeout=httpx.Timeout(read, connect=10.0),
                 ) as r:
+                    if r.status_code in (404, 410):
+                        self.closed = self.closed or "no longer on the relay"
+                        return
                     if r.status_code != 200:
                         r.read()
                         _check(r)
                     for ev in _sse_events(r.iter_lines()):
                         item = self._apply(ev)
-                        if item is not None:
+                        if item is not None and item.status != "pending":
                             yield item
                         if self.closed:
                             return
                         if deadline is not None and time.monotonic() >= deadline:
                             return
-            except (httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.ReadError):
+            except httpx.TransportError:
+                time.sleep(0.5)
                 continue
 
     # internals --------------------------------------------------------
@@ -352,13 +412,33 @@ class Session:
         kind, data = ev["kind"], ev["data"]
         item = None
         if kind == "participant":
+            # Only fields from the verified signed join count; the relay's
+            # copies of role and name are unsigned.
             try:
                 ac.verify_join(data["signed_join"], self.signed_manifest)
-                self._participants[data["participant_pub"]] = dict(data, cert=ac.join_cert(data["signed_join"]))
-            except ac.AirlockError:
+                join = json.loads(data["signed_join"])["join"]
+                cert = join["cert"]["cert"]
+                self._participants[cert["participant_pub"]] = {
+                    "participant_pub": cert["participant_pub"],
+                    "role": cert["role"],
+                    "display_name": join["display_name"],
+                    "kind": join["kind"],
+                    "cert": ac.join_cert(data["signed_join"]),
+                    "left": False,
+                }
+            except (ac.AirlockError, KeyError, ValueError):
                 pass  # a relay cannot make us accept a forged participant
         elif kind == "item":
             item = self._receive(seq, data["envelope"], fetch)
+        elif kind == "evicted":
+            self._evicted.add(data["item"])
+            pending = self._items.get(data["item"])
+            if pending is not None and pending.status == "pending":
+                pending.status = "evicted"
+        elif kind == "left":
+            p = self._participants.get(data.get("participant_pub"))
+            if p is not None:
+                p["left"] = True
         elif kind == "closed":
             self.closed = data.get("reason", "closed")
         if record:
@@ -366,12 +446,38 @@ class Session:
         self._last_seq = max(self._last_seq, seq)
         return item
 
+    def _retry(self) -> List[Item]:
+        """Retry pending downloads and unsent acks."""
+        out = []
+        for item_id in [i for i in self._order if self._items[i].status == "pending"]:
+            item = self._receive(self._items[item_id].seq, self._envelopes[item_id], True)
+            if item is not None and item.status != "pending":
+                out.append(item)
+        for item_id in list(self._unacked):
+            self._ack(item_id)
+        return out
+
+    def _ack(self, item_id: str) -> None:
+        try:
+            r = self._http.post(self._url(f"/items/{item_id}/ack"), headers={"Authorization": f"Bearer {self._token}"})
+        except httpx.TransportError:
+            self._unacked.add(item_id)
+            return
+        if r.status_code in (204, 404, 410):
+            self._unacked.discard(item_id)
+        elif r.status_code == 429 or r.status_code >= 500:
+            self._unacked.add(item_id)
+        else:
+            self._unacked.discard(item_id)
+            _check(r)
+
     def _receive(self, seq: int, envelope: str, fetch: bool) -> Optional[Item]:
         header = json.loads(envelope)["header"]
         item_id = header["id"]
         existing = self._items.get(item_id)
-        if existing is not None and existing.status == "ok":
+        if existing is not None and existing.status != "pending":
             return None
+        self._envelopes[item_id] = envelope
         author = self._participants.get(header["author"])
         item = Item(
             seq=seq,
@@ -394,12 +500,25 @@ class Session:
         blob = self._cache.read_blob(item_id)
         fresh = False
         if blob is None:
-            if not fetch:
+            if item_id in self._evicted:
                 item.status = "evicted"
                 return item
-            r = self._http.get(self._url(f"/items/{item_id}/blob"), headers={"Authorization": f"Bearer {self._token}"})
-            if r.status_code == 410:
+            if not fetch:
+                # Loaded from the cache without its blob: fetch on the next sync.
+                item.status = "pending"
+                return item
+            try:
+                r = self._http.get(
+                    self._url(f"/items/{item_id}/blob"), headers={"Authorization": f"Bearer {self._token}"}
+                )
+            except httpx.TransportError:
+                item.status = "pending"
+                return item
+            if r.status_code in (404, 410):
                 item.status = "evicted"
+                return item
+            if r.status_code == 429 or r.status_code >= 500:
+                item.status = "pending"
                 return item
             blob = _check(r).content
             fresh = True
@@ -414,11 +533,7 @@ class Session:
         if fresh:
             self._cache.write_blob(item_id, blob)
             if header["author"] != self.participant_pub:
-                r = self._http.post(
-                    self._url(f"/items/{item_id}/ack"), headers={"Authorization": f"Bearer {self._token}"}
-                )
-                if r.status_code not in (204, 404, 410):
-                    _check(r)
+                self._ack(item_id)
         return item
 
 

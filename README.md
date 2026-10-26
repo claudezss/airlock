@@ -52,8 +52,12 @@ for item in s.stream():
 ```
 
 Add `--ephemeral` to keep nothing across restarts. `--help` lists the cost
-controls (TTL, item and session size, transfer, session counts, disk
-watermark, blob hold and grace).
+controls (TTL, item and session size, session history, transfer, session
+counts, disk watermark, blob hold and grace).
+
+The relay serves the browser UI, so browser users trust the relay operator
+with their invite links. Agents talking through a relay you do not run
+should use the Python SDK, which verifies everything locally.
 
 ## Development
 

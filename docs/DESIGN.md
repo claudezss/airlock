@@ -199,8 +199,16 @@ link carries only the owner seed. The normative format is in
 3. `POST /v1/sessions/:id/participants` with `P.pub`, `cert`, and a
    signed join record (display name, kind: `sdk|web|runner`, runner metadata).
 4. The server verifies `cert` against the manifest's role public key and issues
-   a short-lived bearer token bound to `P.pub`. Every later write is also
-   signed by `P`, so the token is a convenience, not the trust anchor.
+   a bearer token bound to `P.pub`. Each key joins once: signed joins are
+   published to every participant, so accepting one twice would hand a new
+   token to whoever replays it. A client that loses its token joins again
+   with a new key.
+
+Items are signed by `P`, so the token cannot forge content. It does
+authorize relay-side actions that carry no signature: downloading, acking,
+leaving and, for the owner, closing. In M1 a token lasts until the
+participant leaves or the session ends; signed acks and close requests are an
+open question (§13).
 
 The same certificate is what other participants verify end-to-end: a runner
 checks `cert` chains to `roles.sender` in the owner-signed manifest before it
@@ -459,23 +467,31 @@ Everything else runs on the participants' machines.
 A blob stays on the relay only until its recipients have it.
 
 - **Recipients** of an item are the participants admitted when it was posted
-  (runners: approved), excluding the author.
+  and not departed (runners: approved), excluding the author. A participant
+  that is done, or a browser clearing its history, calls
+  `POST …/leave`: its token stops working and the relay stops waiting for its
+  acks, so a stale identity cannot pin blobs for the whole hold time.
 - A client **acks** an item after it has verified the blob and stored it in
   its local cache (`POST …/items/:item/ack`). A runner acks a job and its
   input files once they are in the job's work dir; the sender acks result
   output files.
 - The relay **evicts** the blob when every recipient has acked and
   `AIRLOCK_BLOB_GRACE` has passed, or when `AIRLOCK_BLOB_HOLD` has passed
-  since upload, whichever comes first. It emits `blob.evicted`.
+  since upload, whichever comes first. It emits an `evicted` event.
 - **Envelopes stay** in the log for the whole session. The timeline remains
   complete and every reference still verifies; only the ciphertext is gone
   from the relay.
-- **Re-seeding.** A participant that joins late, or opens the session on a
-  new device, posts `want`. Any client still holding the blob in its cache
-  re-uploads it with `PUT …/blob`. The relay accepts the upload from anyone,
-  because the envelope already pins the blob's SHA-256 under the author's
-  signature, so a re-seed cannot alter content. If no holder is online, the
-  UI shows the file as "delivered and removed from the relay".
+- **Re-seeding (M4).** A participant that joins late, or opens the session on
+  a new device, posts `want`. Any participant still holding the blob in its
+  cache re-uploads it with `PUT …/blob`. The envelope already pins the blob's
+  SHA-256 under the author's signature, so a re-seed cannot alter content.
+  To keep it from becoming an amplifier: `PUT` needs a participant token and
+  is accepted only while a `want` is open and the blob is absent; the first
+  matching upload closes the `want`; `want` is rate-limited per participant
+  and allowed only for items the asker has not acked; and re-seeded bytes
+  count against the session transfer cap and get a fresh, short hold. If no
+  holder is online, the UI shows the file as "delivered and removed from the
+  relay".
 - This needs no protocol change: blob location and lifetime are relay
   behaviour, and integrity already rests on the signed blob hash.
 
@@ -499,10 +515,14 @@ better than a database server plus an object store:
 ```
 $AIRLOCK_DATA/
   LOCK                         flock'd by the running server; a second server on the same dir refuses to start
+  ip.key                       random secret for hashing client addresses (0600)
+  tombstones/<session_id>      closed sessions, kept until they would have expired, so they cannot be re-created
+  trash/                       purged session directories being deleted in the background
   sessions/<session_id>/
     manifest.json              signed manifest, canonical JSON, exactly as received
     log.jsonl                  append-only events, one canonical JSON object per line:
-                                 {seq, ts_ms, type: join | item | ack | evict | reseed | job_state | approve | reject | revoke | close, ...}
+                                 {seq, ts_ms, type: create | join | item | ack | leave | evict | close, ...}
+                                 (M2 and M4 add job_state, approve, reject, revoke and reseed)
     blobs/<item_id>            ciphertext, exactly as uploaded; deleted on eviction
 ```
 
@@ -512,24 +532,34 @@ $AIRLOCK_DATA/
   little RAM. Ciphertext is never held in memory: uploads stream to disk and
   downloads stream from disk.
 - **Write order.** Stream the blob to `blobs/.<id>.tmp`, fsync, rename to
-  `blobs/<id>`, then append the log line and fsync it, then broadcast on SSE.
-  A crash can leave only an orphaned blob with no log line; startup deletes
-  those. A log line never points at a missing blob.
+  `blobs/<id>`, fsync `blobs/`, then append the log line and fsync it, then
+  broadcast on SSE. Every log line is fsynced before its event is broadcast,
+  so a client never holds an event id that a crash could reuse. A failed
+  append truncates the log back to its last good line. A crash can leave
+  only an orphaned blob with no log line; startup deletes those. Startup also
+  records an eviction for any blob the log references but the disk lacks,
+  which only happens if the disk itself lost data.
 - **Concurrency.** One process owns the data dir (`LOCK`). Each session has
-  its own async mutex, so writers to different sessions never contend. Job
-  routing ("mark one runner busy atomically") is a check-and-set under that
-  mutex.
-- **Eviction timers** are rebuilt from the log at startup: an item whose
-  hold has passed, or whose recipients have all acked, is evicted
-  immediately.
+  its own mutex, so writers to different sessions never contend. Writes that
+  fsync run on Tokio's blocking pool, never on the async workers, and the
+  global session map is locked only to insert or remove. Job routing ("mark
+  one runner busy atomically") is a check-and-set under the session mutex.
+- **Eviction deadlines** are rebuilt from the log at startup and checked by
+  a sweeper (`--sweep-interval`, default 1 s): an item whose hold has passed,
+  or whose recipients all acked more than `BLOB_GRACE` ago, is evicted on the
+  first sweep.
 - **What is not persisted.** Runner presence, heartbeats and SSE
   subscriptions live in memory only. After a restart, runners and clients
   reconnect and re-subscribe from their last seen `seq`.
-- **Purge.** Each session arms a timer for `expires_at`; startup also sweeps
-  expired sessions. Purging renames the directory to `.trash/<id>` and deletes
-  it in the background, so purge is instant and needs no cron job.
-- **Audit export.** It is `log.jsonl` itself, which already holds only
-  envelopes, hashes and events, never ciphertext.
+- **Purge.** The same sweeper purges sessions past `expires_at` or idle too
+  long; startup also skips expired sessions. Purging writes a tombstone,
+  renames the directory into `trash/` and deletes it in the background, so
+  purge is instant and needs no cron job. The tombstone stops anyone who saw
+  the public signed manifest from re-creating a closed session.
+- **Audit export (M4).** It is derived from `log.jsonl`, which holds only
+  envelopes, hashes and events, never ciphertext. The export omits the
+  creator's address hash. That hash is keyed with `ip.key`, so it cannot be
+  reversed by enumerating addresses.
 - **SSE fan-out** is an in-process broadcast per session
   (`tokio::sync::broadcast`).
 
@@ -547,20 +577,34 @@ refuses a manifest or an upload that exceeds a limit.
 | `AIRLOCK_MAX_TTL` | 24 h | Rejects manifests that live longer, although the protocol allows 30 days. The web UI defaults to 1 h. |
 | `AIRLOCK_MAX_ITEM_BYTES` | 25 MiB | A manifest's `max_item_bytes` may not exceed it. |
 | `AIRLOCK_BLOB_HOLD` | 1 h | Longest a blob stays on the relay after upload, delivered or not. |
-| `AIRLOCK_BLOB_GRACE` | 5 min | How long a blob stays after its last recipient acked, for late joiners. |
+| `AIRLOCK_BLOB_GRACE` | 5 min | How long a blob stays after its last recipient acked. It absorbs a recipient that acks and then immediately re-fetches; late joiners need re-seeding (M4). |
 | `AIRLOCK_MAX_SESSION_BYTES` | 200 MiB | Ciphertext a session may have held on the relay at once; uploads past it get `413`. |
 | `AIRLOCK_MAX_SESSION_TRANSFER` | 1 GiB | Total bytes uploaded plus downloaded per session, the bandwidth cap; past it, `429`. |
 | `AIRLOCK_MAX_ITEMS` | 5 000 | Items per session. |
-| `AIRLOCK_IDLE_TTL` | 2 h | Purges a session early after this long with no new items or joins. |
-| `AIRLOCK_MAX_SESSIONS_PER_IP` | 20 | Active sessions per creator IP. |
+| `AIRLOCK_MAX_LOG_BYTES` | 4 MiB | Session log size (joins and envelopes). It bounds the per-session memory index; past it, joins and items get `413`. |
+| `AIRLOCK_IDLE_TTL` | 2 h | Purges a session early after this long with no joins, items, acks or downloads, and no upload in progress. |
+| `AIRLOCK_MAX_SESSIONS_PER_IP` | 20 | Active sessions per creator address: per IPv4 address, per IPv6 /64. With `--trust-proxy`, the address is the last `X-Forwarded-For` hop, the one the proxy appended. |
 | `AIRLOCK_MAX_SESSIONS` | 1 000 | Active sessions in total. |
-| `AIRLOCK_DISK_HIGH_WATERMARK` | 90 % | Above this volume usage, new sessions and uploads get `507`. |
+| `AIRLOCK_DISK_HIGH_WATERMARK` | 90 % | Above this volume usage, new sessions, joins and uploads get `507`. |
+
+Fixed limits: 64 participants and 4 concurrent streams per participant per
+session; request bodies that stall for 30 s get `408`; an upload must finish
+within 2 minutes plus 16 KiB/s of its size. Uploads are charged to the
+transfer cap as they are reserved, so concurrent uploads cannot overshoot it,
+and the bytes of a failed upload stay charged. Download charges live in
+memory and reset on restart. Slow-header attacks are left to the reverse
+proxy in front of a public relay.
 
 The worst case disk use is therefore bounded by
-`MAX_SESSIONS × MAX_SESSION_BYTES`, and the realistic case is far lower:
-blobs are usually gone minutes after upload, once delivered. Bandwidth is
-bounded by `MAX_SESSIONS × MAX_SESSION_TRANSFER`, and the hold limit means a
-blob is never downloaded for longer than an hour. Content-level savings such as dedupe or
+`MAX_SESSIONS × (MAX_SESSION_BYTES + MAX_LOG_BYTES)` plus in-flight
+temporary files, and the realistic case is far lower: blobs are usually gone
+minutes after upload, once delivered. Memory is bounded by
+`MAX_SESSIONS × MAX_LOG_BYTES` for the indexes. Bandwidth is bounded by
+`MAX_SESSIONS × MAX_SESSION_TRANSFER` *at any one time*: a closed session's
+budget goes with it, so sustained bandwidth also depends on how fast sessions
+can be created (`MAX_SESSIONS_PER_IP`, and on a public relay a rate limit at
+the proxy). The hold limit means a blob is never downloaded for longer than
+an hour. Content-level savings such as dedupe or
 compression are not possible on the server: every item is encrypted under its
 own key.
 
@@ -608,8 +652,10 @@ it at design parity in M4.
 
 - All crypto in the browser goes through the `airlock-core` wasm package
   (session creation, certificates, item encrypt/decrypt/sign/verify). No
-  JavaScript crypto library is used. The fragment is parsed once and kept in
-  memory only; never written to storage or sent in requests.
+  JavaScript crypto library is used. The fragment never goes in a request.
+  On load the page moves it into the tab's `sessionStorage`, so a reload
+  works, and strips it from the address bar and history with
+  `history.replaceState`. Closing the tab forgets it.
 - The owner seed and `K` live in memory for the tab's lifetime; the
   **owner link** (`#v=1&r=owner&ok=…`) is shown once at creation so the owner
   can reopen the session later. "My sessions" in v1 is a localStorage list of
@@ -617,8 +663,9 @@ it at design parity in M4.
 - **Local history.** The browser keeps each session's envelopes and blobs in
   IndexedDB exactly as received, so they are still ciphertext at rest. Opening
   the invite link again supplies the key to decrypt them. The tab acks each
-  item once stored, answers `blob.wanted` by re-seeding from its cache, and
-  offers "Clear local history" per session. Browser storage quotas apply; when
+  item once stored (from M4 it also answers `want` by re-seeding from its
+  cache), and offers "Clear local history" per session, which also leaves the
+  session on the relay. Browser storage quotas apply; when
   one is hit, the oldest sessions' blobs are dropped first.
 - Viewers: Markdown (markdown-it + DOMPurify), image preview (re-encoded on
   send), ZIP manifest (zip.js, listing only), Python (Shiki/Prism highlighting),
@@ -654,10 +701,14 @@ create|close|invite`, `send text|file`, `run <file.py>
 [--runner|--label|--any]`, `runner join`, `watch`.
 
 **Local cache.** The SDK, CLI and runner keep a cache that mirrors the
-relay's layout, `~/.cache/airlock/<session_id>/` with `log.jsonl` and
-`blobs/`, holding ciphertext as received. They ack after writing to it,
-answer `blob.wanted` from it, and delete a session's cache when it expires
-(`Session.join(url, cache_dir=…)` overrides the location).
+relay's layout, `~/.cache/airlock/<session_id>/` with `manifest.json`,
+`events.jsonl`, `identity-<role>.json` (participant seed and token, mode
+0600) and `blobs/`, holding ciphertext as received. The session key is never
+written. They ack after writing to it, retry a failed download or ack on the
+next sync, answer `want` from it (M4), and delete a session's cache when it
+expires (`Session.join(url, cache_dir=…)` overrides the location). If the
+relay has purged the session, `Session.join` reopens the cached history
+read-only. Two processes using the same invite need separate cache dirs.
 
 MCP server (`python -m airlock.mcp`, or `airlock-mcp` from the wheel): tools `send_text`, `send_file`, `list_runners`,
 `run_python`, `get_result`, `list_items`, so any MCP-capable agent can use a
@@ -669,14 +720,17 @@ session without writing code.
 
 | Adversary | What they get | Mitigation |
 |---|---|---|
-| Relay operator / server compromise | Ciphertext, sizes, kinds, timing, participant public keys | E2E encryption with per-item keys; headers carry no names or content; purge on expiry |
-| Someone with an observer link | Read everything | Observers cannot post; runners refuse anything not signed by a sender cert |
+| Relay operator / server compromise | Ciphertext, sizes, kinds, timing, participant public keys and display names | E2E encryption with per-item keys; headers carry no content; purge on expiry. Clients label participants only from signed joins, never from relay fields |
+| Relay operator, against browser users | Everything a browser user can read or sign | The relay serves the web UI that parses the invite fragment, so a malicious relay can serve a UI that leaks it. Browser users must trust the relay that serves the page; agents on an untrusted relay should use the SDK, which verifies locally. A UI served from a separate, pinned origin (fixed hashes, reproducible build) is a v2 item |
+| Someone with an observer link | Read everything | Observers cannot post; runners refuse anything not signed by a sender cert. A participant cannot obtain another's token: each key joins once, so replaying a published signed join gets `409` |
 | Someone with a sender link | Can submit jobs | Jobs run only on runners the receiver started and the owner approved, under manifest limits, with no network |
 | Malicious job code | Tries to escape, exfiltrate, exhaust | docker/k8s: no network, read-only rootfs, caps dropped, memory/cpu/pids/time limits, fresh container per job. local: documented as weak; dev only |
 | Malicious inputs (zip, image, md) | Traversal, bombs, XSS | Zip validator; image re-encode; Markdown HTML stripped and sanitised |
 | Replay / cross-session reuse | Reuse a signed job elsewhere | Signatures cover `session_id` and item `id`; per-item HKDF keys include `session_id`; server rejects duplicate ids |
 | Lost invite link | Full role access | Short expiry by default; server-side role revoke; close & purge |
-| Anyone re-seeding an evicted blob | Upload bytes for an item id | Accepted only if SHA-256 matches the author-signed envelope; counted against the session transfer cap |
+| A participant abusing re-seeding (M4) | Upload bytes for an item id, or make holders re-upload | Accepted only from a participant, while a `want` is open, if SHA-256 matches the author-signed envelope; `want` rate-limited; counted against the session transfer cap |
+| Someone who saw a closed session's manifest | Re-create the session so old invites work again | Tombstones refuse re-creation until the manifest would have expired |
+| Abusive clients of a public relay | Exhaust disk, memory, bandwidth or connections | Per-session caps on bytes, log size, items, transfer and streams; per-address session limit keyed on the proxy's hop and IPv6 /64; body timeouts; disk watermark; slow headers and request rates left to the reverse proxy |
 
 Out of scope for v1: side channels on shared hosts, a compromised sender
 machine, and metadata privacy from the relay (who talks to whom and when).
@@ -759,3 +813,9 @@ format churn is where Rust is slowest.
    than `AIRLOCK_BLOB_HOLD`, or joins later, depends on a peer being online to
    re-seed. Proposed: accept this; the owner can raise the hold on a
    self-hosted relay.
+8. **Signed relay actions.** Acks, leave and close are authorized by bearer
+   token only, so a stolen token can evict blobs early or close the session.
+   Each join is single-use now, which closes the replay route. Signing those
+   requests with the participant key, and expiring tokens, would remove the
+   remaining reliance on the token. Proposed: add both with the M4 role
+   revoke work.
