@@ -1,9 +1,16 @@
 name: ci
 
+# Runs on pull requests only: main requires up-to-date, passing PRs, so a push
+# to main would re-test the same tree. Each job runs only when files it covers
+# changed; `ci-ok` is the one required check and passes when every job that
+# ran passed. Run it by hand to test everything.
 on:
-  push:
-    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,19 +19,85 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ github.event_name != 'pull_request' || steps.filter.outputs.rust == 'true' }}
+      macos: ${{ github.event_name != 'pull_request' || steps.filter.outputs.macos == 'true' }}
+      python: ${{ github.event_name != 'pull_request' || steps.filter.outputs.python == 'true' }}
+      wasm: ${{ github.event_name != 'pull_request' || steps.filter.outputs.wasm == 'true' }}
+      wheels: ${{ github.event_name != 'pull_request' || steps.filter.outputs.wheels == 'true' }}
+    steps:
+      - if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            build: &build
+              - Cargo.toml
+              - Cargo.lock
+              - rust-toolchain.toml
+              - Makefile
+              - .github/workflows/ci.yml
+            rust:
+              - *build
+              - rustfmt.toml
+              - 'crates/**'
+              - 'bindings/**'
+            # Platform-specific code: the runner and its sandboxes, and how the
+            # Python extension links on macOS.
+            macos:
+              - *build
+              - 'crates/airlox/**'
+              - 'bindings/python/**'
+            # The SDK tests drive the real relay and runner.
+            python:
+              - *build
+              - 'crates/**'
+              - 'bindings/python/**'
+              - 'python/**'
+            wasm:
+              - *build
+              - 'crates/airlox-core/**'
+              - 'bindings/wasm/**'
+            wheels:
+              - *build
+              - 'crates/airlox-core/**'
+              - 'bindings/python/**'
+              - python/airlox/pyproject.toml
+              - .github/workflows/release.yml
+
   rust:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: make fmt lint test-rust
 
+  rust-macos:
+    needs: changes
+    if: needs.changes.outputs.macos == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: make test-rust
+
   python:
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: rustup show active-toolchain || rustup toolchain install
@@ -36,7 +109,10 @@ jobs:
       - run: make test-python test-sdk
 
   wasm:
+    needs: changes
+    if: needs.changes.outputs.wasm == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: rustup show active-toolchain || rustup toolchain install
@@ -47,37 +123,41 @@ jobs:
       - run: cargo install wasm-bindgen-cli --version 0.2.100 --locked
       - run: make test-wasm
 
+  # Every platform the release ships, so a packaging breakage shows up before
+  # a tag. Native builds also install the wheel and load the Rust core.
   wheels:
-    needs: python
+    needs: changes
+    if: needs.changes.outputs.wheels == 'true'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - { os: ubuntu-latest, target: x86_64, native: true }
+          - { os: ubuntu-latest, target: aarch64, native: false }
+          - { os: macos-latest, target: aarch64, native: true }
+          - { os: windows-latest, target: x64, native: true }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           working-directory: python/airlox
+          target: ${{ matrix.target }}
           args: --release --out dist
           manylinux: auto
-      # Install the built wheel and load the Rust core from it.
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
-      - run: uv run --isolated --no-project --find-links python/airlox/dist --with airlox python -c "import airlox, airlox._core as c; print('airlox core', c.PROTOCOL_VERSION)"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: wheels-${{ matrix.os }}
-          path: python/airlox/dist
+        if: matrix.native
+      - if: matrix.native
+        run: uv run --isolated --no-project --find-links python/airlox/dist --with airlox python -c "import airlox, airlox._core as c; print('airlox core', c.PROTOCOL_VERSION)"
 
-  # The release also ships a Linux arm64 wheel (a manylinux cross build); build
-  # it here too so a breakage shows up before a tag.
-  wheels-linux-aarch64:
-    needs: python
+  # The single required check: green when every job that ran passed (skipped
+  # jobs count as passing).
+  ci-ok:
+    if: always()
+    needs: [changes, rust, rust-macos, python, wasm, wheels]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
-        with:
-          working-directory: python/airlox
-          target: aarch64
-          args: --release --out dist
-          manylinux: auto
+      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+      - run: echo "all required jobs passed or were not needed"

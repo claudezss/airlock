@@ -1,0 +1,112 @@
+#!/bin/sh
+# Deploy one commit of main. Installed as /usr/local/bin/airlox-deploy (by
+# setup-droplet.sh, the only way a new version of this script reaches the host)
+# and run as the forced command of the deploy user's SSH key:
+#
+#   printf '%s' "$GHCR_TOKEN" | ssh deploy@host <commit-sha>
+#
+# The commit must be on main and must contain the commit already deployed, so
+# a late or out-of-order run never downgrades the relay. The script pulls
+# ghcr.io/claudezss/airlox-server:sha-<commit> (the token on stdin is used for
+# this pull only), installs deploy/docker-compose.yml and deploy/Caddyfile from
+# that commit, restarts, and checks the relay through Caddy on this host. If
+# that fails, the previous image and files are put back.
+set -eu
+
+REPO=claudezss/airlox
+DIR=/opt/airlox
+cd "$DIR"
+
+sha=${SSH_ORIGINAL_COMMAND:-${1:-}}
+case "$sha" in
+  *[!0-9a-f]* | "") echo "usage: airlox-deploy <40-hex commit sha>" >&2; exit 2 ;;
+esac
+[ "${#sha}" -eq 40 ] || { echo "need a full 40-character commit sha" >&2; exit 2; }
+
+# One deploy at a time; a second one waits for the first.
+exec 9>"$DIR/.lock"
+flock -w 900 9 || { echo "another deploy is still running" >&2; exit 1; }
+
+# shellcheck disable=SC1091  # written only by setup-droplet.sh and this script
+. ./.env
+image="ghcr.io/$REPO-server:sha-$sha"
+prev_image=${AIRLOX_IMAGE:-}
+prev_sha=${AIRLOX_SHA:-}
+
+# GitHub's compare API: "ahead" or "identical" when $2 contains $1.
+contains() {
+  status=$(curl -fsS --max-time 20 -H 'Accept: application/vnd.github+json' \
+    "https://api.github.com/repos/$REPO/compare/$1...$2" |
+    sed -n 's/^  "status": "\([a-z]*\)",$/\1/p')
+  [ "$status" = ahead ] || [ "$status" = identical ]
+}
+
+contains "$sha" main || { echo "$sha is not on main; refusing" >&2; exit 1; }
+if [ -n "$prev_sha" ] && [ "$prev_sha" != "$sha" ] && ! contains "$prev_sha" "$sha"; then
+  echo "$prev_sha is deployed and $sha does not contain it; skipping" >&2
+  exit 0
+fi
+
+set_env() {
+  grep -v "^$1=" .env > .env.new || true
+  echo "$1=$2" >> .env.new
+  mv .env.new .env
+}
+
+healthy() {
+  i=0
+  while [ "$i" -lt 30 ]; do
+    if curl -fsS --max-time 3 --resolve "$AIRLOX_DOMAIN:443:127.0.0.1" \
+        "https://$AIRLOX_DOMAIN/v1/health" 2>/dev/null | grep -q '"ok":true'; then
+      running=$(docker inspect --format '{{.Config.Image}}' "$(docker compose ps -q airlox)")
+      [ "$running" = "$AIRLOX_IMAGE" ] && return 0
+    fi
+    i=$((i + 1))
+    sleep 2
+  done
+  return 1
+}
+
+start() {
+  docker compose up -d --remove-orphans &&
+    docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile
+}
+
+echo "deploying $sha"
+for f in docker-compose.yml Caddyfile; do
+  curl -fsSL --max-time 30 "https://raw.githubusercontent.com/$REPO/$sha/deploy/$f" -o "$f.new"
+done
+
+# Pull before touching anything. The registry token arrives on stdin and is
+# dropped right after.
+trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+docker login ghcr.io -u airlox-deploy --password-stdin >/dev/null
+docker pull -q "$image"
+docker logout ghcr.io >/dev/null
+
+cp docker-compose.yml docker-compose.yml.prev 2>/dev/null || true
+cp caddy/Caddyfile Caddyfile.prev 2>/dev/null || true
+mv docker-compose.yml.new docker-compose.yml
+mv Caddyfile.new caddy/Caddyfile
+set_env AIRLOX_IMAGE "$image"
+set_env AIRLOX_SHA "$sha"
+AIRLOX_IMAGE=$image
+
+if start && healthy; then
+  echo "healthy: https://$AIRLOX_DOMAIN ($image)"
+  docker image prune -af --filter "until=168h" >/dev/null 2>&1 || true
+  exit 0
+fi
+
+echo "not healthy after the deploy" >&2
+docker compose logs --tail 50 airlox caddy >&2 || true
+if [ -n "$prev_image" ]; then
+  echo "rolling back to $prev_image" >&2
+  [ -f docker-compose.yml.prev ] && mv docker-compose.yml.prev docker-compose.yml
+  [ -f Caddyfile.prev ] && mv Caddyfile.prev caddy/Caddyfile
+  set_env AIRLOX_IMAGE "$prev_image"
+  set_env AIRLOX_SHA "$prev_sha"
+  AIRLOX_IMAGE=$prev_image
+  if start && healthy; then echo "rolled back to $prev_image" >&2; fi
+fi
+exit 1

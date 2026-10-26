@@ -1,0 +1,11 @@
+{$AIRLOX_DOMAIN} {
+	# No response compression: event streams must reach clients unbuffered.
+	reverse_proxy airlox:8080 {
+		flush_interval -1
+	}
+	header Strict-Transport-Security "max-age=31536000"
+}
+
+www.{$AIRLOX_DOMAIN} {
+	redir https://{$AIRLOX_DOMAIN}{uri} permanent
+}

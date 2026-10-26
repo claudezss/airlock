@@ -1,102 +1,214 @@
-# Airlox
+<p align="center">
+  <a href="https://airlox.app"><img src="docs/assets/logo.svg" width="96" height="96" alt="Airlox logo"></a>
+</p>
 
-Secure, short-lived sessions where code/LLM agents share messages, files and
-runnable Python. Receivers can run submitted code on their own machines with
-headless runners (local, Docker or Kubernetes sandboxes) and post results back.
-No LLM is needed on the receiving side.
+<h1 align="center">Airlox</h1>
 
-- [docs/DESIGN.md](docs/DESIGN.md): v1 architecture, language decision, milestones.
-- [docs/protocol.md](docs/protocol.md): the frozen v1 wire protocol.
+<p align="center">
+  End-to-end encrypted, short-lived sessions where AI agents exchange messages,
+  files and runnable code.
+</p>
 
-## Status
+<p align="center">
+  <a href="https://airlox.app"><strong>airlox.app</strong></a> ·
+  <a href="docs/DESIGN.md">Design</a> ·
+  <a href="docs/protocol.md">Protocol</a> ·
+  <a href="docs/deploy.md">Self-hosting</a>
+</p>
 
-**M2 (execute mode) is done.** `airlox-server` relays end-to-end encrypted
-sessions with no database: each session is an append-only log plus blob
-files, and blobs leave the relay once every recipient has stored them. In
-execute sessions it also routes jobs to runners, with no queue. The
-`airlox` binary runs jobs in a **docker** sandbox or a **local** one
-(namespaces, a read-only minimal root and Landlock on Linux; a plain process
-elsewhere), after verifying every signature itself. The Python SDK and the
-browser UI share text, Markdown, Python, ZIP and images, approve runners,
-submit jobs and show signed results. Kubernetes is next (M3).
+<p align="center">
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License: MIT OR Apache-2.0"></a>
+  <img src="https://img.shields.io/badge/python-3.9%2B-blue" alt="Python 3.9+">
+  <img src="https://img.shields.io/badge/rust-1.88-orange" alt="Rust 1.88">
+</p>
 
-| Path | What |
-|---|---|
-| `crates/airlox-core` | Protocol types, canonical JSON, Ed25519/AES-GCM/HKDF, invites, certificates, item envelope, payloads, policy, ZIP/Markdown/image validators, job shim |
-| `crates/airlox-core/vectors/v1.json` | Conformance vectors every implementation must pass |
-| `crates/airlox-server` | The relay: file-backed sessions, SSE, ack and evict-on-delivery, cost controls, job routing, embedded web UI |
-| `crates/airlox` | The `airlox` binary: `airlox runner join` with docker and local sandboxes |
-| `bindings/python` | PyO3 crate built into the `airlox` wheel as `airlox._core` (abi3, Python 3.9+) |
-| `bindings/wasm` | wasm-bindgen package for browsers and Node |
-| `python/airlox` | Python SDK `airlox` with a local ciphertext cache |
-| `web` | Browser UI (plain JS over the wasm package): sessions, timeline, runner console, jobs |
-| `examples/summarize` | The execute-mode scenario: pandas and matplotlib on a docker runner |
+---
 
-## Quick start
+Airlox gives two or more agents (or an agent and a person) a private, temporary
+place to work together. One party creates a session and hands out invite
+links; each link carries the keys for one role. Participants share text,
+Markdown, Python, ZIP archives and images, and in execute sessions they can
+send Python to a runner on someone else's machine and receive its output and
+files back. The relay in the middle only ever sees ciphertext.
 
-Build the browser assets, then run a relay on localhost:
+## Features
 
-```bash
-make web
+- **End-to-end encryption.** Every item is encrypted with AES-256-GCM under its
+  own key and signed with Ed25519. Keys travel only in the invite link's
+  fragment, which browsers never send to the server.
+- **Roles, not accounts.** Owner, sender, observer and runner invites grant
+  exactly what each participant may do. A participant proves its role with a
+  certificate signed by that role's key, and the role keys are fixed in the
+  session manifest the owner signed. Every client verifies both.
+- **Short-lived by design.** Sessions expire, and files leave the relay once
+  every recipient has stored them. There is no database, and the relay keeps
+  nothing after a session ends.
+- **Remote execution without an LLM on the other side.** A headless runner
+  executes signed Python jobs in a Docker sandbox (no network, read-only root,
+  dropped capabilities, resource limits) or, on Linux, a namespace and
+  Landlock sandbox, and posts back a signed result with any files the job
+  wrote.
+- **Owner approval.** Execute sessions can require the owner to approve each
+  runner before it receives work.
+- **One protocol core.** Cryptography, wire formats and input validation live
+  in a single Rust crate, used natively by the relay and runner, by Python
+  through PyO3 and by the browser through WebAssembly, and checked against
+  shared conformance vectors.
+
+## How it works
+
+```
+ agent (SDK) ─┐                                   ┌─ runner (airlox runner join)
+              │   HTTPS + server-sent events      │
+ browser UI ──┼───────────▶   relay   ◀───────────┤
+              │   ciphertext and signatures only  │
+ agent (SDK) ─┘            (airlox.app)           └─ agent (SDK)
 ```
 
+1. The owner creates a session. Its signed manifest fixes the mode, lifetime,
+   allowed content types and, for execute sessions, the job limits.
+2. The owner shares invite links of the form
+   `https://airlox.app/s/<session>#…`, with the session key and a role key
+   after the `#`.
+3. Participants join with a certificate for their role, then post encrypted,
+   signed items. Every participant verifies every item locally; the relay
+   checks signatures and limits but cannot read content.
+4. In an execute session a sender targets a runner by name or label. The
+   runner verifies the job, runs it in its sandbox and returns a signed result
+   bound to that job.
+
+The full design is in [docs/DESIGN.md](docs/DESIGN.md) and the wire format in
+[docs/protocol.md](docs/protocol.md).
+
+## Getting started
+
+### Install
+
 ```bash
-cargo run --release -p airlox-server -- --data ./data
+pip install airlox
 ```
 
-Open http://127.0.0.1:8080, create a session and hand the sender invite to an
-agent:
+The runner is a single binary:
+
+```bash
+cargo install --git https://github.com/claudezss/airlox airlox
+```
+
+### Share messages and files
 
 ```python
 from airlox import Session
 
-s = Session.join("http://127.0.0.1:8080/s/ax_…#v=1&r=send&k=…&rk=…", display_name="build-agent")
-s.send_text("Build finished.")
-s.send_file("report.md")
-for item in s.stream():
-    print(item.author_role, item.kind, item.text or item.name)
+owner = Session.create("https://airlox.app")
+print(owner.invites["sender"])       # give this link to the other agent
+
+# On the other side:
+agent = Session.join(invite_url, display_name="build-agent")
+agent.send_text("Build finished.")
+agent.send_file("report.md")
+
+for item in owner.stream(timeout=60):
+    print(item.author_name, item.kind, item.text or item.name)
 ```
 
-### Running code (execute mode)
+The same invite links open in a browser at [airlox.app](https://airlox.app).
 
-Create an execute session (in the browser, or `Session.create(url,
-mode="execute", job_limits={…})`), then start a runner on the machine that
-should run the code, with the runner invite:
+### Run code on another machine
+
+Create an execute session and start a runner with its runner invite:
+
+```python
+owner = Session.create(
+    "https://airlox.app",
+    mode="execute",
+    job_limits={"runtime": "python3.12", "timeout_s": 120, "memory_mb": 512,
+                "network": False, "packages": ["pandas", "matplotlib"],
+                "return_out": True, "approve_runners": True},
+)
+print(owner.invites["runner"])
+```
 
 ```bash
-cargo run --release -p airlox -- runner join --invite '<runner invite>' --name runner-01 --labels cpu --sandbox docker
+airlox runner join --invite '<runner invite>' --name runner-01 --labels cpu --sandbox docker
+```
+
+Approve the runner, then send it work:
+
+```python
+owner.approve_runner("runner-01")
+
+data = agent.send_file("dataset.zip")
+job = agent.run_python(open("summarize.py").read(), filename="summarize.py",
+                       files=[data], runner="runner-01")
+res = job.wait()
+print(res.status, res.exit_code, res.stdout)
+chart = res.out_file("chart.png").data   # files the job wrote to $AIRLOX_OUT
 ```
 
 The runner builds its job image once (`python:3.12-slim` plus the session's
-package allowlist) and waits for the owner's approval. Then a sender can run
-code on it:
+package allowlist) and refuses any job not signed by a sender or the owner.
+`--sandbox local` runs jobs with `uv` instead of Docker: sandboxed with
+namespaces and Landlock on Linux, and as a plain process on macOS, which is
+only suitable for trusted code. A complete example is in
+[examples/summarize](examples/summarize).
 
-```python
-data = s.send_file("dataset.zip")
-job = s.run_python(open("summarize.py").read(), filename="summarize.py", files=[data], runner="runner-01")
-res = job.wait()                      # NoRunnerAvailable is raised at once if no runner matches
-print(res.status, res.exit_code, res.stdout)
-chart = res.out_file("chart.png").data  # files the job wrote to $AIRLOX_OUT (/out)
+## Self-hosting
+
+A session's relay is simply the host in its invite links, so anyone can run
+their own. The relay is one static binary that needs a single writable
+directory:
+
+```bash
+docker build -t airlox-server . && docker run -p 8080:8080 -v airlox-data:/data airlox-server
 ```
 
-Jobs run with no network, under the session's time and memory limits, and
-the runner refuses anything not signed by a sender or the owner. See
-[examples/summarize](examples/summarize). `--sandbox local` needs `uv` and,
-on Linux, unprivileged user namespaces; on macOS it is a plain process, for
-trusted code only.
+or, from a checkout:
 
-Add `--ephemeral` to keep nothing across restarts. `--help` lists the cost
-controls (TTL, item and session size, session history, transfer, session
-counts, disk watermark, blob hold and grace).
+```bash
+make web && cargo run --release -p airlox-server -- --data ./data
+```
 
-The relay serves the browser UI, so browser users trust the relay operator
-with their invite links. Agents talking through a relay you do not run
-should use the Python SDK, which verifies everything locally.
+Limits such as session lifetime, item and session size, transfer, session
+counts and the disk watermark are flags and `AIRLOX_*` environment variables;
+see `airlox-server --help`. `--ephemeral` keeps nothing across restarts.
+[docs/deploy.md](docs/deploy.md) describes the production setup behind
+airlox.app: Caddy for HTTPS and automatic deploys from CI.
+
+## Security model
+
+- The relay stores and forwards ciphertext. It cannot read items, forge
+  them, or impersonate a participant.
+- Whoever holds an invite link holds that role. Share links only over a
+  channel you trust.
+- The browser UI is served by the relay, so browser users trust the relay
+  operator to serve unmodified code. Agents using a relay they do not operate
+  should use the Python SDK, which verifies everything locally.
+- Jobs run with no network by default and within the session's time and
+  memory limits. The Docker sandbox is the recommended runner for untrusted
+  senders.
+
+Please report vulnerabilities privately through
+[GitHub security advisories](https://github.com/claudezss/airlox/security/advisories/new).
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `crates/airlox-core` | Protocol types, canonical JSON, cryptography, certificates, item envelopes, policy, validators and the job shim |
+| `crates/airlox-core/vectors` | Conformance vectors every implementation must pass |
+| `crates/airlox-server` | The relay, with the web UI embedded |
+| `crates/airlox` | The `airlox` runner binary and its Docker and local sandboxes |
+| `bindings/python` | PyO3 bindings, built into the `airlox` wheel as `airlox._core` |
+| `bindings/wasm` | WebAssembly bindings used by the web UI |
+| `python/airlox` | The Python SDK |
+| `web` | The browser UI |
+| `deploy` | Docker Compose, Caddy and Droplet scripts for the hosted relay |
+| `examples` | End-to-end examples |
 
 ## Development
 
 Requirements: `rustup` (the toolchain is pinned in `rust-toolchain.toml`),
-`uv`, `maturin`, `wasm-bindgen-cli` 0.2.100 and Node 20+.
+`uv`, `maturin`, `wasm-bindgen-cli` 0.2.100 and Node 20 or later.
 
 ```bash
 uv tool install maturin==1.8.6
@@ -110,25 +222,11 @@ cargo install wasm-bindgen-cli --version 0.2.100 --locked
 make check
 ```
 
-`make check` runs rustfmt, Clippy with warnings as errors (native and wasm),
-the Rust tests (including the relay), the Python binding and SDK tests
-(including execute mode against a real runner, and the docker scenario when a
-Docker daemon is available), and the wasm tests in Node.
-
-## Releasing
-
-Releases come from CI (`.github/workflows/release.yml`), never from a laptop.
-PyPI gets one package, `airlox`: the SDK with the Rust core compiled in as
-`airlox._core`. Its version is `workspace.package.version` in `Cargo.toml`;
-bump it, then push a matching tag:
-
-```bash
-git tag v0.1.0 && git push origin v0.1.0
-```
-
-The workflow checks the tag against that version, builds abi3 wheels for Linux
-(x86_64, aarch64), macOS (x86_64, arm64) and Windows plus an sdist, and uploads
-them with the `PYPI_TOKEN` secret only if every build succeeded.
+`make check` runs rustfmt, Clippy with warnings as errors (native and
+WebAssembly), the Rust tests, the Python binding and SDK tests (including
+execute mode against a real runner, and the Docker scenario when a Docker
+daemon is available) and the WebAssembly tests in Node. Release steps are in
+[docs/releasing.md](docs/releasing.md).
 
 ## License
 
