@@ -126,7 +126,8 @@ fn remount_ro(target: &Path) -> Result<()> {
         (FsFlags::ST_NOEXEC, MsFlags::MS_NOEXEC),
         (FsFlags::ST_NOATIME, MsFlags::MS_NOATIME),
         (FsFlags::ST_NODIRATIME, MsFlags::MS_NODIRATIME),
-        (FsFlags::ST_RELATIME, MsFlags::MS_RELATIME),
+        // nix leaves ST_RELATIME out on musl; the kernel's value is 0x1000.
+        (FsFlags::from_bits_retain(0x1000), MsFlags::MS_RELATIME),
     ] {
         if f.contains(fs_flag) {
             ms |= ms_flag;

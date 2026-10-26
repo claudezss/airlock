@@ -30,17 +30,28 @@ Nothing is published unless every build succeeded. PyPI, npm and the GitHub
 release go out in parallel, then the registry entry, since the registry checks
 that each package exists and names the server (`mcpName` in the npm wrapper's
 `package.json`, `mcp-name:` in the PyPI README, `mcp` in the bundle's URL).
-Each step skips what is already published, so a failed release can be re-run
-from the Actions page.
+
+If a release fails partway, use **Re-run failed jobs**: the builds' artifacts
+are kept, and each publish step skips what is already published. A full
+re-run rebuilds the files, which then differ from those already out, so the
+GitHub release step refuses to replace them. Fix forward with a new version
+instead.
 
 ## Setup (once)
 
-- `PYPI_TOKEN`: a PyPI API token for the `airlox` project, as a repository
-  secret.
-- `NPM_TOKEN`: an npm automation (or granular, publish-only) token for a
-  member of the `airlox` npm organization, which owns the `@airlox` scope, as a
-  repository secret. The first release creates the packages; after it, npm
-  trusted publishing can replace the token.
+- An npm organization `airlox`, which owns the `@airlox` scope of the
+  platform packages, and the unscoped `airlox` package name.
+- A GitHub environment `release` (Settings → Environments) limited to `v*`
+  tags, with required reviewers if more than one person can push tags, and a
+  tag ruleset that limits who may create `v*` tags. The publish jobs run in
+  it, so its secrets reach only them:
+  - `PYPI_TOKEN`: a PyPI API token scoped to the `airlox` project.
+  - `NPM_TOKEN`: a granular npm access token with read and write access to
+    `airlox` and `@airlox/*` only. Not a classic "automation" token, which
+    skips two-factor authentication for everything the account can publish.
+
+  After the first release, PyPI and npm trusted publishing (this repository,
+  `release.yml`, environment `release`) can replace both tokens.
 - The MCP registry needs no secret: the workflow logs in with the repository's
   GitHub OIDC token, which grants the `io.github.claudezss/*` namespace.
 

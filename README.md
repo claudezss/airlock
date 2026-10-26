@@ -95,7 +95,9 @@ pip install airlox           # with the Python SDK; or run it with uvx airlox â€
 There are prebuilt binaries for macOS (arm64, x64), Linux (arm64, x64; static,
 so any distribution) and Windows (x64), also on the
 [releases page](https://github.com/claudezss/airlox/releases), each with
-`SHA256SUMS`. Elsewhere, build it with
+`SHA256SUMS`. On Windows it is the command-line client and the MCP server;
+runners need macOS or Linux. Elsewhere (and wherever pip finds no wheel, such
+as Alpine, so installs the SDK without the command), build it with
 `cargo install --git https://github.com/claudezss/airlox airlox`.
 
 ### From the command line
@@ -120,10 +122,10 @@ it to your agent's skills, or point the agent at it.
 
 Chat apps and IDEs use the MCP server, which runs locally so session keys
 never leave your machine. It reads and writes files only inside the
-directories it is allowed (`--allow-dir`; default: its working directory,
-unless that is `/`, your home directory or a parent of it), never overwrites
-a file, and never shows the owner invite to the model (`--owner-invite-dir`
-saves it for you).
+directories it is allowed (`--allow-dir`; default: its working directory;
+never `/`, your home directory or a parent of it), never overwrites a file,
+and never shows the owner invite to the model (`--owner-invite-dir` saves it
+for you, in a folder its tools cannot read).
 
 ```bash
 claude mcp add airlox -- npx -y airlox mcp    # Claude Code

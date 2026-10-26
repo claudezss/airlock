@@ -714,14 +714,19 @@ impl ServerHandler for Airlox {
     }
 }
 
-/// The allowed directories: those given, else the working directory unless
-/// it is `/`, the home directory or one containing it (where GUI clients
-/// often start servers), which would open up everything.
+/// The allowed directories: those given, else the working directory. Never
+/// a filesystem root, the home directory or one containing it (where GUI
+/// clients often start servers), which would open up everything: a default
+/// like that allows nothing, a given one is refused.
 fn allow_dirs(given: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .and_then(|h| PathBuf::from(h).canonicalize().ok());
+    // Some(true) if `d` is the home directory or contains it; None if unknown.
+    let holds_home = |d: &Path| home.as_ref().map(|h| h.starts_with(d));
     if given.is_empty() {
         let cwd = std::env::current_dir()?.canonicalize()?;
-        let home = std::env::var_os("HOME").and_then(|h| PathBuf::from(h).canonicalize().ok());
-        if cwd.parent().is_none() || home.is_none_or(|h| h.starts_with(&cwd)) {
+        if cwd.parent().is_none() || holds_home(&cwd) != Some(false) {
             tracing::warn!("not allowing file access in {}: pass --allow-dir", cwd.display());
             return Ok(vec![]);
         }
@@ -729,7 +734,16 @@ fn allow_dirs(given: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
     }
     given
         .iter()
-        .map(|d| d.canonicalize().map_err(|e| anyhow::anyhow!("--allow-dir {}: {e}", d.display())))
+        .map(|d| {
+            let c = d.canonicalize().map_err(|e| anyhow::anyhow!("--allow-dir {}: {e}", d.display()))?;
+            if c.parent().is_none() || holds_home(&c) == Some(true) {
+                anyhow::bail!(
+                    "--allow-dir {}: too wide; allow a directory for this, not / or your home directory",
+                    c.display()
+                );
+            }
+            Ok(c)
+        })
         .collect()
 }
 
@@ -743,6 +757,17 @@ pub async fn serve(a: McpArgs) -> anyhow::Result<()> {
         }
         None => None,
     };
+    // The tools refuse the owner invite directory, so one holding an allowed
+    // directory would leave them nothing.
+    if let Some(o) = &owner_invite_dir {
+        if let Some(a) = allow.iter().find(|a| a.starts_with(o)) {
+            anyhow::bail!(
+                "--owner-invite-dir {} holds the allowed directory {}; choose a separate one",
+                o.display(),
+                a.display()
+            );
+        }
+    }
     let http = client::http()?;
     let cache_root = a.cache_dir.clone().unwrap_or_else(default_cache_root);
     let server = Airlox {

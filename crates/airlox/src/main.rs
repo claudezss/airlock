@@ -82,9 +82,16 @@ fn main() -> std::process::ExitCode {
     }
     // An empty AIRLOX_* variable counts as unset, so a launcher that fills in
     // every setting (an MCPB bundle's optional fields) leaves out the ones the
-    // user left blank.
+    // user left blank. Not the relay: blanking a self-hosted one must not
+    // quietly fall back to the public relay.
     for (k, v) in std::env::vars_os() {
         if v.is_empty() && k.to_str().is_some_and(|k| k.starts_with("AIRLOX_")) {
+            if k == "AIRLOX_RELAY" {
+                eprintln!(
+                    "airlox: AIRLOX_RELAY is empty; set it to your relay, or unset it for https://airlox.app"
+                );
+                return std::process::ExitCode::from(2);
+            }
             std::env::remove_var(k);
         }
     }

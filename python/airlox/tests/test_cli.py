@@ -265,6 +265,29 @@ class McpToolError(Exception):
     pass
 
 
+def test_mcp_refuses_unsafe_settings(relay, caches, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+
+    def start(*args, **env):
+        cmd = [BIN, "mcp", "--relay", relay.url, "--cache-dir", str(caches("mcp")), *args]
+        return subprocess.run(cmd, env={**os.environ, **env}, stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, timeout=30)
+
+    # A directory as wide as home or / is refused when given, not just by default.
+    for wide in [os.path.expanduser("~"), "/"]:
+        p = start("--allow-dir", wide)
+        assert p.returncode != 0 and "too wide" in p.stderr, p.stderr
+    # An owner link folder holding the working folder would leave the tools nothing.
+    for owner in [work, tmp_path]:
+        p = start("--allow-dir", str(work), "--owner-invite-dir", str(owner))
+        assert p.returncode != 0 and "choose a separate one" in p.stderr, p.stderr
+    # A blanked relay does not fall back to the public one.
+    p = subprocess.run([BIN, "mcp", "--allow-dir", str(work)], env={**os.environ, "AIRLOX_RELAY": ""},
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    assert p.returncode == 2 and "AIRLOX_RELAY is empty" in p.stderr, p.stderr
+
+
 def test_mcp_owner_invites_in_the_work_dir(relay, caches, tmp_path):
     # As an MCPB bundle starts it: owner links saved inside the allowed
     # directory, and every optional setting passed, empty when left blank.

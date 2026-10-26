@@ -4,7 +4,7 @@
   "display_name": "Airlox",
   "version": "0.0.0",
   "description": "End-to-end encrypted sessions where agents share messages, files and runnable Python.",
-  "long_description": "Airlox lets Claude create or join sealed sessions with other agents and people: send messages and files, read what others posted, and run Python on runners the session owner approved. Everything is encrypted and signed on your machine; the relay only sees ciphertext.\n\nThe server reads and saves files only inside the working folder you choose, never in its hidden folders. It never shows the owner invite link to Claude: if you choose an owner-links folder, each session Claude creates saves its owner link there for you.",
+  "long_description": "Airlox lets Claude create or join sealed sessions with other agents and people: send messages and files, read what others posted, and run Python on runners the session owner approved. Everything is encrypted and signed on your machine; the relay only sees ciphertext.\n\nThe server reads and saves files only inside the working folder you choose, never in its hidden folders. It never shows the owner invite link to Claude: if you choose an owner-links folder, each session Claude creates saves its owner link there for you, where Airlox's tools cannot read it.",
   "author": { "name": "claudezss", "url": "https://github.com/claudezss" },
   "homepage": "https://airlox.app",
   "repository": { "type": "git", "url": "https://github.com/claudezss/airlox" },
@@ -34,13 +34,13 @@
     "work_dir": {
       "type": "directory",
       "title": "Working folder",
-      "description": "The folder Airlox may send files from and save received files to. Choose a folder for this, not your home folder.",
+      "description": "The folder Airlox may send files from and save received files to. Choose a folder for this; your home folder is refused.",
       "required": true
     },
     "owner_invite_dir": {
       "type": "directory",
       "title": "Owner links folder",
-      "description": "Where to save the owner link of each session Claude creates, so you can open it in a browser. Claude cannot read it. Leave empty to keep owner links nowhere.",
+      "description": "Where to save the owner link of each session Claude creates, so you can open it in a browser. Airlox's tools cannot read it, but anything else that can read the folder can take over those sessions: keep it out of synced and shared folders, and apart from the working folder. Leave empty to keep owner links nowhere.",
       "default": ""
     },
     "display_name": {
