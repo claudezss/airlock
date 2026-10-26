@@ -53,11 +53,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "airlock"
+name = "airlox"
 version = "0.1.0"
 dependencies = [
- "airlock-core",
- "airlock-server",
+ "airlox-core",
+ "airlox-server",
  "anyhow",
  "bytes",
  "caps",
@@ -79,7 +79,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "airlock-core"
+name = "airlox-core"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
@@ -99,30 +99,30 @@ dependencies = [
 ]
 
 [[package]]
-name = "airlock-core-py"
+name = "airlox-core-py"
 version = "0.1.0"
 dependencies = [
- "airlock-core",
+ "airlox-core",
  "pyo3",
  "pyo3-build-config",
  "serde",
 ]
 
 [[package]]
-name = "airlock-core-wasm"
+name = "airlox-core-wasm"
 version = "0.1.0"
 dependencies = [
- "airlock-core",
+ "airlox-core",
  "getrandom 0.2.17",
  "js-sys",
  "wasm-bindgen",
 ]
 
 [[package]]
-name = "airlock-server"
+name = "airlox-server"
 version = "0.1.0"
 dependencies = [
- "airlock-core",
+ "airlox-core",
  "axum",
  "bytes",
  "clap",

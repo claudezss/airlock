@@ -1,4 +1,4 @@
-// Replays crates/airlock-core/vectors/v1.json through the wasm binding.
+// Replays crates/airlox-core/vectors/v1.json through the wasm binding.
 // Run: npm test  (after `npm run build`)
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -6,9 +6,9 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
-const ac = require("../pkg/node/airlock_core_wasm.js");
+const ac = require("../pkg/node/airlox_core_wasm.js");
 const VEC = JSON.parse(
-  readFileSync(new URL("../../../crates/airlock-core/vectors/v1.json", import.meta.url), "utf8"),
+  readFileSync(new URL("../../../crates/airlox-core/vectors/v1.json", import.meta.url), "utf8"),
 );
 const MANIFEST = VEC.manifest.signed_canonical;
 const CERTS = Object.fromEntries(VEC.certs.map((c) => [c.role, c]));

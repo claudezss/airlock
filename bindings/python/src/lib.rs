@@ -1,24 +1,19 @@
-//! Python bindings: a one-to-one wrapper over `airlock_core::api`.
+//! Python bindings: a one-to-one wrapper over `airlox_core::api`.
 //!
 //! Structured values are JSON strings; secrets and blobs are `bytes`.
-//! Errors raise `AirlockError` or one of its subclasses.
+//! Errors raise `AirloxError` or one of its subclasses.
 
-use ::airlock_core::{api, Error};
+use ::airlox_core::{api, Error};
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-create_exception!(airlock_core, AirlockError, PyException, "Any airlock-core failure.");
-create_exception!(airlock_core, SignatureError, AirlockError, "A signature did not verify.");
-create_exception!(
-    airlock_core,
-    DecryptError,
-    AirlockError,
-    "Decryption failed (wrong key or tampered data)."
-);
-create_exception!(airlock_core, PolicyError, AirlockError, "The session policy forbids this.");
-create_exception!(airlock_core, ValidationError, AirlockError, "Malformed or unsafe input.");
+create_exception!(airlox_core, AirloxError, PyException, "Any airlox-core failure.");
+create_exception!(airlox_core, SignatureError, AirloxError, "A signature did not verify.");
+create_exception!(airlox_core, DecryptError, AirloxError, "Decryption failed (wrong key or tampered data).");
+create_exception!(airlox_core, PolicyError, AirloxError, "The session policy forbids this.");
+create_exception!(airlox_core, ValidationError, AirloxError, "Malformed or unsafe input.");
 
 fn err(e: Error) -> PyErr {
     let msg = e.to_string();
@@ -29,7 +24,7 @@ fn err(e: Error) -> PyErr {
         Error::Zip(_) | Error::Image(_) | Error::Invalid { .. } | Error::Encoding(_) | Error::Json(_) => {
             ValidationError::new_err(msg)
         }
-        Error::Io(_) => AirlockError::new_err(msg),
+        Error::Io(_) => AirloxError::new_err(msg),
     }
 }
 
@@ -81,7 +76,7 @@ fn parse_invite<'py>(
 }
 
 fn serde_json_string<T: serde::Serialize>(v: &T) -> PyResult<String> {
-    ::airlock_core::encoding::canonical_json(v).map(|b| String::from_utf8(b).expect("utf-8")).map_err(err)
+    ::airlox_core::encoding::canonical_json(v).map(|b| String::from_utf8(b).expect("utf-8")).map_err(err)
 }
 
 #[pyfunction]
@@ -265,10 +260,10 @@ fn shim_source() -> &'static str {
 }
 
 #[pymodule]
-fn airlock_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn airlox_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
-    m.add("PROTOCOL_VERSION", ::airlock_core::PROTOCOL_VERSION)?;
-    m.add("AirlockError", py.get_type::<AirlockError>())?;
+    m.add("PROTOCOL_VERSION", ::airlox_core::PROTOCOL_VERSION)?;
+    m.add("AirloxError", py.get_type::<AirloxError>())?;
     m.add("SignatureError", py.get_type::<SignatureError>())?;
     m.add("DecryptError", py.get_type::<DecryptError>())?;
     m.add("PolicyError", py.get_type::<PolicyError>())?;

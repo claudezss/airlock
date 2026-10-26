@@ -1,11 +1,11 @@
-//! WebAssembly bindings: a one-to-one wrapper over `airlock_core::api`.
+//! WebAssembly bindings: a one-to-one wrapper over `airlox_core::api`.
 //!
 //! Names are camelCase. Structured values are JSON strings, secrets and
 //! blobs are `Uint8Array`. Multi-value results are plain objects. Errors
 //! throw a JS `Error` whose message starts with the error class, e.g.
 //! `"SignatureError: …"`.
 
-use airlock_core::{api, Error};
+use airlox_core::{api, Error};
 use js_sys::{Object, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 
@@ -14,7 +14,7 @@ fn err(e: Error) -> JsError {
         Error::Signature(_) => "SignatureError",
         Error::Decrypt => "DecryptError",
         Error::Policy(_) => "PolicyError",
-        Error::Io(_) => "AirlockError",
+        Error::Io(_) => "AirloxError",
         _ => "ValidationError",
     };
     JsError::new(&format!("{class}: {e}"))
@@ -36,7 +36,7 @@ fn bytes(v: &[u8]) -> JsValue {
 
 #[wasm_bindgen(js_name = protocolVersion)]
 pub fn protocol_version() -> u32 {
-    airlock_core::PROTOCOL_VERSION
+    airlox_core::PROTOCOL_VERSION
 }
 
 #[wasm_bindgen(js_name = generateSeed)]

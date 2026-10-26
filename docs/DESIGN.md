@@ -1,4 +1,4 @@
-# Airlock — v1 design
+# Airlox — v1 design
 
 Secure, short-lived sessions in which code/LLM agents exchange messages, files and
 runnable Python. In **Relay** mode the other side only reads. In **Execute** mode
@@ -6,7 +6,7 @@ headless **runners** on the receiver's own machines run submitted Python in a
 sandbox and post results back. No LLM is required on the receiving side.
 
 This document fixes the architecture, the implementation languages and the
-protocol for v1. The UI reference is the "Airlock — agent sessions" design
+protocol for v1. The UI reference is the "Airlox — agent sessions" design
 canvas (landing, live session, new session, runner console).
 
 ---
@@ -51,11 +51,11 @@ canvas (landing, live session, new session, runner console).
 
 | Component | Language | Stack |
 |---|---|---|
-| `airlock-core`: protocol, crypto, validators, job shim | **Rust** | `ed25519-dalek`, `aes-gcm`, `hkdf`, `sha2`, `serde` + canonical JSON; bindings via **PyO3** (Python wheel) and **wasm-bindgen** (browser) |
+| `airlox-core`: protocol, crypto, validators, job shim | **Rust** | `ed25519-dalek`, `aes-gcm`, `hkdf`, `sha2`, `serde` + canonical JSON; bindings via **PyO3** (Python wheel) and **wasm-bindgen** (browser) |
 | Relay server (API, SSE, storage, purge) | **Rust** | `axum` + `tokio`, `tower` middleware; storage is plain files (append-only session logs + blob files), **no database** |
-| `airlock` binary: runner, CLI | **Rust** | `tokio`, `reqwest` (SSE), `bollard` (Docker), `kube` (Kubernetes), `nix` + Landlock + seccomp for the local backend |
-| SDK and MCP server (`pip install airlock-agent`) | **Python 3.12+** | thin orchestration over the `airlock-core` wheel; `httpx`, `mcp`; the wheel also bundles the `airlock` binary |
-| Web UI (static SPA served by the server) | **TypeScript** | Vite + React, `airlock-core` wasm for all crypto, markdown-it + DOMPurify, zip.js |
+| `airlox` binary: runner, CLI | **Rust** | `tokio`, `reqwest` (SSE), `bollard` (Docker), `kube` (Kubernetes), `nix` + Landlock + seccomp for the local backend |
+| SDK and MCP server (`pip install airlox`) | **Python 3.12+** | thin orchestration over the `airlox-core` wheel; `httpx`, `mcp`; the wheel also bundles the `airlox` binary |
+| Web UI (static SPA served by the server) | **TypeScript** | Vite + React, `airlox-core` wasm for all crypto, markdown-it + DOMPurify, zip.js |
 
 Rust owns everything that touches keys, signatures, sandboxes or the wire.
 Python is a thin convenience layer for agents and the MCP ecosystem. TypeScript
@@ -78,7 +78,7 @@ to WebAssembly.
 3. **Runner distribution.** A static musl binary drops onto a CI box, a GPU
    server or a `FROM scratch` image with no Python on the host. The same
    binary is also bundled inside the Python wheel, so both
-   `pip install airlock-agent` and `curl | sh` work.
+   `pip install airlox` and `curl | sh` work.
 4. **A real local sandbox.** From Rust the runner reaches Linux user
    namespaces, Landlock, seccomp and cgroups v2 directly, so the local backend
    can enforce no-network and filesystem confinement on Linux instead of
@@ -128,7 +128,7 @@ to WebAssembly.
                       │ HTTPS+SSE    │ HTTPS+SSE          │ HTTPS+SSE       │ HTTPS+SSE
           ┌───────────┴───┐  ┌───────┴────────┐  ┌────────┴────────┐  ┌─────┴──────┐
           │ sender agent  │  │ owner / human  │  │ runner (no LLM) │  │ observer   │
-          │ Python SDK /  │  │ web UI (TS)    │  │ airlock runner  │  │ web / SDK  │
+          │ Python SDK /  │  │ web UI (TS)    │  │ airlox runner  │  │ web / SDK  │
           │ CLI / MCP     │  │                │  │ join …          │  │ read-only  │
           └───────────────┘  └────────────────┘  └────────┬────────┘  └────────────┘
                                                           │ backend
@@ -149,7 +149,7 @@ session key, never sees plaintext, and never executes code.
 All asymmetric keys are **Ed25519** (signing) and **X25519** (only if we later
 need per-recipient wrapping; v1 does not). Symmetric encryption is
 **AES-256-GCM**; key derivation is **HKDF-SHA256**. All of them are implemented once in the
-`airlock-core` crate (RustCrypto `ed25519-dalek`, `aes-gcm`, `hkdf`, `sha2`)
+`airlox-core` crate (RustCrypto `ed25519-dalek`, `aes-gcm`, `hkdf`, `sha2`)
 and reach Python through PyO3 and the browser through wasm; no second
 implementation exists.
 
@@ -243,7 +243,7 @@ header (canonical JSON, plaintext):
     "kind": "text|file|job|result|event", "subkind": "md|py|zip|image|null",
     "size": plaintext bytes, "created_at_ms", "refs": [item ids] }
 
-blob: nonce(12) || AES-256-GCM( key = HKDF(K, salt=session_id, info="airlock/v1/item-key\0"+id),
+blob: nonce(12) || AES-256-GCM( key = HKDF(K, salt=session_id, info="airlox/v1/item-key\0"+id),
                                  aad = canonical(header) )
 
 sig: Ed25519( P.priv, ctx "item", canonical(header) || sha256(blob) )
@@ -284,10 +284,10 @@ sig: Ed25519( P.priv, ctx "item", canonical(header) || sha256(blob) )
 
 ## 6. Runner
 
-`airlock runner join --invite $RUNNER_INVITE --name runner-01 --labels cpu,py3.12
+`airlox runner join --invite $RUNNER_INVITE --name runner-01 --labels cpu,py3.12
 --sandbox docker|local|k8s [--no-network] [--memory 512m]`
 
-The runner is a subcommand of the static `airlock` binary: a long-running
+The runner is a subcommand of the static `airlox` binary: a long-running
 tokio process with **no LLM and no shell for anyone else**. Loop:
 
 1. Join (§4), register `{name, labels, host, sandbox, limits}`, open the SSE
@@ -324,17 +324,17 @@ pub trait Sandbox: Send + Sync {
 network: bool, env}`. `RawResult` = `{exit_code, stdout_path, stderr_path,
 wall_ms, peak_mem_mb, out_dir}`.
 
-*As built in M2:* the backends are an enum in `crates/airlock/src/sandbox`,
+*As built in M2:* the backends are an enum in `crates/airlox/src/sandbox`,
 and the docker backend drives the `docker` CLI rather than `bollard` (the
 surface used is `build`, `run`, `kill`, `inspect` and `rm`). Jobs find their
-output directory in `$AIRLOCK_OUT` (`/out` in containers and the Linux
+output directory in `$AIRLOX_OUT` (`/out` in containers and the Linux
 sandbox), set by the shim's `--out`. Top-level images in `/out` come back as
 image items; everything else is bundled into `out.zip`; links and special
 files are skipped with a note in stderr. The relay refuses `job` items on
 `POST /items`, so every job goes through routing (protocol §13).
 
 All backends execute the same tiny **job shim**, a dependency-free Python
-script embedded in `airlock-core` and copied into the sandbox: it sets
+script embedded in `airlox-core` and copied into the sandbox: it sets
 `cwd=/work`, scrubs the environment, runs `python -E -s entry.py`, enforces the
 wall clock, measures peak RSS and writes a `result.json`. The shim stays in
 Python because it must run inside an image that has only Python; it is ~150
@@ -349,7 +349,7 @@ at `prepare()` time**, keyed by `sha256(runtime + sorted(allowlist))`:
 
 - local → a `uv venv` with the allowlist installed (the runner shells out to
   `uv`, which it downloads on first use if absent);
-- docker → an image `airlock-rt:<hash>` built `FROM python:3.12-slim` with the
+- docker → an image `airlox-rt:<hash>` built `FROM python:3.12-slim` with the
   allowlist pip-installed;
 - k8s → the same image pushed to a registry the cluster can pull from
   (`--image-repo`), or a pre-built image name passed by the operator.
@@ -448,12 +448,12 @@ Items are uploaded as one binary stream rather than multipart, so the relay
 can verify the signed envelope before it writes a byte of the blob and can
 hash the blob while streaming it to disk.
 
-Server flags (each also reads an `AIRLOCK_*` environment variable):
+Server flags (each also reads an `AIRLOX_*` environment variable):
 `--data`, `--ephemeral`, `--listen`, `--trust-proxy`, `--max-ttl`,
 `--max-item-bytes`, `--max-session-bytes`, `--max-session-transfer`,
 `--max-items`, `--idle-ttl`, `--max-sessions-per-ip`, `--max-sessions`,
 `--disk-high-watermark`, `--blob-hold`, `--blob-grace` and
-`--sweep-interval`. `airlock-server --help` lists defaults.
+`--sweep-interval`. `airlox-server --help` lists defaults.
 
 ### Cost model: clients do the heavy lifting
 
@@ -485,7 +485,7 @@ A blob stays on the relay only until its recipients have it.
   input files once they are in the job's work dir; the sender acks result
   output files.
 - The relay **evicts** the blob when every recipient has acked and
-  `AIRLOCK_BLOB_GRACE` has passed, or when `AIRLOCK_BLOB_HOLD` has passed
+  `AIRLOX_BLOB_GRACE` has passed, or when `AIRLOX_BLOB_HOLD` has passed
   since upload, whichever comes first. It emits an `evicted` event.
 - **Envelopes stay** in the log for the whole session. The timeline remains
   complete and every reference still verifies; only the ciphertext is gone
@@ -522,7 +522,7 @@ server never queries across them. That fits a directory per session far
 better than a database server plus an object store:
 
 ```
-$AIRLOCK_DATA/
+$AIRLOX_DATA/
   LOCK                         flock'd by the running server; a second server on the same dir refuses to start
   ip.key                       random secret for hashing client addresses (0600)
   tombstones/<session_id>      closed sessions, kept until they would have expired, so they cannot be re-created
@@ -583,18 +583,18 @@ refuses a manifest or an upload that exceeds a limit.
 
 | Setting | Default | Effect |
 |---|---|---|
-| `AIRLOCK_MAX_TTL` | 24 h | Rejects manifests that live longer, although the protocol allows 30 days. The web UI defaults to 1 h. |
-| `AIRLOCK_MAX_ITEM_BYTES` | 25 MiB | A manifest's `max_item_bytes` may not exceed it. |
-| `AIRLOCK_BLOB_HOLD` | 1 h | Longest a blob stays on the relay after upload, delivered or not. |
-| `AIRLOCK_BLOB_GRACE` | 5 min | How long a blob stays after its last recipient acked. It absorbs a recipient that acks and then immediately re-fetches; late joiners need re-seeding (M4). |
-| `AIRLOCK_MAX_SESSION_BYTES` | 200 MiB | Ciphertext a session may have held on the relay at once; uploads past it get `413`. |
-| `AIRLOCK_MAX_SESSION_TRANSFER` | 1 GiB | Total bytes uploaded plus downloaded per session, the bandwidth cap; past it, `429`. |
-| `AIRLOCK_MAX_ITEMS` | 5 000 | Items per session. |
-| `AIRLOCK_MAX_LOG_BYTES` | 4 MiB | Session log size (joins and envelopes). It bounds the per-session memory index; past it, joins and items get `413`. |
-| `AIRLOCK_IDLE_TTL` | 2 h | Purges a session early after this long with no joins, items, acks or downloads, and no upload in progress. |
-| `AIRLOCK_MAX_SESSIONS_PER_IP` | 20 | Active sessions per creator address: per IPv4 address, per IPv6 /64. With `--trust-proxy`, the address is the last `X-Forwarded-For` hop, the one the proxy appended. |
-| `AIRLOCK_MAX_SESSIONS` | 1 000 | Active sessions in total. |
-| `AIRLOCK_DISK_HIGH_WATERMARK` | 90 % | Above this volume usage, new sessions, joins and uploads get `507`. |
+| `AIRLOX_MAX_TTL` | 24 h | Rejects manifests that live longer, although the protocol allows 30 days. The web UI defaults to 1 h. |
+| `AIRLOX_MAX_ITEM_BYTES` | 25 MiB | A manifest's `max_item_bytes` may not exceed it. |
+| `AIRLOX_BLOB_HOLD` | 1 h | Longest a blob stays on the relay after upload, delivered or not. |
+| `AIRLOX_BLOB_GRACE` | 5 min | How long a blob stays after its last recipient acked. It absorbs a recipient that acks and then immediately re-fetches; late joiners need re-seeding (M4). |
+| `AIRLOX_MAX_SESSION_BYTES` | 200 MiB | Ciphertext a session may have held on the relay at once; uploads past it get `413`. |
+| `AIRLOX_MAX_SESSION_TRANSFER` | 1 GiB | Total bytes uploaded plus downloaded per session, the bandwidth cap; past it, `429`. |
+| `AIRLOX_MAX_ITEMS` | 5 000 | Items per session. |
+| `AIRLOX_MAX_LOG_BYTES` | 4 MiB | Session log size (joins and envelopes). It bounds the per-session memory index; past it, joins and items get `413`. |
+| `AIRLOX_IDLE_TTL` | 2 h | Purges a session early after this long with no joins, items, acks or downloads, and no upload in progress. |
+| `AIRLOX_MAX_SESSIONS_PER_IP` | 20 | Active sessions per creator address: per IPv4 address, per IPv6 /64. With `--trust-proxy`, the address is the last `X-Forwarded-For` hop, the one the proxy appended. |
+| `AIRLOX_MAX_SESSIONS` | 1 000 | Active sessions in total. |
+| `AIRLOX_DISK_HIGH_WATERMARK` | 90 % | Above this volume usage, new sessions, joins and uploads get `507`. |
 
 Fixed limits: 64 participants and 4 concurrent streams per participant per
 session; request bodies that stall for 30 s get `408`; an upload must finish
@@ -621,7 +621,7 @@ own key.
 
 - One static musl binary in a `FROM scratch` (or distroless) image, with the
   built web SPA embedded via `rust-embed`. It needs one writable directory and
-  nothing else, so local dev is just `airlock-server --data ./data`.
+  nothing else, so local dev is just `airlox-server --data ./data`.
 - **Persistent mode** (default): the data dir is a small persistent volume.
   Sessions survive restarts and redeploys.
 - **Ephemeral mode** (`--ephemeral`): the data dir is a temp dir or `tmpfs`
@@ -630,7 +630,7 @@ own key.
 - Serving blobs from the same machine uses the host's bundled bandwidth, not
   per-request object-store fees or metered egress.
 - **Bring your own relay.** Which relay a session uses is simply the base URL
-  in its invite links, so any user can run `airlock-server` themselves: on a
+  in its invite links, so any user can run `airlox-server` themselves: on a
   small VM, or in ephemeral mode next to their runner behind a tunnel. They
   then pay their own disk and bandwidth, with their own limits. The hosted
   relay keeps tight free-tier caps and points heavy users here. Self-hosting
@@ -643,7 +643,7 @@ own key.
   ingress routing by the `session_id` in the path (consistent hashing). New
   sessions go to the least-loaded instance; the session id stays the shard
   key. This is a v2 item and changes no API.
-- Config via env (`AIRLOCK_DATA`, `AIRLOCK_PUBLIC_URL`, plus the cost
+- Config via env (`AIRLOX_DATA`, `AIRLOX_PUBLIC_URL`, plus the cost
   controls above).
 
 ---
@@ -659,7 +659,7 @@ sessions, joins from an invite, renders all content types, sends text and
 files, keeps IndexedDB history and acks after storing. The React SPA replaces
 it at design parity in M4.
 
-- All crypto in the browser goes through the `airlock-core` wasm package
+- All crypto in the browser goes through the `airlox-core` wasm package
   (session creation, certificates, item encrypt/decrypt/sign/verify). No
   JavaScript crypto library is used. The fragment never goes in a request.
   On load the page moves it into the tab's `sessionStorage`, so a reload
@@ -687,14 +687,14 @@ it at design parity in M4.
 
 ## 9. SDK, CLI, MCP
 
-One Python package, `airlock-agent`, importable as `airlock`. It depends on
-the `airlock-core` wheel (PyO3) for every cryptographic and protocol
+One Python package, `airlox`, importable as `airlox`. It depends on
+the `airlox-core` wheel (PyO3) for every cryptographic and protocol
 operation and adds only HTTP plumbing and ergonomics. The wheel also ships the
-static `airlock` binary so `pip install airlock-agent` puts `airlock runner
+static `airlox` binary so `pip install airlox` puts `airlox runner
 join` on `PATH`; the same binary is downloadable standalone.
 
 ```python
-from airlock import Session
+from airlox import Session
 s = Session.join("https://host/s/ak_7f3e#v=1&r=send&k=…&rk=…")
 s.send_text("Cleaned data attached.")
 f = s.send_file("dataset.zip")
@@ -705,12 +705,12 @@ print(r.exit_code, r.stdout, r.out_files)
 for item in s.stream(): ...                       # decrypted items as they arrive
 ```
 
-CLI (`airlock …`, Rust, same binary as the runner): `session
+CLI (`airlox …`, Rust, same binary as the runner): `session
 create|close|invite`, `send text|file`, `run <file.py>
 [--runner|--label|--any]`, `runner join`, `watch`.
 
 **Local cache.** The SDK, CLI and runner keep a cache that mirrors the
-relay's layout, `~/.cache/airlock/<session_id>/` with `manifest.json`,
+relay's layout, `~/.cache/airlox/<session_id>/` with `manifest.json`,
 `events.jsonl`, `identity-<role>.json` (participant seed and token, mode
 0600) and `blobs/`, holding ciphertext as received. The session key is never
 written. They ack after writing to it, retry a failed download or ack on the
@@ -719,7 +719,7 @@ expires (`Session.join(url, cache_dir=…)` overrides the location). If the
 relay has purged the session, `Session.join` reopens the cached history
 read-only. Two processes using the same invite need separate cache dirs.
 
-MCP server (`python -m airlock.mcp`, or `airlock-mcp` from the wheel): tools `send_text`, `send_file`, `list_runners`,
+MCP server (`python -m airlox.mcp`, or `airlox-mcp` from the wheel): tools `send_text`, `send_file`, `list_runners`,
 `run_python`, `get_result`, `list_items`, so any MCP-capable agent can use a
 session without writing code.
 
@@ -749,25 +749,25 @@ machine, and metadata privacy from the relay (who talks to whom and when).
 ## 11. Repository layout
 
 ```
-airlock/
+airlox/
   Cargo.toml                Rust workspace
   crates/
-    airlock-core/           protocol types, canonical JSON, crypto, certs, validators (zip/md/image),
+    airlox-core/           protocol types, canonical JSON, crypto, certs, validators (zip/md/image),
                             embedded job shim, test vectors (generated into docs/protocol.md)
-    airlock-server/         axum app, file-backed session logs and blobs, SSE, routing, purge, embedded web
-    airlock/                the `airlock` binary: runner (+ backends/local|docker|k8s) and CLI
+    airlox-server/         axum app, file-backed session logs and blobs, SSE, routing, purge, embedded web
+    airlox/                the `airlox` binary: runner (+ backends/local|docker|k8s) and CLI
   bindings/
-    python/                 PyO3 crate → `airlock-core` wheel (maturin)
-    wasm/                   wasm-bindgen crate → `@airlock/core` npm package (wasm-pack)
+    python/                 PyO3 crate → `airlox-core` wheel (maturin)
+    wasm/                   wasm-bindgen crate → `@airlox/core` npm package (wasm-pack)
   python/
-    airlock-agent/          SDK (airlock/), MCP server; depends on the airlock-core wheel, bundles the binary
-  web/                      browser UI embedded into airlock-server (M1: plain JS timeline; M4: Vite + React + TS SPA)
+    airlox/          SDK (airlox/), MCP server; depends on the airlox-core wheel, bundles the binary
+  web/                      browser UI embedded into airlox-server (M1: plain JS timeline; M4: Vite + React + TS SPA)
   deploy/
     docker/                 Dockerfiles (server, runtime base image)
     k8s/                    runner Deployment + RBAC + NetworkPolicy examples; server manifests
   docs/
     DESIGN.md               this document
-    protocol.md             canonical manifest/cert/item formats + test vectors (generated from airlock-core)
+    protocol.md             canonical manifest/cert/item formats + test vectors (generated from airlox-core)
 ```
 
 Tooling: `cargo` workspace with `clippy -D warnings`, `cargo-deny`,
@@ -788,8 +788,8 @@ format churn is where Rust is slowest.
 
 | # | Deliverable | Done when |
 |---|---|---|
-| M0 | **Protocol freeze.** `docs/protocol.md` (manifest, certs, item envelope, job/result payloads) and generated test vectors; `airlock-core` crate implementing it; PyO3 wheel and wasm package passing the same vectors; CI building wheels, wasm and static binaries | vectors round-trip in Rust, Python and the browser; a protocol change requires a version bump |
-| M1 | **Relay mode.** Rust server with file-backed storage (sessions, participants, items, SSE, expiry purge, ack and evict-on-delivery, cost controls) + Python SDK with local cache + minimal web timeline with IndexedDB history, all four content types | two SDK processes exchange text, md, zip and image through one `airlock-server --data ./data` process; the browser renders them; blobs leave the relay once both sides acked; a restart in persistent mode keeps the session |
+| M0 | **Protocol freeze.** `docs/protocol.md` (manifest, certs, item envelope, job/result payloads) and generated test vectors; `airlox-core` crate implementing it; PyO3 wheel and wasm package passing the same vectors; CI building wheels, wasm and static binaries | vectors round-trip in Rust, Python and the browser; a protocol change requires a version bump |
+| M1 | **Relay mode.** Rust server with file-backed storage (sessions, participants, items, SSE, expiry purge, ack and evict-on-delivery, cost controls) + Python SDK with local cache + minimal web timeline with IndexedDB history, all four content types | two SDK processes exchange text, md, zip and image through one `airlox-server --data ./data` process; the browser renders them; blobs leave the relay once both sides acked; a restart in persistent mode keeps the session |
 | M2 | **Execute mode.** Runner with **local** (Linux sandboxed) and **docker** backends, routing, approval, results with `/out`, runner console page | the design's `summarize.py` scenario runs end to end on docker with network off (**done**: `examples/summarize`, `test_docker.py`) |
 | M3 | **kubernetes** backend, runtime image build/push, RBAC + NetworkPolicy manifests, Helm chart | same scenario on `kind` |
 | M4 | New-session and live-session pages to design parity, full CLI, MCP server, audit export, role revoke, re-seeding evicted blobs | a non-coding user can create a session, hand out links, approve a runner and read results; a late joiner gets an evicted file from a peer's cache |
@@ -799,7 +799,7 @@ format churn is where Rust is slowest.
 
 ## 13. Open questions
 
-1. **Hosted vs self-hosted first.** The design uses `airlock.dev`. The code is
+1. **Hosted vs self-hosted first.** The design uses `airlox.dev`. The code is
    the same; the difference is whether M1 ships a public relay (needs abuse
    limits, now covered by the cost controls in §7) or a single-binary
    self-hosted story. Recommendation: self-hosted first, hosted once M2
@@ -819,7 +819,7 @@ format churn is where Rust is slowest.
    persistent by default, ephemeral as a flag.
 7. **Delivery versus availability.** Evicting blobs after delivery cuts
    storage to minutes per file, but a participant who was offline for longer
-   than `AIRLOCK_BLOB_HOLD`, or joins later, depends on a peer being online to
+   than `AIRLOX_BLOB_HOLD`, or joins later, depends on a peer being online to
    re-seed. Proposed: accept this; the owner can raise the hold on a
    self-hosted relay.
 8. **Signed relay actions.** Acks, leave and close are authorized by bearer

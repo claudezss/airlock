@@ -1,6 +1,6 @@
 [package]
-name = "airlock-core-wasm"
-description = "WebAssembly bindings for airlock-core"
+name = "airlox-core-wasm"
+description = "WebAssembly bindings for airlox-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,7 @@ publish.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-airlock-core = { workspace = true, default-features = false, features = ["image"] }
+airlox-core = { workspace = true, default-features = false, features = ["image"] }
 wasm-bindgen = "=0.2.100"
 js-sys = "0.3.77"
 getrandom = { workspace = true, features = ["js"] }

@@ -1,4 +1,4 @@
-# Airlock
+# Airlox
 
 Secure, short-lived sessions where code/LLM agents share messages, files and
 runnable Python. Receivers can run submitted code on their own machines with
@@ -10,11 +10,11 @@ No LLM is needed on the receiving side.
 
 ## Status
 
-**M2 (execute mode) is done.** `airlock-server` relays end-to-end encrypted
+**M2 (execute mode) is done.** `airlox-server` relays end-to-end encrypted
 sessions with no database: each session is an append-only log plus blob
 files, and blobs leave the relay once every recipient has stored them. In
 execute sessions it also routes jobs to runners, with no queue. The
-`airlock` binary runs jobs in a **docker** sandbox or a **local** one
+`airlox` binary runs jobs in a **docker** sandbox or a **local** one
 (namespaces, a read-only minimal root and Landlock on Linux; a plain process
 elsewhere), after verifying every signature itself. The Python SDK and the
 browser UI share text, Markdown, Python, ZIP and images, approve runners,
@@ -22,13 +22,13 @@ submit jobs and show signed results. Kubernetes is next (M3).
 
 | Path | What |
 |---|---|
-| `crates/airlock-core` | Protocol types, canonical JSON, Ed25519/AES-GCM/HKDF, invites, certificates, item envelope, payloads, policy, ZIP/Markdown/image validators, job shim |
-| `crates/airlock-core/vectors/v1.json` | Conformance vectors every implementation must pass |
-| `crates/airlock-server` | The relay: file-backed sessions, SSE, ack and evict-on-delivery, cost controls, job routing, embedded web UI |
-| `crates/airlock` | The `airlock` binary: `airlock runner join` with docker and local sandboxes |
-| `bindings/python` | PyO3 module `airlock_core` (abi3 wheel, Python 3.9+) |
+| `crates/airlox-core` | Protocol types, canonical JSON, Ed25519/AES-GCM/HKDF, invites, certificates, item envelope, payloads, policy, ZIP/Markdown/image validators, job shim |
+| `crates/airlox-core/vectors/v1.json` | Conformance vectors every implementation must pass |
+| `crates/airlox-server` | The relay: file-backed sessions, SSE, ack and evict-on-delivery, cost controls, job routing, embedded web UI |
+| `crates/airlox` | The `airlox` binary: `airlox runner join` with docker and local sandboxes |
+| `bindings/python` | PyO3 module `airlox_core` (abi3 wheel, Python 3.9+) |
 | `bindings/wasm` | wasm-bindgen package for browsers and Node |
-| `python/airlock-agent` | Python SDK `airlock` with a local ciphertext cache |
+| `python/airlox` | Python SDK `airlox` with a local ciphertext cache |
 | `web` | Browser UI (plain JS over the wasm package): sessions, timeline, runner console, jobs |
 | `examples/summarize` | The execute-mode scenario: pandas and matplotlib on a docker runner |
 
@@ -41,14 +41,14 @@ make web
 ```
 
 ```bash
-cargo run --release -p airlock-server -- --data ./data
+cargo run --release -p airlox-server -- --data ./data
 ```
 
 Open http://127.0.0.1:8080, create a session and hand the sender invite to an
 agent:
 
 ```python
-from airlock import Session
+from airlox import Session
 
 s = Session.join("http://127.0.0.1:8080/s/ak_…#v=1&r=send&k=…&rk=…", display_name="build-agent")
 s.send_text("Build finished.")
@@ -64,7 +64,7 @@ mode="execute", job_limits={…})`), then start a runner on the machine that
 should run the code, with the runner invite:
 
 ```bash
-cargo run --release -p airlock -- runner join --invite '<runner invite>' --name runner-01 --labels cpu --sandbox docker
+cargo run --release -p airlox -- runner join --invite '<runner invite>' --name runner-01 --labels cpu --sandbox docker
 ```
 
 The runner builds its job image once (`python:3.12-slim` plus the session's
@@ -76,7 +76,7 @@ data = s.send_file("dataset.zip")
 job = s.run_python(open("summarize.py").read(), filename="summarize.py", files=[data], runner="runner-01")
 res = job.wait()                      # NoRunnerAvailable is raised at once if no runner matches
 print(res.status, res.exit_code, res.stdout)
-chart = res.out_file("chart.png").data  # files the job wrote to $AIRLOCK_OUT (/out)
+chart = res.out_file("chart.png").data  # files the job wrote to $AIRLOX_OUT (/out)
 ```
 
 Jobs run with no network, under the session's time and memory limits, and
