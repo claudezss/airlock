@@ -17,6 +17,19 @@ pub fn safe_name(name: &str) -> Option<&str> {
     (n == name && !n.starts_with('.') && !n.chars().any(unsafe_char)).then_some(n)
 }
 
+/// The name a received file is saved under: `airlox-<8 random hex>-<name>`,
+/// with Python files ending in `.py.txt`. The prefix is chosen here, not by
+/// the sender (an item id is the author's choice), so a received file can
+/// never be `conftest.py`, `CLAUDE.md` or `test_*.py`, and the extension
+/// keeps test runners and importers from picking up received code under any
+/// name (`*_test.py`).
+pub fn received_name(name: &str) -> Option<String> {
+    let name = safe_name(name)?;
+    let tag: String = airlox_core::api::generate_seed()[..4].iter().map(|b| format!("{b:02x}")).collect();
+    let tail = if name.to_ascii_lowercase().ends_with(".py") { ".txt" } else { "" };
+    Some(format!("airlox-{tag}-{name}{tail}"))
+}
+
 /// A job's out file may only be what runners produce: top-level images and
 /// `out.zip`.
 pub fn out_file_name(name: &str) -> Option<&str> {
@@ -52,13 +65,17 @@ pub fn save_new(dir: &Path, name: &str, data: &[u8]) -> Result<PathBuf> {
 }
 
 /// Characters that move the cursor, recolour, retitle or reorder what a
-/// terminal shows: C0/C1 controls (ESC among them), and bidi and other
-/// invisible formatting characters.
+/// terminal shows, or hide text: C0/C1 controls (ESC among them), bidi and
+/// other invisible formatting characters, tag characters (which can smuggle
+/// hidden text to a model) and the rarer variation selectors. The common
+/// emoji selector U+FE0F stays.
 fn unsafe_char(c: char) -> bool {
     c.is_control()
         || matches!(c,
-            '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}'
-            | '\u{2060}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
+            '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}'
+            | '\u{180B}'..='\u{180F}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}' | '\u{3164}' | '\u{FE00}'..='\u{FE0E}' | '\u{FEFF}' | '\u{FFA0}'
+            | '\u{FFF9}'..='\u{FFFB}' | '\u{E0000}'..='\u{E007F}' | '\u{E0100}'..='\u{E01EF}')
 }
 
 /// Untrusted text for the terminal, kept to one line.
@@ -101,6 +118,23 @@ mod tests {
     }
 
     #[test]
+    fn received_names_are_not_the_senders_choice() {
+        for (sent, ext) in [
+            ("conftest.py", "-conftest.py.txt"),
+            ("x_test.py", "-x_test.py.txt"),
+            ("CLAUDE.md", "-CLAUDE.md"),
+        ] {
+            let n = received_name(sent).unwrap();
+            assert!(
+                n.starts_with("airlox-") && n.ends_with(ext) && n.len() == "airlox-".len() + 8 + ext.len(),
+                "{n}"
+            );
+        }
+        assert_ne!(received_name("a.md"), received_name("a.md"));
+        assert_eq!(received_name("../a.md"), None);
+    }
+
+    #[test]
     fn save_never_overwrites_or_follows_links() {
         let d = tempfile::tempdir().unwrap();
         fs::write(d.path().join("a.md"), "mine").unwrap();
@@ -131,6 +165,8 @@ mod tests {
         assert!(line.starts_with("hi\\n#99"));
         assert_eq!(clean_text("a\n\tb\r\u{1b}[1m"), "a\n\tb\\r\\u{1b}[1m");
         assert_eq!(clean_line("ab\u{202e}cd"), "ab\\u{202e}cd");
-        assert_eq!(clean_line("héllo ✓"), "héllo ✓");
+        assert_eq!(clean_line("héllo ✓ ❤\u{fe0f}"), "héllo ✓ ❤\u{fe0f}");
+        // Tag characters spell hidden text; they are shown escaped.
+        assert_eq!(clean_line("a\u{e0069}\u{e0067}b"), "a\\u{e0069}\\u{e0067}b");
     }
 }

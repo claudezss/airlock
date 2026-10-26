@@ -120,8 +120,9 @@ it to your agent's skills, or point the agent at it.
 Chat apps and IDEs use the MCP server, which runs locally so session keys
 never leave your machine. It reads and writes files only inside the
 directories it is allowed (`--allow-dir`; default: its working directory,
-unless that is `/` or your home directory), never overwrites a file, and
-keeps the owner invite out of the conversation.
+unless that is `/`, your home directory or a parent of it), never overwrites
+a file, and never shows the owner invite to the model (`--owner-invite-dir`
+saves it for you).
 
 ```bash
 claude mcp add airlox -- airlox mcp           # Claude Code

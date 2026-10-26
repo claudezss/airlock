@@ -24,6 +24,9 @@ use crate::client::{self, is_transient, status_of, Relay, RelayError};
 use crate::sse::SseParser;
 use crate::view::write_atomic;
 
+/// Largest believable gap between consecutive event sequence numbers.
+const MAX_SEQ_JUMP: u64 = 1_000_000;
+
 /// Content types a new session allows unless told otherwise.
 pub const DEFAULT_TYPES: &[&str] = &["text", "py", "md", "zip", "image"];
 
@@ -42,6 +45,14 @@ pub fn file_type(name: &str) -> Option<(&'static str, &'static str)> {
 }
 
 pub const FILE_TYPES_HELP: &str = ".py, .md, .zip, .png, .jpg, .webp";
+
+/// A job id goes into relay URLs: it must be a well-formed item id.
+fn check_job_id(job: &str) -> Result<()> {
+    if !airlox_core::item::is_item_id(job) {
+        bail!("{} is not a job id", client::relay_text(job));
+    }
+    Ok(())
+}
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -67,8 +78,9 @@ pub fn default_cache_root() -> PathBuf {
 // ---------------------------------------------------------------- cache --
 
 /// `<root>/<session_id>/`: `manifest.json`, `events.jsonl` as received,
-/// `identity-<role>.json` (participant seed and token, 0600) and `blobs/`
-/// (ciphertext). The session key is never written.
+/// `identity-<role>.json` (participant seed, token and the relay it is for,
+/// 0600) and `blobs/` (ciphertext). The session key and invite links are
+/// never written.
 struct Cache {
     dir: PathBuf,
 }
@@ -79,6 +91,11 @@ struct Identity {
     token: String,
     #[serde(default)]
     role: Option<String>,
+    /// The relay that issued `token`. An invite with the same session and
+    /// keys but another relay must not get it (it would hand the token to
+    /// whoever runs that host).
+    #[serde(default)]
+    base_url: Option<String>,
 }
 
 impl Cache {
@@ -145,6 +162,11 @@ impl Cache {
         let now = now_ms();
         let Ok(entries) = fs::read_dir(root) else { return };
         for e in entries.flatten() {
+            // Only session caches: never another directory that happens to
+            // hold a manifest.json.
+            if !e.file_name().to_str().is_some_and(airlox_core::session::is_session_id) {
+                continue;
+            }
             let Ok(text) = fs::read_to_string(e.path().join("manifest.json")) else { continue };
             let expires = serde_json::from_str::<Value>(&text)
                 .ok()
@@ -259,7 +281,7 @@ pub struct NoRunnerAvailable {
 
 impl std::fmt::Display for NoRunnerAvailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "no runner available: {}", self.message)
+        write!(f, "no runner available: {:?}", client::relay_text(&self.message))
     }
 }
 
@@ -391,6 +413,16 @@ impl Session {
         Cache::sweep_expired(cache_root);
         let cache = Cache::open(cache_root, &sid)?;
         let identity = cache.load_identity(role.as_str())?;
+        if let Some(bound) = identity.as_ref().and_then(|i| i.base_url.as_deref()) {
+            if bound != base {
+                bail!(
+                    "this invite names relay {} but you joined session {sid} on {}; refusing to send your \
+                     token to another relay (the link may have been altered)",
+                    client::relay_text(&base),
+                    client::relay_text(bound)
+                );
+            }
+        }
         let (signed, offline) = match client::get_manifest(http, &base, &sid).await {
             Ok(s) => (s, false),
             Err(e) if matches!(status_of(&e), Some(404 | 410)) => match (cache.load_manifest(), &identity) {
@@ -420,7 +452,21 @@ impl Session {
                 });
                 let signed_join = api::sign_join(&seed, &join.to_string())?;
                 let token = client::join(http, &base, &sid, signed_join).await?;
-                let id = Identity { participant_seed: hex(&seed), token, role: Some(role.as_str().into()) };
+                let id = Identity {
+                    participant_seed: hex(&seed),
+                    token,
+                    role: Some(role.as_str().into()),
+                    base_url: Some(base.clone()),
+                };
+                cache.save_identity(role.as_str(), &id)?;
+                id
+            }
+        };
+        // Identities cached before the relay was recorded are bound now.
+        let identity = match identity.base_url {
+            Some(_) => identity,
+            None => {
+                let id = Identity { base_url: Some(base.clone()), ..identity };
                 cache.save_identity(role.as_str(), &id)?;
                 id
             }
@@ -667,6 +713,16 @@ impl Session {
         let target = match &spec.target {
             Target::Runner(which) => {
                 let r = self.runner(which).await?;
+                // The relay may route to a runner the owner has not signed an
+                // approval for (if posting it failed); it would get the code
+                // and inputs only to refuse them.
+                if !r.approved {
+                    bail!(
+                        "runner {} has no signed approval from the owner yet; ask the owner to approve it \
+                         (again)",
+                        client::relay_text(&r.name)
+                    );
+                }
                 json!({"type": "runner", "participant_pub": r.participant_pub, "name": r.name})
             }
             Target::Labels(l) => json!({"type": "labels", "labels": l}),
@@ -705,6 +761,7 @@ impl Session {
     /// Ask a job's runner to stop it (owner or the job's sender), with a
     /// signed `job_cancel` event recording who asked.
     pub async fn cancel_job(&mut self, job: &str) -> Result<()> {
+        check_job_id(job)?;
         self.sync().await?;
         let job_ref =
             self.get(job).filter(|i| i.kind == "job").map(|i| i.item_ref.clone()).context("no such job")?;
@@ -716,6 +773,7 @@ impl Session {
 
     /// The relay's routing view of a job: `{job, state, runner, reason}`.
     pub async fn job_state(&self, job: &str) -> Result<Value> {
+        check_job_id(job)?;
         self.relay.get_json(&format!("/jobs/{job}")).await
     }
 
@@ -815,6 +873,7 @@ impl Session {
     /// One look at a job: its outcome if it has one. Network trouble and a
     /// busy relay count as "not yet", so long waits survive them.
     pub async fn poll_job(&mut self, job: &str) -> Result<Option<Outcome>> {
+        check_job_id(job)?;
         match self.sync().await {
             Err(e) if is_transient(&e) => return Ok(None),
             r => r?,
@@ -972,6 +1031,13 @@ impl Session {
     async fn apply(&mut self, ev: &Value, fetch: bool, record: bool) -> Result<Option<usize>> {
         let Some(seq) = ev["seq"].as_u64() else { return Ok(None) };
         if record && self.last_seq.is_some_and(|l| seq <= l) {
+            return Ok(None);
+        }
+        // Sequence numbers count up from 1, with gaps only for events this
+        // participant does not see. A wild jump would make every later
+        // event look old, and the cache would keep it: drop it unrecorded.
+        if seq > self.last_seq.unwrap_or(0).saturating_add(MAX_SEQ_JUMP) {
+            tracing::warn!(seq, "ignoring an event with an implausible sequence number");
             return Ok(None);
         }
         let data = &ev["data"];
