@@ -1,6 +1,15 @@
 // Airlox web client (M1 timeline). All cryptography runs in the
 // airlox-core WebAssembly module; the relay only sees ciphertext.
-import init, * as ac from "/assets/pkg/airlox_core_wasm.js";
+// The WebAssembly core is loaded on demand so the landing page renders even if
+// it (or IndexedDB) is unavailable; only /new and /s/<id> need them.
+let ac;
+let corePromise;
+const loadCore = () =>
+  (corePromise ??= (async () => {
+    const m = await import("/assets/pkg/airlox_core_wasm.js");
+    await m.default();
+    ac = m;
+  })());
 
 const MB = 1024 * 1024;
 const MAX_ITEM_MB = 25;
@@ -49,6 +58,28 @@ function svg(paths, size = 18) {
 }
 const ICON_CLIP = ["M21 11.5l-8.5 8.5a5 5 0 0 1-7-7L14 4.5a3.3 3.3 0 0 1 4.7 4.7L10.2 17.7a1.7 1.7 0 0 1-2.4-2.4L15.5 7.6"];
 const app = document.getElementById("app");
+// Invite links are shown once and kept nowhere; warn before the page that
+// shows them is closed or reloaded.
+let invitesShown = false;
+addEventListener("beforeunload", (ev) => {
+  if (!invitesShown) return;
+  ev.preventDefault();
+  ev.returnValue = "";
+});
+// Never leave invite links in a page the back/forward cache could restore:
+// empty the page when it is hidden, and start over if it comes back.
+let invitesCreated = false;
+addEventListener("pagehide", () => {
+  if (!invitesCreated) return;
+  invitesShown = false; // the page is gone; a restore must not prompt on leaving
+  app.replaceChildren();
+});
+addEventListener("pageshow", (ev) => {
+  if (ev.persisted && invitesCreated) {
+    invitesShown = false;
+    location.reload();
+  }
+});
 const show = (...nodes) => app.replaceChildren(...nodes);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const fmtBytes = (n) => (n < 1024 ? `${n} B` : n < MB ? `${(n / 1024).toFixed(1)} KB` : `${(n / MB).toFixed(1)} MB`);
@@ -71,7 +102,7 @@ function announce(msg) {
 function deadEnd(title, cause) {
   show(el("div", { class: "panel stack dead-end", role: "alert" },
     el("h1", {}, title), el("p", { class: "muted" }, cause),
-    el("div", { class: "row" }, el("a", { class: "button primary", href: "/" }, "New session"))));
+    el("div", { class: "row" }, el("a", { class: "button primary", href: "/new" }, "New session"))));
 }
 
 // Plain-language reasons for items that fail verification.
@@ -85,15 +116,18 @@ function explain(err) {
 }
 
 // ---------- IndexedDB: identity, events and ciphertext blobs ----------
-const db = await new Promise((res, rej) => {
-  const r = indexedDB.open("airlox", 1);
-  r.onupgradeneeded = () => {
-    for (const s of ["identity", "events", "blobs"]) r.result.createObjectStore(s);
-  };
-  r.onsuccess = () => res(r.result);
-  r.onerror = () => rej(r.error);
-});
-function tx(store, mode, fn) {
+let dbPromise;
+const openDb = () =>
+  (dbPromise ??= new Promise((res, rej) => {
+    const r = indexedDB.open("airlox", 1);
+    r.onupgradeneeded = () => {
+      for (const s of ["identity", "events", "blobs"]) r.result.createObjectStore(s);
+    };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  }));
+async function tx(store, mode, fn) {
+  const db = await openDb();
   return new Promise((res, rej) => {
     const t = db.transaction(store, mode);
     const req = fn(t.objectStore(store));
@@ -171,8 +205,22 @@ function runnerInviteRow(url) {
       el("code", {}, `airlox runner join --invite '${maskInvite(url)}' --name runner-01 --sandbox docker`)));
 }
 
-// ---------- new session ----------
-function landing() {
+// Open the session as its owner without ever putting the key in a URL the
+// browser could keep in history: hand the fragment to the session page through
+// sessionStorage, the same place takeInvite() keeps it.
+function openOwnerSession(link) {
+  invitesShown = false;
+  const u = new URL(link);
+  try {
+    sessionStorage.setItem(`invite:${u.pathname}`, u.hash.slice(1));
+    location.assign(u.pathname);
+  } catch {
+    location.assign(link);
+  }
+}
+
+// ---------- new session (the create flow, at /new) ----------
+function newSession() {
   const radio = (name, value, label, checked, extra = {}) =>
     el("label", { class: "option" }, el("input", { type: "radio", name, value, checked, ...extra }), label);
   const mode = el("fieldset", { class: "stack" }, el("legend", {}, "Mode"),
@@ -223,7 +271,8 @@ function landing() {
   const fields = el("fieldset", { class: "stack" }, mode, jobBox, ttl, types, pyNote, sizeField);
   const aside = el("aside", { class: "panel stack" },
     el("h2", {}, "Invites"),
-    el("p", { class: "muted" }, "Invite links appear here once the session exists. Each one carries a role and the session key."));
+    el("p", { class: "muted" }, "Invite links appear here once the session exists. Each one carries a role and the session key."),
+    el("p", { class: "muted" }, "Joining a session someone else opened? Skip this page and open the invite link you were given, including the part after #."));
 
   const form = el("form", { class: "stack", onsubmit: async (ev) => {
     ev.preventDefault();
@@ -268,11 +317,14 @@ function landing() {
         inviteRow("Owner", owner, "you · keep it private"),
         inviteRow("Sender", ac.memberInvite(base, s.ownerSeed, "sender"), "your code agent"),
         inviteRow("Observer", ac.memberInvite(base, s.ownerSeed, "observer"), "read-only, optional"),
-        execute ? runnerInviteRow(ac.memberInvite(base, s.ownerSeed, "runner")) : null,
+        ...(execute ? [runnerInviteRow(ac.memberInvite(base, s.ownerSeed, "runner"))] : []),
         el("div", { class: "row" },
-          el("a", { class: "button primary cta", href: owner }, "Open session"),
-          el("button", { type: "button", onclick: () => location.reload() }, "Create another")));
+          // A button, not a link: the owner key must not show in the status bar on hover.
+          el("button", { class: "primary cta", type: "button", onclick: () => openOwnerSession(owner) }, "Open session"),
+          el("button", { type: "button", onclick: () => { invitesShown = false; location.reload(); } }, "Create another")));
       heading.focus();
+      invitesShown = true;
+      invitesCreated = true;
     } catch (e) {
       err.textContent = `Could not create the session: ${e.message || e}`;
       create.disabled = false;
@@ -1132,7 +1184,9 @@ function renderRunners(s, list, note) {
         el("span", { class: `chip approval ${r.rejected ? "bad" : r.approved ? "good" : "wait"}` }, approval),
         r.networkUnblocked && !r.rejected ? el("span", { class: "chip warn", title: "This runner's sandbox cannot block network access" }, "⚠ network not blocked") : null),
       owner && !r.rejected ? el("div", { class: "row" },
-        r.approved ? null : el("button", { type: "button", class: "small primary", onclick: (ev) => decideRunner(s, r, true, ev.currentTarget) }, "Approve"),
+        // Kept after a failed approval: the relay may say approved while the
+        // signed approval never got posted, and the owner must be able to retry.
+        r.approved && !err ? null : el("button", { type: "button", class: "small primary", onclick: (ev) => decideRunner(s, r, true, ev.currentTarget) }, "Approve"),
         el("button", { type: "button", class: "small danger", onclick: (ev) => decideRunner(s, r, false, ev.currentTarget) }, "Reject")) : null,
       err ? el("p", { class: "error", role: "alert" }, err) : null);
   }));
@@ -1145,8 +1199,12 @@ async function decideRunner(s, r, approve, btn) {
   try {
     const meta = approve ? { type: "event", event: "runner_approve", participant_pub: r.pub }
       : { type: "event", event: "runner_reject", participant_pub: r.pub, reason: null };
+    const relay = () => api("POST", `/v1/sessions/${s.sid}/runners/${encodeURIComponent(r.pub)}/${approve ? "approve" : "reject"}`, { token: s.identity.token });
+    // Approve on the relay first: a runner awaiting approval is not a
+    // recipient, so the relay would not keep the signed event for it.
+    if (approve) await relay();
     await sendPayload(s, "event", null, meta, new Uint8Array());
-    await api("POST", `/v1/sessions/${s.sid}/runners/${encodeURIComponent(r.pub)}/${approve ? "approve" : "reject"}`, { token: s.identity.token });
+    if (!approve) await relay();
     await pollRunners(s);
   } catch (e) {
     s.runnerErrors.set(r.pub, `Could not ${approve ? "approve" : "reject"} the runner: ${e.message || e}`);
@@ -1356,11 +1414,43 @@ async function streamLoop(s) {
   }
 }
 
+// ---------- landing page and routing ----------
+// "/" is the landing page, "/new" the create-session form and "/s/<id>" a
+// session. They are separate documents (full page loads), so the landing page
+// can be served with a different policy from pages that hold keys. The landing
+// page needs nothing but this file; the others wait for the WebAssembly core.
+function showHome() {
+  document.body.classList.add("landing");
+  document.getElementById("site-nav").hidden = false;
+  document.getElementById("site-foot").hidden = false;
+  app.classList.add("wide");
+  document.title = "Airlox · Secure sessions for code and LLM agents";
+  show(document.getElementById("home-tpl").content.cloneNode(true));
+  let target = null;
+  try {
+    target = location.hash.length > 1 ? document.getElementById(decodeURIComponent(location.hash.slice(1))) : null;
+  } catch {}
+  if (target) target.scrollIntoView();
+}
+
 // ---------- boot ----------
-try {
-  await init();
-  if (location.pathname.startsWith("/s/")) await sessionView();
-  else landing();
-} catch (e) {
-  deadEnd("Airlox failed to start", String(e.message || e));
+if (location.pathname.startsWith("/s/")) {
+  try {
+    await loadCore();
+    await sessionView();
+  } catch (e) {
+    deadEnd("Airlox failed to start", String(e.message || e));
+  }
+} else if (location.pathname === "/new") {
+  document.title = "New session · Airlox";
+  try {
+    await loadCore();
+    newSession();
+  } catch (e) {
+    deadEnd("Airlox failed to start", String(e.message || e));
+  }
+} else if (location.hash === "#new") {
+  location.replace("/new"); // old links to /#new
+} else {
+  showHome();
 }

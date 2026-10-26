@@ -382,7 +382,10 @@ class Session:
             join = json.loads(r["signed_join"])["join"]
             info = join["runner"]
             pub = join["cert"]["cert"]["participant_pub"]
-            approved = approvals.get(pub, False) if listing["approval_required"] else not r["rejected"]
+            # Whether approval is required comes from the signed manifest, not
+            # the relay's listing.
+            required = self.manifest["job_limits"]["approve_runners"]
+            approved = approvals.get(pub, False) if required else not r["rejected"]
             out.append(
                 Runner(
                     participant_pub=pub,
@@ -403,17 +406,24 @@ class Session:
     def _runner(self, which: Union[Runner, str]) -> Runner:
         if isinstance(which, Runner):
             return which
-        matches = [r for r in self.runners() if which in (r.name, r.participant_pub)]
+        runners = self.runners()
+        # A key names exactly one runner; only then try names (a runner may
+        # pick another runner's key as its name to make the lookup ambiguous).
+        matches = [r for r in runners if r.participant_pub == which] or [r for r in runners if r.name == which]
         if len(matches) != 1:
             raise LookupError(f"{'no' if not matches else 'more than one'} runner matches {which!r}")
         return matches[0]
 
     def approve_runner(self, runner: Union[Runner, str]) -> Runner:
-        """Let a runner take jobs (owner only): a signed ``runner_approve``
-        event for runners and senders to verify, plus the relay's copy."""
+        """Let a runner take jobs (owner only): the relay's approval, then a
+        signed ``runner_approve`` event for runners and senders to verify.
+
+        In that order: a runner awaiting approval is not a recipient, so the
+        relay would not keep the event's blob for it, and a runner that
+        fetched it late would never see its own approval."""
         r = self._runner(runner)
-        self._send("event", None, {"type": "event", "event": "runner_approve", "participant_pub": r.participant_pub}, b"", [])
         self._req("POST", f"/runners/{r.participant_pub}/approve")
+        self._send("event", None, {"type": "event", "event": "runner_approve", "participant_pub": r.participant_pub}, b"", [])
         return r
 
     def reject_runner(self, runner: Union[Runner, str], reason: Optional[str] = None) -> None:
@@ -446,7 +456,12 @@ class Session:
         if runner is not None and labels is not None:
             raise ValueError("pass runner or labels, not both")
         if runner is not None:
-            r = self._runner(runner)
+            # Re-resolved (not a caller's possibly stale Runner) so approval is current.
+            r = self._runner(runner.participant_pub if isinstance(runner, Runner) else runner)
+            if not r.approved:
+                # The relay may still route to it (if posting the owner's
+                # signed approval failed); it would get the code only to refuse.
+                raise ac.PolicyError(f"runner {r.name} has no signed approval from the owner yet")
             target = {"type": "runner", "participant_pub": r.participant_pub, "name": r.name}
         elif labels is not None:
             target = {"type": "labels", "labels": list(labels)}
