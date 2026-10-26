@@ -20,6 +20,17 @@ for item in s.stream():
 ```
 
 In an execute session, `s.run_python(...)` sends code to an approved runner
-and `job.wait()` returns its output and any files it wrote. See the
-[repository](https://github.com/claudezss/airlox) for the relay, the runner
-and the protocol.
+and `job.wait()` returns its output and any files it wrote.
+
+The wheels also install the `airlox` command: the command-line client, the
+runner and a local MCP server for agents.
+
+```bash
+uvx airlox session create --json
+uvx airlox mcp --allow-dir ~/airlox-work
+```
+
+See the [repository](https://github.com/claudezss/airlox) for the relay, the
+runner and the protocol.
+
+<!-- mcp-name: io.github.claudezss/airlox -->

@@ -1,8 +1,11 @@
 name: release
 
-# Push a tag `vX.Y.Z` (matching the workspace version) to build the `airlox`
-# wheels and sdist and publish them to PyPI. Nothing is uploaded unless every
-# build succeeds.
+# Push a tag `vX.Y.Z` (matching the workspace version) to build everything
+# (build.yml) and publish it: the wheels and sdist to PyPI, the npm packages,
+# a GitHub release with the binaries and the MCPB bundle, and then the MCP
+# registry entry that names all three. Nothing is published unless every
+# build succeeds. Each publish step skips what already exists, so a failed
+# release can be re-run.
 on:
   push:
     tags: ["v*"]
@@ -10,16 +13,20 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+
 jobs:
-  version:
+  check:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
       # Only release commits that reached main (and so passed CI).
       - run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
-      # The package version comes from the Rust workspace; the tag must match it.
+      # Every package's version comes from the Rust workspace; the tag must match it.
       - run: |
           python3 - <<'EOF'
           import os, sys, tomllib
@@ -30,53 +37,14 @@ jobs:
               sys.exit("the tag does not match workspace.package.version")
           EOF
 
-  wheels:
-    needs: version
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - { os: ubuntu-latest, target: x86_64, native: true }
-          - { os: ubuntu-latest, target: aarch64, native: false }
-          - { os: macos-latest, target: x86_64, native: false }
-          - { os: macos-latest, target: aarch64, native: true }
-          - { os: windows-latest, target: x64, native: true }
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
-        with:
-          working-directory: python/airlox
-          target: ${{ matrix.target }}
-          args: --release --out dist
-          manylinux: auto
-      # Install the wheel and load the Rust core, where the runner can run it.
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
-        if: matrix.native
-      - if: matrix.native
-        run: uv run --isolated --no-project --find-links python/airlox/dist --with airlox python -c "import airlox, airlox._core as c; print('airlox core', c.PROTOCOL_VERSION)"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: dist-${{ matrix.os }}-${{ matrix.target }}
-          path: python/airlox/dist
+  build:
+    needs: check
+    uses: ./.github/workflows/build.yml
 
-  sdist:
-    needs: version
+  pypi:
+    needs: build
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
-        with:
-          working-directory: python/airlox
-          command: sdist
-          args: --out dist
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: dist-sdist
-          path: python/airlox/dist
-
-  publish:
-    needs: [wheels, sdist]
-    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -87,3 +55,114 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           password: ${{ secrets.PYPI_TOKEN }}
+          skip-existing: true
+
+  # The platform packages first, so the wrapper never points at a missing one.
+  npm:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write # npm provenance
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: npm
+          path: npm
+      - env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          for t in npm/airlox-*-"$VERSION".tgz npm/airlox-"$VERSION".tgz; do
+            name=$(tar xzf "$t" -O package/package.json | jq -r .name)
+            if npm view "$name@$VERSION" version > /dev/null 2>&1; then
+              echo "$name@$VERSION is already published"
+            else
+              npm publish "$t" --access public --provenance
+            fi
+          done
+
+  github:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: bin-*
+          merge-multiple: true
+          path: bins
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: mcpb
+          path: mcpb
+      - name: Archive the binaries
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          mkdir release
+          for d in bins/bin-*; do
+            t=${d#bins/bin-}
+            [ "$t" = universal-apple-darwin ] && continue
+            name="airlox-$VERSION-$t"
+            mkdir "$name"
+            cp "$d"/airlox* LICENSE-MIT LICENSE-APACHE "$name/"
+            chmod +x "$name"/airlox*
+            case "$t" in
+              *windows*) zip -qr "release/$name.zip" "$name" ;;
+              *) tar czf "release/$name.tar.gz" "$name" ;;
+            esac
+          done
+          cp "mcpb/airlox-$VERSION.mcpb" release/
+          (cd release && sha256sum * > SHA256SUMS)
+          cat release/SHA256SUMS
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" release/* --clobber
+          else
+            gh release create "$TAG" release/* --verify-tag --title "$TAG" --generate-notes
+          fi
+
+  # The registry checks that each package exists and names this server (npm's
+  # mcpName, the PyPI README's mcp-name, the bundle's URL), so this runs last.
+  registry:
+    needs: [build, pypi, npm, github]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write # GitHub OIDC login for the io.github.claudezss namespace
+    env:
+      MCP_PUBLISHER: https://github.com/modelcontextprotocol/registry/releases/download/v1.8.1/mcp-publisher_linux_amd64.tar.gz
+      MCP_PUBLISHER_SHA256: a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: mcpb
+          path: mcpb
+      - run: |
+          curl -fsSL -o mcp-publisher.tar.gz "$MCP_PUBLISHER"
+          echo "$MCP_PUBLISHER_SHA256  mcp-publisher.tar.gz" | sha256sum -c
+          tar xzf mcp-publisher.tar.gz mcp-publisher
+      - run: ./mcp-publisher login github-oidc
+      # PyPI and npm can take a moment to serve a version just published.
+      - run: |
+          cp mcpb/server.json server.json
+          for i in 1 2 3 4 5; do
+            out=$(./mcp-publisher publish 2>&1) && { echo "$out"; exit 0; }
+            echo "$out"
+            echo "$out" | grep -qi "already exists\|cannot publish duplicate" && exit 0
+            sleep $((i * 30))
+          done
+          exit 1

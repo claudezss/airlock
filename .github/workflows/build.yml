@@ -1,0 +1,248 @@
+name: build
+
+# Builds everything a release ships, without publishing anything: the
+# `airlox` binary per platform, the PyPI wheels (each with the binary) and
+# sdist, the npm packages and the MCPB bundle. Each is smoke-tested where the
+# runner can run it. Called by release.yml for a tag and by ci.yml when
+# packaging could have changed.
+on:
+  workflow_call:
+    outputs:
+      version:
+        description: The workspace version, which every package carries
+        value: ${{ jobs.version.outputs.version }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - id: v
+        run: python3 -c "import tomllib; print('version=' + tomllib.load(open('Cargo.toml', 'rb'))['workspace']['package']['version'])" >> "$GITHUB_OUTPUT"
+
+  # Static musl binaries on Linux (one per architecture runs on any
+  # distribution), both macOS architectures plus a universal binary for the
+  # MCPB bundle, and Windows x64. Artifacts hold bin-<target>/airlox[.exe].
+  binaries:
+    needs: version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-latest
+            targets: x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+            build: zigbuild
+            run: x86_64-unknown-linux-musl
+          - name: macos
+            os: macos-latest
+            targets: aarch64-apple-darwin x86_64-apple-darwin
+            build: build
+            run: aarch64-apple-darwin universal-apple-darwin
+          - name: windows
+            os: windows-latest
+            targets: x86_64-pc-windows-msvc
+            build: build
+            run: x86_64-pc-windows-msvc
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: rustup target add ${{ matrix.targets }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: dist-${{ matrix.name }}
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        if: matrix.build == 'zigbuild'
+      # cargo-zigbuild runs zig through `python3 -m ziglang`, so both go in a
+      # venv put first on PATH.
+      - if: matrix.build == 'zigbuild'
+        run: |
+          uv venv "$RUNNER_TEMP/zig"
+          VIRTUAL_ENV="$RUNNER_TEMP/zig" uv pip install cargo-zigbuild==0.23.4 ziglang==0.15.2
+          echo "$RUNNER_TEMP/zig/bin" >> "$GITHUB_PATH"
+      - name: Build
+        env:
+          # Release builds keep symbols for the Python extension's sake
+          # (Cargo.toml); the binary ships stripped.
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+        run: |
+          for t in ${{ matrix.targets }}; do
+            cargo ${{ matrix.build }} --release --locked -p airlox --target "$t"
+            mkdir -p "out/bin-$t"
+            cp target/"$t"/release/airlox* "out/bin-$t/"
+            rm -f "out/bin-$t"/*.d "out/bin-$t"/*.pdb
+          done
+      - if: runner.os == 'macOS'
+        run: |
+          mkdir -p out/bin-universal-apple-darwin
+          lipo -create -output out/bin-universal-apple-darwin/airlox \
+            out/bin-aarch64-apple-darwin/airlox out/bin-x86_64-apple-darwin/airlox
+      - name: Smoke test
+        run: |
+          for t in ${{ matrix.run }}; do
+            got=$(out/bin-$t/airlox --version)
+            echo "$t: $got"
+            test "$got" = "airlox ${{ needs.version.outputs.version }}"
+            out/bin-$t/airlox mcp --help > /dev/null
+          done
+      - if: runner.os == 'Linux'
+        run: |
+          for f in out/bin-*/airlox; do
+            file "$f"
+            file "$f" | grep -Eq 'static(-pie)? linked|statically linked'
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bin-${{ matrix.name }}
+          path: out/
+          if-no-files-found: error
+
+  wheels:
+    needs: [version, binaries]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64, bin: x86_64-unknown-linux-musl, native: true }
+          - { os: ubuntu-latest, target: aarch64, bin: aarch64-unknown-linux-musl, native: false }
+          - { os: macos-latest, target: x86_64, bin: x86_64-apple-darwin, native: false }
+          - { os: macos-latest, target: aarch64, bin: aarch64-apple-darwin, native: true }
+          - { os: windows-latest, target: x64, bin: x86_64-pc-windows-msvc, native: true }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: bin-*
+          merge-multiple: true
+          path: bins
+      # The wheel installs the binary onto PATH: maturin puts airlox.data/scripts
+      # in the wheel's scripts. Only release builds add it (pyproject.toml).
+      - name: Add the binary to the wheel
+        run: |
+          mkdir -p python/airlox/airlox.data/scripts
+          cp bins/bin-${{ matrix.bin }}/airlox* python/airlox/airlox.data/scripts/
+          chmod +x python/airlox/airlox.data/scripts/*
+          printf '%s\n' 'data = "airlox.data"' >> python/airlox/pyproject.toml
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          working-directory: python/airlox
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: auto
+      # Install the wheel, load the Rust core and run the binary, where the
+      # runner can run them.
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        if: matrix.native
+      - if: matrix.native
+        run: |
+          uv run --isolated --no-project --find-links python/airlox/dist --with airlox python -c "import airlox, airlox._core as c; print('airlox core', c.PROTOCOL_VERSION)"
+          got=$(uv run --isolated --no-project --find-links python/airlox/dist --with airlox airlox --version)
+          echo "$got"
+          test "$got" = "airlox ${{ needs.version.outputs.version }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-${{ matrix.os }}-${{ matrix.target }}
+          path: python/airlox/dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          working-directory: python/airlox
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-sdist
+          path: python/airlox/dist
+
+  # The wrapper package `airlox` and one package per platform, packed. The
+  # smoke test installs the packed wrapper and the Linux x64 package offline
+  # and runs the binary through npx.
+  npm:
+    needs: [version, binaries]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: bin-*
+          merge-multiple: true
+          path: bins
+      - run: node packaging/stage.mjs npm "${{ needs.version.outputs.version }}" bins npm-stage
+      - run: |
+          mkdir npm-dist
+          for d in npm-stage/*/; do npm pack --pack-destination npm-dist "$d"; done
+          ls -l npm-dist
+      - name: Smoke test
+        run: |
+          v="${{ needs.version.outputs.version }}"
+          mkdir "$RUNNER_TEMP/try" && cd "$RUNNER_TEMP/try"
+          npm init -y > /dev/null
+          npm install --no-audit --no-fund --offline \
+            "$GITHUB_WORKSPACE/npm-dist/airlox-linux-x64-$v.tgz" "$GITHUB_WORKSPACE/npm-dist/airlox-$v.tgz"
+          got=$(npx --no-install airlox --version)
+          echo "$got"
+          test "$got" = "airlox $v"
+          npx --no-install airlox mcp --help > /dev/null
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: npm
+          path: npm-dist
+
+  # One bundle for Claude Desktop (macOS universal and Windows x64), and the
+  # MCP registry entry that names it.
+  mcpb:
+    needs: [version, binaries]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: bin-*
+          merge-multiple: true
+          path: bins
+      - run: |
+          v="${{ needs.version.outputs.version }}"
+          node packaging/stage.mjs mcpb "$v" bins mcpb-stage
+          npx -y @anthropic-ai/mcpb@2.1.2 validate mcpb-stage/manifest.json
+          mkdir mcpb-dist
+          npx -y @anthropic-ai/mcpb@2.1.2 pack mcpb-stage "mcpb-dist/airlox-$v.mcpb"
+          node packaging/stage.mjs server-json "$v" "mcpb-dist/airlox-$v.mcpb" mcpb-dist/server.json
+          cat mcpb-dist/server.json
+      # The bundle keeps the binaries executable.
+      - run: |
+          v="${{ needs.version.outputs.version }}"
+          unzip -Z "mcpb-dist/airlox-$v.mcpb" | tee /dev/stderr | grep -E 'rwx.* server/airlox$'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mcpb
+          path: mcpb-dist

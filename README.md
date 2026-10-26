@@ -85,17 +85,18 @@ The full design is in [docs/DESIGN.md](docs/DESIGN.md) and the wire format in
 ### Install
 
 The `airlox` binary is the command-line client, the runner and the MCP
-server:
+server. Any of these puts it on your `PATH`:
 
 ```bash
-cargo install --git https://github.com/claudezss/airlox airlox
+npm install -g airlox        # or run it with npx -y airlox …
+pip install airlox           # with the Python SDK; or run it with uvx airlox …
 ```
 
-The Python SDK:
-
-```bash
-pip install airlox
-```
+There are prebuilt binaries for macOS (arm64, x64), Linux (arm64, x64; static,
+so any distribution) and Windows (x64), also on the
+[releases page](https://github.com/claudezss/airlox/releases), each with
+`SHA256SUMS`. Elsewhere, build it with
+`cargo install --git https://github.com/claudezss/airlox airlox`.
 
 ### From the command line
 
@@ -125,13 +126,21 @@ a file, and never shows the owner invite to the model (`--owner-invite-dir`
 saves it for you).
 
 ```bash
-claude mcp add airlox -- airlox mcp           # Claude Code
-codex mcp add airlox -- airlox mcp            # Codex
+claude mcp add airlox -- npx -y airlox mcp    # Claude Code
+codex mcp add airlox -- npx -y airlox mcp     # Codex
 ```
 
 ```json
-{ "mcpServers": { "airlox": { "command": "airlox", "args": ["mcp", "--allow-dir", "/path/to/workdir"] } } }
+{ "mcpServers": { "airlox": { "command": "npx", "args": ["-y", "airlox", "mcp", "--allow-dir", "/path/to/workdir"] } } }
 ```
+
+`uvx airlox mcp` works the same way. For Claude Desktop, download
+`airlox-<version>.mcpb` from the
+[releases page](https://github.com/claudezss/airlox/releases) and open it:
+it asks for the working folder and, optionally, a folder to save owner links
+to. The server is also listed in the
+[MCP registry](https://registry.modelcontextprotocol.io) as
+`io.github.claudezss/airlox`.
 
 The tools let the agent create or join sessions, send messages and files,
 read items, approve runners and run Python.
@@ -247,6 +256,7 @@ Please report vulnerabilities privately through
 | `python/airlox` | The Python SDK |
 | `web` | The browser UI |
 | `skills/airlox` | Agent skill that teaches coding agents the CLI |
+| `packaging` | The npm packages, the MCPB bundle and the MCP registry entry, staged around the release binaries |
 | `deploy` | Docker Compose, Caddy and Droplet scripts for the hosted relay |
 | `examples` | End-to-end examples |
 

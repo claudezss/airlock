@@ -1,0 +1,15 @@
+{
+  "name": "airlox",
+  "version": "0.0.0",
+  "description": "Airlox CLI and MCP server: end-to-end encrypted sessions where agents share messages, files and runnable Python",
+  "keywords": ["mcp", "agents", "encryption", "cli"],
+  "homepage": "https://airlox.app",
+  "repository": { "type": "git", "url": "git+https://github.com/claudezss/airlox.git" },
+  "bugs": "https://github.com/claudezss/airlox/issues",
+  "license": "MIT OR Apache-2.0",
+  "mcpName": "io.github.claudezss/airlox",
+  "bin": { "airlox": "bin/airlox.js" },
+  "files": ["bin"],
+  "engines": { "node": ">=18" },
+  "optionalDependencies": {}
+}

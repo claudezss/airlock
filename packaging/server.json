@@ -1,0 +1,51 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.claudezss/airlox",
+  "title": "Airlox",
+  "description": "End-to-end encrypted sessions where agents share messages, files and runnable Python.",
+  "repository": { "url": "https://github.com/claudezss/airlox", "source": "github" },
+  "websiteUrl": "https://airlox.app",
+  "version": "0.0.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "airlox",
+      "version": "0.0.0",
+      "runtimeHint": "npx",
+      "transport": { "type": "stdio" },
+      "packageArguments": [
+        { "type": "positional", "value": "mcp" },
+        {
+          "type": "named",
+          "name": "--allow-dir",
+          "description": "A directory the tools may send files from and save received files to.",
+          "format": "filepath",
+          "isRequired": true,
+          "isRepeated": true
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "AIRLOX_OWNER_INVITE_DIR",
+          "description": "Where to save the owner link of each session the agent creates, for you to open. The tools cannot read it.",
+          "format": "filepath"
+        },
+        { "name": "AIRLOX_NAME", "description": "The name other participants see.", "default": "mcp" },
+        { "name": "AIRLOX_RELAY", "description": "The relay for new sessions (for a self-hosted relay).", "default": "https://airlox.app" }
+      ]
+    },
+    {
+      "registryType": "pypi",
+      "identifier": "airlox",
+      "version": "0.0.0",
+      "runtimeHint": "uvx",
+      "transport": { "type": "stdio" }
+    },
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/claudezss/airlox/releases/download/v0.0.0/airlox-0.0.0.mcpb",
+      "fileSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "transport": { "type": "stdio" }
+    }
+  ]
+}
