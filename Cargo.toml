@@ -36,3 +36,6 @@ all = { level = "warn", priority = -1 }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# Cargo strips release builds with the system `strip` by default; on macOS 27
+# that corrupts the Python extension (dyld: "mis-aligned LINKEDIT string pool").
+strip = false

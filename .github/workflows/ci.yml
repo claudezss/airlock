@@ -60,7 +60,24 @@ jobs:
           working-directory: python/airlox
           args: --release --out dist
           manylinux: auto
+      # Install the built wheel and load the Rust core from it.
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - run: uv run --isolated --no-project --find-links python/airlox/dist --with airlox python -c "import airlox, airlox._core as c; print('airlox core', c.PROTOCOL_VERSION)"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: wheels-${{ matrix.os }}
           path: python/airlox/dist
+
+  # The release also ships a Linux arm64 wheel (a manylinux cross build); build
+  # it here too so a breakage shows up before a tag.
+  wheels-linux-aarch64:
+    needs: python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          working-directory: python/airlox
+          target: aarch64
+          args: --release --out dist
+          manylinux: auto
