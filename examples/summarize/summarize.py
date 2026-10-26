@@ -1,7 +1,7 @@
 """Summarize orders by region: the M2 execute-mode scenario.
 
-Runs on an Airlock runner. Inputs arrive in the work dir (dataset.zip is
-unpacked there); files written to $AIRLOCK_OUT come back as out files.
+Runs on an Airlox runner. Inputs arrive in the work dir (dataset.zip is
+unpacked there); files written to $AIRLOX_OUT come back as out files.
 """
 
 import os
@@ -10,7 +10,7 @@ import socket
 import matplotlib.pyplot as plt
 import pandas as pd
 
-out = os.environ.get("AIRLOCK_OUT", "/out")
+out = os.environ.get("AIRLOX_OUT", "/out")
 
 orders = pd.read_csv("dataset/orders.csv")
 by_region = orders.groupby("region")["total"].agg(["count", "sum"]).sort_values("sum", ascending=False)

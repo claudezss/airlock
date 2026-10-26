@@ -1,10 +1,10 @@
 {
-  "name": "@airlock/core",
+  "name": "@airlox/core",
   "version": "0.1.0",
   "private": true,
-  "description": "Airlock protocol core compiled to WebAssembly",
+  "description": "Airlox protocol core compiled to WebAssembly",
   "scripts": {
-    "build": "cargo build -p airlock-core-wasm --release --target wasm32-unknown-unknown && wasm-bindgen ../../target/wasm32-unknown-unknown/release/airlock_core_wasm.wasm --out-dir pkg/web --target web && wasm-bindgen ../../target/wasm32-unknown-unknown/release/airlock_core_wasm.wasm --out-dir pkg/node --target nodejs",
+    "build": "cargo build -p airlox-core-wasm --release --target wasm32-unknown-unknown && wasm-bindgen ../../target/wasm32-unknown-unknown/release/airlox_core_wasm.wasm --out-dir pkg/web --target web && wasm-bindgen ../../target/wasm32-unknown-unknown/release/airlox_core_wasm.wasm --out-dir pkg/node --target nodejs",
     "test": "node --test tests/*.test.mjs"
   }
 }

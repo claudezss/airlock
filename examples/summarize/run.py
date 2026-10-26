@@ -1,9 +1,9 @@
 """Drive the summarize scenario against a relay with one runner.
 
-    airlock-server --data ./data &
+    airlox-server --data ./data &
     python examples/summarize/run.py http://127.0.0.1:8080
     # it prints a runner invite; start the runner with it:
-    airlock runner join --invite '<runner invite>' --name runner-01 --sandbox docker
+    airlox runner join --invite '<runner invite>' --name runner-01 --sandbox docker
 """
 
 import io
@@ -12,7 +12,7 @@ import sys
 import time
 import zipfile
 
-from airlock import Session
+from airlox import Session
 
 HERE = pathlib.Path(__file__).parent
 

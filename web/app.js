@@ -1,6 +1,6 @@
-// Airlock web client (M1 timeline). All cryptography runs in the
-// airlock-core WebAssembly module; the relay only sees ciphertext.
-import init, * as ac from "/assets/pkg/airlock_core_wasm.js";
+// Airlox web client (M1 timeline). All cryptography runs in the
+// airlox-core WebAssembly module; the relay only sees ciphertext.
+import init, * as ac from "/assets/pkg/airlox_core_wasm.js";
 
 const MB = 1024 * 1024;
 const MAX_ITEM_MB = 25;
@@ -86,7 +86,7 @@ function explain(err) {
 
 // ---------- IndexedDB: identity, events and ciphertext blobs ----------
 const db = await new Promise((res, rej) => {
-  const r = indexedDB.open("airlock", 1);
+  const r = indexedDB.open("airlox", 1);
   r.onupgradeneeded = () => {
     for (const s of ["identity", "events", "blobs"]) r.result.createObjectStore(s);
   };
@@ -168,7 +168,7 @@ function inviteRow(name, url, hint) {
 function runnerInviteRow(url) {
   return el("div", { class: "stack" }, inviteRow("Runner", url, "your sandboxed machine"),
     el("p", { class: "muted hint-text" }, "Run on the runner host: ",
-      el("code", {}, `airlock runner join --invite '${maskInvite(url)}' --name runner-01 --sandbox docker`)));
+      el("code", {}, `airlox runner join --invite '${maskInvite(url)}' --name runner-01 --sandbox docker`)));
 }
 
 // ---------- new session ----------
@@ -1234,7 +1234,7 @@ function buildJobPanel(s, text, file) {
     const refs = [...s.picked].map((id) => s.items.get(id)?.ref).filter(Boolean);
     const meta = { type: "job", filename, code, runtime: lim.runtime, timeout_s: t, memory_mb: null, files: refs, requirements: [], target: tgt };
     try {
-      await sendPayload(s, "job", "py", meta, new Uint8Array(), { path: "jobs", headers: { "Airlock-Target": JSON.stringify(tgt) } });
+      await sendPayload(s, "job", "py", meta, new Uint8Array(), { path: "jobs", headers: { "Airlox-Target": JSON.stringify(tgt) } });
     } catch (e) {
       if (e.code !== "no_runner_available") throw e;
       const err = new Error(notAvailableText(tgt));
@@ -1341,5 +1341,5 @@ try {
   if (location.pathname.startsWith("/s/")) await sessionView();
   else landing();
 } catch (e) {
-  deadEnd("Airlock failed to start", String(e.message || e));
+  deadEnd("Airlox failed to start", String(e.message || e));
 }

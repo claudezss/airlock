@@ -1,4 +1,4 @@
-"""Replays crates/airlock-core/vectors/v1.json through the Python binding."""
+"""Replays crates/airlox-core/vectors/v1.json through the Python binding."""
 
 import base64
 import io
@@ -8,10 +8,10 @@ import zipfile
 
 import pytest
 
-import airlock_core as ac
+import airlox_core as ac
 
 VEC = json.loads(
-    (pathlib.Path(__file__).parents[3] / "crates/airlock-core/vectors/v1.json").read_text()
+    (pathlib.Path(__file__).parents[3] / "crates/airlox-core/vectors/v1.json").read_text()
 )
 MANIFEST = VEC["manifest"]["signed_canonical"]
 CERTS = {c["role"]: c for c in VEC["certs"]}

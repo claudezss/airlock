@@ -1,0 +1,39 @@
+[package]
+name = "airlox-server"
+description = "Airlox relay: a file-backed transit buffer for encrypted agent sessions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "airlox-server"
+path = "src/main.rs"
+
+[dependencies]
+airlox-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+rand_core.workspace = true
+thiserror.workspace = true
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "sync", "time", "signal"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rust-embed = "8"
+mime_guess = "2"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["fs"] }
+
+[dev-dependencies]
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+
+[lints]
+workspace = true

@@ -1,9 +1,9 @@
-# Airlock wire protocol v1
+# Airlox wire protocol v1
 
 Status: **frozen** at M0. Any change to a byte on the wire requires bumping
 `v` and adding `vectors/v2.json`. The reference implementation is the
-`airlock-core` crate; the conformance suite is
-[`crates/airlock-core/vectors/v1.json`](../crates/airlock-core/vectors/v1.json).
+`airlox-core` crate; the conformance suite is
+[`crates/airlox-core/vectors/v1.json`](../crates/airlox-core/vectors/v1.json).
 Every implementation (Rust, Python binding, wasm binding) must reproduce every
 derived value in that file from its `inputs` and pass every verification step.
 
@@ -23,7 +23,7 @@ derived value in that file from its `inputs` and pass every verification step.
 - **Timestamps** are integer Unix milliseconds (`*_ms`). The core never reads
   a clock; callers supply times.
 - **Signatures** are Ed25519 (strict verification) over
-  `"airlock/v1/" || context || 0x00 || message`. Contexts: `manifest`,
+  `"airlox/v1/" || context || 0x00 || message`. Contexts: `manifest`,
   `cert`, `join`, `item`.
 - **Hashes** are SHA-256. **KDF** is HKDF-SHA256. **AEAD** is AES-256-GCM
   with a 12-byte random nonce and 16-byte tag.
@@ -35,8 +35,8 @@ The owner generates a 32-byte **owner seed**. Everything else derives from it:
 | Value | Derivation |
 |---|---|
 | owner keypair | Ed25519 key from seed = owner seed |
-| session key `K` | `HKDF(salt="airlock/v1", ikm=owner_seed, info="session-key", L=32)` |
-| role seed for R ∈ {sender, runner, observer} | `HKDF(salt="airlock/v1", ikm=owner_seed, info="role:" + R, L=32)` |
+| session key `K` | `HKDF(salt="airlox/v1", ikm=owner_seed, info="session-key", L=32)` |
+| role seed for R ∈ {sender, runner, observer} | `HKDF(salt="airlox/v1", ikm=owner_seed, info="role:" + R, L=32)` |
 | role keypair | Ed25519 key from seed = role seed |
 | session id | `"ak_" + base32_lower(SHA-256(owner_pub)[0..16])` (26 characters, 128 bits) |
 
@@ -162,7 +162,7 @@ Every message, file, job, result and event is an item: a plaintext
 ```
 
 ```text
-item_key = HKDF(salt = session_id, ikm = K, info = "airlock/v1/item-key" || 0x00 || id, L = 32)
+item_key = HKDF(salt = session_id, ikm = K, info = "airlox/v1/item-key" || 0x00 || id, L = 32)
 blob     = nonce(12) || AES-256-GCM(item_key, nonce, payload, aad = canonical(header))
 sig      = Ed25519(author, "item", canonical(header) || SHA-256(blob))
 ```
@@ -299,7 +299,7 @@ python3 shim.py --work DIR --entry FILE --timeout SECONDS --result PATH
 - **Environment.** Only a fixed `PATH` (the interpreter's directory plus
   `/usr/local/bin:/usr/bin:/bin`), `LANG=C.UTF-8`, `HOME` (the work dir),
   `TMPDIR` (a directory inside the work dir), `MPLBACKEND=Agg` and, with
-  `--out`, `AIRLOCK_OUT` (the output directory: `/out` in containers) reach
+  `--out`, `AIRLOX_OUT` (the output directory: `/out` in containers) reach
   the job. It runs as `python -E -s -u -B -X utf8 FILE`: the work dir is
   importable, `PYTHON*` variables and user site-packages are ignored, output
   is unbuffered so it survives a kill, and no `.pyc` files are written.
@@ -321,7 +321,7 @@ python3 shim.py --work DIR --entry FILE --timeout SECONDS --result PATH
 
 ## 12. Relay HTTP binding
 
-This section fixes how clients talk to `airlock-server` in relay mode. The
+This section fixes how clients talk to `airlox-server` in relay mode. The
 relay sees only what is listed here: signed manifests, signed join requests,
 item envelopes and ciphertext blobs. Execute-mode endpoints (jobs, runners)
 are in §13 and change nothing here except that `POST /items` refuses `job`
@@ -443,7 +443,7 @@ items stay the source of truth.
 
 | Method and path | Auth | Body | Success |
 |---|---|---|---|
-| `POST /v1/sessions/{id}/jobs` | sender or owner | `Airlock-Target` header + upload frame of a `job` item | `201 {"id", "seq", "state": "assigned", "runner"}` |
+| `POST /v1/sessions/{id}/jobs` | sender or owner | `Airlox-Target` header + upload frame of a `job` item | `201 {"id", "seq", "state": "assigned", "runner"}` |
 | `GET /v1/sessions/{id}/jobs/{job}` | any | none | `200 {"job", "state", "runner", "reason"}` |
 | `POST /v1/sessions/{id}/jobs/{job}/claim` | the assigned runner | none | `204` |
 | `POST /v1/sessions/{id}/jobs/{job}/cancel` | owner, or the job's sender | none | `202 {"job", "state", "runner", "reason"}` |
@@ -463,7 +463,7 @@ with `runner_rejected` and ends its streams. When `approve_runners` is false
 every runner is eligible as soon as it joins.
 
 **Submitting.** A sender seals a `job` item and posts its upload frame to
-`POST /jobs` with `Airlock-Target` set to the job's `target` JSON (§7). The
+`POST /jobs` with `Airlox-Target` set to the job's `target` JSON (§7). The
 relay routes on this copy; the runner refuses a job whose signed target does
 not match it. Candidates are runners that are eligible, online, idle and
 match the target (a `runner` target matches only that key; `labels` needs
