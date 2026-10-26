@@ -1,14 +1,32 @@
 name: deploy
 
-# Every push to main builds the relay image, pushes it to
-# ghcr.io/claudezss/airlox-server and deploys it to the Droplet (see
-# docs/deploy.md). Pull requests, and manual runs on other branches, only build
-# the image. Run it by hand on main to redeploy.
+# A push to main that changes the relay (or how it is deployed) builds the
+# image, pushes it to ghcr.io/claudezss/airlox-server and deploys it to the
+# Droplet (see docs/deploy.md). Pull requests touching the same files, and
+# manual runs on other branches, only build the image. Run it by hand on main
+# to redeploy.
 on:
   push:
     branches: [main]
+    paths: &relay
+      - Dockerfile
+      - .dockerignore
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - 'crates/airlox-core/**'
+      - 'crates/airlox-server/**'
+      - 'bindings/wasm/**'
+      - 'web/**'
+      - 'deploy/**'
+      - .github/workflows/deploy.yml
   pull_request:
+    paths: *relay
   workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -19,6 +37,7 @@ env:
 jobs:
   image:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
@@ -46,6 +65,7 @@ jobs:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: image
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment:
       name: production
       url: https://${{ vars.AIRLOX_DOMAIN }}
