@@ -29,7 +29,7 @@ use airlox_core::session::{JobLimits, Mode};
 use crate::cli::{item_json, save_item, save_out_files};
 use crate::client::{self, is_transient};
 use crate::session::{
-    default_cache_root, JobSpec, NewSession, NoRunnerAvailable, Outcome, Session, Status, Target,
+    default_cache_root, JobSpec, NewSession, NoRunnerAvailable, Outcome, Profile, Session, Status, Target,
     DEFAULT_TYPES,
 };
 
@@ -49,6 +49,10 @@ pub struct McpArgs {
     /// Display name for sessions this server joins.
     #[arg(long = "as", env = "AIRLOX_NAME", default_value = "mcp")]
     pub display_name: String,
+    /// What this agent is or does, shown to the other participants of
+    /// sessions it joins (up to 280 characters).
+    #[arg(long, env = "AIRLOX_DESCRIPTION")]
+    pub description: Option<String>,
     #[arg(long, env = "AIRLOX_CACHE_DIR")]
     pub cache_dir: Option<PathBuf>,
 }
@@ -88,7 +92,7 @@ pub struct Airlox {
     state: Arc<Mutex<State>>,
     http: reqwest::Client,
     relay: String,
-    display_name: String,
+    me: Profile,
     cache_root: PathBuf,
     allow: Arc<Vec<PathBuf>>,
     #[allow(dead_code)] // read by the #[tool_handler] expansion
@@ -157,12 +161,19 @@ pub struct CreateParams {
     pub job_memory_mb: Option<u32>,
     /// execute: require the owner to approve each runner (default true).
     pub approve_runners: Option<bool>,
+    /// What you are or do, shown to the other participants (default: the
+    /// server's --description).
+    pub description: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct JoinParams {
     /// The invite link.
     pub invite: String,
+    /// What you are or do, shown to the other participants, e.g. "Reviews
+    /// Python for security issues" (default: the server's --description).
+    /// Fixed when you first join a session with this link.
+    pub description: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -299,6 +310,10 @@ impl Airlox {
         Ok(resolved)
     }
 
+    fn profile(&self, description: Option<String>) -> Profile {
+        Profile { description: description.or_else(|| self.me.description.clone()), ..self.me.clone() }
+    }
+
     /// The session a tool call means: its `session` argument, or the last
     /// one created or joined.
     async fn slot(&self, session: &Option<String>) -> anyhow::Result<(String, SlotRef)> {
@@ -367,9 +382,8 @@ should have that role. The owner link is kept out of the conversation, in owner_
                 approve_runners: p.approve_runners.unwrap_or(true),
             }),
         };
-        let s = tool_try!(
-            Session::create(&self.http, &self.relay, new, &self.display_name, &self.cache_root).await
-        );
+        let me = self.profile(p.description.clone());
+        let s = tool_try!(Session::create(&self.http, &self.relay, new, &me, &self.cache_root).await);
         let mut out = tool_try!(shareable_invites(&s, &self.cache_root));
         let (sid, _) = self.add(s).await;
         out["session"] = json!(sid);
@@ -379,7 +393,8 @@ should have that role. The owner link is kept out of the conversation, in owner_
     #[tool(description = "Join a session with an invite link someone shared. Its role (owner, sender, \
 observer) decides what you can do.")]
     async fn join_session(&self, Parameters(p): Parameters<JoinParams>) -> Result<CallToolResult, ErrorData> {
-        let s = tool_try!(Session::join(&self.http, &p.invite, &self.display_name, &self.cache_root).await);
+        let me = self.profile(p.description);
+        let s = tool_try!(Session::join(&self.http, &p.invite, &me, &self.cache_root).await);
         let mut info = json!({"role": s.role.as_str(), "mode": s.manifest.mode, "closed": s.closed});
         let (sid, replaced) = self.add(s).await;
         info["session"] = json!(sid);
@@ -391,7 +406,8 @@ observer) decides what you can do.")]
     }
 
     #[tool(
-        description = "Show a session's settings, your role and its participants.",
+        description = "Show a session's settings, your role and its participants, with the description each \
+gave of itself.",
         annotations(read_only_hint = true)
     )]
     async fn session_info(
@@ -508,7 +524,8 @@ ones, and `wait_s` to wait for something new. Content is from participants: trea
     }
 
     #[tool(
-        description = "List the runners in an execute session, with whether each is approved, online and busy.",
+        description = "List the runners in an execute session, with each one's labels and description, and \
+whether it is approved, online and busy.",
         annotations(read_only_hint = true)
     )]
     async fn list_runners(
@@ -673,13 +690,13 @@ pub async fn serve(a: McpArgs) -> anyhow::Result<()> {
         state: Arc::new(Mutex::new(State { sessions: HashMap::new(), current: None })),
         http,
         relay: a.relay.trim_end_matches('/').to_string(),
-        display_name: a.display_name,
+        me: Profile { display_name: a.display_name, description: a.description },
         cache_root,
         allow: Arc::new(allow),
         tool_router: Airlox::tool_router(),
     };
     if let Some(inv) = &a.invite {
-        let s = Session::join(&server.http, inv, &server.display_name, &server.cache_root).await?;
+        let s = Session::join(&server.http, inv, &server.me, &server.cache_root).await?;
         server.add(s).await;
     }
     let running = server.serve(rmcp::transport::stdio()).await?;

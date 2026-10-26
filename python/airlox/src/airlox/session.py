@@ -155,6 +155,7 @@ class Session:
         max_item_bytes: int = 25 * 1024 * 1024,
         job_limits: Optional[dict] = None,
         display_name: str = "owner",
+        description: Optional[str] = None,
         cache_dir: Optional[Union[str, Path]] = None,
     ) -> "Session":
         """Create a session on ``relay`` and join it as the owner."""
@@ -170,7 +171,7 @@ class Session:
         http = httpx.Client(timeout=httpx.Timeout(30.0, connect=10.0))
         _check(http.post(relay.rstrip("/") + "/v1/sessions", content=signed))
         url = ac.owner_invite(relay, owner_seed)
-        return cls.join(url, display_name=display_name, cache_dir=cache_dir, _http=http)
+        return cls.join(url, display_name=display_name, description=description, cache_dir=cache_dir, _http=http)
 
     @classmethod
     def join(
@@ -178,11 +179,16 @@ class Session:
         invite_url: str,
         *,
         display_name: str = "agent",
+        description: Optional[str] = None,
         cache_dir: Optional[Union[str, Path]] = None,
         _http: Optional[httpx.Client] = None,
     ) -> "Session":
         """Join with an invite link. Rejoins as the same participant if this
         cache already holds an identity for the session and role.
+
+        ``description`` (up to 280 characters) tells the other participants
+        what you are or do, e.g. ``"reviews Python for security issues"``.
+        Like ``display_name`` it is signed and fixed at the first join.
 
         If the relay no longer has the session but this cache does, the
         session opens read-only with its local history and ``closed`` set.
@@ -216,6 +222,7 @@ class Session:
                 "session_id": sid,
                 "cert": json.loads(cert),
                 "display_name": display_name,
+                "description": description,
                 "kind": "sdk",
                 "runner": None,
                 "created_at_ms": _now_ms(),
@@ -373,6 +380,7 @@ class Session:
                     rejected=r["rejected"] or approvals.get(pub) is False,
                     online=r["online"],
                     job=r["job"],
+                    description=join.get("description"),
                 )
             )
         return out
@@ -546,6 +554,7 @@ class Session:
                     "participant_pub": cert["participant_pub"],
                     "role": cert["role"],
                     "display_name": join["display_name"],
+                    "description": join.get("description"),
                     "kind": join["kind"],
                     "cert": ac.join_cert(data["signed_join"]),
                     "left": False,

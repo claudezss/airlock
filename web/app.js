@@ -541,7 +541,8 @@ function buildSessionLayout(s) {
         el("span", { class: "dot", "aria-hidden": "true" }),
         el("div", { class: "who" },
           el("div", { class: "name" }, p.display_name, p.participant_pub === s.me ? el("span", { class: "you" }, "you") : null),
-          el("div", { class: "sub" }, `${p.role} · ${p.kind}${p.left ? " · left" : ""}`)),
+          el("div", { class: "sub" }, `${p.role} · ${p.kind}${p.left ? " · left" : ""}`),
+          p.description ? el("div", { class: "desc" }, p.description) : null),
         el("span", { class: "key", title: "Key fingerprint" }, ac.fingerprint(p.participant_pub).slice(0, 4))))),
     item: (it) => {
       const stick = nearBottom();
@@ -602,7 +603,7 @@ async function applyEvent(s, ev, { fetch, record }) {
       const j = JSON.parse(ev.data.signed_join).join;
       const c = j.cert.cert;
       s.participants.set(c.participant_pub, { participant_pub: c.participant_pub, role: c.role,
-        display_name: j.display_name, kind: j.kind, cert: ac.joinCert(ev.data.signed_join) });
+        display_name: j.display_name, description: j.description, kind: j.kind, cert: ac.joinCert(ev.data.signed_join) });
       s.render.people();
     } catch (e) {
       console.warn("ignoring unverifiable participant", e);
@@ -1059,9 +1060,12 @@ async function pollRunners(s) {
         ac.verifyJoin(e.signed_join, s.signed);
         const j = JSON.parse(e.signed_join).join;
         if (j.cert.cert.participant_pub !== e.participant_pub || j.cert.cert.role !== "runner" || !j.runner) continue;
-        list.push({ pub: e.participant_pub, name: j.runner.name, labels: j.runner.labels, host: j.runner.host, sandbox: j.runner.sandbox,
+        list.push({ pub: e.participant_pub, name: j.runner.name, description: j.description, labels: j.runner.labels,
+          host: j.runner.host, sandbox: j.runner.sandbox,
           networkUnblocked: !!j.runner.network_unblocked, online: !!e.online, job: e.job, rejected: !!e.rejected,
-          approved: !!e.approved || !r.approval_required });
+          // Approval as the owner signed it (and whether it is required, from
+          // the signed manifest), never the relay's unsigned listing.
+          approved: approvedRunners(s)?.includes(e.participant_pub) ?? !e.rejected });
       } catch (err) {
         console.warn("ignoring unverifiable runner", err);
       }
@@ -1106,6 +1110,7 @@ function renderRunners(s, list, note) {
         el("strong", { class: "name" }, r.name),
         el("span", { class: "sub" }, live)),
       el("div", { class: "sub" }, `${r.sandbox} · ${r.host}`),
+      r.description ? el("div", { class: "desc" }, r.description) : null,
       r.labels.length ? el("div", { class: "chips" }, r.labels.map((l) => el("span", { class: "chip" }, l))) : null,
       el("div", { class: "chips" },
         el("span", { class: `chip approval ${r.rejected ? "bad" : r.approved ? "good" : "wait"}` }, approval),

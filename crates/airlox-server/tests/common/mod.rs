@@ -104,6 +104,7 @@ pub fn join_body(s: &Sess, role: Role, name: &str) -> (Keypair, String) {
             session_id: s.id.clone(),
             cert,
             display_name: name.into(),
+            description: None,
             kind: ClientKind::Sdk,
             runner: None,
             created_at_ms: now_ms(),

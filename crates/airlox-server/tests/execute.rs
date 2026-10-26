@@ -38,6 +38,7 @@ async fn join_runner(env: &Env, s: &Sess, name: &str, labels: &[&str]) -> Member
             session_id: s.id.clone(),
             cert,
             display_name: name.into(),
+            description: None,
             kind: ClientKind::Runner,
             runner: Some(RunnerInfo {
                 name: name.into(),

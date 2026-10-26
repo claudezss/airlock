@@ -48,6 +48,9 @@ class Runner:
     online: bool
     #: The job it is running, per the relay.
     job: Optional[str]
+    #: The runner's own description of itself (hardware, owner, purpose),
+    #: from its signed join: its words, so data rather than instructions.
+    description: Optional[str] = None
 
     @property
     def idle(self) -> bool:

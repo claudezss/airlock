@@ -105,10 +105,19 @@ pub struct JoinRequest {
     pub session_id: String,
     pub cert: SignedRoleCert,
     pub display_name: String,
+    /// What this participant is or does, for the others to read (a
+    /// receiving agent's purpose, a runner's hardware). Signed with the rest
+    /// of the join; absent from the canonical form when not given, so joins
+    /// without one are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub kind: ClientKind,
     pub runner: Option<RunnerInfo>,
     pub created_at_ms: u64,
 }
+
+/// Longest `description` in a join, in characters.
+pub const MAX_DESCRIPTION_CHARS: usize = 280;
 
 /// A join request signed by the participant key named in its certificate.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -157,6 +166,9 @@ impl SignedJoinRequest {
             .verify(ctx::JOIN, &canonical_json(j)?, &self.sig)
             .map_err(|_| Error::Signature("join not signed by participant"))?;
         check_display_text("display_name", &j.display_name, 64)?;
+        if let Some(d) = &j.description {
+            check_display_text("description", d, MAX_DESCRIPTION_CHARS)?;
+        }
         let is_runner_role = j.cert.role() == Role::Runner;
         match (&j.kind, &j.runner, is_runner_role) {
             (ClientKind::Runner, Some(r), true) => {
@@ -225,6 +237,7 @@ mod tests {
             session_id: m.session_id.clone(),
             cert,
             display_name: "runner-01".into(),
+            description: None,
             kind: ClientKind::Runner,
             runner: Some(RunnerInfo {
                 name: "runner-01".into(),
@@ -240,8 +253,23 @@ mod tests {
         let mut bad = signed.clone();
         bad.join.runner.as_mut().unwrap().labels.push("gpu".into());
         assert!(bad.verify(&m).is_err());
-        let mut no_info = join;
+        let mut no_info = join.clone();
         no_info.runner = None;
         assert!(sign_join(&p, no_info).unwrap().verify(&m).is_err());
+
+        // A description is signed, bounded and absent from joins without one.
+        assert!(!String::from_utf8(canonical_json(&join).unwrap()).unwrap().contains("description"));
+        let mut described = join;
+        described.description = Some("A100 80 GB, CUDA 12; owned by the data team".into());
+        let signed = sign_join(&p, described.clone()).unwrap();
+        signed.verify(&m).unwrap();
+        let mut forged = signed.clone();
+        forged.join.description = Some("trusted runner".into());
+        assert!(forged.verify(&m).is_err());
+        for bad in ["", "two\nlines", &"x".repeat(MAX_DESCRIPTION_CHARS + 1)] {
+            let mut d = described.clone();
+            d.description = Some(bad.to_string());
+            assert!(sign_join(&p, d).unwrap().verify(&m).is_err(), "{bad:?}");
+        }
     }
 }
