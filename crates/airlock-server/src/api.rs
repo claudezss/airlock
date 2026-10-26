@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use airlock_core::cert::SignedJoinRequest;
 use airlock_core::encoding::parse_canonical;
-use airlock_core::item::{is_item_id, ItemEnvelope, ItemKind};
+use airlock_core::item::{is_item_id, ItemEnvelope, ItemHeader, ItemKind};
 use airlock_core::policy;
 use airlock_core::session::{is_session_id, Mode, Role, SignedManifest};
 use axum::body::{Body, BodyDataStream};
@@ -437,15 +437,15 @@ pub(crate) struct Upload {
 
 /// Read an upload frame (`u32_be(len) || envelope || blob`), check the
 /// envelope against the author and header policy, and stream the blob to a
-/// temp file while hashing it. `kind_ok` decides which item kinds this
-/// endpoint takes.
+/// temp file while hashing it. `header_ok` decides which items this endpoint
+/// takes, from the verified header.
 pub(crate) async fn receive_upload(
     st: &AppState,
     s: &Arc<Session>,
     who: &str,
     role: Role,
     body: Body,
-    kind_ok: impl FnOnce(ItemKind) -> ApiResult<()>,
+    header_ok: impl FnOnce(&ItemHeader) -> ApiResult<()>,
 ) -> ApiResult<Upload> {
     let cfg = st.store.cfg.clone();
     let mut chunks = body.into_data_stream();
@@ -482,7 +482,7 @@ pub(crate) async fn receive_upload(
         )));
     }
     policy::check_header(&s.signed.manifest, role, h)?;
-    kind_ok(h.kind)?;
+    header_ok(h)?;
     let item_id = h.id.clone();
     let blob_len = h.blob_len()?;
 
@@ -620,9 +620,26 @@ pub async fn post_item(
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let s = session(&st, &id)?;
     let (who, role) = auth(&s, &headers)?;
-    let up = receive_upload(&st, &s, &who, role, body, |kind| match kind {
-        ItemKind::Job => Err(ApiError::forbidden("submit jobs with POST /jobs")),
-        _ => Ok(()),
+    let s2 = s.clone();
+    let who2 = who.clone();
+    let up = receive_upload(&st, &s, &who, role, body, |h| {
+        if h.kind == ItemKind::Job {
+            return Err(ApiError::forbidden("submit jobs with POST /jobs"));
+        }
+        if role == Role::Runner {
+            // A runner posts only as an eligible runner, and a result only
+            // for a job the relay gave it.
+            let g = s2.lock();
+            if !g.runner_eligible(&who2) {
+                return Err(ApiError::forbidden("this runner is not approved"));
+            }
+            let assigned =
+                h.refs.iter().any(|r| g.jobs.get(&r.id).is_some_and(|j| j.runner.as_deref() == Some(&who2)));
+            if h.kind == ItemKind::Result && !assigned {
+                return Err(ApiError::forbidden("results must reference a job assigned to this runner"));
+            }
+        }
+        Ok(())
     })
     .await?;
     let item_id = up.env.header.id.clone();

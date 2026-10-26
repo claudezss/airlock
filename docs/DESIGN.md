@@ -834,4 +834,9 @@ format churn is where Rust is slowest.
    runner has a delegated cgroup (e.g. under `systemd-run --user`), and a
    seccomp denylist (`ptrace`, `bpf`, `keyctl`, `perf_event_open`, new
    namespaces) before M4. The job also sees itself as uid 0 inside its user
-   namespace, with no capabilities.
+   namespace, with no capabilities; for that reason the runner refuses the
+   local sandbox when it runs as root. Also open: per-job process and disk
+   quotas (a fork bomb or many files can still exhaust the host), blocking
+   loopback and link-local addresses (`169.254.169.254`) when a session
+   allows network, binding only the needed `/etc` files, pinning the runtime
+   base image and packages, and size caps on relay responses in the runner.

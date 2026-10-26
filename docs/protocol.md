@@ -499,11 +499,21 @@ heartbeats go every 10 seconds. At most 2 streams per runner.
 **Claiming and results.** A runner claims an assignment right away, then
 verifies and runs it, then posts its output files and the `result` item
 through `POST /items`. A claim for a job that has failed or was reassigned is
-`409`, and the runner drops the job.
+`409`, and the runner drops the job. The relay takes items from a runner only
+while it is eligible (approved when approval is required, not rejected), and
+a `result` only if its `refs` include a job assigned to that runner.
+
+Clients accept a result for a job only if, besides the §8 rules, its author
+holds the runner role and, when the session requires approval, has a
+verified `runner_approve` event from an owner-role participant and no
+`runner_reject`. A rejection is final: a later or replayed approval does not
+undo it. Runners apply the same rule to themselves. A runner records a job
+id as handled before it runs the job, so a job runs at most once per runner.
 
 **Cancelling.** `…/cancel` fails an unclaimed job at once. For a running job
 the relay forwards `job_cancel` to the runner, which kills the job and posts a
-`cancelled` result. Clients also post a signed `job_cancel` event item as the
+`cancelled` result. The relay remembers the request and repeats it when the
+runner's stream reconnects. Clients also post a signed `job_cancel` event item as the
 record of who asked.
 
 **Runner list.** Each entry is `{participant_pub, runner, approved, rejected,

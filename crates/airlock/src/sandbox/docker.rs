@@ -154,6 +154,8 @@ impl Docker {
             self.cpus.clone(),
             "--pids-limit".into(),
             self.pids_limit.to_string(),
+            "--ulimit".into(),
+            "nofile=1024:1024".into(),
             "--read-only".into(),
             "--tmpfs".into(),
             "/tmp:rw,nosuid,nodev,size=64m".into(),

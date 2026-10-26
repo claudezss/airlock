@@ -138,6 +138,8 @@ pub struct JobRec {
     pub reason: Option<String>,
     /// When it entered its current state.
     pub since_ms: u64,
+    /// A cancel was requested while it ran (in memory only).
+    pub cancel_requested: bool,
 }
 
 /// A runner's liveness. In memory only: after a restart runners reconnect.
@@ -354,6 +356,7 @@ impl Inner {
                         state: *state,
                         reason: reason.clone(),
                         since_ms: ts,
+                        cancel_requested: false,
                     },
                 );
                 Ok(self.push_event(

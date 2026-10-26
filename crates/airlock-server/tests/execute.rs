@@ -466,3 +466,52 @@ async fn runners_need_execute_mode_and_approval_survives_restart() {
     let mut stream = RunnerStream::open(&env, &s, &runner).await;
     assert_eq!(stream.next("job_assigned").await["job"], id.as_str());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_assigned_approved_runner_posts_results() {
+    let (env, s, owner, sender) = execute_env(|_| {}).await;
+    let runner = join_runner(&env, &s, "runner-01", &[]).await;
+    let other = join_runner(&env, &s, "runner-02", &[]).await;
+    let _stream = RunnerStream::open(&env, &s, &runner).await;
+    approve(&env, &s, &owner, &runner).await;
+    let job = seal_job(&s, &sender, &Target::Any);
+    assert_eq!(submit(&env, &s, &sender, &job).await.status(), StatusCode::CREATED);
+
+    // Unapproved: no results, no files.
+    let forged = seal_result(&s, &other, &job);
+    assert_eq!(post(&env, &s, &other, frame(&forged)).await.status(), StatusCode::FORBIDDEN);
+    // Approved but not assigned this job: no result for it.
+    approve(&env, &s, &owner, &other).await;
+    let forged = seal_result(&s, &other, &job);
+    assert_eq!(post(&env, &s, &other, frame(&forged)).await.status(), StatusCode::FORBIDDEN);
+    // The assigned runner may.
+    let real = seal_result(&s, &runner, &job);
+    assert_eq!(post(&env, &s, &runner, frame(&real)).await.status(), StatusCode::CREATED);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancels_survive_a_reconnect_and_leaving_fails_the_job() {
+    let (env, s, owner, sender) = execute_env(|_| {}).await;
+    let runner = join_runner(&env, &s, "runner-01", &[]).await;
+    let stream = RunnerStream::open(&env, &s, &runner).await;
+    approve(&env, &s, &owner, &runner).await;
+    let job = seal_job(&s, &sender, &Target::Any);
+    let id = job.envelope.header.id.clone();
+    assert_eq!(submit(&env, &s, &sender, &job).await.status(), StatusCode::CREATED);
+    claim(&env, &s, &runner, &id).await;
+
+    // The cancel arrives while the runner's stream is down.
+    drop(stream);
+    let r =
+        call(&env, &sender, reqwest::Method::POST, format!("/v1/sessions/{}/jobs/{id}/cancel", s.id)).await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    let mut stream = RunnerStream::open(&env, &s, &runner).await;
+    assert_eq!(stream.next("job_assigned").await["job"], id.as_str());
+    assert_eq!(stream.next("job_cancel").await["job"], id.as_str());
+
+    // Leaving with a job in hand fails it.
+    let r = call(&env, &runner, reqwest::Method::POST, format!("/v1/sessions/{}/leave", s.id)).await;
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    let st = job_state(&env, &s, &owner, &id).await;
+    assert_eq!((st["state"].as_str(), st["reason"].as_str()), (Some("failed"), Some("runner_left")));
+}

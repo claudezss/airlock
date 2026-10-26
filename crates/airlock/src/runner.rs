@@ -185,6 +185,12 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         )),
         SandboxArg::Local => Backend::Local(Local::new(&state_dir, !args.unsandboxed)),
     };
+    // The Linux sandbox maps the runner's own uid into the job: as root, the
+    // job could read every root-only file on the host (/etc/shadow, keys).
+    #[cfg(unix)]
+    if nix::unistd::getuid().is_root() && matches!(args.sandbox, SandboxArg::Local) {
+        bail!("refusing to run the local sandbox as root; run the runner as an unprivileged user, or use --sandbox docker");
+    }
     let spec = RuntimeSpec { runtime: limits.runtime.clone(), packages: limits.packages.clone() };
     backend.prepare(&spec).await.context("preparing the sandbox")?;
     if backend.network_unblocked() && !limits.network {
@@ -256,6 +262,82 @@ struct Running {
     task: JoinHandle<Result<()>>,
 }
 
+/// What the assignment stream tells the loop.
+enum Msg {
+    Assigned(String),
+    Cancel(String),
+    Rejected,
+    /// The relay no longer has the session.
+    Gone,
+    /// The relay no longer accepts this runner's token.
+    Unauthorized,
+}
+
+/// Hold the assignment stream open, reconnecting with backoff, and forward
+/// its events. Runs apart from the main loop so reconnects never delay a
+/// claim or a heartbeat.
+async fn stream_assignments(relay: Relay, tx: tokio::sync::mpsc::Sender<Msg>) {
+    let mut backoff = Duration::from_millis(500);
+    loop {
+        let resp = match relay.runner_stream().await {
+            Ok(r) => r,
+            Err(e) => {
+                let terminal = match status_of(&e) {
+                    Some(401) => Some(Msg::Unauthorized),
+                    Some(404 | 410) => Some(Msg::Gone),
+                    _ => None,
+                };
+                if let Some(m) = terminal {
+                    let _ = tx.send(m).await;
+                    return;
+                }
+                tracing::warn!("assignment stream unavailable, retrying: {e:#}");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+                continue;
+            }
+        };
+        backoff = Duration::from_millis(500);
+        let mut body = resp.bytes_stream();
+        let mut parser = SseParser::default();
+        while let Some(Ok(chunk)) = body.next().await {
+            for ev in parser.push(&chunk) {
+                let data: Value = serde_json::from_str(&ev.data).unwrap_or(Value::Null);
+                let job = data["job"].as_str().unwrap_or_default().to_string();
+                let msg = match ev.event.as_str() {
+                    "job_assigned" => Msg::Assigned(job),
+                    "job_cancel" => Msg::Cancel(job),
+                    "rejected" => Msg::Rejected,
+                    _ => continue,
+                };
+                if tx.send(msg).await.is_err() {
+                    return;
+                }
+            }
+        }
+        // Ended: the relay restarted, the session closed, or we fell behind.
+        tokio::time::sleep(backoff).await;
+    }
+}
+
+/// Heartbeat every 10 s with the current job, whatever the stream is doing.
+/// Ends (and says so) once the relay refuses the token.
+async fn heartbeats(relay: Relay, current: Arc<std::sync::Mutex<Option<String>>>, lost: watch::Sender<bool>) {
+    let mut tick = tokio::time::interval(HEARTBEAT);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let job = current.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Err(e) = relay.heartbeat(job.as_deref()).await {
+            if status_of(&e) == Some(401) {
+                let _ = lost.send(true);
+                return;
+            }
+            tracing::warn!("heartbeat failed: {e:#}");
+        }
+    }
+}
+
 /// The assignment loop. Returns when the session ends, the runner is
 /// rejected, or on Ctrl-C.
 async fn serve(
@@ -265,124 +347,135 @@ async fn serve(
     max_jobs: Option<usize>,
 ) -> Result<()> {
     view.lock().await.sync().await?;
+    if !view.lock().await.approved {
+        tracing::info!("waiting for the owner's approval");
+    }
+    let current_id = Arc::new(std::sync::Mutex::new(None::<String>));
+    let (lost_tx, mut lost) = watch::channel(false);
+    let hb = tokio::spawn(heartbeats(relay.clone(), current_id.clone(), lost_tx));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let streamer = tokio::spawn(stream_assignments(relay.clone(), tx));
     let mut current: Option<Running> = None;
+    // An assignment that arrived while the previous job was still finishing.
+    let mut pending: Option<String> = None;
+    let mut syncing: Option<JoinHandle<()>> = None;
     let mut handled = 0usize;
     let mut tick = tokio::time::interval(HEARTBEAT);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut backoff = Duration::from_millis(500);
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
-    let result = 'outer: loop {
-        let resp = match relay.runner_stream().await {
-            Ok(r) => r,
-            Err(e) => match status_of(&e) {
-                Some(401) => {
-                    break Err(anyhow::anyhow!("the relay no longer accepts this runner (rejected or left)"))
-                }
-                Some(404 | 410) => break Ok(()),
-                _ => {
-                    tracing::warn!("assignment stream unavailable, retrying: {e:#}");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
-                    continue;
-                }
-            },
-        };
-        backoff = Duration::from_millis(500);
-        if !view.lock().await.approved {
-            tracing::info!("waiting for the owner's approval");
-        }
-        let mut body = resp.bytes_stream();
-        let mut parser = SseParser::default();
-        loop {
-            let done = async {
-                match current.as_mut() {
-                    Some(r) => Some((&mut r.task).await),
-                    None => std::future::pending().await,
-                }
-            };
-            tokio::select! {
-                chunk = body.next() => {
-                    let Some(Ok(chunk)) = chunk else { break };
-                    for ev in parser.push(&chunk) {
-                        let data: Value = serde_json::from_str(&ev.data).unwrap_or(Value::Null);
-                        let job = data["job"].as_str().unwrap_or_default().to_string();
-                        match ev.event.as_str() {
-                            "job_assigned" if current.is_none() => {
-                                if !relay.claim(&job).await? {
-                                    tracing::info!(job = %job, "assignment withdrawn before claim");
-                                    continue;
-                                }
-                                tracing::info!(job = %job, "claimed");
-                                let (tx, rx) = watch::channel(false);
-                                let task = tokio::spawn(job::handle(ctx.clone(), view.clone(), job.clone(), rx));
-                                current = Some(Running { id: job, cancel: tx, task });
-                            }
-                            "job_assigned" => {}
-                            "job_cancel" => {
-                                if let Some(r) = current.as_ref().filter(|r| r.id == job) {
-                                    tracing::info!(job = %job, "cancel requested");
-                                    let _ = r.cancel.send(true);
-                                }
-                            }
-                            "rejected" => break 'outer Err(anyhow::anyhow!("the owner rejected this runner")),
-                            _ => {}
-                        }
-                    }
-                }
-                Some(r) = done => {
-                    let id = current.take().map(|c| c.id).unwrap_or_default();
-                    match r {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => tracing::error!(job = %id, "job failed: {e:#}"),
-                        Err(e) => tracing::error!(job = %id, "job task panicked: {e}"),
-                    }
-                    handled += 1;
-                    let _ = relay.heartbeat(None).await;
-                    if max_jobs.is_some_and(|m| handled >= m) {
-                        break 'outer Ok(());
-                    }
-                }
-                _ = tick.tick() => {
-                    let job = current.as_ref().map(|c| c.id.clone());
-                    if let Err(e) = relay.heartbeat(job.as_deref()).await {
-                        if status_of(&e) == Some(401) {
-                            break 'outer Err(anyhow::anyhow!("the relay no longer accepts this runner"));
-                        }
-                        tracing::warn!("heartbeat failed: {e:#}");
-                    }
-                    // Catch up on approvals, cancels and closure between jobs.
-                    if current.is_none() {
-                        let mut v = view.lock().await;
-                        if let Err(e) = v.sync().await {
-                            tracing::warn!("sync failed: {e:#}");
-                        }
-                        if v.closed {
-                            break 'outer Ok(());
-                        }
-                        if v.rejected {
-                            break 'outer Err(anyhow::anyhow!("the owner rejected this runner"));
-                        }
-                    }
-                }
-                _ = &mut ctrl_c => {
-                    tracing::info!("interrupted");
-                    break 'outer Ok(());
-                }
+
+    let start = async |job: String| -> Option<Running> {
+        match relay.claim(&job).await {
+            Ok(true) => {
+                tracing::info!(job = %job, "claimed");
+                *current_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(job.clone());
+                let (tx, rx) = watch::channel(false);
+                let task = tokio::spawn(job::handle(ctx.clone(), view.clone(), job.clone(), rx));
+                Some(Running { id: job, cancel: tx, task })
+            }
+            Ok(false) => {
+                tracing::info!(job = %job, "assignment withdrawn before claim");
+                None
+            }
+            Err(e) => {
+                // The relay fails it as unclaimed; keep serving.
+                tracing::warn!(job = %job, "claim failed: {e:#}");
+                None
             }
         }
-        // The stream ended: the session may have closed, or the relay restarted.
-        let mut v = view.lock().await;
-        let _ = v.sync().await;
-        if v.closed {
-            break Ok(());
-        }
-        drop(v);
-        tokio::time::sleep(backoff).await;
     };
+
+    let result = loop {
+        let done = async {
+            match current.as_mut() {
+                Some(r) => Some((&mut r.task).await),
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            msg = rx.recv() => match msg {
+                Some(Msg::Assigned(job)) => {
+                    if current.as_ref().is_some_and(|c| c.id == job) {
+                        continue; // a repeat after reconnecting
+                    }
+                    if current.is_some() {
+                        pending = Some(job);
+                    } else {
+                        current = start(job).await;
+                    }
+                }
+                Some(Msg::Cancel(job)) => {
+                    if let Some(r) = current.as_ref().filter(|r| r.id == job) {
+                        tracing::info!(job = %job, "cancel requested");
+                        let _ = r.cancel.send(true);
+                    }
+                    if pending.as_deref() == Some(job.as_str()) {
+                        pending = None;
+                    }
+                }
+                Some(Msg::Rejected) => break Err(anyhow::anyhow!("the owner rejected this runner")),
+                Some(Msg::Unauthorized) => {
+                    break Err(anyhow::anyhow!("the relay no longer accepts this runner (rejected or left)"))
+                }
+                Some(Msg::Gone) | None => {
+                    view.lock().await.closed = true;
+                    break Ok(());
+                }
+            },
+            Some(r) = done => {
+                let id = current.take().map(|c| c.id).unwrap_or_default();
+                *current_id.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                match r {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::error!(job = %id, "job failed: {e:#}"),
+                    Err(e) => tracing::error!(job = %id, "job task panicked: {e}"),
+                }
+                handled += 1;
+                let _ = relay.heartbeat(None).await;
+                if max_jobs.is_some_and(|m| handled >= m) {
+                    break Ok(());
+                }
+                if let Some(job) = pending.take() {
+                    current = start(job).await;
+                }
+            }
+            _ = tick.tick() => {
+                // Catch up on approvals and closure between jobs, off the loop.
+                if current.is_none() && syncing.as_ref().is_none_or(|t| t.is_finished()) {
+                    let v = view.clone();
+                    syncing = Some(tokio::spawn(async move {
+                        if let Err(e) = v.lock().await.sync().await {
+                            tracing::warn!("sync failed: {e:#}");
+                        }
+                    }));
+                }
+                if let Ok(v) = view.try_lock() {
+                    if v.closed {
+                        break Ok(());
+                    }
+                    if v.rejected {
+                        break Err(anyhow::anyhow!("the owner rejected this runner"));
+                    }
+                }
+            }
+            _ = lost.changed() => {
+                break Err(anyhow::anyhow!("the relay no longer accepts this runner"));
+            }
+            _ = &mut ctrl_c => {
+                tracing::info!("interrupted");
+                break Ok(());
+            }
+        }
+    };
+    streamer.abort();
     if let Some(r) = current.take() {
         let _ = r.cancel.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(20), r.task).await;
+    }
+    hb.abort();
+    if let Some(t) = syncing {
+        t.abort();
     }
     result
 }

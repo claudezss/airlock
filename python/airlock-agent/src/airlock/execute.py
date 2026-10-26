@@ -123,7 +123,8 @@ class Job:
         self.session._req("POST", f"/jobs/{self.id}/cancel")
 
     def result(self) -> Optional[Result]:
-        """The result, if it has arrived."""
+        """The result, once it and its out files have arrived. An out file
+        that left the relay before it was fetched has ``data = None``."""
         if self._result is None:
             self._result = self._find()
         return self._result
@@ -160,22 +161,28 @@ class Job:
 
     def _find(self) -> Optional[Result]:
         s = self.session
-        for item in s._items.values():
+        items = [s._items[i] for i in s._order]
+        approved = None
+        if s.manifest["job_limits"]["approve_runners"]:
+            approved = json.dumps(sorted(approved_runners(items)))
+        for item in items:
             if item.kind != "result" or item.status != "ok" or item.meta.get("job", {}).get("id") != self.id:
+                continue
+            if item.author_role != "runner":
                 continue
             try:
                 ac.check_result_for_job(
-                    json.dumps(self.ref), json.dumps(self.meta), item.author, json.dumps(item.meta)
+                    json.dumps(self.ref), json.dumps(self.meta), item.author, json.dumps(item.meta), approved
                 )
             except ac.AirlockError:
                 continue  # not a valid answer to this job; ignore it
-            if item.author_role != "runner":
-                continue
             m = item.meta
             outs = []
             for o in m["out_files"]:
                 got = s._items.get(o["item"]["id"])
-                data = got.body if got is not None and got.status == "ok" and got.ref == o["item"] else None
+                if got is None or got.status == "pending":
+                    return None  # not here yet; the next sync fetches it
+                data = got.body if got.status == "ok" and got.ref == o["item"] else None
                 outs.append(OutFile(name=o["name"], size=o["size"], ref=o["item"], data=data))
             return Result(
                 status=m["status"],
@@ -196,15 +203,20 @@ class Job:
 
 
 def signed_approvals(items: "List[Item]") -> dict:
-    """``participant_pub -> approved?`` from the owner's signed events,
-    latest first wins."""
+    """``participant_pub -> approved?`` from the owner's signed events. A
+    rejection is final: a later (or replayed) approval does not undo it."""
     out: dict = {}
     for it in items:
         if it.kind != "event" or it.status != "ok" or it.author_role != "owner":
             continue
         ev = it.meta.get("event")
-        if ev == "runner_approve":
-            out[it.meta["participant_pub"]] = True
+        pub = it.meta.get("participant_pub")
+        if ev == "runner_approve" and out.get(pub) is not False:
+            out[pub] = True
         elif ev == "runner_reject":
-            out[it.meta["participant_pub"]] = False
+            out[pub] = False
     return out
+
+
+def approved_runners(items: "List[Item]") -> set:
+    return {pub for pub, ok in signed_approvals(items).items() if ok}

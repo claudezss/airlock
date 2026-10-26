@@ -102,7 +102,7 @@ pub async fn post_job(
     let (who, role) = auth(&s, &headers)?;
     require_execute(&s)?;
     let target = parse_target(&headers)?;
-    let up = receive_upload(&st, &s, &who, role, body, |kind| match kind {
+    let up = receive_upload(&st, &s, &who, role, body, |h| match h.kind {
         ItemKind::Job => Ok(()),
         _ => Err(ApiError::forbidden("POST /jobs takes job items only")),
     })
@@ -200,7 +200,12 @@ pub async fn cancel_job(
             JobState::Assigned => {
                 s.set_job(&mut g, &job, JobState::Failed, runner.clone(), Some("cancelled"))?;
             }
-            JobState::Running => {}
+            JobState::Running => {
+                // Remembered so a runner that reconnects still gets it.
+                if let Some(j) = g.jobs.get_mut(&job) {
+                    j.cancel_requested = true;
+                }
+            }
             _ => return Err(ApiError::conflict("the job has already finished")),
         }
         if let Some(r) = &runner {
@@ -375,8 +380,8 @@ fn runner_event(m: &RunnerMsg) -> SseEvent {
 
 /// `GET /v1/sessions/:id/runners/me/stream` — SSE for one runner:
 /// `job_assigned {job, envelope}`, `job_cancel {job}` and `rejected {}`.
-/// On connect it repeats the runner's active assignment, so a runner that
-/// reconnects does not lose it. Holding this stream (plus heartbeats) is
+/// On connect it repeats the runner's active assignment (and a pending
+/// cancel of it), so a runner that reconnects loses neither. Holding this stream (plus heartbeats) is
 /// what makes a runner online.
 pub async fn runner_stream(
     State(st): State<AppState>,
@@ -397,14 +402,15 @@ pub async fn runner_stream(
         p.streams += 1;
         p.last_seen_ms = now_ms();
         let active = g.participants.get(&who).and_then(|p| p.job.clone());
-        let backlog = active.map(|job| {
+        let mut backlog = std::collections::VecDeque::new();
+        if let Some(job) = active {
             let envelope = g.item_event(&job).map(|e| e.data["envelope"].clone());
-            Arc::new(RunnerMsg {
-                runner: who.clone(),
-                kind: "job_assigned",
-                data: json!({"job": job, "envelope": envelope}),
-            })
-        });
+            let msg = |kind, data| Arc::new(RunnerMsg { runner: who.clone(), kind, data });
+            backlog.push_back(msg("job_assigned", json!({"job": job, "envelope": envelope})));
+            if g.jobs.get(&job).is_some_and(|j| j.cancel_requested) {
+                backlog.push_back(msg("job_cancel", json!({"job": job})));
+            }
+        }
         (
             backlog,
             s.runner_tx.subscribe(),
@@ -414,7 +420,7 @@ pub async fn runner_stream(
     };
     struct St {
         who: String,
-        backlog: Option<Arc<RunnerMsg>>,
+        backlog: std::collections::VecDeque<Arc<RunnerMsg>>,
         rx: broadcast::Receiver<Arc<RunnerMsg>>,
         closed_rx: broadcast::Receiver<Arc<Event>>,
         shutdown: watch::Receiver<bool>,
@@ -427,7 +433,7 @@ pub async fn runner_stream(
             return None;
         }
         let msg = loop {
-            if let Some(m) = st.backlog.take() {
+            if let Some(m) = st.backlog.pop_front() {
                 break m;
             }
             tokio::select! {

@@ -202,16 +202,25 @@ pub fn item_ref(envelope_json: &str, blob: &[u8]) -> R<String> {
     api::item_ref(envelope_json, blob).map_err(err)
 }
 
-/// Bind a result to its job: same job reference, and for a job aimed at one
-/// runner, a result from that runner.
+/// Bind a result to its job: same job reference, for a job aimed at one
+/// runner a result from that runner, and when `approvedRunnersJson` (a JSON
+/// list of approved runner keys) is given, an author on that list.
 #[wasm_bindgen(js_name = checkResultForJob)]
 pub fn check_result_for_job(
     job_ref_json: &str,
     job_meta_json: &str,
     result_author: &str,
     result_meta_json: &str,
+    approved_runners_json: Option<String>,
 ) -> R<()> {
-    api::check_result_for_job(job_ref_json, job_meta_json, result_author, result_meta_json).map_err(err)
+    api::check_result_for_job(
+        job_ref_json,
+        job_meta_json,
+        result_author,
+        result_meta_json,
+        approved_runners_json.as_deref(),
+    )
+    .map_err(err)
 }
 
 #[wasm_bindgen(js_name = inspectZip)]

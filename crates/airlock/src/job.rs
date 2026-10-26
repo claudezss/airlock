@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -159,18 +159,8 @@ fn stage_inputs(root: &Path, work: &Path, a: &Accepted) -> Result<()> {
     create_new(&work.join(&a.spec.filename), a.spec.code.as_bytes())
 }
 
-/// Read a sandbox output file without following links and within `max` bytes.
 fn read_capped(path: &Path, max: u64) -> Result<(Vec<u8>, bool)> {
-    let mut o = fs::OpenOptions::new();
-    o.read(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut o, nix::fcntl::OFlag::O_NOFOLLOW.bits());
-    let f = o.open(path)?;
-    let mut buf = Vec::new();
-    f.take(max + 1).read_to_end(&mut buf)?;
-    let truncated = buf.len() as u64 > max;
-    buf.truncate(max as usize);
-    Ok((buf, truncated))
+    crate::sandbox::read_sandbox_file(path, max)
 }
 
 /// stdout/stderr as UTF-8 within the 1 MiB result limit.
@@ -231,7 +221,13 @@ pub fn collect_out(out: &Path, max_item_bytes: u64, notes: &mut Vec<String>) -> 
             let ext = name.rsplit_once('.').map(|(_, x)| x.to_ascii_lowercase()).unwrap_or_default();
             let image = IMAGE_EXTS.iter().find(|(x, _)| *x == ext);
             if prefix.is_empty() && image.is_some() && check_file_name(&name).is_ok() && items.len() < 63 {
-                let (bytes, truncated) = read_capped(&e.path(), max_item_bytes)?;
+                let (bytes, truncated) = match read_capped(&e.path(), max_item_bytes) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        notes.push(format!("skipped out/{rel}: {err:#}"));
+                        continue;
+                    }
+                };
                 if truncated {
                     notes.push(format!("skipped out/{rel}: larger than the session's item limit"));
                     continue;
@@ -259,7 +255,13 @@ pub fn collect_out(out: &Path, max_item_bytes: u64, notes: &mut Vec<String>) -> 
             .large_file(false);
         let mut total = 0u64;
         for (rel, path) in zipped {
-            let (bytes, truncated) = read_capped(&path, max_item_bytes)?;
+            let (bytes, truncated) = match read_capped(&path, max_item_bytes) {
+                Ok(r) => r,
+                Err(e) => {
+                    notes.push(format!("skipped out/{rel}: {e:#}"));
+                    continue;
+                }
+            };
             total += bytes.len() as u64;
             if truncated || total > max_item_bytes {
                 notes.push(format!(
@@ -274,7 +276,9 @@ pub fn collect_out(out: &Path, max_item_bytes: u64, notes: &mut Vec<String>) -> 
         let body = w.finish()?.into_inner();
         if body.len() as u64 + 1024 > max_item_bytes {
             notes.push("skipped out.zip: compressed output exceeds the session's item limit".into());
-        } else if airlock_core::validate::zip::inspect_zip(&body, &ZipLimits::default()).is_ok() {
+        } else if let Err(e) = airlock_core::validate::zip::inspect_zip(&body, &ZipLimits::default()) {
+            notes.push(format!("skipped out.zip: {e}"));
+        } else {
             items.push(OutItem {
                 name: "out.zip".into(),
                 subkind: ContentType::Zip,
@@ -295,11 +299,16 @@ fn outcome(raw: &RawResult, timeout_s: u32, memory_mb: u32) -> (JobStatus, Optio
     if let Some(e) = s.and_then(|s| s.error.clone()) {
         return (JobStatus::Failed, None, Some(e));
     }
-    if raw.cancelled || s.is_some_and(|s| s.cancelled) {
+    // What the runner did comes first: when it stops an overrunning
+    // sandbox, the shim reports that stop as a cancel.
+    if raw.cancelled {
         return (JobStatus::Cancelled, None, Some("cancelled".into()));
     }
     if raw.killed_on_timeout || s.is_some_and(|s| s.timed_out) {
         return (JobStatus::TimedOut, None, Some(format!("exceeded the {timeout_s} s timeout")));
+    }
+    if s.is_some_and(|s| s.cancelled) {
+        return (JobStatus::Cancelled, None, Some("cancelled".into()));
     }
     if raw.oom_killed {
         return (JobStatus::Failed, None, Some(format!("killed: out of memory (limit {memory_mb} MB)")));
@@ -384,6 +393,9 @@ pub async fn handle(
         input_sha256: hex(&sha256(b"")),
     };
     let mut refs = vec![job_ref.clone()];
+    // At most once: recorded before anything runs, so a relay that refuses
+    // the result cannot get the same signed job run again.
+    mark_done(&ctx, &job_id)?;
     match verdict {
         Verdict::Refuse(why) => {
             tracing::warn!(job = %job_id, "refusing: {why}");
@@ -407,19 +419,28 @@ pub async fn handle(
             };
             for d in [job.work_dir(), job.out_dir(), job.meta_dir()] {
                 fs::create_dir(&d)?;
+                // A root runner runs docker jobs as nobody, who must be able to write here.
+                #[cfg(unix)]
+                if nix::unistd::getuid().is_root() && matches!(ctx.backend, Backend::Docker(_)) {
+                    nix::unistd::chown(&d, Some(65534.into()), Some(65534.into()))?;
+                }
+            }
+            {
+                // Job and inputs are in our cache: the relay need not keep them for us.
+                let mut v = view.lock().await;
+                v.ack(&job_id).await;
+                for (r, ..) in &a.inputs {
+                    v.ack(&r.id).await;
+                }
             }
             if let Err(e) = stage_inputs(&job.root, &job.work_dir(), &a) {
                 result.reason = Some(format!("could not stage inputs: {e:#}"));
             } else {
-                {
-                    let mut v = view.lock().await;
-                    v.ack(&job_id).await;
-                    for (r, ..) in &a.inputs {
-                        v.ack(&r.id).await;
-                    }
-                }
                 tracing::info!(job = %job_id, entry = %job.entry, "running");
-                let raw = ctx.backend.run(&job, cancel).await?;
+                let raw = ctx.backend.run(&job, cancel).await.unwrap_or_else(|e| RawResult {
+                    error: Some(format!("the sandbox could not run the job: {e:#}")),
+                    ..Default::default()
+                });
                 let (status, exit_code, reason) = outcome(&raw, job.timeout_s, memory_mb);
                 result.status = status;
                 result.exit_code = exit_code;
@@ -433,19 +454,21 @@ pub async fn handle(
                     let v = view.lock().await;
                     // The payload adds a few hundred bytes of meta to the file.
                     let max = v.manifest.max_item_bytes.saturating_sub(4096);
-                    for o in collect_out(&job.out_dir(), max, &mut notes)? {
+                    let outs = collect_out(&job.out_dir(), max, &mut notes).unwrap_or_else(|e| {
+                        notes.push(format!("could not collect /out: {e:#}"));
+                        vec![]
+                    });
+                    for o in outs {
                         let size = o.body.len() as u64;
-                        let r = post(
-                            &v,
-                            &ctx.keypair,
-                            ItemKind::File,
-                            Some(o.subkind),
-                            vec![],
-                            Payload::file(&o.name, &o.mime, o.body),
-                        )
-                        .await?;
-                        result.out_files.push(OutFile { name: o.name, size, item: r.clone() });
-                        refs.push(r);
+                        let name = o.name.clone();
+                        let file = Payload::file(&o.name, &o.mime, o.body);
+                        match post(&v, &ctx.keypair, ItemKind::File, Some(o.subkind), vec![], file).await {
+                            Ok(r) => {
+                                result.out_files.push(OutFile { name: o.name, size, item: r.clone() });
+                                refs.push(r);
+                            }
+                            Err(e) => notes.push(format!("could not upload out/{name}: {e:#}")),
+                        }
                     }
                 }
                 for n in notes {
@@ -455,6 +478,7 @@ pub async fn handle(
                     }
                 }
             }
+            crate::sandbox::make_removable(dir.path());
             drop(dir);
         }
     }
@@ -466,7 +490,6 @@ pub async fn handle(
     let status = result.status;
     let v = view.lock().await;
     post(&v, &ctx.keypair, ItemKind::Result, None, refs, Payload::result(result)).await?;
-    mark_done(&ctx, &job_id)?;
     tracing::info!(job = %job_id, ?status, "result posted");
     Ok(())
 }
@@ -504,6 +527,28 @@ mod tests {
         img.write_to(&mut std::io::Cursor::new(buf), image::ImageFormat::Png).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_files_cannot_hang_or_flood_the_runner() {
+        let d = tempfile::tempdir().unwrap();
+        // A FIFO would block a plain open forever.
+        let fifo = d.path().join("stdout.txt");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let t = std::time::Instant::now();
+        assert!(read_capped(&fifo, 1024).is_err());
+        assert!(t.elapsed() < Duration::from_secs(1));
+        assert_eq!(stdio(&fifo), (String::new(), false));
+        // A link to an endless device is not followed.
+        let link = d.path().join("result.json");
+        std::os::unix::fs::symlink("/dev/zero", &link).unwrap();
+        assert!(read_capped(&link, 1024).is_err());
+        // Regular files are read up to the cap.
+        let big = d.path().join("big");
+        fs::write(&big, vec![b'x'; 5000]).unwrap();
+        let (b, more) = read_capped(&big, 1024).unwrap();
+        assert!(b.len() == 1024 && more);
+    }
+
     #[test]
     fn stdio_is_capped_on_a_char_boundary() {
         let d = tempfile::tempdir().unwrap();
@@ -533,6 +578,10 @@ mod tests {
         assert_eq!(outcome(&shim(None, None, true, false), 30, 512).0, JobStatus::TimedOut);
         assert_eq!(outcome(&shim(None, None, false, true), 30, 512).0, JobStatus::Cancelled);
         assert_eq!(outcome(&shim(None, Some(9), false, false), 30, 512).0, JobStatus::Failed);
+        // The runner stopped an overrunning sandbox; the shim calls that a cancel.
+        let mut overran = shim(None, None, false, true);
+        overran.killed_on_timeout = true;
+        assert_eq!(outcome(&overran, 30, 512).0, JobStatus::TimedOut);
         let mut oom = shim(None, Some(9), false, false);
         oom.oom_killed = true;
         assert!(outcome(&oom, 30, 512).2.unwrap().contains("out of memory"));

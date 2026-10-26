@@ -122,6 +122,11 @@ impl View {
         for ev in evs {
             let seq = ev["seq"].as_u64().context("event without seq")?;
             if let Err(e) = self.apply(&ev).await {
+                // A network hiccup must not lose an event (say, the owner's
+                // approval): stop here and pick it up again on the next sync.
+                if crate::client::is_transient(&e) {
+                    return Err(e.context(format!("event {seq}")));
+                }
                 tracing::warn!(seq, "ignoring event: {e:#}");
             }
             self.last_seq = Some(seq);
@@ -172,9 +177,11 @@ impl View {
                 }
             }
             "job" => {
-                // Someone else's job (or one that never ran): we will not need it.
+                // Unless it is ours to run, we will not need the job's blob.
                 let job = data["job"].as_str().unwrap_or_default().to_string();
-                if data["runner"].as_str() != Some(self.me.to_b64().as_str()) {
+                let ours = data["runner"].as_str() == Some(self.me.to_b64().as_str());
+                let active = matches!(data["state"].as_str(), Some("assigned" | "running"));
+                if !(ours && active) {
                     self.ack(&job).await;
                 }
             }
@@ -186,7 +193,10 @@ impl View {
 
     fn on_owner_event(&mut self, meta: &Meta) {
         match meta {
-            Meta::Event(Event::RunnerApprove { participant_pub }) if *participant_pub == self.me => {
+            // A rejection is final: a replayed approval does not undo it.
+            Meta::Event(Event::RunnerApprove { participant_pub })
+                if *participant_pub == self.me && !self.rejected =>
+            {
                 tracing::info!("approved by the owner");
                 self.approved = true;
             }

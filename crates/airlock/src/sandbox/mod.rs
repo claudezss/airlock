@@ -175,10 +175,56 @@ pub(crate) async fn supervise(
     Ok(Waited { status, wall_ms: start.elapsed().as_millis() as u64, killed_on_timeout, cancelled })
 }
 
+/// Read a file the sandbox wrote, at most `max` bytes. The job can replace
+/// anything in its directories, so: no following links, no blocking on a
+/// FIFO, regular files only. Returns the bytes and whether more were there.
+pub fn read_sandbox_file(path: &std::path::Path, max: u64) -> Result<(Vec<u8>, bool)> {
+    use std::io::Read;
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut o,
+        (nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK).bits(),
+    );
+    let f = o.open(path)?;
+    if !f.metadata()?.is_file() {
+        anyhow::bail!("{} is not a regular file", path.display());
+    }
+    let mut buf = Vec::new();
+    f.take(max + 1).read_to_end(&mut buf)?;
+    let more = buf.len() as u64 > max;
+    buf.truncate(max as usize);
+    Ok((buf, more))
+}
+
 /// Read the shim's result.json, if it wrote a valid one.
 pub(crate) fn read_shim_result(job: &PreparedJob) -> Option<ShimResult> {
-    let raw = std::fs::read(job.meta_dir().join("result.json")).ok()?;
+    let (raw, more) = read_sandbox_file(&job.meta_dir().join("result.json"), 64 * 1024).ok()?;
+    if more {
+        return None;
+    }
     serde_json::from_slice(&raw).ok()
+}
+
+/// Make a job directory deletable again: a job may have removed the owner's
+/// write or search permission on directories it created.
+pub fn make_removable(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(meta) = std::fs::symlink_metadata(path) else { return };
+        if meta.is_dir() {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for e in entries.flatten() {
+                    make_removable(&e.path());
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// Send `sig` to a process group (the sandbox's), ignoring "already gone".
