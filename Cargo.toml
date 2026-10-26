@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/airlock-core", "crates/airlock-server", "bindings/python", "bindings/wasm"]
+members = ["crates/airlock-core", "crates/airlock-server", "crates/airlock", "bindings/python", "bindings/wasm"]
 
 [workspace.package]
 version = "0.1.0"

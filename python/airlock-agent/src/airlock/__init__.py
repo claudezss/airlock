@@ -14,14 +14,21 @@
 
 from airlock_core import AirlockError, DecryptError, PolicyError, SignatureError, ValidationError
 
+from .execute import Job, JobTimeout, NoRunnerAvailable, OutFile, Result, Runner
 from .session import Item, RelayError, Session
 
 __all__ = [
     "AirlockError",
     "DecryptError",
     "Item",
+    "Job",
+    "JobTimeout",
+    "NoRunnerAvailable",
+    "OutFile",
     "PolicyError",
     "RelayError",
+    "Result",
+    "Runner",
     "Session",
     "SignatureError",
     "ValidationError",

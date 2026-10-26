@@ -63,3 +63,49 @@ def caches(tmp_path):
     def make(name):
         return tmp_path / "cache" / name
     return make
+
+
+class RunnerProc:
+    """An `airlock runner join` process."""
+
+    def __init__(self, invite: str, name: str, cache: pathlib.Path, *extra: str) -> None:
+        binary = os.environ.get("AIRLOCK_BIN", str(REPO / "target/debug/airlock"))
+        sandbox = os.environ.get("AIRLOCK_TEST_SANDBOX", "local")
+        self.log = cache / f"{name}.log"
+        cache.mkdir(parents=True, exist_ok=True)
+        if "--sandbox" not in extra:
+            extra = ("--sandbox", sandbox, *extra)
+        args = [binary, "runner", "join", "--name", name, "--cache-dir", str(cache), *extra]
+        env = dict(os.environ, AIRLOCK_INVITE=invite, RUST_LOG="airlock=debug")
+        self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=self.log.open("w"), env=env)
+
+    def output(self) -> str:
+        return self.log.read_text()
+
+    def stop(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+
+@pytest.fixture(scope="session")
+def runner_cache(tmp_path_factory):
+    # Shared so the job runtime is built once per test run.
+    return tmp_path_factory.mktemp("runner-cache")
+
+
+@pytest.fixture
+def start_runner(runner_cache):
+    procs = []
+
+    def start(invite, name="runner-01", *extra):
+        p = RunnerProc(invite, name, runner_cache, *extra)
+        procs.append(p)
+        return p
+
+    yield start
+    for p in procs:
+        p.stop()
