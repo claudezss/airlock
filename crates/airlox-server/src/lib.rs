@@ -47,6 +47,7 @@ pub fn router(state: api::AppState) -> Router {
         .route("/v1/sessions/{id}/runners/{participant}/approve", post(exec::approve_runner))
         .route("/v1/sessions/{id}/runners/{participant}/reject", post(exec::reject_runner))
         .route("/", get(web::index))
+        .route("/new", get(web::new_page))
         .route("/s/{id}", get(web::session_page))
         .route("/assets/{*path}", get(web::asset))
         .with_state(state)

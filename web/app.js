@@ -1,7 +1,7 @@
 // Airlox web client (M1 timeline). All cryptography runs in the
 // airlox-core WebAssembly module; the relay only sees ciphertext.
 // The WebAssembly core is loaded on demand so the landing page renders even if
-// it (or IndexedDB) is unavailable; only /#new and /s/<id> need them.
+// it (or IndexedDB) is unavailable; only /new and /s/<id> need them.
 let ac;
 let corePromise;
 const loadCore = () =>
@@ -88,7 +88,7 @@ function announce(msg) {
 function deadEnd(title, cause) {
   show(el("div", { class: "panel stack dead-end", role: "alert" },
     el("h1", {}, title), el("p", { class: "muted" }, cause),
-    el("div", { class: "row" }, el("a", { class: "button primary", href: "/#new" }, "New session"))));
+    el("div", { class: "row" }, el("a", { class: "button primary", href: "/new" }, "New session"))));
 }
 
 // Plain-language reasons for items that fail verification.
@@ -191,7 +191,7 @@ function runnerInviteRow(url) {
       el("code", {}, `airlox runner join --invite '${maskInvite(url)}' --name runner-01 --sandbox docker`)));
 }
 
-// ---------- new session (the create flow, at /#new) ----------
+// ---------- new session (the create flow, at /new) ----------
 function newSession() {
   const radio = (name, value, label, checked, extra = {}) =>
     el("label", { class: "option" }, el("input", { type: "radio", name, value, checked, ...extra }), label);
@@ -1357,49 +1357,23 @@ async function streamLoop(s) {
   }
 }
 
-// ---------- landing page and routing at / ----------
-// "/" shows the landing page; "/#new" shows the create-session form. Other
-// fragments on "/" are in-page anchors. Invites live under /s/<id>. The
-// landing page needs nothing but this file; the form waits for the core.
-let homeView = null;
-let homeScroll = 0;
-async function route(initial) {
-  const view = location.hash === "#new" ? "new" : "home";
-  if (view === homeView) return;
-  // Leaving the form after invites were created would lose them for good:
-  // stay on the invite panel (the unload guard covers closing the tab).
-  if (invitesShown) return;
-  if (homeView === "home") homeScroll = scrollY;
-  homeView = view;
-  const home = view === "home";
-  document.body.classList.toggle("landing", home);
-  document.getElementById("site-nav").hidden = !home;
-  document.getElementById("site-foot").hidden = !home;
-  app.classList.toggle("wide", home);
-  document.title = home ? "Airlox · Secure sessions for code and LLM agents" : "New session · Airlox";
-  if (home) {
-    show(document.getElementById("home-tpl").content.cloneNode(true));
-    let target = null;
-    try {
-      target = location.hash.length > 1 ? document.getElementById(decodeURIComponent(location.hash.slice(1))) : null;
-    } catch {}
-    if (target) target.scrollIntoView();
-    else scrollTo(0, initial ? 0 : homeScroll);
-  } else {
-    try {
-      await loadCore();
-    } catch (e) {
-      return deadEnd("Airlox failed to start", String(e.message || e));
-    }
-    if (homeView !== view) return; // navigated away while loading
-    newSession();
-    scrollTo(0, 0);
-    const h1 = app.querySelector("h1");
-    if (h1 && !initial) {
-      h1.tabIndex = -1;
-      h1.focus();
-    }
-  }
+// ---------- landing page and routing ----------
+// "/" is the landing page, "/new" the create-session form and "/s/<id>" a
+// session. They are separate documents (full page loads), so the landing page
+// can be served with a different policy from pages that hold keys. The landing
+// page needs nothing but this file; the others wait for the WebAssembly core.
+function showHome() {
+  document.body.classList.add("landing");
+  document.getElementById("site-nav").hidden = false;
+  document.getElementById("site-foot").hidden = false;
+  app.classList.add("wide");
+  document.title = "Airlox · Secure sessions for code and LLM agents";
+  show(document.getElementById("home-tpl").content.cloneNode(true));
+  let target = null;
+  try {
+    target = location.hash.length > 1 ? document.getElementById(decodeURIComponent(location.hash.slice(1))) : null;
+  } catch {}
+  if (target) target.scrollIntoView();
 }
 
 // ---------- boot ----------
@@ -1410,7 +1384,16 @@ if (location.pathname.startsWith("/s/")) {
   } catch (e) {
     deadEnd("Airlox failed to start", String(e.message || e));
   }
+} else if (location.pathname === "/new") {
+  document.title = "New session · Airlox";
+  try {
+    await loadCore();
+    newSession();
+  } catch (e) {
+    deadEnd("Airlox failed to start", String(e.message || e));
+  }
+} else if (location.hash === "#new") {
+  location.replace("/new"); // old links to /#new
 } else {
-  addEventListener("hashchange", () => route(false));
-  await route(true);
+  showHome();
 }
