@@ -1,0 +1,93 @@
+name: release
+
+# Push a tag `vX.Y.Z` (matching the workspace version) to build every wheel and
+# publish `airlox-core` and `airlox` to PyPI.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # The tag, the Rust workspace, the SDK and its airlox-core pin must agree.
+      - run: |
+          python3 - <<'EOF'
+          import os, sys, tomllib
+          tag = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          rust = tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"]
+          sdk = tomllib.load(open("python/airlox/pyproject.toml", "rb"))["project"]
+          pin = [d for d in sdk["dependencies"] if d.startswith("airlox-core")]
+          print(f"tag={tag} rust={rust} sdk={sdk['version']} pin={pin}")
+          if not (tag == rust == sdk["version"] and pin == [f"airlox-core=={tag}"]):
+              sys.exit("version mismatch")
+          EOF
+
+  core-wheels:
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64 }
+          - { os: ubuntu-latest, target: aarch64 }
+          - { os: macos-latest, target: x86_64 }
+          - { os: macos-latest, target: aarch64 }
+          - { os: windows-latest, target: x64 }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          working-directory: bindings/python
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: auto
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-core-${{ matrix.os }}-${{ matrix.target }}
+          path: bindings/python/dist
+
+  core-sdist:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          working-directory: bindings/python
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-core-sdist
+          path: bindings/python/dist
+
+  sdk:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - run: uv build python/airlox --out-dir dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-sdk
+          path: dist
+
+  publish:
+    needs: [core-wheels, core-sdist, sdk]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - run: ls -l dist
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          password: ${{ secrets.PYPI_TOKEN }}

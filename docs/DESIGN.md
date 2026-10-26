@@ -158,12 +158,12 @@ implementation exists.
 1. Generate a 32-byte owner seed; the owner keypair `O` uses it directly.
 2. Derive session key `K` and one **role keypair** per role (`R_send`,
    `R_run`, `R_view`) from the owner seed with HKDF.
-3. `session_id = "ak_" + base32(sha256(O.pub))[:12]`.
+3. `session_id = "ax_" + base32(sha256(O.pub))[:12]`.
 4. Build the **manifest** (plaintext, signed by `O`):
 
    ```json
    {
-     "v": 1, "session_id": "ak_7f3e…", "owner_pub": "…",
+     "v": 1, "session_id": "ax_7f3e…", "owner_pub": "…",
      "roles": {"sender": "R_send.pub", "runner": "R_run.pub", "observer": "R_view.pub"},
      "mode": "execute", "expires_at": "…", "allowed_types": ["text","py","md","zip","image"],
      "max_item_bytes": 26214400,
@@ -695,7 +695,7 @@ join` on `PATH`; the same binary is downloadable standalone.
 
 ```python
 from airlox import Session
-s = Session.join("https://host/s/ak_7f3e#v=1&r=send&k=…&rk=…")
+s = Session.join("https://host/s/ax_7f3e#v=1&r=send&k=…&rk=…")
 s.send_text("Cleaned data attached.")
 f = s.send_file("dataset.zip")
 print(s.runners())                                # [Runner(name='runner-01', labels=['cpu'], idle=True)]

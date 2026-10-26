@@ -209,7 +209,7 @@ mod tests {
         let s = SessionSecrets::from_owner_seed([3u8; 32]);
         let o = Invite::owner("https://airlox.example/", &s).unwrap();
         let url = o.to_url();
-        assert!(url.starts_with("https://airlox.example/s/ak_"));
+        assert!(url.starts_with("https://airlox.example/s/ax_"));
         assert_eq!(Invite::parse(&url).unwrap(), o);
         for role in Role::MEMBERS {
             let i = Invite::member("https://airlox.example", &s, role).unwrap();

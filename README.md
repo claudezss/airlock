@@ -50,7 +50,7 @@ agent:
 ```python
 from airlox import Session
 
-s = Session.join("http://127.0.0.1:8080/s/ak_…#v=1&r=send&k=…&rk=…", display_name="build-agent")
+s = Session.join("http://127.0.0.1:8080/s/ax_…#v=1&r=send&k=…&rk=…", display_name="build-agent")
 s.send_text("Build finished.")
 s.send_file("report.md")
 for item in s.stream():
@@ -114,3 +114,18 @@ make check
 the Rust tests (including the relay), the Python binding and SDK tests
 (including execute mode against a real runner, and the docker scenario when a
 Docker daemon is available), and the wasm tests in Node.
+
+## Releasing
+
+PyPI releases come from CI (`.github/workflows/release.yml`), never from a
+laptop. Set the same version in `Cargo.toml` (`workspace.package.version`),
+`python/airlox/pyproject.toml` (`version` and the `airlox-core==` pin), then
+push a matching tag:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+The workflow checks that the versions agree, builds `airlox-core` wheels for
+Linux (x86_64, aarch64), macOS (x86_64, arm64) and Windows plus its sdist,
+builds the `airlox` SDK, and uploads them all with the `PYPI_TOKEN` secret.

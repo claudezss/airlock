@@ -275,17 +275,17 @@ impl SignedManifest {
     }
 }
 
-/// `ak_` + base32 of the first 16 bytes (128 bits) of SHA-256(owner public
+/// `ax_` + base32 of the first 16 bytes (128 bits) of SHA-256(owner public
 /// key): 26 characters. A member link pins the manifest through this id, so it
 /// must be infeasible to grind another owner key onto the same id.
 pub fn derive_session_id(owner_pub: &PublicKey) -> String {
     let h = sha256(&owner_pub.to_bytes());
-    format!("ak_{}", base32_lower(&h[..16]))
+    format!("ax_{}", base32_lower(&h[..16]))
 }
 
 pub fn is_session_id(s: &str) -> bool {
     s.len() == 29
-        && s.starts_with("ak_")
+        && s.starts_with("ax_")
         && s[3..].bytes().all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
 }
 
