@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="Airlox">
+  <title>Airlox</title>
+  <!-- The web UI's mark (web/index.html) on its background: an airlock
+       chamber with its two doors, and the item in transit between them. -->
+  <rect width="128" height="128" rx="28" fill="#0f1113"/>
+  <g transform="translate(22 22) scale(3)" fill="none" stroke="#f2a93b" stroke-width="2">
+    <rect x="3" y="3" width="22" height="22" rx="3"/>
+    <path d="M10 3v22M18 3v22"/>
+    <circle cx="14" cy="14" r="2" fill="#f2a93b" stroke="none"/>
+  </g>
+</svg>
