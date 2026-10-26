@@ -360,7 +360,10 @@ class Session:
             join = json.loads(r["signed_join"])["join"]
             info = join["runner"]
             pub = join["cert"]["cert"]["participant_pub"]
-            approved = approvals.get(pub, False) if listing["approval_required"] else not r["rejected"]
+            # Whether approval is required comes from the signed manifest, not
+            # the relay's listing.
+            required = self.manifest["job_limits"]["approve_runners"]
+            approved = approvals.get(pub, False) if required else not r["rejected"]
             out.append(
                 Runner(
                     participant_pub=pub,
@@ -386,11 +389,15 @@ class Session:
         return matches[0]
 
     def approve_runner(self, runner: Union[Runner, str]) -> Runner:
-        """Let a runner take jobs (owner only): a signed ``runner_approve``
-        event for runners and senders to verify, plus the relay's copy."""
+        """Let a runner take jobs (owner only): the relay's approval, then a
+        signed ``runner_approve`` event for runners and senders to verify.
+
+        In that order: a runner awaiting approval is not a recipient, so the
+        relay would not keep the event's blob for it, and a runner that
+        fetched it late would never see its own approval."""
         r = self._runner(runner)
-        self._send("event", None, {"type": "event", "event": "runner_approve", "participant_pub": r.participant_pub}, b"", [])
         self._req("POST", f"/runners/{r.participant_pub}/approve")
+        self._send("event", None, {"type": "event", "event": "runner_approve", "participant_pub": r.participant_pub}, b"", [])
         return r
 
     def reject_runner(self, runner: Union[Runner, str], reason: Optional[str] = None) -> None:

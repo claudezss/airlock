@@ -29,6 +29,10 @@ use crate::client::is_transient;
 use crate::sandbox::{Backend, PreparedJob, RawResult};
 use crate::view::View;
 
+/// How long a job that arrives just ahead of the owner's signed approval
+/// waits for it before being refused.
+const APPROVAL_WAIT: Duration = Duration::from_secs(5);
+
 /// What stays fixed for a runner across jobs.
 pub struct Ctx {
     pub keypair: Keypair,
@@ -96,6 +100,17 @@ async fn verify(ctx: &Ctx, view: &mut View, job_id: &str) -> Result<(ItemRef, Ve
     }
     if !target_matches(&spec.target, ctx.keypair.public(), &ctx.labels) {
         return refuse("the job's signed target does not match this runner".into());
+    }
+    if !view.approved {
+        // The owner approves on the relay just before posting the signed
+        // event, so a job can arrive a moment ahead of it: wait for it briefly.
+        let until = tokio::time::Instant::now() + APPROVAL_WAIT;
+        while !view.approved && !view.rejected && tokio::time::Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if let Err(e) = view.sync().await {
+                tracing::debug!("sync while waiting for approval: {e:#}");
+            }
+        }
     }
     if !view.approved {
         return refuse("this runner has no signed approval from the session owner".into());
