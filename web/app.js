@@ -71,7 +71,7 @@ function announce(msg) {
 function deadEnd(title, cause) {
   show(el("div", { class: "panel stack dead-end", role: "alert" },
     el("h1", {}, title), el("p", { class: "muted" }, cause),
-    el("div", { class: "row" }, el("a", { class: "button primary", href: "/" }, "New session"))));
+    el("div", { class: "row" }, el("a", { class: "button primary", href: "/#new" }, "New session"))));
 }
 
 // Plain-language reasons for items that fail verification.
@@ -171,8 +171,8 @@ function runnerInviteRow(url) {
       el("code", {}, `airlox runner join --invite '${maskInvite(url)}' --name runner-01 --sandbox docker`)));
 }
 
-// ---------- new session ----------
-function landing() {
+// ---------- new session (the create flow, at /#new) ----------
+function newSession() {
   const radio = (name, value, label, checked, extra = {}) =>
     el("label", { class: "option" }, el("input", { type: "radio", name, value, checked, ...extra }), label);
   const mode = el("fieldset", { class: "stack" }, el("legend", {}, "Mode"),
@@ -223,7 +223,8 @@ function landing() {
   const fields = el("fieldset", { class: "stack" }, mode, jobBox, ttl, types, pyNote, sizeField);
   const aside = el("aside", { class: "panel stack" },
     el("h2", {}, "Invites"),
-    el("p", { class: "muted" }, "Invite links appear here once the session exists. Each one carries a role and the session key."));
+    el("p", { class: "muted" }, "Invite links appear here once the session exists. Each one carries a role and the session key."),
+    el("p", { class: "muted" }, "Joining a session someone else opened? Skip this page and open the invite link you were given, including the part after #."));
 
   const form = el("form", { class: "stack", onsubmit: async (ev) => {
     ev.preventDefault();
@@ -1335,11 +1336,46 @@ async function streamLoop(s) {
   }
 }
 
+// ---------- landing page and routing at / ----------
+// "/" shows the landing page; "/#new" shows the create-session form. Other
+// fragments on "/" are in-page anchors. Invites live under /s/<id>.
+let homeView = null;
+function route(initial) {
+  const view = location.hash === "#new" ? "new" : "home";
+  if (view === homeView) return;
+  homeView = view;
+  const home = view === "home";
+  document.body.classList.toggle("landing", home);
+  document.getElementById("site-nav").hidden = !home;
+  app.classList.toggle("wide", home);
+  document.title = home ? "Airlox · Secure sessions for code and LLM agents" : "New session · Airlox";
+  if (home) {
+    show(document.getElementById("home-tpl").content.cloneNode(true));
+    let target = null;
+    try {
+      target = location.hash.length > 1 ? document.getElementById(decodeURIComponent(location.hash.slice(1))) : null;
+    } catch {}
+    if (target) target.scrollIntoView();
+    else if (!initial) scrollTo(0, 0);
+  } else {
+    newSession();
+    scrollTo(0, 0);
+    const h1 = app.querySelector("h1");
+    if (h1 && !initial) {
+      h1.tabIndex = -1;
+      h1.focus();
+    }
+  }
+}
+
 // ---------- boot ----------
 try {
   await init();
   if (location.pathname.startsWith("/s/")) await sessionView();
-  else landing();
+  else {
+    route(true);
+    addEventListener("hashchange", () => route(false));
+  }
 } catch (e) {
   deadEnd("Airlox failed to start", String(e.message || e));
 }
