@@ -162,19 +162,38 @@ pub fn decode_payload(payload: &[u8]) -> R<JsValue> {
     Ok(obj(&[("meta", meta.into()), ("body", bytes(&body))]))
 }
 
+/// Verify the author's certificate, bind it to the item, verify the item
+/// signature and apply header policy. Returns the author's role.
 #[wasm_bindgen(js_name = checkHeader)]
-pub fn check_header(signed_manifest_json: &str, author_role: &str, envelope_json: &str) -> R<()> {
-    api::check_header(signed_manifest_json, author_role, envelope_json).map_err(err)
+pub fn check_header(
+    signed_manifest_json: &str,
+    author_cert_json: &str,
+    envelope_json: &str,
+    blob: &[u8],
+) -> R<String> {
+    api::check_header(signed_manifest_json, author_cert_json, envelope_json, blob).map_err(err)
 }
 
-#[wasm_bindgen(js_name = checkPayload)]
-pub fn check_payload(
+/// checkHeader, then decrypt, decode and apply payload policy.
+/// Returns `{ role: string, meta: string, body: Uint8Array }`.
+#[wasm_bindgen(js_name = openChecked)]
+pub fn open_checked(
     signed_manifest_json: &str,
-    author_role: &str,
+    author_cert_json: &str,
+    session_key: &[u8],
     envelope_json: &str,
-    payload: &[u8],
-) -> R<()> {
-    api::check_payload(signed_manifest_json, author_role, envelope_json, payload).map_err(err)
+    blob: &[u8],
+) -> R<JsValue> {
+    let (role, meta, body) =
+        api::open_checked(signed_manifest_json, author_cert_json, session_key, envelope_json, blob)
+            .map_err(err)?;
+    Ok(obj(&[("role", role.into()), ("meta", meta.into()), ("body", bytes(&body))]))
+}
+
+/// The `{id, blob_sha256}` reference other items use to point at this one.
+#[wasm_bindgen(js_name = itemRef)]
+pub fn item_ref(envelope_json: &str, blob: &[u8]) -> R<String> {
+    api::item_ref(envelope_json, blob).map_err(err)
 }
 
 #[wasm_bindgen(js_name = inspectZip)]

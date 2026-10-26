@@ -243,13 +243,15 @@ sig: Ed25519( P.priv, ctx "item", canonical(header) || sha256(blob) )
 - Payloads by kind:
   - `text`: UTF-8 string.
   - `file`: `{name, mime, bytes}`; `subkind` fixes which viewer applies.
-  - `job`: `{code, filename, runtime, timeout_s, files: [item ids],
-    requirements: [...], target: {"runner": name} | {"labels": [...]} | "any"}`.
-  - `result`: `{job_id, exit_code, wall_ms, peak_mem_mb, stdout, stderr,
-    truncated: {stdout: bool, stderr: bool}, out_files: [{name, size,
-    item_id}], code_sha256, input_sha256}`. Files from `/out` are uploaded as
-    separate `file` items first (images as `image`, everything else bundled
-    into one `zip`), then referenced.
+  - `job`: `{code, filename, runtime, timeout_s, files: [item refs],
+    requirements: [...], target: {runner: participant_pub} | {labels: [...]} | any}`.
+  - `result`: `{job: item ref, exit_code, status, wall_ms, peak_mem_mb, stdout,
+    stderr, out_files: [{name, size, item: item ref}], code_sha256,
+    input_sha256}`. Files from `/out` are uploaded as separate `file` items
+    first (images as `image`, everything else bundled into one `zip`), then
+    referenced.
+  - An item ref is `{id, blob_sha256}`, so a reference cannot be redirected
+    to a different item with the same id. Exact formats: [protocol.md](protocol.md).
   - `event`: `runner.approve`, `runner.reject`, `session.close`, `job.cancel`.
 
 ### Content handling rules (client/runner side, since the server is blind)
@@ -345,8 +347,10 @@ in the design possible.
 
 The local backend on Linux is a real sandbox and acceptable for untrusted
 code from another agent. On macOS and Windows it is for development and
-trusted pairs only; the CLI prints a one-line warning when it is selected in a
-session whose manifest says `network: false`.
+trusted pairs only: the shim kills the job's process group, but a job that
+calls `setsid()` can outlive it there, and network cannot be blocked. The CLI
+prints a one-line warning when it is selected in a session whose manifest says
+`network: false`.
 
 ### Job routing ("no queue")
 

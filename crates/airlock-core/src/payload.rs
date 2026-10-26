@@ -9,17 +9,21 @@
 use serde::{Deserialize, Serialize};
 
 use crate::encoding::canonical_json;
-use crate::item::ItemKind;
+use crate::item::{ItemKind, ItemRef};
+use crate::keys::PublicKey;
 use crate::{Error, Result};
 
 pub const MAX_META_BYTES: usize = 4 * 1024 * 1024;
+/// Ceiling for each of `stdout` and `stderr` in a result.
 pub const MAX_STDIO_BYTES: usize = 1024 * 1024;
+pub const MAX_OUT_FILES: usize = 64;
+pub const MAX_REASON_CHARS: usize = 4096;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Target {
-    /// A runner by its registered name.
-    Runner { name: String },
+    /// One specific runner, pinned by its participant key. `name` is for display.
+    Runner { participant_pub: PublicKey, name: String },
     /// Any idle runner carrying every listed label.
     Labels { labels: Vec<String> },
     /// Any idle approved runner.
@@ -37,8 +41,8 @@ pub struct JobSpec {
     pub timeout_s: u32,
     /// Optional, at most the manifest ceiling. Absent = the ceiling.
     pub memory_mb: Option<u32>,
-    /// Item ids of `file` items to place in the work dir. ZIPs are unpacked.
-    pub files: Vec<String>,
+    /// `file` items to place in the work dir, pinned by blob hash. ZIPs are unpacked.
+    pub files: Vec<ItemRef>,
     /// Package names; each must be in the manifest allowlist.
     pub requirements: Vec<String>,
     pub target: Target,
@@ -49,13 +53,14 @@ pub struct JobSpec {
 pub struct OutFile {
     pub name: String,
     pub size: u64,
-    pub item_id: String,
+    pub item: ItemRef,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct JobResult {
-    pub job_id: String,
+    /// The job this result answers, pinned by blob hash.
+    pub job: ItemRef,
     /// None when the job never ran to completion (refused, cancelled, killed).
     pub exit_code: Option<i32>,
     pub status: JobStatus,
@@ -86,9 +91,9 @@ pub enum JobStatus {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
-    RunnerApprove { participant_pub: String },
-    RunnerReject { participant_pub: String, reason: Option<String> },
-    JobCancel { job_id: String },
+    RunnerApprove { participant_pub: PublicKey },
+    RunnerReject { participant_pub: PublicKey, reason: Option<String> },
+    JobCancel { job: ItemRef },
     SessionClose,
 }
 
@@ -201,7 +206,12 @@ mod tests {
                 requirements: vec![],
                 target: Target::Labels { labels: vec!["gpu".into()] },
             }),
-            Payload::event(Event::JobCancel { job_id: "AAAAAAAAAAAAAAAAAAAAAA".into() }),
+            Payload::event(Event::JobCancel {
+                job: ItemRef {
+                    id: "AAAAAAAAAAAAAAAAAAAAAA".into(),
+                    blob_sha256: crate::encoding::b64e(&[0u8; 32]),
+                },
+            }),
             Payload::event(Event::SessionClose),
         ];
         for p in cases {
@@ -223,8 +233,13 @@ mod tests {
 
     #[test]
     fn target_json_shape() {
-        let t = serde_json::to_string(&Target::Runner { name: "runner-01".into() }).unwrap();
-        assert_eq!(t, r#"{"type":"runner","name":"runner-01"}"#);
+        let pk = crate::keys::Keypair::from_seed(&[1u8; 32]).public();
+        let t =
+            serde_json::to_string(&Target::Runner { participant_pub: pk, name: "runner-01".into() }).unwrap();
+        assert_eq!(
+            t,
+            format!(r#"{{"type":"runner","participant_pub":"{}","name":"runner-01"}}"#, pk.to_b64())
+        );
         assert_eq!(serde_json::to_string(&Target::Any).unwrap(), r#"{"type":"any"}"#);
     }
 }

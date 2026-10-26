@@ -2,17 +2,36 @@
 //!
 //! Two layers, because the server never sees plaintext:
 //! - [`check_header`] runs anywhere, including the server.
-//! - [`check_payload`] and [`check_job`] run on clients and runners after decryption.
+//! - [`check_payload`] and the job/result helpers run on clients and runners
+//!   after decryption.
+//!
+//! An author's role is never taken on trust: [`author_role`] derives it from a
+//! role certificate verified against the manifest and bound to the item's
+//! author key. The checks below take that derived role.
 
-use crate::cert::is_runner_token;
-use crate::item::{is_item_id, ItemHeader, ItemKind};
-use crate::payload::{Event, JobSpec, Meta, Payload, Target};
+use crate::cert::{is_runner_token, SignedRoleCert};
+use crate::item::{ItemHeader, ItemKind, ItemRef};
+use crate::keys::PublicKey;
+use crate::payload::{
+    Event, JobResult, JobSpec, JobStatus, Meta, Payload, Target, MAX_OUT_FILES, MAX_REASON_CHARS,
+    MAX_STDIO_BYTES,
+};
 use crate::session::{ContentType, Manifest, Mode, Role};
-use crate::validate::sniff;
+use crate::validate::{check_name_component, sniff};
 use crate::{Error, Result};
 
 pub const MAX_CODE_BYTES: usize = 1024 * 1024;
 pub const MAX_JOB_FILES: usize = 32;
+
+/// Verify `cert` against the manifest and that it certifies the item's author.
+/// Returns the author's role.
+pub fn author_role(m: &Manifest, cert: &SignedRoleCert, h: &ItemHeader) -> Result<Role> {
+    cert.verify(m)?;
+    if cert.participant() != h.author {
+        return Err(Error::policy("item author does not match the certificate"));
+    }
+    Ok(cert.role())
+}
 
 /// Which item kinds each role may author.
 pub fn role_may_post(role: Role, kind: ItemKind) -> bool {
@@ -25,7 +44,8 @@ pub fn role_may_post(role: Role, kind: ItemKind) -> bool {
     }
 }
 
-/// Server-enforceable checks on a header whose author holds `author_role`.
+/// Server-enforceable checks on a header whose author holds `author_role`
+/// (obtained from [`author_role`]).
 pub fn check_header(m: &Manifest, author_role: Role, h: &ItemHeader) -> Result<()> {
     h.validate()?;
     if h.session_id != m.session_id {
@@ -37,6 +57,9 @@ pub fn check_header(m: &Manifest, author_role: Role, h: &ItemHeader) -> Result<(
             author_role.as_str(),
             h.kind.as_str()
         )));
+    }
+    if author_role == Role::Runner {
+        require_execute(m)?;
     }
     if h.size > m.max_item_bytes {
         return Err(Error::policy(format!("item exceeds {} bytes", m.max_item_bytes)));
@@ -80,29 +103,43 @@ pub fn check_payload(m: &Manifest, author_role: Role, h: &ItemHeader, p: &Payloa
         return Err(Error::policy("payload type does not match header kind"));
     }
     match &p.meta {
-        Meta::Text { .. } | Meta::Result(_) => Ok(()),
+        Meta::Text { .. } => Ok(()),
         Meta::File { name, mime } => check_file(h.subkind.expect("validated"), name, mime, &p.body),
         Meta::Job(spec) => check_job(m, spec),
-        Meta::Event(e) => match (author_role, e) {
-            (Role::Owner, _) => Ok(()),
-            (Role::Sender, Event::JobCancel { .. }) => Ok(()),
-            _ => Err(Error::policy("only the owner may post this event")),
-        },
+        Meta::Result(r) => check_result(r),
+        Meta::Event(e) => check_event(author_role, e),
     }
 }
 
-/// A bare file name: no separators, no traversal, at most 255 bytes.
+fn check_event(author_role: Role, e: &Event) -> Result<()> {
+    match e {
+        Event::RunnerReject { reason: Some(r), .. } if r.chars().count() > MAX_REASON_CHARS => {
+            return Err(Error::policy("reason too long"));
+        }
+        Event::JobCancel { job } => job.validate()?,
+        _ => {}
+    }
+    match (author_role, e) {
+        (Role::Owner, _) => Ok(()),
+        // Whether this sender authored the job is checked with `may_cancel`
+        // once the job item is at hand.
+        (Role::Sender, Event::JobCancel { .. }) => Ok(()),
+        _ => Err(Error::policy("only the owner may post this event")),
+    }
+}
+
+/// A job may be cancelled by the owner or by the sender who submitted it.
+pub fn may_cancel(canceller_role: Role, canceller: PublicKey, job_author: PublicKey) -> bool {
+    canceller_role == Role::Owner || (canceller_role == Role::Sender && canceller == job_author)
+}
+
+/// A bare, portable file name for a shared file: the component rules from
+/// [`check_name_component`], no leading dot, at most 255 bytes.
 pub fn check_file_name(name: &str) -> Result<()> {
-    let bad = name.is_empty()
-        || name.len() > 255
-        || name == "."
-        || name == ".."
-        || name.starts_with('.') && name.len() == 1
-        || name.chars().any(|c| c == '/' || c == '\\' || c == '\0' || c.is_control());
-    if bad {
+    if name.len() > 255 || name.starts_with('.') {
         return Err(Error::policy(format!("bad file name {name:?}")));
     }
-    Ok(())
+    check_name_component(name).map_err(|why| Error::policy(format!("bad file name {name:?}: {why}")))
 }
 
 fn ext(name: &str) -> String {
@@ -119,7 +156,15 @@ pub fn check_file(subkind: ContentType, name: &str, mime: &str, body: &[u8]) -> 
                 && mime == "text/markdown"
                 && crate::validate::markdown::validate_markdown(body).is_ok()
         }
-        ContentType::Zip => e == "zip" && mime == "application/zip" && sniff::is_zip(body),
+        ContentType::Zip => {
+            if !(e == "zip" && mime == "application/zip" && sniff::is_zip(body)) {
+                false
+            } else {
+                // The full archive rules from protocol §9.
+                crate::validate::zip::inspect_zip(body, &Default::default())?;
+                true
+            }
+        }
         ContentType::Image => {
             let sniffed = sniff::image_mime(body);
             let ext_ok = match mime {
@@ -192,8 +237,11 @@ pub fn check_job(m: &Manifest, job: &JobSpec) -> Result<()> {
             return Err(Error::policy(format!("memory must be 1..={} MB", limits.memory_mb)));
         }
     }
-    if job.files.len() > MAX_JOB_FILES || !job.files.iter().all(|f| is_item_id(f)) {
-        return Err(Error::policy("files must be up to 32 item ids"));
+    if job.files.len() > MAX_JOB_FILES {
+        return Err(Error::policy("at most 32 input files"));
+    }
+    for f in &job.files {
+        f.validate()?;
     }
     for r in &job.requirements {
         let n = normalize_package(r)?;
@@ -202,7 +250,7 @@ pub fn check_job(m: &Manifest, job: &JobSpec) -> Result<()> {
         }
     }
     match &job.target {
-        Target::Runner { name } if !is_runner_token(name) => {
+        Target::Runner { name, .. } if !is_runner_token(name) => {
             Err(Error::policy(format!("bad runner name {name:?}")))
         }
         Target::Labels { labels }
@@ -214,26 +262,94 @@ pub fn check_job(m: &Manifest, job: &JobSpec) -> Result<()> {
     }
 }
 
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Shape checks on a job result.
+pub fn check_result(r: &JobResult) -> Result<()> {
+    r.job.validate()?;
+    if r.stdout.len() > MAX_STDIO_BYTES || r.stderr.len() > MAX_STDIO_BYTES {
+        return Err(Error::policy("stdout and stderr are limited to 1 MiB each"));
+    }
+    if !is_hex64(&r.code_sha256) || !is_hex64(&r.input_sha256) {
+        return Err(Error::policy("hashes must be 64 lowercase hex characters"));
+    }
+    if r.out_files.len() > MAX_OUT_FILES {
+        return Err(Error::policy("at most 64 output files"));
+    }
+    for f in &r.out_files {
+        check_file_name(&f.name)?;
+        f.item.validate()?;
+    }
+    if r.reason.as_ref().is_some_and(|s| s.chars().count() > MAX_REASON_CHARS) {
+        return Err(Error::policy("reason too long"));
+    }
+    let consistent = match r.status {
+        JobStatus::Completed => r.exit_code.is_some(),
+        JobStatus::Refused | JobStatus::TimedOut | JobStatus::Cancelled => r.exit_code.is_none(),
+        JobStatus::Failed => true,
+    };
+    if !consistent {
+        return Err(Error::policy("status and exit_code disagree"));
+    }
+    if matches!(r.status, JobStatus::Refused | JobStatus::Failed) && r.reason.is_none() {
+        return Err(Error::policy("refused and failed results need a reason"));
+    }
+    Ok(())
+}
+
+/// Bind a result to the job it claims to answer. `job_ref` must already have
+/// been matched against the fetched job item ([`ItemRef::matches`]). A job
+/// aimed at one runner only accepts a result from that runner's key.
+pub fn check_result_matches_job(
+    job_ref: &ItemRef,
+    job: &JobSpec,
+    result_author: PublicKey,
+    r: &JobResult,
+) -> Result<()> {
+    if &r.job != job_ref {
+        return Err(Error::policy("result references a different job"));
+    }
+    if let Target::Runner { participant_pub, .. } = &job.target {
+        if *participant_pub != result_author {
+            return Err(Error::policy("result is not from the runner the job targeted"));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cert::issue_cert;
+    use crate::encoding::b64e;
     use crate::item::{seal, NewItem};
     use crate::keys::Keypair;
+    use crate::payload::OutFile;
     use crate::session::{JobLimits, SessionParams, SessionSecrets};
+
+    fn secrets() -> SessionSecrets {
+        SessionSecrets::from_owner_seed([1u8; 32])
+    }
 
     fn manifest(mode: Mode) -> Manifest {
         let limits = JobLimits { packages: vec!["numpy".into(), "pandas".into()], ..Default::default() };
-        SessionSecrets::from_owner_seed([1u8; 32])
+        secrets()
             .manifest(&SessionParams {
                 mode,
                 created_at_ms: 1000,
                 ttl_ms: 1000,
-                allowed_types: vec![ContentType::Text, ContentType::Py, ContentType::Md],
-                max_item_bytes: 1024,
+                allowed_types: vec![ContentType::Text, ContentType::Py, ContentType::Md, ContentType::Zip],
+                max_item_bytes: 1024 * 1024,
                 job_limits: (mode == Mode::Execute).then_some(limits),
             })
             .unwrap()
             .manifest
+    }
+
+    fn iref(byte: u8) -> ItemRef {
+        ItemRef { id: b64e(&[byte; 16]), blob_sha256: b64e(&[byte; 32]) }
     }
 
     fn job() -> JobSpec {
@@ -243,9 +359,27 @@ mod tests {
             runtime: "python3.12".into(),
             timeout_s: 30,
             memory_mb: None,
-            files: vec![],
+            files: vec![iref(1)],
             requirements: vec!["Pandas".into()],
             target: Target::Any,
+        }
+    }
+
+    fn result() -> JobResult {
+        JobResult {
+            job: iref(3),
+            exit_code: Some(0),
+            status: JobStatus::Completed,
+            reason: None,
+            wall_ms: 10,
+            peak_mem_mb: 1,
+            stdout: "ok".into(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            out_files: vec![OutFile { name: "chart.png".into(), size: 1, item: iref(4) }],
+            code_sha256: "a".repeat(64),
+            input_sha256: "b".repeat(64),
         }
     }
 
@@ -269,19 +403,33 @@ mod tests {
     }
 
     #[test]
+    fn author_role_is_bound_to_cert() {
+        let m = manifest(Mode::Execute);
+        let h = header(&m, ItemKind::Text, None, 1);
+        let author = Keypair::from_seed(&[2u8; 32]).public();
+        let other = Keypair::from_seed(&[9u8; 32]).public();
+        let s = secrets();
+        let good = issue_cert(&s.role_keypair(Role::Sender), &m.session_id, Role::Sender, author, 1).unwrap();
+        assert_eq!(author_role(&m, &good, &h).unwrap(), Role::Sender);
+        // An owner cert for someone else cannot lend its role to this author.
+        let theirs = issue_cert(&s.owner(), &m.session_id, Role::Owner, other, 1).unwrap();
+        assert!(author_role(&m, &theirs, &h).is_err());
+    }
+
+    #[test]
     fn roles_and_types() {
         let m = manifest(Mode::Execute);
         let job_h = header(&m, ItemKind::Job, Some(ContentType::Py), 10);
         check_header(&m, Role::Sender, &job_h).unwrap();
         assert!(check_header(&m, Role::Observer, &job_h).is_err());
         assert!(check_header(&m, Role::Runner, &job_h).is_err());
-        let zip_h = header(&m, ItemKind::File, Some(ContentType::Zip), 10);
-        assert!(check_header(&m, Role::Sender, &zip_h).is_err());
-        let big = header(&m, ItemKind::Text, None, 2000);
+        let big = header(&m, ItemKind::Text, None, 2 * 1024 * 1024);
         assert!(check_header(&m, Role::Sender, &big).is_err());
         let relay = manifest(Mode::Relay);
         let job_r = header(&relay, ItemKind::Job, Some(ContentType::Py), 10);
         assert!(check_header(&relay, Role::Sender, &job_r).is_err());
+        let file_r = header(&relay, ItemKind::File, Some(ContentType::Md), 10);
+        assert!(check_header(&relay, Role::Runner, &file_r).is_err(), "runners are execute-only");
     }
 
     #[test]
@@ -300,6 +448,51 @@ mod tests {
         let mut j = job();
         j.runtime = "python3.11".into();
         assert!(check_job(&m, &j).is_err());
+        let mut j = job();
+        j.files[0].blob_sha256 = "short".into();
+        assert!(check_job(&m, &j).is_err());
+    }
+
+    #[test]
+    fn result_checks() {
+        check_result(&result()).unwrap();
+        let mut r = result();
+        r.out_files[0].name = "../../../.bashrc".into();
+        assert!(check_result(&r).is_err());
+        let mut r = result();
+        r.stdout = "x".repeat(MAX_STDIO_BYTES + 1);
+        assert!(check_result(&r).is_err());
+        let mut r = result();
+        r.code_sha256 = "zz".into();
+        assert!(check_result(&r).is_err());
+        let mut r = result();
+        r.status = JobStatus::Refused;
+        r.reason = Some("nope".into());
+        assert!(check_result(&r).is_err(), "refused with an exit code");
+        r.exit_code = None;
+        check_result(&r).unwrap();
+    }
+
+    #[test]
+    fn result_binds_to_job_and_runner() {
+        let runner = Keypair::from_seed(&[5u8; 32]).public();
+        let intruder = Keypair::from_seed(&[6u8; 32]).public();
+        let mut j = job();
+        j.target = Target::Runner { participant_pub: runner, name: "runner-01".into() };
+        let r = result();
+        check_result_matches_job(&iref(3), &j, runner, &r).unwrap();
+        assert!(check_result_matches_job(&iref(3), &j, intruder, &r).is_err());
+        assert!(check_result_matches_job(&iref(7), &j, runner, &r).is_err());
+    }
+
+    #[test]
+    fn cancel_rules() {
+        let a = Keypair::from_seed(&[1u8; 32]).public();
+        let b = Keypair::from_seed(&[2u8; 32]).public();
+        assert!(may_cancel(Role::Sender, a, a));
+        assert!(!may_cancel(Role::Sender, a, b));
+        assert!(may_cancel(Role::Owner, a, b));
+        assert!(!may_cancel(Role::Runner, a, a));
     }
 
     #[test]
@@ -315,5 +508,18 @@ mod tests {
         assert!(check_file(ContentType::Md, "README.md", "text/markdown", &[0xff, 0xfe]).is_err());
         assert!(check_file(ContentType::Image, "a.png", "image/png", b"GIF89a").is_err());
         assert!(check_file(ContentType::Py, "a/b.py", "text/x-python", b"").is_err());
+        assert!(check_file(ContentType::Py, "a.py:evil", "text/x-python", b"").is_err());
+        assert!(check_file(ContentType::Py, ".bashrc.py", "text/x-python", b"").is_err());
+        assert!(check_file(ContentType::Py, "x\u{202e}gnp.py", "text/x-python", b"").is_err());
+    }
+
+    #[test]
+    fn zip_payloads_get_full_archive_rules() {
+        use std::io::Write;
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        w.start_file("../../escape.txt", zip::write::SimpleFileOptions::default()).unwrap();
+        w.write_all(b"x").unwrap();
+        let evil = w.finish().unwrap().into_inner();
+        assert!(check_file(ContentType::Zip, "data.zip", "application/zip", &evil).is_err());
     }
 }

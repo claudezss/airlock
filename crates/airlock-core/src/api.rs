@@ -3,14 +3,16 @@
 //! The Python and wasm bindings wrap these functions one-to-one, so both
 //! bindings expose exactly the same surface and the same error messages.
 //! Structured values cross the boundary as JSON strings; secrets and blobs
-//! cross as raw bytes.
+//! cross as raw bytes. Signed structures received from elsewhere (manifests,
+//! certificates, joins, item envelopes) must be canonical JSON, exactly as
+//! produced by these functions; anything else is rejected.
 
 use serde::{Deserialize, Serialize};
 
 use crate::cert::{issue_cert as issue, sign_join as sign, JoinRequest, SignedJoinRequest, SignedRoleCert};
-use crate::encoding::canonical_json;
+use crate::encoding::{canonical_json, parse_canonical};
 use crate::invite::Invite;
-use crate::item::{seal, ItemEnvelope, NewItem, SealedItem};
+use crate::item::{seal, ItemEnvelope, ItemRef, NewItem, SealedItem};
 use crate::keys::{Keypair, PublicKey};
 use crate::payload::{Meta, Payload};
 use crate::session::{Role, SessionParams, SessionSecrets, SignedManifest};
@@ -108,7 +110,7 @@ pub fn issue_cert(
 /// Verify a certificate; returns its role.
 pub fn verify_cert(cert_json: &str, signed_manifest_json: &str) -> Result<String> {
     let m = SignedManifest::from_json(signed_manifest_json)?;
-    let c: SignedRoleCert = serde_json::from_str(cert_json)?;
+    let c: SignedRoleCert = parse_canonical(cert_json, "certificate")?;
     c.verify(&m.manifest)?;
     Ok(c.role().as_str().to_string())
 }
@@ -120,7 +122,7 @@ pub fn sign_join(participant_seed: &[u8], join_json: &str) -> Result<String> {
 
 pub fn verify_join(signed_join_json: &str, signed_manifest_json: &str) -> Result<()> {
     let m = SignedManifest::from_json(signed_manifest_json)?;
-    let j: SignedJoinRequest = serde_json::from_str(signed_join_json)?;
+    let j: SignedJoinRequest = parse_canonical(signed_join_json, "join request")?;
     j.verify(&m.manifest)
 }
 
@@ -146,8 +148,15 @@ pub fn seal_item(
 }
 
 fn sealed(envelope_json: &str, blob: &[u8]) -> Result<SealedItem> {
-    let envelope: ItemEnvelope = serde_json::from_str(envelope_json)?;
+    let envelope: ItemEnvelope = parse_canonical(envelope_json, "item envelope")?;
     Ok(SealedItem { envelope, blob: blob.to_vec() })
+}
+
+/// The `{id, blob_sha256}` reference other items use to point at this one.
+pub fn item_ref(envelope_json: &str, blob: &[u8]) -> Result<String> {
+    let s = sealed(envelope_json, blob)?;
+    s.verify()?;
+    json(&ItemRef::to(&s))
 }
 
 pub fn verify_item(envelope_json: &str, blob: &[u8]) -> Result<()> {
@@ -169,22 +178,41 @@ pub fn decode_payload(bytes: &[u8]) -> Result<(String, Vec<u8>)> {
     Ok((json(&p.meta)?, p.body))
 }
 
-pub fn check_header(signed_manifest_json: &str, author_role: &str, envelope_json: &str) -> Result<()> {
+/// Server-side check: verify the author's certificate, bind it to the item's
+/// author key, verify the item signature, and apply header policy. Returns
+/// the author's role.
+pub fn check_header(
+    signed_manifest_json: &str,
+    author_cert_json: &str,
+    envelope_json: &str,
+    blob: &[u8],
+) -> Result<String> {
     let m = SignedManifest::from_json(signed_manifest_json)?;
-    let e: ItemEnvelope = serde_json::from_str(envelope_json)?;
-    crate::policy::check_header(&m.manifest, Role::parse(author_role)?, &e.header)
+    let cert: SignedRoleCert = parse_canonical(author_cert_json, "certificate")?;
+    let s = sealed(envelope_json, blob)?;
+    s.verify()?;
+    let role = crate::policy::author_role(&m.manifest, &cert, s.header())?;
+    crate::policy::check_header(&m.manifest, role, s.header())?;
+    Ok(role.as_str().to_string())
 }
 
-pub fn check_payload(
+/// Client-side open: everything [`check_header`] does, then decrypt, decode
+/// and apply payload policy. Returns `(author_role, meta_json, body)`.
+pub fn open_checked(
     signed_manifest_json: &str,
-    author_role: &str,
+    author_cert_json: &str,
+    session_key: &[u8],
     envelope_json: &str,
-    payload: &[u8],
-) -> Result<()> {
+    blob: &[u8],
+) -> Result<(String, String, Vec<u8>)> {
     let m = SignedManifest::from_json(signed_manifest_json)?;
-    let e: ItemEnvelope = serde_json::from_str(envelope_json)?;
-    let p = Payload::decode(payload)?;
-    crate::policy::check_payload(&m.manifest, Role::parse(author_role)?, &e.header, &p)
+    let cert: SignedRoleCert = parse_canonical(author_cert_json, "certificate")?;
+    let s = sealed(envelope_json, blob)?;
+    let role = crate::policy::author_role(&m.manifest, &cert, s.header())?;
+    let pt = s.open(&seed32(session_key, "session key")?)?;
+    let p = Payload::decode(&pt)?;
+    crate::policy::check_payload(&m.manifest, role, s.header(), &p)?;
+    Ok((role.as_str().to_string(), json(&p.meta)?, p.body))
 }
 
 /// Returns a JSON array of entries.

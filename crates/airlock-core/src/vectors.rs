@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use crate::cert::{issue_cert, sign_join, ClientKind, JoinRequest, RunnerInfo, SandboxKind};
 use crate::encoding::{b64e, canonical_json};
 use crate::invite::Invite;
-use crate::item::{item_key, seal_with_nonce, ItemKind, NewItem};
+use crate::item::{item_key, seal_with_nonce, ItemKind, ItemRef, NewItem, SealedItem};
 use crate::keys::Keypair;
 use crate::payload::{JobResult, JobSpec, JobStatus, OutFile, Payload, Target};
 use crate::session::{ContentType, JobLimits, Mode, Role, SessionParams, SessionSecrets};
@@ -20,12 +20,31 @@ use crate::Result;
 
 pub const BASE_URL: &str = "https://airlock.example";
 
-/// (name, author, author role, kind, subkind, refs, payload, item id)
-type ItemCase<'a> =
-    (&'a str, &'a Keypair, Role, ItemKind, Option<ContentType>, Vec<String>, Payload, &'a str);
-
 fn s(b: Vec<u8>) -> String {
     String::from_utf8(b).expect("utf-8")
+}
+
+fn framed(meta: &[u8]) -> Vec<u8> {
+    let mut v = (meta.len() as u32).to_be_bytes().to_vec();
+    v.extend_from_slice(meta);
+    v
+}
+
+fn negative_invites(secrets: &SessionSecrets) -> Result<Value> {
+    let good = Invite::member(BASE_URL, secrets, Role::Sender)?.to_url();
+    let owner = Invite::owner(BASE_URL, secrets)?.to_url();
+    let other = SessionSecrets::from_owner_seed([0xEE; 32]);
+    let forged_owner =
+        Invite::owner(BASE_URL, &other)?.to_url().replace(&other.session_id(), &secrets.session_id());
+    Ok(json!([
+        {"name": "wrong_version", "url": good.replace("v=1", "v=2")},
+        {"name": "duplicate_role", "url": format!("{good}&r=view")},
+        {"name": "query_instead_of_fragment", "url": good.replace('#', "?")},
+        {"name": "plain_http", "url": good.replace("https://", "http://")},
+        {"name": "owner_link_with_member_key", "url": format!("{owner}&k=AAAA")},
+        {"name": "owner_seed_for_other_session", "url": forged_owner},
+        {"name": "short_session_id", "url": good.replace(&secrets.session_id(), "ak_aaaaaaaaaaaa")},
+    ]))
 }
 
 pub fn generate() -> Result<Value> {
@@ -69,6 +88,7 @@ pub fn generate() -> Result<Value> {
             "participant_fingerprint": p.public().fingerprint(),
             "canonical": s(canonical_json(&c.cert)?),
             "signed": c,
+            "signed_canonical": s(canonical_json(&c)?),
         }));
     }
 
@@ -100,80 +120,18 @@ pub fn generate() -> Result<Value> {
     )?;
 
     let sender = Keypair::from_seed(&participants[1].1);
-    let job_spec = JobSpec {
-        filename: "summarize.py".into(),
-        code: "print(sum(range(10)))\n".into(),
-        runtime: "python3.12".into(),
-        timeout_s: 30,
-        memory_mb: None,
-        files: vec!["AQEBAQEBAQEBAQEBAQEBAQ".into()],
-        requirements: vec!["pandas".into()],
-        target: Target::Runner { name: "runner-01".into() },
-    };
-    let result = JobResult {
-        job_id: "AwMDAwMDAwMDAwMDAwMDAw".into(),
-        exit_code: Some(0),
-        status: JobStatus::Completed,
-        reason: None,
-        wall_ms: 1840,
-        peak_mem_mb: 212,
-        stdout: "45\n".into(),
-        stderr: String::new(),
-        stdout_truncated: false,
-        stderr_truncated: false,
-        out_files: vec![OutFile {
-            name: "chart.png".into(),
-            size: 38_912,
-            item_id: "BAQEBAQEBAQEBAQEBAQEBA".into(),
-        }],
-        code_sha256: crate::encoding::hex(&crate::encoding::sha256(job_spec.code.as_bytes())),
-        input_sha256: crate::encoding::hex(&crate::encoding::sha256(b"")),
-    };
-    let item_cases: Vec<ItemCase<'_>> = vec![
-        (
-            "text",
-            &sender,
-            Role::Sender,
-            ItemKind::Text,
-            None,
-            vec![],
-            Payload::text("Cleaned dataset attached."),
-            "AAAAAAAAAAAAAAAAAAAAAA",
-        ),
-        (
-            "markdown_file",
-            &sender,
-            Role::Sender,
-            ItemKind::File,
-            Some(ContentType::Md),
-            vec![],
-            Payload::file("README.md", "text/markdown", b"# Orders\n\nDeduplicated export.\n".to_vec()),
-            "AQEBAQEBAQEBAQEBAQEBAQ",
-        ),
-        (
-            "job",
-            &sender,
-            Role::Sender,
-            ItemKind::Job,
-            Some(ContentType::Py),
-            vec!["AQEBAQEBAQEBAQEBAQEBAQ".into()],
-            Payload::job(job_spec),
-            "AwMDAwMDAwMDAwMDAwMDAw",
-        ),
-        (
-            "result",
-            &runner_p,
-            Role::Runner,
-            ItemKind::Result,
-            None,
-            vec!["AwMDAwMDAwMDAwMDAwMDAw".into()],
-            Payload::result(result),
-            "BQUFBQUFBQUFBQUFBQUFBQ",
-        ),
-    ];
-
     let mut items = Vec::new();
-    for (i, (name, author, role, kind, subkind, refs, payload, id)) in item_cases.into_iter().enumerate() {
+    let mut sealed_items = Vec::new();
+    let mut seal_case = |name: &str,
+                         author: &Keypair,
+                         role: Role,
+                         kind: ItemKind,
+                         subkind: Option<ContentType>,
+                         refs: Vec<ItemRef>,
+                         payload: Payload,
+                         id: &str|
+     -> Result<SealedItem> {
+        let i = items.len();
         let new = NewItem {
             id: id.into(),
             session_id: sid.clone(),
@@ -189,6 +147,7 @@ pub fn generate() -> Result<Value> {
             "name": name,
             "author_role": role.as_str(),
             "author_seed": b64e(&author.seed()),
+            "author_cert_index": participants.iter().position(|(r, _)| *r == role).expect("role"),
             "new_item": new,
             "nonce": b64e(&nonce),
             "payload": b64e(&encoded),
@@ -196,25 +155,87 @@ pub fn generate() -> Result<Value> {
             "item_key": b64e(&item_key(&key, &sid, id)),
             "header_canonical": s(sealed.header().canonical_bytes()?),
             "envelope": sealed.envelope,
+            "envelope_canonical": s(canonical_json(&sealed.envelope)?),
             "blob": b64e(&sealed.blob),
+            "blob_sha256": b64e(&sealed.blob_sha256()),
         }));
-    }
+        Ok(sealed)
+    };
+
+    let text = seal_case(
+        "text",
+        &sender,
+        Role::Sender,
+        ItemKind::Text,
+        None,
+        vec![],
+        Payload::text("Cleaned dataset attached. Ünïcödé, \u{2028}line sep, \"quotes\" and \\ back\\slash."),
+        "AAAAAAAAAAAAAAAAAAAAAA",
+    )?;
+    let readme = seal_case(
+        "markdown_file",
+        &sender,
+        Role::Sender,
+        ItemKind::File,
+        Some(ContentType::Md),
+        vec![ItemRef::to(&text)],
+        Payload::file("README.md", "text/markdown", b"# Orders\n\nDeduplicated export.\n".to_vec()),
+        "AQEBAQEBAQEBAQEBAQEBAQ",
+    )?;
+    let job_spec = JobSpec {
+        filename: "summarize.py".into(),
+        code: "print(sum(range(10)))\n".into(),
+        runtime: "python3.12".into(),
+        timeout_s: 30,
+        memory_mb: None,
+        files: vec![ItemRef::to(&readme)],
+        requirements: vec!["pandas".into()],
+        target: Target::Runner { participant_pub: runner_p.public(), name: "runner-01".into() },
+    };
+    let job = seal_case(
+        "job",
+        &sender,
+        Role::Sender,
+        ItemKind::Job,
+        Some(ContentType::Py),
+        vec![ItemRef::to(&readme)],
+        Payload::job(job_spec.clone()),
+        "AwMDAwMDAwMDAwMDAwMDAw",
+    )?;
+    let result = JobResult {
+        job: ItemRef::to(&job),
+        exit_code: Some(0),
+        status: JobStatus::Completed,
+        reason: None,
+        wall_ms: 1840,
+        peak_mem_mb: 212,
+        stdout: "45\n".into(),
+        stderr: String::new(),
+        stdout_truncated: false,
+        stderr_truncated: false,
+        // Points at an output item not included in these vectors.
+        out_files: vec![OutFile {
+            name: "chart.png".into(),
+            size: 38_912,
+            item: ItemRef { id: "BAQEBAQEBAQEBAQEBAQEBA".into(), blob_sha256: b64e(&[4u8; 32]) },
+        }],
+        code_sha256: crate::encoding::hex(&crate::encoding::sha256(job_spec.code.as_bytes())),
+        input_sha256: crate::encoding::hex(&crate::encoding::sha256(&readme.blob)),
+    };
+    seal_case(
+        "result",
+        &runner_p,
+        Role::Runner,
+        ItemKind::Result,
+        None,
+        vec![ItemRef::to(&job)],
+        Payload::result(result),
+        "BQUFBQUFBQUFBQUFBQUFBQ",
+    )?;
+    sealed_items.push(text);
 
     // Negative cases built from the first item.
-    let base = seal_with_nonce(
-        &key,
-        &sender,
-        NewItem {
-            id: "AAAAAAAAAAAAAAAAAAAAAA".into(),
-            session_id: sid.clone(),
-            kind: ItemKind::Text,
-            subkind: None,
-            created_at_ms: params.created_at_ms + 10,
-            refs: vec![],
-        },
-        &Payload::text("Cleaned dataset attached.").encode()?,
-        [0xA0; 12],
-    )?;
+    let base = sealed_items.remove(0);
     let mut flipped = base.blob.clone();
     *flipped.last_mut().expect("non-empty") ^= 0x01;
     let mut relabeled = base.envelope.clone();
@@ -241,6 +262,7 @@ pub fn generate() -> Result<Value> {
         "manifest": {
             "canonical": s(signed.manifest.canonical_bytes()?),
             "signed": signed,
+            "signed_canonical": s(canonical_json(&signed)?),
         },
         "invites": {
             "owner": Invite::owner(BASE_URL, &secrets)?.to_url(),
@@ -252,13 +274,32 @@ pub fn generate() -> Result<Value> {
         "join": {
             "canonical": s(canonical_json(&join.join)?),
             "signed": join,
+            "signed_canonical": s(canonical_json(&join)?),
         },
         "items": items,
         "negative_items": [
-            {"name": "flipped_blob_byte", "envelope": base.envelope, "blob": b64e(&flipped), "expect": "signature"},
-            {"name": "header_changed_after_signing", "envelope": relabeled, "blob": b64e(&base.blob), "expect": "signature"},
-            {"name": "wrong_session_key", "envelope": base.envelope, "blob": b64e(&base.blob),
-             "session_key": b64e(&[0u8; 32]), "expect": "decrypt"},
+            {"name": "flipped_blob_byte", "envelope_canonical": s(canonical_json(&base.envelope)?),
+             "blob": b64e(&flipped), "expect": "signature"},
+            {"name": "header_changed_after_signing", "envelope_canonical": s(canonical_json(&relabeled)?),
+             "blob": b64e(&base.blob), "expect": "signature"},
+            {"name": "wrong_session_key", "envelope_canonical": s(canonical_json(&base.envelope)?),
+             "blob": b64e(&base.blob), "session_key": b64e(&[0u8; 32]), "expect": "decrypt"},
+            {"name": "non_canonical_envelope", "envelope_canonical": serde_json::to_string_pretty(&base.envelope)?,
+             "blob": b64e(&base.blob), "expect": "invalid"},
+            {"name": "missing_null_subkind", "envelope_canonical": s(canonical_json(&base.envelope)?).replace("\"subkind\":null,", ""),
+             "blob": b64e(&base.blob), "expect": "invalid"},
+        ],
+        "negative_invites": negative_invites(&secrets)?,
+        "negative_payloads": [
+            {"name": "truncated", "payload": b64e(&[0, 0, 0])},
+            {"name": "meta_length_past_end", "payload": b64e(&[0, 0, 0, 9, b'{', b'}'])},
+            {"name": "non_canonical_meta", "payload": b64e(&framed(br#"{"text":"hi", "type":"text"}"#))},
+            {"name": "body_on_text", "payload": b64e(&[framed(br#"{"text":"hi","type":"text"}"#), b"x".to_vec()].concat())},
+            {"name": "float_in_meta", "payload": b64e(&framed(br#"{"text":"hi","type":"text","x":1.5}"#))},
+        ],
+        "negative_canonical": [
+            {"name": "pretty_printed_manifest", "signed_manifest": serde_json::to_string_pretty(&signed)?},
+            {"name": "space_after_colon", "signed_manifest": s(canonical_json(&signed)?).replacen("\"v\":1", "\"v\": 1", 1)},
         ],
     }))
 }

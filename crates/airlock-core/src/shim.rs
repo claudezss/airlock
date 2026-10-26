@@ -20,6 +20,8 @@ pub struct ShimResult {
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
     pub timed_out: bool,
+    /// The shim received SIGTERM/SIGINT/SIGHUP (runner cancel) and killed the job.
+    pub cancelled: bool,
     pub wall_ms: u64,
     pub peak_rss_kb: u64,
     pub error: Option<String>,

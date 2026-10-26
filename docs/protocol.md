@@ -12,10 +12,14 @@ derived value in that file from its `inputs` and pass every verification step.
 - **Binary in text** is base64url without padding (RFC 4648 §5).
 - **Canonical JSON** is used for everything signed or used as AEAD associated
   data: UTF-8, no insignificant whitespace, object keys sorted by byte order,
-  ASCII-only keys, integers only (floats are an error), strings escaped only
-  where JSON requires (`"`, `\`, control characters). `null` fields are
-  written, not omitted. Receivers re-serialize the parsed value and compare,
-  so unknown fields make verification fail.
+  ASCII-only keys, integers only and within ±(2^53 − 1) (floats are an
+  error), strings escaped only where JSON requires (`"`, `\`, control
+  characters; U+2028 and `/` stay raw). `null` fields are written, not
+  omitted.
+- **Signed structures travel as canonical JSON.** A receiver parses the
+  bytes, re-serializes canonically and rejects the input unless the two are
+  identical. Whitespace, key order, alternate escapes, missing `null` fields
+  and unknown fields are therefore all rejected before any signature check.
 - **Timestamps** are integer Unix milliseconds (`*_ms`). The core never reads
   a clock; callers supply times.
 - **Signatures** are Ed25519 (strict verification) over
@@ -34,10 +38,12 @@ The owner generates a 32-byte **owner seed**. Everything else derives from it:
 | session key `K` | `HKDF(salt="airlock/v1", ikm=owner_seed, info="session-key", L=32)` |
 | role seed for R ∈ {sender, runner, observer} | `HKDF(salt="airlock/v1", ikm=owner_seed, info="role:" + R, L=32)` |
 | role keypair | Ed25519 key from seed = role seed |
-| session id | `"ak_" + base32_lower(SHA-256(owner_pub)[0..8])[0..12]` |
+| session id | `"ak_" + base32_lower(SHA-256(owner_pub)[0..16])` (26 characters, 128 bits) |
 
 `base32_lower` is RFC 4648 base32 with the alphabet `a-z2-7`, no padding.
-Rotating `K` therefore means a new owner seed, i.e. a new session.
+Rotating `K` therefore means a new owner seed, i.e. a new session. Member
+links pin the manifest only through the session id, which is why it carries
+128 bits: forging a different owner key with the same id is infeasible.
 
 ## 3. Manifest
 
@@ -45,7 +51,7 @@ Rotating `K` therefore means a new owner seed, i.e. a new session.
 {
   "manifest": {
     "v": 1,
-    "session_id": "ak_kzdvvj2umndu",
+    "session_id": "ak_kzdvvj2umnduyauf35o36k6kw4",
     "owner_pub": "<b64 32>",
     "roles": { "sender": "<b64>", "runner": "<b64>", "observer": "<b64>" },
     "mode": "relay" | "execute",
@@ -86,7 +92,9 @@ owner:  {base}/s/{session_id}#v=1&r=owner&ok={owner_seed}
 member: {base}/s/{session_id}#v=1&r={send|run|view}&k={K}&rk={role_seed}
 ```
 
-- `base` is `http(s)://host[/path]` without query, fragment or trailing `/`.
+- `base` is `https://host[:port][/path]` without query, fragment, userinfo or
+  trailing `/`. `http://` is accepted only for `localhost`, `*.localhost`,
+  `127.0.0.1` and `[::1]`.
 - The fragment never reaches the server.
 - Parsers reject: missing or non-`1` `v`, duplicate keys, an owner link
   carrying `k`/`rk`, a member link carrying `ok`, and an owner seed whose
@@ -147,7 +155,7 @@ Every message, file, job, result and event is an item: a plaintext
     "subkind": null | "py|md|zip|image",
     "size": 31,
     "created_at_ms": 0,
-    "refs": ["<item id>", …]
+    "refs": [{"id": "<item id>", "blob_sha256": "<b64 SHA-256 of that item's blob>"}, …]
   },
   "sig": "<author signature, context item>"
 }
@@ -162,7 +170,15 @@ sig      = Ed25519(author, "item", canonical(header) || SHA-256(blob))
 - `subkind` rules: `text`, `result`, `event` → `null`; `file` → one of
   `py|md|zip|image`; `job` → `py`.
 - `size` is the plaintext payload length; `len(blob) == size + 28`.
-- `refs` holds at most 64 item ids.
+- `id` must decode (strict base64url) to exactly 16 bytes.
+- `refs` holds at most 64 **item references**. A reference is
+  `{id, blob_sha256}`; it matches an item only if both the id and the hash of
+  that item's blob agree. Anyone holding `K` (observers included) can seal a
+  different item under an existing id, so references never name an item by id
+  alone, and receivers fetch referenced items and check the hash.
+- Item ids are unique per session. The server rejects duplicates; a client
+  that sees two items with the same id treats the later one as a conflict and
+  ignores it.
 - Because the header is the AAD, re-labelling a header (even re-signed by a
   different author) makes decryption fail. Because the signature covers the
   blob hash, the server can check authorship without the key.
@@ -180,13 +196,17 @@ meta. Only `file` carries a non-empty `body`.
 |---|---|
 | `text` | `text` |
 | `file` | `name` (bare file name, ≤ 255 bytes), `mime` |
-| `job` | `filename`, `code`, `runtime`, `timeout_s`, `memory_mb` (nullable), `files` (item ids), `requirements` (package names), `target` |
-| `result` | `job_id`, `exit_code` (nullable), `status`, `reason` (nullable), `wall_ms`, `peak_mem_mb`, `stdout`, `stderr`, `stdout_truncated`, `stderr_truncated`, `out_files` [`{name, size, item_id}`], `code_sha256`, `input_sha256` (hex) |
-| `event` | tagged by `event`: `runner_approve {participant_pub}`, `runner_reject {participant_pub, reason}`, `job_cancel {job_id}`, `session_close` |
+| `job` | `filename`, `code`, `runtime`, `timeout_s`, `memory_mb` (nullable), `files` (item references), `requirements` (package names), `target` |
+| `result` | `job` (item reference), `exit_code` (nullable), `status`, `reason` (nullable), `wall_ms`, `peak_mem_mb`, `stdout`, `stderr`, `stdout_truncated`, `stderr_truncated`, `out_files` [`{name, size, item}`] where `item` is an item reference, `code_sha256`, `input_sha256` (lowercase hex) |
+| `event` | tagged by `event`: `runner_approve {participant_pub}`, `runner_reject {participant_pub, reason}`, `job_cancel {job}` (item reference), `session_close` |
 
-`target` is `{"type":"runner","name":…}`, `{"type":"labels","labels":[…]}`
-or `{"type":"any"}`. `status` is one of `completed`, `refused`, `timed_out`,
-`cancelled`, `failed`.
+`target` is `{"type":"runner","participant_pub":…,"name":…}` (one runner,
+pinned by its participant key; `name` is for display),
+`{"type":"labels","labels":[…]}` or `{"type":"any"}`. `status` is one of
+`completed`, `refused`, `timed_out`, `cancelled`, `failed`.
+
+File names follow the component rules of §9 and additionally may not start
+with `.`; at most 255 bytes.
 
 File type rules (checked after decryption):
 
@@ -194,10 +214,14 @@ File type rules (checked after decryption):
 |---|---|---|---|
 | `py` | `.py` | `text/x-python` | UTF-8 |
 | `md` | `.md`, `.markdown` | `text/markdown` | UTF-8, no NUL |
-| `zip` | `.zip` | `application/zip` | `PK\x03\x04` or `PK\x05\x06` magic; passes §9 |
+| `zip` | `.zip` | `application/zip` | `PK\x03\x04` or `PK\x05\x06` magic; passes every §9 inspection rule |
 | `image` | `.png` / `.jpg` `.jpeg` / `.webp` | `image/png` / `image/jpeg` / `image/webp` | magic bytes match the mime |
 
 ## 8. Policy
+
+An author's role always comes from a role certificate that verifies against
+the manifest **and** whose `participant_pub` equals the item's `author`.
+Never from relay metadata or caller input.
 
 **Server-enforceable** (header only):
 
@@ -208,36 +232,59 @@ File type rules (checked after decryption):
 | runner | result, file |
 | observer | none |
 
-Plus: `size ≤ max_item_bytes`; `created_at_ms` within the session lifetime;
-`text` needs `text` allowed; `file` needs its subkind allowed; `job` needs
-execute mode and `py` allowed; `result` needs execute mode.
+Plus: runners may post only in execute mode; `size ≤ max_item_bytes`;
+`created_at_ms` within the session lifetime; `text` needs `text` allowed;
+`file` needs its subkind allowed; `job` needs execute mode and `py` allowed;
+`result` needs execute mode.
 
 **Client and runner** (after decryption): payload type equals header kind;
-file rules from §7; events other than `job_cancel` come from the owner only.
+file rules from §7; events other than `job_cancel` come from the owner only;
+a `job_cancel` is honored only from the owner or the sender who authored the
+job. Results must satisfy: `stdout` and `stderr` ≤ 1 MiB each; hashes are 64
+lowercase hex characters; at most 64 `out_files`, each with a valid file name
+and item reference; `reason` ≤ 4096 characters and present for `refused` and
+`failed`; `completed` has an `exit_code`, `refused`/`timed_out`/`cancelled`
+have none. A result is accepted for a job only if its `job` reference matches
+the job item, and, for a `runner` target, only if its author is that runner's
+participant key. Clients accept the first valid result per job.
 A runner additionally refuses a job unless: entry file is a bare `.py` name;
 code ≤ 1 MiB; `runtime` equals the manifest runtime;
-`1 ≤ timeout_s ≤ limit`; `memory_mb` (if set) `≤ limit`; at most 32 `files`;
-every requirement, PEP 503-normalized, is in `packages`; the target is
-well-formed. Runners also verify the author's certificate chains to the
-sender (or owner) role and that a `runner_approve` event for themselves is
-signed by an owner-role participant.
+`1 ≤ timeout_s ≤ limit`; `memory_mb` (if set) `≤ limit`; at most 32 `files`,
+each fetched and matched against its reference; every requirement,
+PEP 503-normalized, is in `packages`; the target is well-formed. Runners also
+verify the author's certificate chains to the sender (or owner) role, that a
+`runner_approve` event for themselves is signed by an owner-role participant,
+and keep a per-session set of job ids so a relayed duplicate never runs twice.
 
 ## 9. ZIP handling
 
-Inspection reads only the central directory. Rejected: more than 10 000
-entries; paths that are empty, absolute, contain `..`, `.`, empty components,
-backslashes, NUL or control characters, a drive letter, or exceed 512 bytes or
-depth 32; case-insensitive duplicates; symlinks (unix mode `0o120000`);
-encrypted entries; compression other than stored or deflate; an entry over
-512 MiB; a total over 1 GiB; a compression ratio above 200 for entries over
-1 MiB. Extraction refuses to follow a destination escape, creates files with
-`create_new`, and fails if any entry inflates beyond its declared size.
+Inspection reads only the central directory. Path components must be
+non-empty, not `.` or `..`, contain no `/`, `\`, `:` (drive letters, NTFS
+streams), NUL, control or invisible formatting characters (bidi overrides,
+zero-width characters and the like), not end in `.` or space, and not be a
+Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM0-9`, `LPT0-9`, with any
+extension). Also rejected: more than 10 000 entries; absolute paths; paths
+over 512 bytes or depth 32; duplicates after Unicode NFC normalization and
+lowercasing; symlinks (unix mode `0o120000`); encrypted entries; compression
+other than stored or deflate; an entry over 512 MiB; a total over 1 GiB; a
+compression ratio above 100 for any entry over 1 MiB, or for the archive as a
+whole (total declared size / archive size) once the total exceeds 1 MiB.
+
+Extraction writes only into an existing, **empty** directory that nothing
+else writes to (a fresh per-job work dir), so no pre-existing symlink can
+redirect a write. Every created directory is checked to resolve inside the
+destination, files are created with `create_new`, and extraction fails if any
+entry inflates beyond its declared size. Runners also cap total extracted
+bytes per job.
 
 ## 10. Images
 
-Images are decoded with limits (16 384 px per side, 512 MiB allocation),
-EXIF orientation is applied, and the pixels are re-encoded in the same format
-(PNG; JPEG at quality 90; lossless WebP). Re-encoding drops all metadata.
+Images are decoded with limits: at most 16 384 px per side, and both the
+decoded buffer and its 8-bit RGBA size must fit a 128 MiB budget. The budget
+is checked from the header before any pixel buffer is allocated, so peak
+memory stays near three times the budget. EXIF orientation is applied, and the
+pixels are re-encoded in the same format (PNG; JPEG at quality 90; lossless
+WebP). Re-encoding drops all metadata.
 Senders sanitize before upload; receivers still treat images as untrusted.
 
 ## 11. Job shim
@@ -246,11 +293,27 @@ All sandbox backends run the embedded `shim.py`:
 
 ```text
 python3 shim.py --work DIR --entry FILE --timeout SECONDS --result PATH
+                [--fsize-mb N] [--memory-mb N] [--nproc N]
 ```
 
-It keeps only `PATH`, `LANG`, `LC_ALL`, `TZ` from the environment, sets
-`HOME` to the work dir, runs `python -E -s FILE` in a new process group (so
-the work dir is importable but `PYTHON*` variables and user site-packages are
-ignored), kills the whole group on timeout, and writes
-`{shim_version, exit_code, signal, timed_out, wall_ms, peak_rss_kb, error}` to
-`PATH`, with `stdout.txt` and `stderr.txt` beside it.
+- **Environment.** Only a fixed `PATH` (the interpreter's directory plus
+  `/usr/local/bin:/usr/bin:/bin`), `LANG=C.UTF-8`, `HOME` (the work dir),
+  `TMPDIR` (a directory inside the work dir) and `MPLBACKEND=Agg` reach the
+  job. It runs as `python -E -s -u -B -X utf8 FILE`: the work dir is
+  importable, `PYTHON*` variables and user site-packages are ignored, output
+  is unbuffered so it survives a kill, and no `.pyc` files are written.
+- **Containment.** The job runs in its own process group. That group is
+  killed when the job exits, on timeout, and when the shim receives SIGTERM,
+  SIGINT or SIGHUP; the result then records `cancelled: true`. On Linux the
+  shim is a child subreaper and also kills every descendant, including ones
+  that called `setsid()`. On other systems only the sandbox (container or pod)
+  contains a `setsid()` escape, so the macOS local backend is not a security
+  boundary.
+- **Limits.** `RLIMIT_FSIZE` (default 1024 MiB) caps every file the job
+  writes, including `stdout.txt` and `stderr.txt`. `RLIMIT_CORE` is 0.
+  `RLIMIT_AS` and `RLIMIT_NPROC` are applied when given; real memory and
+  process limits come from cgroups in the docker and kubernetes backends.
+- **Output.** `PATH` receives `{shim_version, exit_code, signal, timed_out,
+  cancelled, wall_ms, peak_rss_kb, error}`, written atomically through a
+  randomly named temporary file. `stdout.txt` and `stderr.txt` sit beside it.
+  The directory holding `PATH` must not be writable by the job.

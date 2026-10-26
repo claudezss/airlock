@@ -174,19 +174,43 @@ fn decode_payload<'py>(py: Python<'py>, payload: &[u8]) -> PyResult<(String, Bou
     Ok((meta, b(py, &body)))
 }
 
+/// Verify the author's certificate, bind it to the item, verify the item
+/// signature and apply header policy. Returns the author's role.
 #[pyfunction]
-fn check_header(signed_manifest_json: &str, author_role: &str, envelope_json: &str) -> PyResult<()> {
-    api::check_header(signed_manifest_json, author_role, envelope_json).map_err(err)
+fn check_header(
+    py: Python<'_>,
+    signed_manifest_json: &str,
+    author_cert_json: &str,
+    envelope_json: &str,
+    blob: &[u8],
+) -> PyResult<String> {
+    py.allow_threads(|| api::check_header(signed_manifest_json, author_cert_json, envelope_json, blob))
+        .map_err(err)
 }
 
+/// check_header, then decrypt, decode and apply payload policy.
+/// Returns (author_role: str, meta_json: str, body: bytes).
 #[pyfunction]
-fn check_payload(
+fn open_checked<'py>(
+    py: Python<'py>,
     signed_manifest_json: &str,
-    author_role: &str,
+    author_cert_json: &str,
+    session_key: &[u8],
     envelope_json: &str,
-    payload: &[u8],
-) -> PyResult<()> {
-    api::check_payload(signed_manifest_json, author_role, envelope_json, payload).map_err(err)
+    blob: &[u8],
+) -> PyResult<(String, String, Bound<'py, PyBytes>)> {
+    let (role, meta, body) = py
+        .allow_threads(|| {
+            api::open_checked(signed_manifest_json, author_cert_json, session_key, envelope_json, blob)
+        })
+        .map_err(err)?;
+    Ok((role, meta, b(py, &body)))
+}
+
+/// The {id, blob_sha256} reference other items use to point at this one.
+#[pyfunction]
+fn item_ref(py: Python<'_>, envelope_json: &str, blob: &[u8]) -> PyResult<String> {
+    py.allow_threads(|| api::item_ref(envelope_json, blob)).map_err(err)
 }
 
 /// Returns a JSON array of {path, size, compressed_size, is_dir}.
@@ -241,7 +265,8 @@ fn airlock_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_payload, m)?)?;
     m.add_function(wrap_pyfunction!(decode_payload, m)?)?;
     m.add_function(wrap_pyfunction!(check_header, m)?)?;
-    m.add_function(wrap_pyfunction!(check_payload, m)?)?;
+    m.add_function(wrap_pyfunction!(open_checked, m)?)?;
+    m.add_function(wrap_pyfunction!(item_ref, m)?)?;
     m.add_function(wrap_pyfunction!(inspect_zip, m)?)?;
     m.add_function(wrap_pyfunction!(extract_zip, m)?)?;
     m.add_function(wrap_pyfunction!(sanitize_image, m)?)?;

@@ -2,15 +2,20 @@
 //!
 //! Canonical JSON (used for everything that is signed or used as AEAD
 //! associated data) is: UTF-8, no insignificant whitespace, object keys
-//! sorted by byte order, keys restricted to ASCII, integers only (no floats),
-//! strings escaped as `serde_json` does (only `"`, `\` and control characters).
+//! sorted by byte order, keys restricted to ASCII, integers only (no floats)
+//! within ±(2^53 − 1) so JavaScript reads them exactly, strings escaped as
+//! `serde_json` does (only `"`, `\` and control characters).
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{Error, Result};
+
+/// Largest integer allowed in canonical JSON (JavaScript's `Number.MAX_SAFE_INTEGER`).
+pub const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
 /// base64url without padding (RFC 4648 §5).
 pub fn b64e(bytes: &[u8]) -> String {
@@ -67,6 +72,18 @@ pub fn canonical_json<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Parse JSON that must already be canonical: the bytes received are exactly
+/// the bytes that are signed. Rejects whitespace, key reordering, alternate
+/// escapes, missing `null` fields and anything else that re-serializes
+/// differently, so every verifier sees the same input.
+pub fn parse_canonical<T: DeserializeOwned + Serialize>(s: &str, what: &'static str) -> Result<T> {
+    let v: T = serde_json::from_str(s)?;
+    if canonical_json(&v)? != s.as_bytes() {
+        return Err(Error::invalid(what, "not canonical json"));
+    }
+    Ok(v)
+}
+
 fn write_canonical(v: &Value, out: &mut Vec<u8>) -> Result<()> {
     match v {
         Value::Null => out.extend_from_slice(b"null"),
@@ -75,6 +92,11 @@ fn write_canonical(v: &Value, out: &mut Vec<u8>) -> Result<()> {
         Value::Number(n) => {
             if n.is_f64() {
                 return Err(Error::Encoding("floats are not allowed in canonical json".into()));
+            }
+            let in_range = n.as_u64().map(|u| u <= MAX_SAFE_INTEGER).unwrap_or(false)
+                || n.as_i64().map(|i| i.unsigned_abs() <= MAX_SAFE_INTEGER).unwrap_or(false);
+            if !in_range {
+                return Err(Error::Encoding("integer outside ±(2^53-1) in canonical json".into()));
             }
             out.extend_from_slice(n.to_string().as_bytes());
         }
@@ -139,6 +161,31 @@ mod tests {
     fn canonical_rejects_floats_and_non_ascii_keys() {
         assert!(canonical_json(&json!({"a": 1.5})).is_err());
         assert!(canonical_json(&json!({"é": 1})).is_err());
+        assert!(canonical_json(&json!({"a": MAX_SAFE_INTEGER + 1})).is_err());
+        assert!(canonical_json(&json!({"a": -(MAX_SAFE_INTEGER as i64) - 1})).is_err());
+        assert!(canonical_json(&json!({"a": MAX_SAFE_INTEGER})).is_ok());
+    }
+
+    #[test]
+    fn canonical_edge_strings() {
+        // Non-ASCII stays raw, control characters use short or \u escapes,
+        // U+2028 stays raw, "/" is not escaped.
+        let v = json!({"s": "é\u{1}\n\u{2028}/\"\\"});
+        let got = String::from_utf8(canonical_json(&v).unwrap()).unwrap();
+        assert_eq!(got, "{\"s\":\"é\\u0001\\n\u{2028}/\\\"\\\\\"}");
+    }
+
+    #[test]
+    fn parse_canonical_rejects_variants() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct S {
+            a: u32,
+            b: Option<u32>,
+        }
+        assert!(parse_canonical::<S>(r#"{"a":1,"b":null}"#, "s").is_ok());
+        for bad in [r#"{"b":null,"a":1}"#, r#"{"a":1}"#, r#"{"a": 1,"b":null}"#, r#"{"a":1,"b":null} "#] {
+            assert!(parse_canonical::<S>(bad, "s").is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -10,7 +10,7 @@ use rand_core::{CryptoRngCore, OsRng};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
-use crate::encoding::{base32_lower, canonical_json, sha256};
+use crate::encoding::{base32_lower, canonical_json, parse_canonical, sha256, MAX_SAFE_INTEGER};
 use crate::keys::{ctx, Keypair, PublicKey, Sig};
 use crate::{Error, Result, PROTOCOL_VERSION};
 
@@ -182,6 +182,9 @@ impl Manifest {
         if self.session_id != derive_session_id(&self.owner_pub) {
             return Err(Error::invalid("manifest", "session_id does not match owner_pub"));
         }
+        if self.expires_at_ms > MAX_SAFE_INTEGER {
+            return Err(Error::invalid("manifest", "timestamp out of range"));
+        }
         if self.expires_at_ms <= self.created_at_ms {
             return Err(Error::invalid("manifest", "expires_at_ms must be after created_at_ms"));
         }
@@ -264,21 +267,24 @@ impl SignedManifest {
             .map_err(|_| Error::Signature("manifest not signed by owner"))
     }
 
+    /// Parse canonical JSON and verify.
     pub fn from_json(s: &str) -> Result<Self> {
-        let m: SignedManifest = serde_json::from_str(s)?;
+        let m: SignedManifest = parse_canonical(s, "signed manifest")?;
         m.verify()?;
         Ok(m)
     }
 }
 
-/// `ak_` + the first 12 base32 characters of SHA-256(owner public key).
+/// `ak_` + base32 of the first 16 bytes (128 bits) of SHA-256(owner public
+/// key): 26 characters. A member link pins the manifest through this id, so it
+/// must be infeasible to grind another owner key onto the same id.
 pub fn derive_session_id(owner_pub: &PublicKey) -> String {
     let h = sha256(&owner_pub.to_bytes());
-    format!("ak_{}", &base32_lower(&h[..8])[..12])
+    format!("ak_{}", base32_lower(&h[..16]))
 }
 
 pub fn is_session_id(s: &str) -> bool {
-    s.len() == 15
+    s.len() == 29
         && s.starts_with("ak_")
         && s[3..].bytes().all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
 }
@@ -301,8 +307,8 @@ fn default_max_item_bytes() -> u64 {
     DEFAULT_MAX_ITEM_BYTES
 }
 
-/// The owner's root secret. Zeroized on drop by the derived keypairs; keep
-/// this struct short-lived.
+/// The owner's root secret. The seed is zeroized on drop; keep this struct
+/// short-lived and avoid copying the seed out of it.
 pub struct SessionSecrets {
     owner_seed: [u8; 32],
 }
@@ -384,6 +390,13 @@ impl SessionSecrets {
     }
 }
 
+impl Drop for SessionSecrets {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.owner_seed.zeroize();
+    }
+}
+
 impl std::fmt::Debug for SessionSecrets {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "SessionSecrets({})", self.session_id())
@@ -418,8 +431,9 @@ mod tests {
         m.verify().unwrap();
         assert!(is_session_id(&m.manifest.session_id));
         assert_eq!(m.manifest.session_id, s.session_id());
-        let json = serde_json::to_string(&m).unwrap();
+        let json = String::from_utf8(canonical_json(&m).unwrap()).unwrap();
         SignedManifest::from_json(&json).unwrap();
+        assert!(SignedManifest::from_json(&serde_json::to_string_pretty(&m).unwrap()).is_err());
     }
 
     #[test]

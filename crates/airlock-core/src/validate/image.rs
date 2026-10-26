@@ -11,7 +11,10 @@ use crate::validate::sniff;
 use crate::{Error, Result};
 
 pub const MAX_DIMENSION: u32 = 16_384;
-pub const MAX_ALLOC: u64 = 512 * 1024 * 1024;
+/// Budget for one decoded image buffer. Peak memory is at most about three
+/// times this: the decoded buffer, an orientation copy and an 8-bit RGB(A)
+/// conversion copy.
+pub const MAX_DECODED_BYTES: u64 = 128 * 1024 * 1024;
 
 fn ierr(e: impl std::fmt::Display) -> Error {
     Error::Image(e.to_string())
@@ -19,6 +22,11 @@ fn ierr(e: impl std::fmt::Display) -> Error {
 
 /// Returns `(mime, sanitized bytes)`. The output format matches the input.
 pub fn sanitize_image(bytes: &[u8]) -> Result<(&'static str, Vec<u8>)> {
+    sanitize_image_with_budget(bytes, MAX_DECODED_BYTES)
+}
+
+/// As [`sanitize_image`], with an explicit decoded-buffer budget in bytes.
+pub fn sanitize_image_with_budget(bytes: &[u8], budget: u64) -> Result<(&'static str, Vec<u8>)> {
     let mime = sniff::image_mime(bytes).ok_or_else(|| Error::Image("not a png, jpeg or webp".into()))?;
     let format = match mime {
         "image/png" => ImageFormat::Png,
@@ -30,9 +38,17 @@ pub fn sanitize_image(bytes: &[u8]) -> Result<(&'static str, Vec<u8>)> {
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_DIMENSION);
     limits.max_image_height = Some(MAX_DIMENSION);
-    limits.max_alloc = Some(MAX_ALLOC);
+    limits.max_alloc = Some(budget);
     reader.limits(limits);
     let mut decoder = reader.into_decoder().map_err(ierr)?;
+    // `into_decoder` + `from_decoder` does not charge the output buffer
+    // against `max_alloc` (only `ImageReader::decode` does), so check it here
+    // from the header before allocating anything.
+    let (w, h) = decoder.dimensions();
+    let rgba8_bytes = u64::from(w) * u64::from(h) * 4;
+    if decoder.total_bytes() > budget || rgba8_bytes > budget {
+        return Err(Error::Image(format!("{w}x{h} image exceeds the {budget}-byte decode budget")));
+    }
     let orientation = decoder.orientation().map_err(ierr)?;
     let mut img = DynamicImage::from_decoder(decoder).map_err(ierr)?;
     img.apply_orientation(orientation);
@@ -94,6 +110,16 @@ mod tests {
         let back = image::load_from_memory(&clean).unwrap().to_rgb8();
         assert_eq!(back.dimensions(), (4, 3));
         assert_eq!(back.get_pixel(0, 0), &Rgb([200, 10, 10]));
+    }
+
+    #[test]
+    fn enforces_decode_budget_before_allocating() {
+        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(200, 200, Rgb([1, 2, 3])));
+        let mut png = Vec::new();
+        img.write_to(&mut Cursor::new(&mut png), ImageFormat::Png).unwrap();
+        let err = sanitize_image_with_budget(&png, 100_000).unwrap_err();
+        assert!(err.to_string().contains("decode budget"), "{err}");
+        sanitize_image_with_budget(&png, 1_000_000).unwrap();
     }
 
     #[test]

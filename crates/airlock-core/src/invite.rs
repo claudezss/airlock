@@ -19,6 +19,19 @@ pub enum InviteSecret {
     Member { session_key: [u8; 32], role_seed: [u8; 32] },
 }
 
+impl Drop for InviteSecret {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        match self {
+            InviteSecret::Owner { owner_seed } => owner_seed.zeroize(),
+            InviteSecret::Member { session_key, role_seed } => {
+                session_key.zeroize();
+                role_seed.zeroize();
+            }
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct Invite {
     pub base_url: String,
@@ -37,15 +50,31 @@ impl std::fmt::Debug for Invite {
     }
 }
 
+/// `https://host[:port][/path]`, or `http://` for loopback hosts only.
 fn normalize_base(base_url: &str) -> Result<String> {
     let b = base_url.trim_end_matches('/');
-    if !(b.starts_with("https://") || b.starts_with("http://")) {
-        return Err(Error::invalid("base_url", "must start with https:// or http://"));
+    let (scheme, rest) =
+        b.split_once("://").ok_or_else(|| Error::invalid("base_url", "must start with https://"))?;
+    if b.contains('#') || b.contains('?') || b.contains('@') || b.chars().any(|c| c.is_whitespace()) {
+        return Err(Error::invalid("base_url", "must not contain a query, fragment, userinfo or spaces"));
     }
-    if b.contains('#') || b.contains('?') {
-        return Err(Error::invalid("base_url", "must not contain a query or fragment"));
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().map(|h| format!("[{h}]")).unwrap_or_default()
+    } else {
+        authority.split(':').next().unwrap_or("").to_ascii_lowercase()
+    };
+    if host.is_empty() {
+        return Err(Error::invalid("base_url", "missing host"));
     }
-    Ok(b.to_string())
+    let loopback =
+        host == "localhost" || host.ends_with(".localhost") || host == "127.0.0.1" || host == "[::1]";
+    match scheme {
+        "https" => Ok(b.to_string()),
+        "http" if loopback => Ok(b.to_string()),
+        "http" => Err(Error::invalid("base_url", "http:// is only allowed for localhost")),
+        _ => Err(Error::invalid("base_url", "must start with https://")),
+    }
 }
 
 impl Invite {
@@ -198,6 +227,10 @@ mod tests {
         assert!(Invite::parse(&good.replace("v=1", "v=2")).is_err());
         assert!(Invite::parse(&good.replace("#", "?")).is_err());
         assert!(Invite::parse(&format!("{good}&r=view")).is_err());
+        assert!(Invite::parse(&good.replace("https://a.example", "http://a.example")).is_err());
+        assert!(Invite::parse(&good.replace("https://a.example", "https://")).is_err());
+        assert!(Invite::member("http://localhost:8080", &s, Role::Sender).is_ok());
+        assert!(Invite::member("http://evil.example", &s, Role::Sender).is_err());
         let other = SessionSecrets::from_owner_seed([4u8; 32]);
         let forged = Invite::owner("https://a.example", &other)
             .unwrap()

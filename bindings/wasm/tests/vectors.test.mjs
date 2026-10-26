@@ -10,7 +10,8 @@ const ac = require("../pkg/node/airlock_core_wasm.js");
 const VEC = JSON.parse(
   readFileSync(new URL("../../../crates/airlock-core/vectors/v1.json", import.meta.url), "utf8"),
 );
-const MANIFEST = JSON.stringify(VEC.manifest.signed);
+const MANIFEST = VEC.manifest.signed_canonical;
+const CERTS = Object.fromEntries(VEC.certs.map((c) => [c.role, c]));
 const b64d = (s) => new Uint8Array(Buffer.from(s, "base64url"));
 const errClass = (fn) => {
   try {
@@ -27,11 +28,11 @@ test("session derivation and manifest", () => {
   const seed = b64d(VEC.inputs.owner_seed);
   const out = ac.createSession(JSON.stringify(VEC.inputs.session_params), seed);
   assert.deepEqual(out.ownerSeed, seed);
-  assert.deepEqual(JSON.parse(out.signedManifest), VEC.manifest.signed);
+  assert.equal(out.signedManifest, MANIFEST);
   assert.equal(ac.verifyManifest(MANIFEST), VEC.manifest.canonical);
-  const m = JSON.parse(MANIFEST);
-  m.manifest.max_item_bytes += 1;
-  assert.equal(errClass(() => ac.verifyManifest(JSON.stringify(m))), "SignatureError");
+  for (const n of VEC.negative_canonical) {
+    assert.equal(errClass(() => ac.verifyManifest(n.signed_manifest)), "ValidationError", n.name);
+  }
 });
 
 test("invites", () => {
@@ -42,49 +43,60 @@ test("invites", () => {
     assert.deepEqual(inv.sessionKey, b64d(VEC.session.session_key));
     ac.checkInvite(VEC.invites[role], MANIFEST);
   }
+  for (const n of VEC.negative_invites) {
+    assert.equal(errClass(() => ac.parseInvite(n.url)), "ValidationError", n.name);
+  }
 });
 
 test("certs and join", () => {
   for (const c of VEC.certs) {
-    assert.equal(ac.verifyCert(JSON.stringify(c.signed), MANIFEST), c.role);
+    assert.equal(ac.verifyCert(c.signed_canonical, MANIFEST), c.role);
     assert.equal(ac.publicKey(b64d(c.participant_seed)), c.participant_pub);
     assert.equal(ac.fingerprint(c.participant_pub), c.participant_fingerprint);
   }
-  ac.verifyJoin(JSON.stringify(VEC.join.signed), MANIFEST);
+  ac.verifyJoin(VEC.join.signed_canonical, MANIFEST);
 });
 
-test("items open and pass policy", () => {
+test("items open with cert-bound roles", () => {
   const key = b64d(VEC.session.session_key);
   for (const it of VEC.items) {
-    const env = JSON.stringify(it.envelope);
     const blob = b64d(it.blob);
-    const pt = ac.openItem(key, env, blob);
-    assert.deepEqual(pt, b64d(it.payload), it.name);
-    assert.equal(ac.decodePayload(pt).meta, it.payload_meta_canonical);
-    ac.checkPayload(MANIFEST, it.author_role, env, pt);
+    const cert = VEC.certs[it.author_cert_index].signed_canonical;
+    assert.equal(ac.checkHeader(MANIFEST, cert, it.envelope_canonical, blob), it.author_role);
+    const out = ac.openChecked(MANIFEST, cert, key, it.envelope_canonical, blob);
+    assert.equal(out.role, it.author_role);
+    assert.equal(out.meta, it.payload_meta_canonical);
+    assert.equal(JSON.parse(ac.itemRef(it.envelope_canonical, blob)).blob_sha256, it.blob_sha256);
   }
+  const it = VEC.items[0];
+  assert.equal(
+    errClass(() => ac.checkHeader(MANIFEST, CERTS.owner.signed_canonical, it.envelope_canonical, b64d(it.blob))),
+    "PolicyError",
+  );
 });
 
-test("negative items", () => {
+test("negative items and payloads", () => {
   const key = b64d(VEC.session.session_key);
-  const want = { signature: "SignatureError", decrypt: "DecryptError" };
+  const want = { signature: "SignatureError", decrypt: "DecryptError", invalid: "ValidationError" };
   for (const n of VEC.negative_items) {
     const k = n.session_key ? b64d(n.session_key) : key;
-    assert.equal(errClass(() => ac.openItem(k, JSON.stringify(n.envelope), b64d(n.blob))), want[n.expect], n.name);
+    assert.equal(errClass(() => ac.openItem(k, n.envelope_canonical, b64d(n.blob))), want[n.expect], n.name);
+  }
+  for (const n of VEC.negative_payloads) {
+    assert.equal(errClass(() => ac.decodePayload(b64d(n.payload))), "ValidationError", n.name);
   }
 });
 
 test("seal in wasm, open with vectors key", () => {
   const key = b64d(VEC.session.session_key);
-  const sender = b64d(VEC.certs[1].participant_seed);
   const payload = ac.encodePayload(JSON.stringify({ type: "text", text: "from the browser" }), new Uint8Array());
   const created = VEC.inputs.session_params.created_at_ms + 50;
   const out = ac.sealItem(
     key,
-    sender,
+    b64d(CERTS.observer.participant_seed),
     JSON.stringify({ id: ac.newItemId(), session_id: VEC.session.session_id, kind: "text", subkind: null, created_at_ms: created }),
     payload,
   );
   assert.deepEqual(ac.openItem(key, out.envelope, out.blob), payload);
-  assert.equal(errClass(() => ac.checkHeader(MANIFEST, "observer", out.envelope)), "PolicyError");
+  assert.equal(errClass(() => ac.checkHeader(MANIFEST, CERTS.observer.signed_canonical, out.envelope, out.blob)), "PolicyError");
 });

@@ -8,7 +8,9 @@
 //! ```
 //!
 //! The header is plaintext so the server can enforce policy; it carries no
-//! names or content. The AAD binds header to ciphertext, so the server cannot
+//! names or content. References to other items are [`ItemRef`]s carrying the
+//! referenced blob's hash, so a relay (or anyone holding the session key)
+//! cannot substitute a different item under the same id. The AAD binds header to ciphertext, so the server cannot
 //! relabel a job as a message. The signature covers the blob hash, so the
 //! server can check authorship without the key.
 
@@ -19,7 +21,7 @@ use rand_core::{CryptoRngCore, OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
-use crate::encoding::{b64e, canonical_json, sha256};
+use crate::encoding::{b64d, b64d_32, b64e, canonical_json, sha256, MAX_SAFE_INTEGER};
 use crate::keys::{ctx, Keypair, PublicKey, Sig};
 use crate::session::{is_session_id, ContentType};
 use crate::{Error, Result, PROTOCOL_VERSION};
@@ -63,7 +65,35 @@ pub struct ItemHeader {
     /// Plaintext payload length in bytes.
     pub size: u64,
     pub created_at_ms: u64,
-    pub refs: Vec<String>,
+    pub refs: Vec<ItemRef>,
+}
+
+/// A reference to another item, pinned to its exact ciphertext.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct ItemRef {
+    pub id: String,
+    /// base64url SHA-256 of the referenced item's blob.
+    pub blob_sha256: String,
+}
+
+impl ItemRef {
+    pub fn to(item: &SealedItem) -> Self {
+        ItemRef { id: item.envelope.header.id.clone(), blob_sha256: b64e(&item.blob_sha256()) }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !is_item_id(&self.id) {
+            return Err(Error::invalid("item ref", "malformed id"));
+        }
+        b64d_32(&self.blob_sha256).map_err(|_| Error::invalid("item ref", "blob_sha256 must be 32 bytes"))?;
+        Ok(())
+    }
+
+    /// True when `item` is exactly the item this reference names.
+    pub fn matches(&self, item: &SealedItem) -> bool {
+        self.id == item.envelope.header.id && self.blob_sha256 == b64e(&item.blob_sha256())
+    }
 }
 
 /// Item ids are 16 random bytes, base64url (22 characters).
@@ -77,8 +107,9 @@ pub fn new_item_id_with<R: CryptoRngCore + ?Sized>(rng: &mut R) -> String {
     b64e(&b)
 }
 
+/// Exactly 22 base64url characters that decode (strictly) to 16 bytes.
 pub fn is_item_id(s: &str) -> bool {
-    s.len() == 22 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    s.len() == 22 && b64d(s).is_ok_and(|b| b.len() == 16)
 }
 
 impl ItemHeader {
@@ -92,8 +123,14 @@ impl ItemHeader {
         if !is_session_id(&self.session_id) {
             return Err(Error::invalid("item header", "malformed session id"));
         }
-        if self.refs.len() > MAX_REFS || !self.refs.iter().all(|r| is_item_id(r)) {
-            return Err(Error::invalid("item header", "refs must be up to 64 item ids"));
+        if self.created_at_ms > MAX_SAFE_INTEGER || self.size > MAX_SAFE_INTEGER {
+            return Err(Error::invalid("item header", "integer out of range"));
+        }
+        if self.refs.len() > MAX_REFS {
+            return Err(Error::invalid("item header", "at most 64 refs"));
+        }
+        for r in &self.refs {
+            r.validate()?;
         }
         use ContentType as C;
         let ok = matches!(
@@ -143,7 +180,7 @@ pub struct NewItem {
     pub subkind: Option<ContentType>,
     pub created_at_ms: u64,
     #[serde(default)]
-    pub refs: Vec<String>,
+    pub refs: Vec<ItemRef>,
 }
 
 pub fn item_key(session_key: &[u8; 32], session_id: &str, item_id: &str) -> [u8; 32] {
@@ -247,7 +284,7 @@ mod tests {
     fn new(kind: ItemKind, subkind: Option<ContentType>) -> NewItem {
         NewItem {
             id: "AAAAAAAAAAAAAAAAAAAAAA".into(),
-            session_id: "ak_aaaaaaaaaaaa".into(),
+            session_id: "ak_aaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             kind,
             subkind,
             created_at_ms: 5,
@@ -290,6 +327,26 @@ mod tests {
         let forged = SealedItem { envelope: ItemEnvelope { header: h, sig }, blob: s.blob.clone() };
         forged.verify().unwrap();
         assert_eq!(forged.open(&k), Err(Error::Decrypt));
+    }
+
+    #[test]
+    fn item_ids_must_decode() {
+        assert!(is_item_id("AAAAAAAAAAAAAAAAAAAAAA"));
+        assert!(!is_item_id("AAAAAAAAAAAAAAAAAAAAAB"), "non-zero trailing bits");
+        assert!(!is_item_id("AAAAAAAAAAAAAAAAAAAAA"));
+    }
+
+    #[test]
+    fn refs_pin_the_blob() {
+        let k = [1u8; 32];
+        let a = Keypair::from_seed(&[2u8; 32]);
+        let x = seal(&k, &a, new(ItemKind::Text, None), b"original").unwrap();
+        let y = seal(&k, &a, new(ItemKind::Text, None), b"substitute").unwrap();
+        let r = ItemRef::to(&x);
+        r.validate().unwrap();
+        assert!(r.matches(&x));
+        assert_eq!(x.header().id, y.header().id);
+        assert!(!r.matches(&y), "same id, different content must not match");
     }
 
     #[test]
