@@ -1,5 +1,5 @@
 # Airlock developer tasks. Requires: rustup, uv, maturin, wasm-bindgen-cli 0.2.100, node 20+.
-.PHONY: all check fmt lint test test-rust test-python test-sdk test-wasm vectors wasm python server web clean
+.PHONY: all check fmt lint test test-rust test-python test-sdk test-wasm vectors wasm python server runner web clean
 
 all: check
 
@@ -28,10 +28,15 @@ python:
 server:
 	cargo build -q -p airlock-server
 
+runner:
+	cargo build -q -p airlock
+
 test-python: python
 	$(VENV)/bin/python -m pytest -q bindings/python/tests
 
-test-sdk: python server
+# Execute-mode tests use the local sandbox (needs uv; on Linux, unprivileged
+# user namespaces) and, when a Docker daemon is up, the docker backend.
+test-sdk: python server runner
 	$(VENV)/bin/python -m pytest -q python/airlock-agent/tests
 
 wasm:

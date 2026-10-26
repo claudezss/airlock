@@ -324,6 +324,15 @@ pub trait Sandbox: Send + Sync {
 network: bool, env}`. `RawResult` = `{exit_code, stdout_path, stderr_path,
 wall_ms, peak_mem_mb, out_dir}`.
 
+*As built in M2:* the backends are an enum in `crates/airlock/src/sandbox`,
+and the docker backend drives the `docker` CLI rather than `bollard` (the
+surface used is `build`, `run`, `kill`, `inspect` and `rm`). Jobs find their
+output directory in `$AIRLOCK_OUT` (`/out` in containers and the Linux
+sandbox), set by the shim's `--out`. Top-level images in `/out` come back as
+image items; everything else is bundled into `out.zip`; links and special
+files are skipped with a note in stderr. The relay refuses `job` items on
+`POST /items`, so every job goes through routing (protocol §13).
+
 All backends execute the same tiny **job shim**, a dependency-free Python
 script embedded in `airlock-core` and copied into the sandbox: it sets
 `cwd=/work`, scrubs the environment, runs `python -E -s entry.py`, enforces the
@@ -353,7 +362,7 @@ in the design possible.
 
 | | local | docker | kubernetes |
 |---|---|---|---|
-| Isolation | **Linux:** user + mount + net + pid namespaces, Landlock filesystem rules (ro venv, rw `/work` and `/out`), seccomp allowlist, cgroups v2 memory/cpu/pids limits, no network namespace interfaces → `network: false` is enforced. **macOS/Windows:** process only (rlimits, fresh temp dir, scrubbed env, process-group kill); network cannot be blocked, the runner reports `network: host` and the UI shows a warning badge. | Container per job: `--network none`, `--memory`, `--cpus`, `--pids-limit`, `--read-only` rootfs, `--tmpfs /tmp`, `--cap-drop ALL`, `--security-opt no-new-privileges`, non-root user, bind-mount `/work` (rw) and `/out` (rw). Optional `--runtime runsc` (gVisor). | Pod per job (not `Job`, simpler cleanup): restricted `securityContext`, resource requests/limits, `automountServiceAccountToken: false`, emptyDir for `/work` and `/out`, deny-all `NetworkPolicy` label, optional `runtimeClassName: gvisor`. |
+| Isolation | **Linux:** user + mount + net + pid + ipc + uts namespaces, a minimal root of read-only binds (system dirs, the runtime venv) with `/work`, `/out` and `/meta` writable, pivoted into, plus Landlock rules, all capabilities dropped and `no_new_privs`; no network namespace interfaces → `network: false` is enforced. *As built in M2:* memory is `RLIMIT_AS`, not cgroups, and there is no seccomp filter yet (both open, §13). **macOS/Windows:** process only (rlimits, fresh temp dir, scrubbed env, process-group kill); network cannot be blocked, the runner reports `network: host` and the UI shows a warning badge. | Container per job: `--network none`, `--memory`, `--cpus`, `--pids-limit`, `--read-only` rootfs, `--tmpfs /tmp`, `--cap-drop ALL`, `--security-opt no-new-privileges`, non-root user, bind-mount `/work` (rw) and `/out` (rw). Optional `--runtime runsc` (gVisor). | Pod per job (not `Job`, simpler cleanup): restricted `securityContext`, resource requests/limits, `automountServiceAccountToken: false`, emptyDir for `/work` and `/out`, deny-all `NetworkPolicy` label, optional `runtimeClassName: gvisor`. |
 | Input delivery | copy into temp dir | bind mount | runner pod streams a tar into the job pod via the exec API (`kubectl cp` semantics) before signalling start; no shared PVC needed |
 | Output | read temp dir | read bind mount | exec `tar -C /out` back; logs via the logs API |
 | Who runs it | developer laptop, trusted CI | default for receivers | runner deployed as a `Deployment` in-cluster with a ServiceAccount allowed to create/exec/delete pods in one namespace |
@@ -781,7 +790,7 @@ format churn is where Rust is slowest.
 |---|---|---|
 | M0 | **Protocol freeze.** `docs/protocol.md` (manifest, certs, item envelope, job/result payloads) and generated test vectors; `airlock-core` crate implementing it; PyO3 wheel and wasm package passing the same vectors; CI building wheels, wasm and static binaries | vectors round-trip in Rust, Python and the browser; a protocol change requires a version bump |
 | M1 | **Relay mode.** Rust server with file-backed storage (sessions, participants, items, SSE, expiry purge, ack and evict-on-delivery, cost controls) + Python SDK with local cache + minimal web timeline with IndexedDB history, all four content types | two SDK processes exchange text, md, zip and image through one `airlock-server --data ./data` process; the browser renders them; blobs leave the relay once both sides acked; a restart in persistent mode keeps the session |
-| M2 | **Execute mode.** Runner with **local** (Linux sandboxed) and **docker** backends, routing, approval, results with `/out`, runner console page | the design's `summarize.py` scenario runs end to end on docker with network off |
+| M2 | **Execute mode.** Runner with **local** (Linux sandboxed) and **docker** backends, routing, approval, results with `/out`, runner console page | the design's `summarize.py` scenario runs end to end on docker with network off (**done**: `examples/summarize`, `test_docker.py`) |
 | M3 | **kubernetes** backend, runtime image build/push, RBAC + NetworkPolicy manifests, Helm chart | same scenario on `kind` |
 | M4 | New-session and live-session pages to design parity, full CLI, MCP server, audit export, role revoke, re-seeding evicted blobs | a non-coding user can create a session, hand out links, approve a runner and read results; a late joiner gets an evicted file from a peer's cache |
 | v2 | Direct peer-to-peer file transfer over WebRTC (signaling via the relay, STUN only, relay buffer as fallback); sharding across relay instances by session id | files between two online peers never touch the relay |
@@ -819,3 +828,15 @@ format churn is where Rust is slowest.
    requests with the participant key, and expiring tokens, would remove the
    remaining reliance on the token. Proposed: add both with the M4 role
    revoke work.
+9. **Local sandbox hardening (after M2).** The Linux local backend caps
+   memory with `RLIMIT_AS`, which over-counts address space for numeric
+   libraries, and has no seccomp filter. Proposed: cgroup v2 limits when the
+   runner has a delegated cgroup (e.g. under `systemd-run --user`), and a
+   seccomp denylist (`ptrace`, `bpf`, `keyctl`, `perf_event_open`, new
+   namespaces) before M4. The job also sees itself as uid 0 inside its user
+   namespace, with no capabilities; for that reason the runner refuses the
+   local sandbox when it runs as root. Also open: per-job process and disk
+   quotas (a fork bomb or many files can still exhaust the host), blocking
+   loopback and link-local addresses (`169.254.169.254`) when a session
+   allows network, binding only the needed `/etc` files, pinning the runtime
+   base image and packages, and size caps on relay responses in the runner.

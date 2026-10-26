@@ -5,7 +5,7 @@ Runs one job entry file inside a sandbox and records what happened. Standard
 library only, so it works in any python3.8+ image.
 
     python3 shim.py --work DIR --entry FILE --timeout SECONDS --result PATH
-                    [--fsize-mb N] [--memory-mb N] [--nproc N]
+                    [--out DIR] [--fsize-mb N] [--memory-mb N] [--nproc N]
 
 Writes PATH (result.json) plus stdout.txt and stderr.txt beside it. Always
 exits 0 when it managed to write result.json; the job's own outcome is inside.
@@ -159,6 +159,7 @@ def main(argv=None):
     ap.add_argument("--timeout", type=float, required=True)
     ap.add_argument("--result", required=True)
     ap.add_argument("--python", default=sys.executable)
+    ap.add_argument("--out", help="output directory, passed to the job as AIRLOCK_OUT")
     ap.add_argument("--fsize-mb", type=int, default=1024)
     ap.add_argument("--memory-mb", type=int, default=0, help="RLIMIT_AS; prefer cgroups")
     ap.add_argument("--nproc", type=int, default=0, help="RLIMIT_NPROC; needs a dedicated uid")
@@ -205,6 +206,8 @@ def main(argv=None):
         "TMPDIR": tmpdir,
         "MPLBACKEND": "Agg",
     }
+    if a.out:
+        env["AIRLOCK_OUT"] = os.path.abspath(a.out)
     if IS_WINDOWS:
         env["SYSTEMROOT"] = os.environ.get("SYSTEMROOT", r"C:\Windows")
         env["PATH"] = os.path.dirname(python)

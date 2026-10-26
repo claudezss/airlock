@@ -58,6 +58,12 @@ pub struct Config {
     /// How long a blob stays after its last recipient acked.
     #[arg(long = "blob-grace", env = "AIRLOCK_BLOB_GRACE", default_value = "5m", value_parser = parse_duration_ms)]
     pub blob_grace_ms: u64,
+    /// How long a runner has to claim an assigned job before it fails.
+    #[arg(long = "claim-timeout", env = "AIRLOCK_CLAIM_TIMEOUT", default_value = "5s", value_parser = parse_duration_ms)]
+    pub claim_timeout_ms: u64,
+    /// A runner without a heartbeat for this long is offline, and its job fails.
+    #[arg(long = "runner-timeout", env = "AIRLOCK_RUNNER_TIMEOUT", default_value = "30s", value_parser = parse_duration_ms)]
+    pub runner_timeout_ms: u64,
     /// How often expiry, idle and eviction timers are checked.
     #[arg(long = "sweep-interval", env = "AIRLOCK_SWEEP_INTERVAL", default_value = "1s", value_parser = parse_duration_ms)]
     pub sweep_interval_ms: u64,

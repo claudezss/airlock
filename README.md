@@ -10,21 +10,27 @@ No LLM is needed on the receiving side.
 
 ## Status
 
-**M1 (relay mode) is done.** `airlock-server` relays end-to-end encrypted
+**M2 (execute mode) is done.** `airlock-server` relays end-to-end encrypted
 sessions with no database: each session is an append-only log plus blob
-files, and blobs leave the relay once every recipient has stored them. The
-Python SDK and a minimal browser timeline exchange text, Markdown, Python,
-ZIP and images through it. Execute mode and runners are next (M2).
+files, and blobs leave the relay once every recipient has stored them. In
+execute sessions it also routes jobs to runners, with no queue. The
+`airlock` binary runs jobs in a **docker** sandbox or a **local** one
+(namespaces, a read-only minimal root and Landlock on Linux; a plain process
+elsewhere), after verifying every signature itself. The Python SDK and the
+browser UI share text, Markdown, Python, ZIP and images, approve runners,
+submit jobs and show signed results. Kubernetes is next (M3).
 
 | Path | What |
 |---|---|
 | `crates/airlock-core` | Protocol types, canonical JSON, Ed25519/AES-GCM/HKDF, invites, certificates, item envelope, payloads, policy, ZIP/Markdown/image validators, job shim |
 | `crates/airlock-core/vectors/v1.json` | Conformance vectors every implementation must pass |
-| `crates/airlock-server` | The relay: file-backed sessions, SSE, ack and evict-on-delivery, cost controls, embedded web UI |
+| `crates/airlock-server` | The relay: file-backed sessions, SSE, ack and evict-on-delivery, cost controls, job routing, embedded web UI |
+| `crates/airlock` | The `airlock` binary: `airlock runner join` with docker and local sandboxes |
 | `bindings/python` | PyO3 module `airlock_core` (abi3 wheel, Python 3.9+) |
 | `bindings/wasm` | wasm-bindgen package for browsers and Node |
 | `python/airlock-agent` | Python SDK `airlock` with a local ciphertext cache |
-| `web` | Browser timeline (plain JS over the wasm package) |
+| `web` | Browser UI (plain JS over the wasm package): sessions, timeline, runner console, jobs |
+| `examples/summarize` | The execute-mode scenario: pandas and matplotlib on a docker runner |
 
 ## Quick start
 
@@ -50,6 +56,34 @@ s.send_file("report.md")
 for item in s.stream():
     print(item.author_role, item.kind, item.text or item.name)
 ```
+
+### Running code (execute mode)
+
+Create an execute session (in the browser, or `Session.create(url,
+mode="execute", job_limits={…})`), then start a runner on the machine that
+should run the code, with the runner invite:
+
+```bash
+cargo run --release -p airlock -- runner join --invite '<runner invite>' --name runner-01 --labels cpu --sandbox docker
+```
+
+The runner builds its job image once (`python:3.12-slim` plus the session's
+package allowlist) and waits for the owner's approval. Then a sender can run
+code on it:
+
+```python
+data = s.send_file("dataset.zip")
+job = s.run_python(open("summarize.py").read(), filename="summarize.py", files=[data], runner="runner-01")
+res = job.wait()                      # NoRunnerAvailable is raised at once if no runner matches
+print(res.status, res.exit_code, res.stdout)
+chart = res.out_file("chart.png").data  # files the job wrote to $AIRLOCK_OUT (/out)
+```
+
+Jobs run with no network, under the session's time and memory limits, and
+the runner refuses anything not signed by a sender or the owner. See
+[examples/summarize](examples/summarize). `--sandbox local` needs `uv` and,
+on Linux, unprivileged user namespaces; on macOS it is a plain process, for
+trusted code only.
 
 Add `--ephemeral` to keep nothing across restarts. `--help` lists the cost
 controls (TTL, item and session size, session history, transfer, session
@@ -77,5 +111,6 @@ make check
 ```
 
 `make check` runs rustfmt, Clippy with warnings as errors (native and wasm),
-the Rust tests (including the relay), the Python binding and SDK tests, and
-the wasm tests in Node.
+the Rust tests (including the relay), the Python binding and SDK tests
+(including execute mode against a real runner, and the docker scenario when a
+Docker daemon is available), and the wasm tests in Node.

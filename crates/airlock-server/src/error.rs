@@ -30,6 +30,9 @@ impl ApiError {
     pub fn conflict(m: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, "conflict", m)
     }
+    pub fn no_runner(m: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, "no_runner_available", m)
+    }
     pub fn gone(code: &'static str, m: impl Into<String>) -> Self {
         Self::new(StatusCode::GONE, code, m)
     }

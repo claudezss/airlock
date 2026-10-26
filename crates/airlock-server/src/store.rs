@@ -12,7 +12,8 @@
 //!
 //! Every state change is a log line, fsynced before it is applied or
 //! broadcast, so the in-memory index can always be rebuilt from the log and
-//! no client ever sees an event id that a crash could reuse.
+//! no client ever sees an event id that a crash could reuse. Runner presence
+//! (open streams, heartbeats) lives in memory only.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -20,10 +21,10 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
-use airlock_core::cert::SignedJoinRequest;
+use airlock_core::cert::{RunnerInfo, SignedJoinRequest};
 use airlock_core::encoding::{parse_canonical, sha256};
 use airlock_core::item::ItemEnvelope;
-use airlock_core::session::{is_session_id, Role, SignedManifest};
+use airlock_core::session::{is_session_id, Mode, Role, SignedManifest};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
@@ -40,13 +41,66 @@ const EVENT_BUFFER: usize = 1024;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Rec {
-    Create { ip_hash: String },
-    Join { signed_join: String, token_sha256: String },
-    Item { envelope: String, recipients: Vec<String>, blob_len: u64 },
-    Ack { item: String, by: String },
-    Leave { who: String },
-    Evict { item: String },
-    Close { reason: String },
+    Create {
+        ip_hash: String,
+    },
+    Join {
+        signed_join: String,
+        token_sha256: String,
+    },
+    Item {
+        envelope: String,
+        recipients: Vec<String>,
+        blob_len: u64,
+    },
+    Ack {
+        item: String,
+        by: String,
+    },
+    Leave {
+        who: String,
+    },
+    Evict {
+        item: String,
+    },
+    Close {
+        reason: String,
+    },
+    /// The owner let a runner take jobs.
+    Approve {
+        who: String,
+    },
+    /// The owner turned a runner away; like `Leave`, its token stops working.
+    Reject {
+        who: String,
+    },
+    /// A job's relay-side state. The signed result is the source of truth;
+    /// this only tracks routing.
+    Job {
+        job: String,
+        state: JobState,
+        runner: Option<String>,
+        reason: Option<String>,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JobState {
+    /// Sent to a runner, which has not claimed it yet.
+    Assigned,
+    /// Claimed by its runner.
+    Running,
+    /// Its runner posted a result referencing it.
+    Done,
+    /// Never ran or was abandoned; see the reason.
+    Failed,
+}
+
+impl JobState {
+    pub fn active(self) -> bool {
+        matches!(self, JobState::Assigned | JobState::Running)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -70,6 +124,37 @@ pub struct Participant {
     pub seq: u64,
     pub public: Value,
     pub left: bool,
+    pub runner: Option<RunnerInfo>,
+    pub approved: bool,
+    pub rejected: bool,
+    /// The runner's active job, if any.
+    pub job: Option<String>,
+}
+
+pub struct JobRec {
+    pub author: String,
+    pub runner: Option<String>,
+    pub state: JobState,
+    pub reason: Option<String>,
+    /// When it entered its current state.
+    pub since_ms: u64,
+    /// A cancel was requested while it ran (in memory only).
+    pub cancel_requested: bool,
+}
+
+/// A runner's liveness. In memory only: after a restart runners reconnect.
+#[derive(Default)]
+pub struct Presence {
+    pub streams: usize,
+    pub last_seen_ms: u64,
+}
+
+/// A message on one runner's private stream.
+#[derive(Debug, Clone)]
+pub struct RunnerMsg {
+    pub runner: String,
+    pub kind: &'static str,
+    pub data: Value,
 }
 
 pub struct ItemRec {
@@ -101,9 +186,13 @@ pub struct Inner {
     pub closed: bool,
     pub ip_hash: Option<String>,
     pub streams: HashMap<String, usize>,
+    pub jobs: HashMap<String, JobRec>,
+    pub presence: HashMap<String, Presence>,
     evictions: BTreeMap<u64, Vec<String>>,
     hold_ms: u64,
     grace_ms: u64,
+    /// Whether runners need the owner's approval before they get jobs.
+    approve_runners: bool,
 }
 
 impl Inner {
@@ -128,6 +217,21 @@ impl Inner {
                     self.evictions.entry(t).or_default().push(item.to_string());
                 }
             }
+        }
+    }
+
+    /// Stop counting `who` as a recipient and revoke its token.
+    fn depart(&mut self, who: &str, ts: u64) {
+        self.tokens.retain(|_, pk| pk != who);
+        // Stop waiting for this participant on blobs still held.
+        let waiting: Vec<String> = self
+            .items
+            .iter_mut()
+            .filter(|(_, r)| r.blob_present && !r.acked.contains(who))
+            .filter_map(|(id, r)| r.recipients.remove(who).then(|| id.clone()))
+            .collect();
+        for id in waiting {
+            self.check_delivered(&id, ts);
         }
     }
 
@@ -159,7 +263,16 @@ impl Inner {
                 });
                 self.participants.insert(
                     pk.clone(),
-                    Participant { role, seq: line.seq, public: public.clone(), left: false },
+                    Participant {
+                        role,
+                        seq: line.seq,
+                        public: public.clone(),
+                        left: false,
+                        runner: j.join.runner.clone(),
+                        approved: false,
+                        rejected: false,
+                        job: None,
+                    },
                 );
                 self.tokens.insert(token_sha256.clone(), pk);
                 self.last_activity_ms = self.last_activity_ms.max(ts);
@@ -204,18 +317,53 @@ impl Inner {
                 if let Some(p) = self.participants.get_mut(who) {
                     p.left = true;
                 }
-                self.tokens.retain(|_, pk| pk != who);
-                // Stop waiting for this participant on blobs still held.
-                let waiting: Vec<String> = self
-                    .items
-                    .iter_mut()
-                    .filter(|(_, r)| r.blob_present && !r.acked.contains(who))
-                    .filter_map(|(id, r)| r.recipients.remove(who).then(|| id.clone()))
-                    .collect();
-                for id in waiting {
-                    self.check_delivered(&id, ts);
-                }
+                self.depart(who, ts);
                 Ok(self.push_event(line.seq, "left", json!({"participant_pub": who})))
+            }
+            Rec::Approve { who } => {
+                if let Some(p) = self.participants.get_mut(who) {
+                    p.approved = true;
+                }
+                Ok(self.push_event(line.seq, "runner", json!({"participant_pub": who, "status": "approved"})))
+            }
+            Rec::Reject { who } => {
+                if let Some(p) = self.participants.get_mut(who) {
+                    p.rejected = true;
+                    p.approved = false;
+                }
+                self.depart(who, ts);
+                Ok(self.push_event(line.seq, "runner", json!({"participant_pub": who, "status": "rejected"})))
+            }
+            Rec::Job { job, state, runner, reason } => {
+                let author = self.items.get(job).map(|r| r.author.clone()).unwrap_or_default();
+                let prev = self.jobs.get(job).and_then(|j| j.runner.clone());
+                // Free the previous runner; occupy the new one while active.
+                if let Some(p) = prev.as_ref().and_then(|r| self.participants.get_mut(r)) {
+                    if p.job.as_deref() == Some(job.as_str()) {
+                        p.job = None;
+                    }
+                }
+                if state.active() {
+                    if let Some(p) = runner.as_ref().and_then(|r| self.participants.get_mut(r)) {
+                        p.job = Some(job.clone());
+                    }
+                }
+                self.jobs.insert(
+                    job.clone(),
+                    JobRec {
+                        author,
+                        runner: runner.clone(),
+                        state: *state,
+                        reason: reason.clone(),
+                        since_ms: ts,
+                        cancel_requested: false,
+                    },
+                );
+                Ok(self.push_event(
+                    line.seq,
+                    "job",
+                    json!({"job": job, "state": state, "runner": runner, "reason": reason}),
+                ))
             }
             Rec::Evict { item } => {
                 if let Some(r) = self.items.get_mut(item) {
@@ -240,9 +388,41 @@ impl Inner {
         (!p.left).then(|| (pk.clone(), p.role))
     }
 
-    /// Participants who still receive new items.
+    /// Participants who still receive new items. A runner awaiting approval
+    /// is not a recipient, so it cannot pin blobs on the relay.
     pub fn active_participants(&self) -> impl Iterator<Item = &String> {
-        self.participants.iter().filter(|(_, p)| !p.left).map(|(k, _)| k)
+        let need_approval = self.approve_runners;
+        self.participants
+            .iter()
+            .filter(move |(_, p)| {
+                !p.left && !p.rejected && (p.role != Role::Runner || p.approved || !need_approval)
+            })
+            .map(|(k, _)| k)
+    }
+
+    /// Whether a runner may be given jobs: joined, approved (when the
+    /// session requires it) and neither left nor rejected.
+    pub fn runner_eligible(&self, pk: &str) -> bool {
+        self.participants.get(pk).is_some_and(|p| {
+            p.role == Role::Runner && !p.left && !p.rejected && (p.approved || !self.approve_runners)
+        })
+    }
+
+    /// Online: an open runner stream and a heartbeat within `timeout_ms`.
+    pub fn runner_online(&self, pk: &str, now: u64, timeout_ms: u64) -> bool {
+        self.presence
+            .get(pk)
+            .is_some_and(|p| p.streams > 0 && now.saturating_sub(p.last_seen_ms) <= timeout_ms)
+    }
+
+    pub fn approve_runners(&self) -> bool {
+        self.approve_runners
+    }
+
+    /// The `item` event carrying this item's envelope.
+    pub fn item_event(&self, id: &str) -> Option<&Arc<Event>> {
+        let seq = self.items.get(id)?.seq;
+        self.events.binary_search_by_key(&seq, |e| e.seq).ok().map(|i| &self.events[i])
     }
 }
 
@@ -253,6 +433,9 @@ pub struct Session {
     pub manifest_json: String,
     inner: Mutex<Inner>,
     pub tx: broadcast::Sender<Arc<Event>>,
+    /// Private messages to runners (assignments, cancels); each runner
+    /// stream keeps only its own.
+    pub runner_tx: broadcast::Sender<Arc<RunnerMsg>>,
 }
 
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
@@ -267,7 +450,10 @@ fn invalid(e: impl std::fmt::Display) -> io::Error {
 }
 
 impl Session {
-    fn new_inner(log: File, log_len: u64, cfg: &Config) -> Inner {
+    fn new_inner(log: File, log_len: u64, cfg: &Config, signed: &SignedManifest) -> Inner {
+        let m = &signed.manifest;
+        let approve_runners =
+            m.mode == Mode::Execute && m.job_limits.as_ref().is_none_or(|l| l.approve_runners);
         Inner {
             log,
             log_len,
@@ -285,9 +471,12 @@ impl Session {
             closed: false,
             ip_hash: None,
             streams: HashMap::new(),
+            jobs: HashMap::new(),
+            presence: HashMap::new(),
             evictions: BTreeMap::new(),
             hold_ms: cfg.blob_hold_ms,
             grace_ms: cfg.blob_grace_ms,
+            approve_runners,
         }
     }
 
@@ -312,9 +501,10 @@ impl Session {
         if let Some(parent) = dir.parent() {
             sync_dir(parent)?;
         }
-        let mut inner = Self::new_inner(log, 0, cfg);
+        let mut inner = Self::new_inner(log, 0, cfg, &signed);
         inner.last_activity_ms = now_ms();
         let (tx, _) = broadcast::channel(EVENT_BUFFER);
+        let (runner_tx, _) = broadcast::channel(EVENT_BUFFER);
         let s = Session {
             id: signed.manifest.session_id.clone(),
             dir,
@@ -322,6 +512,7 @@ impl Session {
             manifest_json,
             inner: Mutex::new(inner),
             tx,
+            runner_tx,
         };
         {
             let mut g = s.lock();
@@ -347,7 +538,7 @@ impl Session {
             log.set_len(valid as u64)?;
             log.seek(SeekFrom::End(0))?;
         }
-        let mut inner = Self::new_inner(log, valid as u64, cfg);
+        let mut inner = Self::new_inner(log, valid as u64, cfg, &signed);
         for line in raw[..valid].split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
             let line: LogLine = serde_json::from_slice(line).map_err(invalid)?;
             if line.seq != inner.next_seq {
@@ -359,8 +550,19 @@ impl Session {
         if inner.last_activity_ms == 0 {
             inner.last_activity_ms = signed.manifest.created_at_ms;
         }
+        // Runners with an active job get one timeout from now to reconnect.
+        let now = now_ms();
+        let busy: Vec<String> =
+            inner.jobs.values().filter(|j| j.state.active()).filter_map(|j| j.runner.clone()).collect();
+        for r in busy {
+            inner.presence.entry(r).or_default().last_seen_ms = now;
+        }
+        for j in inner.jobs.values_mut().filter(|j| j.state == JobState::Assigned) {
+            j.since_ms = j.since_ms.max(now);
+        }
         let (tx, _) = broadcast::channel(EVENT_BUFFER);
-        let s = Session { id, dir, signed, manifest_json, inner: Mutex::new(inner), tx };
+        let (runner_tx, _) = broadcast::channel(EVENT_BUFFER);
+        let s = Session { id, dir, signed, manifest_json, inner: Mutex::new(inner), tx, runner_tx };
         s.reconcile_blobs()?;
         Ok(s)
     }
@@ -425,6 +627,59 @@ impl Session {
             let _ = self.tx.send(e.clone());
         }
         Ok(ev)
+    }
+
+    /// Send a message on one runner's private stream.
+    pub fn tell_runner(&self, runner: &str, kind: &'static str, data: Value) {
+        let _ = self.runner_tx.send(Arc::new(RunnerMsg { runner: runner.to_string(), kind, data }));
+    }
+
+    /// Record a job state change. Blocks on disk.
+    pub fn set_job(
+        &self,
+        inner: &mut Inner,
+        job: &str,
+        state: JobState,
+        runner: Option<String>,
+        reason: Option<&str>,
+    ) -> io::Result<()> {
+        let rec = Rec::Job { job: job.to_string(), state, runner, reason: reason.map(str::to_string) };
+        self.append(inner, rec).map(|_| ())
+    }
+
+    /// Fail the active job of a runner that left, was rejected or went quiet.
+    pub fn fail_runner_job(&self, inner: &mut Inner, runner: &str, reason: &str) -> io::Result<()> {
+        let job = inner.participants.get(runner).and_then(|p| p.job.clone());
+        if let Some(job) = job {
+            self.set_job(inner, &job, JobState::Failed, Some(runner.to_string()), Some(reason))?;
+            self.tell_runner(runner, "job_cancel", json!({"job": job}));
+        }
+        Ok(())
+    }
+
+    /// Fail jobs that were not claimed in time or whose runner stopped
+    /// sending heartbeats.
+    fn sweep_jobs(&self, now: u64, claim_ms: u64, runner_ms: u64) -> io::Result<()> {
+        let mut g = self.lock();
+        let mut due = Vec::new();
+        for (id, j) in g.jobs.iter().filter(|(_, j)| j.state.active()) {
+            let Some(runner) = j.runner.clone() else { continue };
+            let seen = g.presence.get(&runner).map(|p| p.last_seen_ms).unwrap_or(0);
+            if j.state == JobState::Assigned && now.saturating_sub(j.since_ms) > claim_ms {
+                due.push((id.clone(), runner, "runner_unresponsive"));
+            } else if now.saturating_sub(seen.max(j.since_ms)) > runner_ms {
+                due.push((id.clone(), runner, "runner_lost"));
+            }
+        }
+        for (job, runner, reason) in due {
+            self.set_job(&mut g, &job, JobState::Failed, Some(runner.clone()), Some(reason))?;
+            self.tell_runner(&runner, "job_cancel", json!({"job": job}));
+            // Unresponsive: offline until its next heartbeat.
+            if let Some(p) = g.presence.get_mut(&runner) {
+                p.last_seen_ms = 0;
+            }
+        }
+        Ok(())
     }
 
     pub fn blob_path(&self, item: &str) -> PathBuf {
@@ -730,6 +985,9 @@ impl Store {
             }
             if let Err(e) = s.sweep_evictions(now) {
                 tracing::error!(session = %s.id, "eviction failed: {e}");
+            }
+            if let Err(e) = s.sweep_jobs(now, self.cfg.claim_timeout_ms, self.cfg.runner_timeout_ms) {
+                tracing::error!(session = %s.id, "job sweep failed: {e}");
             }
         }
         self.tombstones.lock().unwrap_or_else(|e| e.into_inner()).retain(|id, until| {

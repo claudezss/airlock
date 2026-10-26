@@ -299,6 +299,29 @@ pub fn check_result(r: &JobResult) -> Result<()> {
     Ok(())
 }
 
+/// A result counts only from a runner the owner approved, when the session
+/// requires approval. `approved` lists the runners with a verified
+/// `runner_approve` event and no `runner_reject` (a rejection is final);
+/// `None` means the session does not require approval.
+pub fn check_result_author(approved: Option<&[PublicKey]>, result_author: PublicKey) -> Result<()> {
+    match approved {
+        Some(list) if !list.contains(&result_author) => {
+            Err(Error::policy("result is not from a runner the owner approved"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Whether a runner with this key and these labels may take a job aimed at
+/// `target`. The relay routes with it; the runner re-checks the signed target.
+pub fn target_matches(target: &Target, runner: PublicKey, labels: &[String]) -> bool {
+    match target {
+        Target::Runner { participant_pub, .. } => *participant_pub == runner,
+        Target::Labels { labels: want } => want.iter().all(|l| labels.contains(l)),
+        Target::Any => true,
+    }
+}
+
 /// Bind a result to the job it claims to answer. `job_ref` must already have
 /// been matched against the fetched job item ([`ItemRef::matches`]). A job
 /// aimed at one runner only accepts a result from that runner's key.
@@ -483,6 +506,22 @@ mod tests {
         check_result_matches_job(&iref(3), &j, runner, &r).unwrap();
         assert!(check_result_matches_job(&iref(3), &j, intruder, &r).is_err());
         assert!(check_result_matches_job(&iref(7), &j, runner, &r).is_err());
+        check_result_author(None, intruder).unwrap();
+        check_result_author(Some(&[runner]), runner).unwrap();
+        assert!(check_result_author(Some(&[runner]), intruder).is_err());
+        assert!(check_result_author(Some(&[]), runner).is_err());
+    }
+
+    #[test]
+    fn targets() {
+        let me = Keypair::from_seed(&[5u8; 32]).public();
+        let other = Keypair::from_seed(&[6u8; 32]).public();
+        let labels = vec!["cpu".to_string(), "py3.12".to_string()];
+        assert!(target_matches(&Target::Any, me, &[]));
+        assert!(target_matches(&Target::Labels { labels: vec!["cpu".into()] }, me, &labels));
+        assert!(!target_matches(&Target::Labels { labels: vec!["gpu".into()] }, me, &labels));
+        assert!(target_matches(&Target::Runner { participant_pub: me, name: "r".into() }, me, &[]));
+        assert!(!target_matches(&Target::Runner { participant_pub: other, name: "r".into() }, me, &[]));
     }
 
     #[test]

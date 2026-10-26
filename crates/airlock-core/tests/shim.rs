@@ -108,6 +108,19 @@ fn runs_job_and_captures_output() {
 }
 
 #[test]
+fn out_dir_is_passed_to_the_job() {
+    if !have_python() {
+        return;
+    }
+    let j = Job::new("import os\nopen(os.path.join(os.environ['AIRLOCK_OUT'], 'r.txt'), 'w').write('ok')\n");
+    let out = j.root.join("out");
+    std::fs::create_dir(&out).unwrap();
+    let r = j.run("job.py", "10", &["--out", out.to_str().unwrap()]);
+    assert_eq!(r.exit_code, Some(0), "{}", j.read("stderr.txt"));
+    assert_eq!(std::fs::read_to_string(out.join("r.txt")).unwrap(), "ok");
+}
+
+#[test]
 fn output_is_unbuffered_when_killed() {
     if !have_python() {
         return;

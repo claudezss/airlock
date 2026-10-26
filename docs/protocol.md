@@ -293,13 +293,14 @@ All sandbox backends run the embedded `shim.py`:
 
 ```text
 python3 shim.py --work DIR --entry FILE --timeout SECONDS --result PATH
-                [--fsize-mb N] [--memory-mb N] [--nproc N]
+                [--out DIR] [--fsize-mb N] [--memory-mb N] [--nproc N]
 ```
 
 - **Environment.** Only a fixed `PATH` (the interpreter's directory plus
   `/usr/local/bin:/usr/bin:/bin`), `LANG=C.UTF-8`, `HOME` (the work dir),
-  `TMPDIR` (a directory inside the work dir) and `MPLBACKEND=Agg` reach the
-  job. It runs as `python -E -s -u -B -X utf8 FILE`: the work dir is
+  `TMPDIR` (a directory inside the work dir), `MPLBACKEND=Agg` and, with
+  `--out`, `AIRLOCK_OUT` (the output directory: `/out` in containers) reach
+  the job. It runs as `python -E -s -u -B -X utf8 FILE`: the work dir is
   importable, `PYTHON*` variables and user site-packages are ignored, output
   is unbuffered so it survives a kill, and no `.pyc` files are written.
 - **Containment.** The job runs in its own process group. That group is
@@ -323,7 +324,8 @@ python3 shim.py --work DIR --entry FILE --timeout SECONDS --result PATH
 This section fixes how clients talk to `airlock-server` in relay mode. The
 relay sees only what is listed here: signed manifests, signed join requests,
 item envelopes and ciphertext blobs. Execute-mode endpoints (jobs, runners)
-are added in M2 and do not change anything below.
+are in §13 and change nothing here except that `POST /items` refuses `job`
+items, which go through `POST /jobs`.
 
 **Conventions.** All paths are under `/v1`. JSON request bodies for create
 and join are the canonical JSON strings defined above, sent as-is and capped
@@ -431,3 +433,89 @@ until its blob is stored.
 individually and IPv6 addresses per /64. Behind a reverse proxy
 (`--trust-proxy`), the address is the last `X-Forwarded-For` entry, the one
 the proxy appended; earlier entries are client-controlled and ignored.
+
+## 13. Execute HTTP binding
+
+Execute-mode sessions add the endpoints below. All of them need a bearer
+token; all of them answer `403` in a relay-mode session. The relay cannot
+read jobs or results, so everything it does here is routing; the signed
+items stay the source of truth.
+
+| Method and path | Auth | Body | Success |
+|---|---|---|---|
+| `POST /v1/sessions/{id}/jobs` | sender or owner | `Airlock-Target` header + upload frame of a `job` item | `201 {"id", "seq", "state": "assigned", "runner"}` |
+| `GET /v1/sessions/{id}/jobs/{job}` | any | none | `200 {"job", "state", "runner", "reason"}` |
+| `POST /v1/sessions/{id}/jobs/{job}/claim` | the assigned runner | none | `204` |
+| `POST /v1/sessions/{id}/jobs/{job}/cancel` | owner, or the job's sender | none | `202 {"job", "state", "runner", "reason"}` |
+| `GET /v1/sessions/{id}/runners` | any | none | `200 {"runners": [runner…], "approval_required"}` |
+| `POST /v1/sessions/{id}/runners/{participant_pub}/approve` | owner | none | `204` |
+| `POST /v1/sessions/{id}/runners/{participant_pub}/reject` | owner | none | `204` |
+| `GET /v1/sessions/{id}/runners/me/stream` | runner | none | SSE, see below |
+| `POST /v1/sessions/{id}/runners/me/heartbeat` | runner | `{"job": id or null}` (optional) | `200 {"approved", "job"}` |
+
+**Approval.** When the manifest's `approve_runners` is true, a runner gets
+no jobs, and is not a recipient of new items, until the owner approves it.
+The owner does two things: posts a signed `runner_approve` event item (what
+runners and senders verify, §8) and calls `…/approve` (what the relay
+routes on). Rejecting is the same with `runner_reject` and `…/reject`; the
+relay then revokes the runner's token like `leave`, fails its active job
+with `runner_rejected` and ends its streams. When `approve_runners` is false
+every runner is eligible as soon as it joins.
+
+**Submitting.** A sender seals a `job` item and posts its upload frame to
+`POST /jobs` with `Airlock-Target` set to the job's `target` JSON (§7). The
+relay routes on this copy; the runner refuses a job whose signed target does
+not match it. Candidates are runners that are eligible, online, idle and
+match the target (a `runner` target matches only that key; `labels` needs
+every label; `any` matches all). The earliest joined candidate gets the job.
+There is no queue: with no candidate the job item is still stored, its state
+becomes `failed` with reason `not_available`, and the answer is
+`409 no_runner_available`.
+
+**Job states** (relay view): `assigned` → `running` (claimed) → `done`
+(the assigned runner posted a `result` item whose `refs` include the job),
+or `failed` with a reason:
+
+| reason | when |
+|---|---|
+| `not_available` | no candidate at submission |
+| `runner_unresponsive` | not claimed within the claim timeout (default 5 s); the runner is offline until its next heartbeat |
+| `runner_lost` | no heartbeat within the runner timeout (default 30 s), or a heartbeat reported a different job |
+| `runner_left`, `runner_rejected` | its runner left or was rejected |
+| `cancelled` | cancelled before it was claimed |
+
+Every change is a `job` event `{job, state, runner, reason}` on the session
+stream. Approvals and rejections are `runner` events
+`{participant_pub, status: "approved" | "rejected"}`. Both are relay
+metadata, unsigned: clients decide what happened from signed items.
+
+**Runner stream.** `GET /runners/me/stream` is SSE without event ids:
+`job_assigned {job, envelope}`, `job_cancel {job}` and `rejected {}` (the
+stream then ends). On connect it repeats the runner's active assignment, so a
+runner that reconnects does not lose it. A runner is **online** while it
+holds this stream and has sent a heartbeat within the runner timeout;
+heartbeats go every 10 seconds. At most 2 streams per runner.
+
+**Claiming and results.** A runner claims an assignment right away, then
+verifies and runs it, then posts its output files and the `result` item
+through `POST /items`. A claim for a job that has failed or was reassigned is
+`409`, and the runner drops the job. The relay takes items from a runner only
+while it is eligible (approved when approval is required, not rejected), and
+a `result` only if its `refs` include a job assigned to that runner.
+
+Clients accept a result for a job only if, besides the §8 rules, its author
+holds the runner role and, when the session requires approval, has a
+verified `runner_approve` event from an owner-role participant and no
+`runner_reject`. A rejection is final: a later or replayed approval does not
+undo it. Runners apply the same rule to themselves. A runner records a job
+id as handled before it runs the job, so a job runs at most once per runner.
+
+**Cancelling.** `…/cancel` fails an unclaimed job at once. For a running job
+the relay forwards `job_cancel` to the runner, which kills the job and posts a
+`cancelled` result. The relay remembers the request and repeats it when the
+runner's stream reconnects. Clients also post a signed `job_cancel` event item as the
+record of who asked.
+
+**Runner list.** Each entry is `{participant_pub, runner, approved, rejected,
+online, job, signed_join}`, where `runner` is the runner info from the join.
+Clients verify `signed_join` and the owner's signed approvals themselves.

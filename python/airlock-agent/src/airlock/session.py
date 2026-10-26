@@ -18,6 +18,7 @@ import airlock_core as ac
 import httpx
 
 from .cache import Cache, default_root
+from .execute import Job, NoRunnerAvailable, Runner, signed_approvals
 
 DEFAULT_TYPES = ("text", "py", "md", "zip", "image")
 FILE_TYPES = {
@@ -310,10 +311,11 @@ class Session:
             ac.inspect_zip(data)
         return self._send("file", subkind, {"type": "file", "name": name, "mime": mime}, data, refs)
 
-    def _send(self, kind: str, subkind: Optional[str], meta: dict, body: bytes, refs: Iterable[dict]) -> dict:
+    def _seal(self, kind: str, subkind: Optional[str], meta: dict, body: bytes, refs: Iterable[dict]):
+        """Returns ``(item_id, envelope_json, blob, frame)``."""
         allowed = self.manifest["allowed_types"]
-        needed = "text" if kind == "text" else subkind
-        if needed not in allowed:
+        needed = {"text": "text", "file": subkind, "job": "py"}.get(kind)
+        if needed is not None and needed not in allowed:
             raise ac.PolicyError(f"{needed} is not allowed in this session (allowed: {', '.join(allowed)})")
         payload = ac.encode_payload(json.dumps(meta), body)
         if len(payload) > self.manifest["max_item_bytes"]:
@@ -329,8 +331,130 @@ class Session:
         env, blob = ac.seal_item(self._key, self._seed, json.dumps(new), payload)
         frame = struct.pack(">I", len(env.encode())) + env.encode() + blob
         self._cache.write_blob(new["id"], blob)
+        return new["id"], env, blob, frame
+
+    def _send(self, kind: str, subkind: Optional[str], meta: dict, body: bytes, refs: Iterable[dict]) -> dict:
+        _, env, blob, frame = self._seal(kind, subkind, meta, body, refs)
         self._req("POST", "/items", content=frame)
         return json.loads(ac.item_ref(env, blob))
+
+    # execute mode -----------------------------------------------------
+    def _require_execute(self) -> dict:
+        if self.manifest["mode"] != "execute":
+            raise ac.PolicyError("this session is in relay mode")
+        return self.manifest["job_limits"]
+
+    def runners(self) -> List[Runner]:
+        """Runners in the session. Names and labels come from each runner's
+        verified join; ``approved`` from the owner's signed approval."""
+        self._require_execute()
+        self.sync()
+        listing = self._req("GET", "/runners").json()
+        approvals = signed_approvals([self._items[i] for i in self._order])
+        out = []
+        for r in listing["runners"]:
+            try:
+                ac.verify_join(r["signed_join"], self.signed_manifest)
+            except ac.AirlockError:
+                continue
+            join = json.loads(r["signed_join"])["join"]
+            info = join["runner"]
+            pub = join["cert"]["cert"]["participant_pub"]
+            approved = approvals.get(pub, False) if listing["approval_required"] else not r["rejected"]
+            out.append(
+                Runner(
+                    participant_pub=pub,
+                    name=info["name"],
+                    labels=info["labels"],
+                    host=info["host"],
+                    sandbox=info["sandbox"],
+                    network_unblocked=info["network_unblocked"],
+                    approved=approved and not r["rejected"],
+                    rejected=r["rejected"] or approvals.get(pub) is False,
+                    online=r["online"],
+                    job=r["job"],
+                )
+            )
+        return out
+
+    def _runner(self, which: Union[Runner, str]) -> Runner:
+        if isinstance(which, Runner):
+            return which
+        matches = [r for r in self.runners() if which in (r.name, r.participant_pub)]
+        if len(matches) != 1:
+            raise LookupError(f"{'no' if not matches else 'more than one'} runner matches {which!r}")
+        return matches[0]
+
+    def approve_runner(self, runner: Union[Runner, str]) -> Runner:
+        """Let a runner take jobs (owner only): a signed ``runner_approve``
+        event for runners and senders to verify, plus the relay's copy."""
+        r = self._runner(runner)
+        self._send("event", None, {"type": "event", "event": "runner_approve", "participant_pub": r.participant_pub}, b"", [])
+        self._req("POST", f"/runners/{r.participant_pub}/approve")
+        return r
+
+    def reject_runner(self, runner: Union[Runner, str], reason: Optional[str] = None) -> None:
+        """Turn a runner away (owner only); its token stops working."""
+        r = self._runner(runner)
+        meta = {"type": "event", "event": "runner_reject", "participant_pub": r.participant_pub, "reason": reason}
+        self._send("event", None, meta, b"", [])
+        self._req("POST", f"/runners/{r.participant_pub}/reject")
+
+    def run_python(
+        self,
+        code: str,
+        *,
+        filename: str = "main.py",
+        files: Iterable[dict] = (),
+        runner: Optional[Union[Runner, str]] = None,
+        labels: Optional[Iterable[str]] = None,
+        timeout: Optional[int] = None,
+        memory_mb: Optional[int] = None,
+        requirements: Iterable[str] = (),
+    ) -> Job:
+        """Submit Python to a runner. ``files`` are item references from
+        ``send_file`` (ZIPs are unpacked into the work dir). Target one
+        ``runner`` (by name, key or ``Runner``), any runner with all of
+        ``labels``, or any idle runner. Raises ``NoRunnerAvailable`` at once
+        if nothing matches: jobs are never queued. Files the job writes to
+        ``os.environ["AIRLOCK_OUT"]`` (``/out`` in containers) come back as
+        out files."""
+        limits = self._require_execute()
+        if runner is not None and labels is not None:
+            raise ValueError("pass runner or labels, not both")
+        if runner is not None:
+            r = self._runner(runner)
+            target = {"type": "runner", "participant_pub": r.participant_pub, "name": r.name}
+        elif labels is not None:
+            target = {"type": "labels", "labels": list(labels)}
+        else:
+            target = {"type": "any"}
+        meta = {
+            "type": "job",
+            "filename": filename,
+            "code": code,
+            "runtime": limits["runtime"],
+            "timeout_s": int(timeout if timeout is not None else limits["timeout_s"]),
+            "memory_mb": memory_mb,
+            "files": list(files),
+            "requirements": list(requirements),
+            "target": target,
+        }
+        _, env, blob, frame = self._seal("job", "py", meta, b"", [])
+        job = Job(self, json.loads(ac.item_ref(env, blob)), meta)
+        try:
+            resp = self._req("POST", "/jobs", content=frame, headers={"Airlock-Target": json.dumps(target)})
+        except RelayError as e:
+            if e.code == "no_runner_available":
+                raise NoRunnerAvailable(job, e.message) from None
+            raise
+        job.runner = resp.json().get("runner")
+        return job
+
+    def run_file(self, path: Union[str, Path], **kw) -> Job:
+        """``run_python`` with a local ``.py`` file as the entry point."""
+        p = Path(path)
+        return self.run_python(p.read_text(), filename=p.name, **kw)
 
     # receiving --------------------------------------------------------
     def sync(self) -> List[Item]:

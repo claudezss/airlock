@@ -1,206 +1,18 @@
 //! End-to-end tests against a real server on a random port.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use airlock_core::cert::{issue_cert, sign_join, ClientKind, JoinRequest};
-use airlock_core::encoding::canonical_json;
-use airlock_core::item::{new_item_id, seal, ItemKind, NewItem, SealedItem};
+use airlock_core::item::SealedItem;
 use airlock_core::keys::Keypair;
 use airlock_core::payload::Payload;
-use airlock_core::session::{ContentType, Mode, Role, SessionParams, SessionSecrets};
-use airlock_server::{start, Config, Running};
-use futures_util::StreamExt;
+use airlock_core::session::{Mode, Role};
+use airlock_server::start;
 use reqwest::StatusCode;
 use serde_json::Value;
 
-fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
-}
-
-fn canon<T: serde::Serialize>(v: &T) -> String {
-    String::from_utf8(canonical_json(v).unwrap()).unwrap()
-}
-
-struct Env {
-    dir: tempfile::TempDir,
-    running: Option<Running>,
-    base: String,
-    http: reqwest::Client,
-}
-
-fn test_config(dir: &std::path::Path) -> Config {
-    let mut c = Config::with_data(dir);
-    c.listen = "127.0.0.1:0".parse().unwrap();
-    c.sweep_interval_ms = 50;
-    c.blob_grace_ms = 200;
-    c
-}
-
-impl Env {
-    async fn new() -> Env {
-        Self::with(|_| {}).await
-    }
-
-    async fn with(f: impl FnOnce(&mut Config)) -> Env {
-        let dir = tempfile::tempdir().unwrap();
-        let mut c = test_config(dir.path());
-        f(&mut c);
-        let running = start(c).await.unwrap();
-        let base = format!("http://{}", running.addr);
-        Env { dir, running: Some(running), base, http: reqwest::Client::new() }
-    }
-
-    async fn restart(&mut self, f: impl FnOnce(&mut Config)) {
-        self.running.take().unwrap().stop().await.unwrap();
-        let mut c = test_config(self.dir.path());
-        f(&mut c);
-        let running = start(c).await.unwrap();
-        self.base = format!("http://{}", running.addr);
-        self.running = Some(running);
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("{}{}", self.base, path)
-    }
-}
-
-struct Sess {
-    secrets: SessionSecrets,
-    id: String,
-    manifest_json: String,
-}
-
-fn new_session(mode: Mode, ttl_ms: u64) -> Sess {
-    let secrets = SessionSecrets::generate();
-    let params = SessionParams {
-        mode,
-        created_at_ms: now_ms(),
-        ttl_ms,
-        allowed_types: vec![ContentType::Text, ContentType::Md, ContentType::Py],
-        max_item_bytes: 1024 * 1024,
-        job_limits: (mode == Mode::Execute).then(Default::default),
-    };
-    let signed = secrets.manifest(&params).unwrap();
-    Sess { id: signed.manifest.session_id.clone(), manifest_json: canon(&signed), secrets }
-}
-
-async fn create(env: &Env, s: &Sess) -> reqwest::Response {
-    env.http.post(env.url("/v1/sessions")).body(s.manifest_json.clone()).send().await.unwrap()
-}
-
-struct Member {
-    kp: Keypair,
-    token: String,
-}
-
-fn join_body(s: &Sess, role: Role, name: &str) -> (Keypair, String) {
-    let kp = Keypair::generate();
-    let cert = issue_cert(&s.secrets.role_keypair(role), &s.id, role, kp.public(), now_ms()).unwrap();
-    let j = sign_join(
-        &kp,
-        JoinRequest {
-            v: 1,
-            session_id: s.id.clone(),
-            cert,
-            display_name: name.into(),
-            kind: ClientKind::Sdk,
-            runner: None,
-            created_at_ms: now_ms(),
-        },
-    )
-    .unwrap();
-    (kp, canon(&j))
-}
-
-async fn post_join(env: &Env, s: &Sess, body: String) -> reqwest::Response {
-    env.http.post(env.url(&format!("/v1/sessions/{}/participants", s.id))).body(body).send().await.unwrap()
-}
-
-async fn join(env: &Env, s: &Sess, role: Role, name: &str) -> Member {
-    let (kp, body) = join_body(s, role, name);
-    let r = post_join(env, s, body).await;
-    assert_eq!(r.status(), StatusCode::CREATED, "{}", r.text().await.unwrap());
-    let v: Value = r.json().await.unwrap();
-    Member { kp, token: v["token"].as_str().unwrap().to_string() }
-}
-
-fn seal_text(s: &Sess, author: &Member, text: &str) -> SealedItem {
-    seal(
-        &s.secrets.session_key(),
-        &author.kp,
-        NewItem {
-            id: new_item_id(),
-            session_id: s.id.clone(),
-            kind: ItemKind::Text,
-            subkind: None,
-            created_at_ms: now_ms(),
-            refs: vec![],
-        },
-        &Payload::text(text).encode().unwrap(),
-    )
-    .unwrap()
-}
-
-fn frame(item: &SealedItem) -> Vec<u8> {
-    let env = canon(&item.envelope);
-    let mut b = (env.len() as u32).to_be_bytes().to_vec();
-    b.extend_from_slice(env.as_bytes());
-    b.extend_from_slice(&item.blob);
-    b
-}
-
-async fn post(env: &Env, s: &Sess, m: &Member, body: Vec<u8>) -> reqwest::Response {
-    env.http
-        .post(env.url(&format!("/v1/sessions/{}/items", s.id)))
-        .bearer_auth(&m.token)
-        .body(body)
-        .send()
-        .await
-        .unwrap()
-}
-
-async fn events(env: &Env, s: &Sess, m: &Member) -> Vec<Value> {
-    let r = env
-        .http
-        .get(env.url(&format!("/v1/sessions/{}/events", s.id)))
-        .bearer_auth(&m.token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
-    let v: Value = r.json().await.unwrap();
-    v["events"].as_array().unwrap().clone()
-}
-
-async fn blob(env: &Env, s: &Sess, m: &Member, item: &str) -> reqwest::Response {
-    env.http
-        .get(env.url(&format!("/v1/sessions/{}/items/{item}/blob", s.id)))
-        .bearer_auth(&m.token)
-        .send()
-        .await
-        .unwrap()
-}
-
-async fn ack(env: &Env, s: &Sess, m: &Member, item: &str) {
-    let r = env
-        .http
-        .post(env.url(&format!("/v1/sessions/{}/items/{item}/ack", s.id)))
-        .bearer_auth(&m.token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::NO_CONTENT);
-}
-
-async fn eventually<F: std::future::Future<Output = bool>>(mut f: impl FnMut() -> F) -> bool {
-    for _ in 0..60 {
-        if f().await {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    false
-}
+mod common;
+use common::*;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn deliver_ack_and_evict() {
@@ -343,18 +155,6 @@ async fn session_storage_and_transfer_limits() {
     let id = a.envelope.header.id.clone();
     assert_eq!(blob(&env, &s, &owner, &id).await.status(), StatusCode::OK);
     assert_eq!(blob(&env, &s, &owner, &id).await.status(), StatusCode::TOO_MANY_REQUESTS);
-}
-
-async fn read_sse_until(resp: reqwest::Response, want: &str) -> String {
-    let mut stream = resp.bytes_stream();
-    let mut text = String::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while !text.contains(want) {
-        let chunk =
-            tokio::time::timeout_at(deadline, stream.next()).await.expect("sse timeout").unwrap().unwrap();
-        text.push_str(&String::from_utf8_lossy(&chunk));
-    }
-    text
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -511,12 +311,6 @@ async fn partial_log_line_is_dropped_on_load() {
     assert_eq!(post(&env, &s, &sender, frame(&item)).await.status(), StatusCode::CREATED);
     env.restart(|_| {}).await;
     assert_eq!(events(&env, &s, &owner).await.len(), 3);
-}
-
-async fn error_code(r: reqwest::Response) -> (StatusCode, String) {
-    let status = r.status();
-    let v: Value = r.json().await.expect("error bodies are JSON");
-    (status, v["error"].as_str().unwrap_or_default().to_string())
 }
 
 #[tokio::test(flavor = "multi_thread")]
