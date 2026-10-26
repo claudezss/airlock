@@ -398,31 +398,45 @@ kills the sandbox and posts a `result` with `exit_code: null, cancelled: true`.
 
 ### API (v1)
 
+The relay-mode endpoints shipped in M1 are normative in
+[protocol.md §12](protocol.md#12-relay-http-binding), including the upload
+frame, event shapes and error codes. The full v1 surface:
+
 ```
-POST   /v1/sessions                          create (manifest + owner sig)
-GET    /v1/sessions/:id                      manifest, state, counts
-POST   /v1/sessions/:id/close                owner; purge now
-POST   /v1/sessions/:id/participants         join with cert → token
-GET    /v1/sessions/:id/participants
-POST   /v1/sessions/:id/items                header + ciphertext + sig  (multipart)
-GET    /v1/sessions/:id/items?after=<id>     headers
-GET    /v1/sessions/:id/items/:item/blob     ciphertext (410 once evicted)
-POST   /v1/sessions/:id/items/:item/ack      recipient stored it locally
-POST   /v1/sessions/:id/items/:item/want     ask holders to re-seed an evicted blob
-PUT    /v1/sessions/:id/items/:item/blob     re-seed: accepted only if SHA-256 matches the signed envelope
-GET    /v1/sessions/:id/stream               SSE: item.created, job.*, runner.*, session.*
-                                             blob.evicted, blob.wanted
+POST   /v1/sessions                          create (signed manifest)                      M1
+GET    /v1/sessions/:id                      signed manifest                               M1
+POST   /v1/sessions/:id/close                owner; purge now                              M1
+POST   /v1/sessions/:id/participants         signed join → token                           M1
+GET    /v1/sessions/:id/participants                                                       M1
+POST   /v1/sessions/:id/items                u32_be(len) || envelope || ciphertext blob    M1
+GET    /v1/sessions/:id/events?after=<seq>   participant, item, evicted, closed events     M1
+GET    /v1/sessions/:id/items/:item/blob     ciphertext (410 once evicted)                 M1
+POST   /v1/sessions/:id/items/:item/ack      recipient stored it locally                   M1
+GET    /v1/sessions/:id/stream               SSE of the same events                        M1
                                              (event id = log seq; resume with Last-Event-ID)
-POST   /v1/sessions/:id/jobs                 job item + target  → assigned | 409
-POST   /v1/sessions/:id/jobs/:job/cancel
-GET    /v1/sessions/:id/jobs/:job
-GET    /v1/sessions/:id/runners
-GET    /v1/sessions/:id/runners/me/stream    SSE (runner): job.assigned, job.cancel
-POST   /v1/sessions/:id/runners/me/heartbeat
-POST   /v1/sessions/:id/jobs/:job/claim      runner
-POST   /v1/sessions/:id/roles/:role/revoke   owner
-GET    /v1/sessions/:id/audit.jsonl          owner / observer
+POST   /v1/sessions/:id/items/:item/want     ask holders to re-seed an evicted blob        M4
+PUT    /v1/sessions/:id/items/:item/blob     re-seed: accepted only if SHA-256 matches     M4
+POST   /v1/sessions/:id/jobs                 job item + target  → assigned | 409           M2
+POST   /v1/sessions/:id/jobs/:job/cancel                                                   M2
+GET    /v1/sessions/:id/jobs/:job                                                          M2
+GET    /v1/sessions/:id/runners                                                            M2
+GET    /v1/sessions/:id/runners/me/stream    SSE (runner): job.assigned, job.cancel        M2
+POST   /v1/sessions/:id/runners/me/heartbeat                                               M2
+POST   /v1/sessions/:id/jobs/:job/claim      runner                                        M2
+POST   /v1/sessions/:id/roles/:role/revoke   owner                                         M4
+GET    /v1/sessions/:id/audit.jsonl          owner / observer                              M4
 ```
+
+Items are uploaded as one binary stream rather than multipart, so the relay
+can verify the signed envelope before it writes a byte of the blob and can
+hash the blob while streaming it to disk.
+
+Server flags (each also reads an `AIRLOCK_*` environment variable):
+`--data`, `--ephemeral`, `--listen`, `--trust-proxy`, `--max-ttl`,
+`--max-item-bytes`, `--max-session-bytes`, `--max-session-transfer`,
+`--max-items`, `--idle-ttl`, `--max-sessions-per-ip`, `--max-sessions`,
+`--disk-high-watermark`, `--blob-hold`, `--blob-grace` and
+`--sweep-interval`. `airlock-server --help` lists defaults.
 
 ### Cost model: clients do the heavy lifting
 
@@ -586,6 +600,12 @@ own key.
 Static SPA (Vite + React + TypeScript) served by the server at `/`, mirroring
 the four design screens: landing, new session, live session, runner console.
 
+M1 ships a deliberately small timeline instead: plain JavaScript modules in
+`web/` with no build step, embedded into the server binary. It creates
+sessions, joins from an invite, renders all content types, sends text and
+files, keeps IndexedDB history and acks after storing. The React SPA replaces
+it at design parity in M4.
+
 - All crypto in the browser goes through the `airlock-core` wasm package
   (session creation, certificates, item encrypt/decrypt/sign/verify). No
   JavaScript crypto library is used. The fragment is parsed once and kept in
@@ -678,7 +698,7 @@ airlock/
     wasm/                   wasm-bindgen crate → `@airlock/core` npm package (wasm-pack)
   python/
     airlock-agent/          SDK (airlock/), MCP server; depends on the airlock-core wheel, bundles the binary
-  web/                      Vite + React + TS SPA; uses @airlock/core; built output embedded into airlock-server
+  web/                      browser UI embedded into airlock-server (M1: plain JS timeline; M4: Vite + React + TS SPA)
   deploy/
     docker/                 Dockerfiles (server, runtime base image)
     k8s/                    runner Deployment + RBAC + NetworkPolicy examples; server manifests

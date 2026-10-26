@@ -317,3 +317,92 @@ python3 shim.py --work DIR --entry FILE --timeout SECONDS --result PATH
   cancelled, wall_ms, peak_rss_kb, error}`, written atomically through a
   randomly named temporary file. `stdout.txt` and `stderr.txt` sit beside it.
   The directory holding `PATH` must not be writable by the job.
+
+## 12. Relay HTTP binding
+
+This section fixes how clients talk to `airlock-server` in relay mode. The
+relay sees only what is listed here: signed manifests, signed join requests,
+item envelopes and ciphertext blobs. Execute-mode endpoints (jobs, runners)
+are added in M2 and do not change anything below.
+
+**Conventions.** All paths are under `/v1`. JSON request bodies for create
+and join are the canonical JSON strings defined above, sent as-is and capped
+at 256 KiB. Authenticated calls carry `Authorization: Bearer <token>`. The
+token is returned by join, never appears in a URL, and the relay stores only
+its SHA-256. Errors are `{"error": <code>, "message": <text>}`.
+
+| Method and path | Auth | Body | Success |
+|---|---|---|---|
+| `GET /v1/health` | none | none | `200 {"ok": true, "protocol": 1}` |
+| `POST /v1/sessions` | none | signed manifest | `201 {"session_id", "expires_at_ms"}` |
+| `GET /v1/sessions/{id}` | none | none | `200 {"signed_manifest"}` |
+| `POST /v1/sessions/{id}/participants` | none | signed join request | `201 {"token", "participant_pub", "role", "seq"}` |
+| `GET /v1/sessions/{id}/participants` | bearer | none | `200 {"participants": [participant…]}` |
+| `GET /v1/sessions/{id}/events?after=N` | bearer | none | `200 {"events": [event…]}` with `seq > N`; omit `after` for all |
+| `GET /v1/sessions/{id}/stream` | bearer | none | SSE, see below |
+| `POST /v1/sessions/{id}/items` | bearer | upload frame | `201 {"id", "seq"}` |
+| `GET /v1/sessions/{id}/items/{item}/blob` | bearer | none | `200` ciphertext, or `410 evicted` |
+| `POST /v1/sessions/{id}/items/{item}/ack` | bearer, recipient | none | `204` |
+| `POST /v1/sessions/{id}/close` | bearer, owner | none | `204`; the session is purged |
+
+**Create.** The relay verifies the manifest signature, requires
+`created_at_ms` within 5 minutes of its clock, and applies its own caps on
+TTL, item size and session count. The session id is derived from the owner
+key, so a second create with the same key is `409`.
+
+**Join.** The relay runs the join verification of §5. Runners are refused in
+relay-mode sessions. A participant who loses its token joins again with a new
+key; the old participant stays in the log.
+
+**Upload frame.** The item body is a single binary stream:
+
+```
+u32_be(len(envelope)) || envelope (canonical JSON, at most 64 KiB) || blob
+```
+
+The relay requires the envelope's `header.author` to be the authenticated
+participant, runs the header policy of §8 with that participant's
+certificate, streams the blob to disk while hashing it, and accepts the item
+only if the blob length equals the header's ciphertext length and the
+signature verifies over the received SHA-256. The recipients are every other
+participant joined at that moment.
+
+**Events.** Every accepted change is one line in the session log, and each
+public event carries that line's `seq`. Events are `{"seq", "kind", "data"}`:
+
+| kind | data |
+|---|---|
+| `participant` | `{participant_pub, role, display_name, kind, runner, signed_join}` |
+| `item` | `{envelope, blob_len, blob_present}` |
+| `evicted` | `{item}`: the blob left the relay; the envelope stays |
+| `closed` | `{reason}`: the last event of a session |
+
+Clients must verify each `signed_join` themselves (§5) and look up an item's
+author certificate from those verified joins, never from relay metadata.
+
+**Stream.** `GET /stream` is Server-Sent Events with `id: <seq>`,
+`event: <kind>` and `data: <event data JSON>`. It first replays every event
+after `Last-Event-ID` (or all events when the header is absent), then streams
+live ones. It ends after `closed`, on server shutdown, or when the client
+falls too far behind; clients reconnect with `Last-Event-ID`. Browsers use
+`fetch` rather than `EventSource` so the token stays in a header.
+
+**Delivery and eviction.** A recipient acks an item only after it has stored
+the ciphertext locally. The relay deletes a blob once every recipient has
+acked and a short grace period has passed, or when the hold limit expires,
+whichever comes first. After that `GET …/blob` is `410 evicted`, and
+clients show the item as delivered but unavailable.
+
+**Error codes.**
+
+| Status | `error` | Meaning |
+|---|---|---|
+| 400 | `invalid`, `signature`, `body`, `clock`, `ttl`, `item_size` | malformed or unverifiable input |
+| 401 | `unauthorized` | missing or unknown bearer token |
+| 403 | `forbidden` | role, author or content policy not allowed |
+| 404 | `not_found` | no such session or item |
+| 409 | `conflict` | duplicate session or item id |
+| 410 | `closed`, `evicted` | session closed, or blob already delivered |
+| 413 | `too_large` | envelope, item or session storage limit |
+| 429 | `limit` | relay, address, participant, item or transfer limit |
+| 507 | `storage_full` | relay disk above its high watermark |
