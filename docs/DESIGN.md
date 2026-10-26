@@ -29,6 +29,11 @@ canvas (landing, live session, new session, runner console).
 - Agent access through a Python SDK, a CLI, an MCP tool server and plain HTTPS.
 - A web UI for humans to open sessions, hand out invites, watch the timeline,
   approve runners and inspect jobs.
+- **Lightweight to host, with cost pushed to users**: one process and one
+  data directory. No database server, no object store, no queue. Clients do
+  the expensive work (crypto, validation, history, execution); the relay is a
+  short-lived transit buffer that deletes each file once it is delivered.
+  Hard server-side caps keep disk and bandwidth bounded (§7).
 
 **Non-goals for v1**
 
@@ -47,7 +52,7 @@ canvas (landing, live session, new session, runner console).
 | Component | Language | Stack |
 |---|---|---|
 | `airlock-core`: protocol, crypto, validators, job shim | **Rust** | `ed25519-dalek`, `aes-gcm`, `hkdf`, `sha2`, `serde` + canonical JSON; bindings via **PyO3** (Python wheel) and **wasm-bindgen** (browser) |
-| Relay server (API, SSE, blob store, purge) | **Rust** | `axum` + `tokio`, `sqlx` (Postgres; SQLite feature for dev), `object_store` (S3 / local disk), `tower` middleware |
+| Relay server (API, SSE, storage, purge) | **Rust** | `axum` + `tokio`, `tower` middleware; storage is plain files (append-only session logs + blob files), **no database** |
 | `airlock` binary: runner, CLI | **Rust** | `tokio`, `reqwest` (SSE), `bollard` (Docker), `kube` (Kubernetes), `nix` + Landlock + seccomp for the local backend |
 | SDK and MCP server (`pip install airlock-agent`) | **Python 3.12+** | thin orchestration over the `airlock-core` wheel; `httpx`, `mcp`; the wheel also bundles the `airlock` binary |
 | Web UI (static SPA served by the server) | **TypeScript** | Vite + React, `airlock-core` wasm for all crypto, markdown-it + DOMPurify, zip.js |
@@ -68,8 +73,8 @@ to WebAssembly.
    SSE connections and shuffle ciphertext. On tokio an idle connection costs a
    few KB and the whole process runs in tens of MB of RSS. That is the
    difference between a public relay on the smallest instance tier and one
-   that needs a worker pool. Blob streaming is zero-copy from request body to
-   object store.
+   that needs a worker pool. Blobs stream from the request body straight to a
+   file on disk without being buffered in memory.
 3. **Runner distribution.** A static musl binary drops onto a CI box, a GPU
    server or a `FROM scratch` image with no Python on the host. The same
    binary is also bundled inside the Python wheel, so both
@@ -115,9 +120,10 @@ to WebAssembly.
 
 ```
                  ┌───────────────────────── relay server ─────────────────────────┐
-                 │  axum/tokio  ·  Postgres (SQLite in dev)  ·  blob store (S3/disk) │
-                 │  stores: sessions, participants, items (ciphertext), jobs,      │
-                 │          runners, audit log (hashes)                            │
+                 │  axum/tokio  ·  one data dir: per-session log + blob files       │
+                 │  no database · in-memory index rebuilt from the logs on start   │
+                 │  holds: manifests, participants, item envelopes, ciphertext,    │
+                 │         job states, audit trail (hashes)                        │
                  └────▲──────────────▲────────────────────▲─────────────────▲──────┘
                       │ HTTPS+SSE    │ HTTPS+SSE          │ HTTPS+SSE       │ HTTPS+SSE
           ┌───────────┴───┐  ┌───────┴────────┐  ┌────────┴────────┐  ┌─────┴──────┐
@@ -379,15 +385,16 @@ kills the sandbox and posts a `result` with `exit_code: null, cancelled: true`.
 - Admission: verify role certificates, issue tokens, enforce role rights.
 - Items: accept header + ciphertext + signature; enforce `size ≤ max`,
   `subkind ∈ allowed_types`, author role may post that kind (observers: none;
-  runners: `result`/`event` only; senders: everything but `event`; owner:
-  everything).
+  runners: `result` and `file`, execute mode only; senders: text, file, job,
+  event; owner: everything). Exact rules: [protocol.md](protocol.md) §8.
 - Jobs: routing (§6), status, heartbeats.
 - Streams: `GET /v1/sessions/:id/stream` (SSE) for the timeline, per-runner
   assignment streams.
 - Audit log: append-only `{ts, actor, action, item_id, sha256}`; exportable as
   JSONL before purge.
-- Purge: a worker deletes ciphertext blobs and rows at `expires_at` or on
-  close. Audit rows are deleted with the session unless the owner exported them.
+- Purge: deleting the session directory at `expires_at` or on close. The
+  audit trail goes with it unless the owner exported it first.
+- Cost limits: the server-side caps in "Cost controls" below.
 
 ### API (v1)
 
@@ -399,8 +406,13 @@ POST   /v1/sessions/:id/participants         join with cert → token
 GET    /v1/sessions/:id/participants
 POST   /v1/sessions/:id/items                header + ciphertext + sig  (multipart)
 GET    /v1/sessions/:id/items?after=<id>     headers
-GET    /v1/sessions/:id/items/:item/blob     ciphertext
+GET    /v1/sessions/:id/items/:item/blob     ciphertext (410 once evicted)
+POST   /v1/sessions/:id/items/:item/ack      recipient stored it locally
+POST   /v1/sessions/:id/items/:item/want     ask holders to re-seed an evicted blob
+PUT    /v1/sessions/:id/items/:item/blob     re-seed: accepted only if SHA-256 matches the signed envelope
 GET    /v1/sessions/:id/stream               SSE: item.created, job.*, runner.*, session.*
+                                             blob.evicted, blob.wanted
+                                             (event id = log seq; resume with Last-Event-ID)
 POST   /v1/sessions/:id/jobs                 job item + target  → assigned | 409
 POST   /v1/sessions/:id/jobs/:job/cancel
 GET    /v1/sessions/:id/jobs/:job
@@ -412,28 +424,160 @@ POST   /v1/sessions/:id/roles/:role/revoke   owner
 GET    /v1/sessions/:id/audit.jsonl          owner / observer
 ```
 
-### Storage
+### Cost model: clients do the heavy lifting
 
-- **Postgres** via `sqlx` for metadata; **S3-compatible** object store via the
-  `object_store` crate for ciphertext (MinIO in compose). Dev / single-node
-  mode: SQLite + local disk behind the same traits, selected by URL.
-- Ciphertext is streamed from the request body to the object store without
-  buffering the whole item in memory; the per-request ceiling is the manifest
-  `max_item_bytes`, enforced by `Content-Length` and a counting stream.
-- Blob keys are `sessions/<id>/items/<item_id>`; purge is a prefix delete.
-- SSE fan-out is an in-process broadcast per session (`tokio::sync::broadcast`).
-  A single replica is the v1 target; multi-replica fan-out via Postgres
-  `LISTEN/NOTIFY` is a v2 item and needs no API change.
+The relay keeps only what cannot live anywhere else: the session's small
+metadata, a rendezvous point, and a brief buffer for files in transit.
+Everything else runs on the participants' machines.
+
+| Work | Where it runs | Server cost |
+|---|---|---|
+| Encryption, signing, verification | Clients (Rust core, Python wheel, wasm) | none |
+| ZIP, image and Markdown validation; image re-encoding | Clients and runners | none |
+| Code execution | Runners on the receiver's machines | none |
+| Timeline history and files | Client-side cache (browser IndexedDB, SDK cache dir) | none |
+| File delivery | Relay buffer, deleted after delivery (below); direct peer-to-peer in v2 | short-lived disk, one upload plus one download per recipient |
+| Metadata, routing, SSE | Relay, in memory plus an append-only log | small |
+| Heavy or long-lived use | The user's own relay (self-hosting, §7 Deployment) | none for the hosted relay |
+
+#### Transit buffer: delete on delivery
+
+A blob stays on the relay only until its recipients have it.
+
+- **Recipients** of an item are the participants admitted when it was posted
+  (runners: approved), excluding the author.
+- A client **acks** an item after it has verified the blob and stored it in
+  its local cache (`POST …/items/:item/ack`). A runner acks a job and its
+  input files once they are in the job's work dir; the sender acks result
+  output files.
+- The relay **evicts** the blob when every recipient has acked and
+  `AIRLOCK_BLOB_GRACE` has passed, or when `AIRLOCK_BLOB_HOLD` has passed
+  since upload, whichever comes first. It emits `blob.evicted`.
+- **Envelopes stay** in the log for the whole session. The timeline remains
+  complete and every reference still verifies; only the ciphertext is gone
+  from the relay.
+- **Re-seeding.** A participant that joins late, or opens the session on a
+  new device, posts `want`. Any client still holding the blob in its cache
+  re-uploads it with `PUT …/blob`. The relay accepts the upload from anyone,
+  because the envelope already pins the blob's SHA-256 under the author's
+  signature, so a re-seed cannot alter content. If no holder is online, the
+  UI shows the file as "delivered and removed from the relay".
+- This needs no protocol change: blob location and lifetime are relay
+  behaviour, and integrity already rests on the signed blob hash.
+
+#### Direct transfer (v2)
+
+When sender and recipient are both online, files can skip the relay
+entirely: the relay only carries WebRTC signaling (offer, answer, ICE
+candidates) over the existing SSE stream and a small POST endpoint. Public
+STUN handles most NATs. There is deliberately no TURN server, because relaying
+traffic is exactly the cost being avoided; peers that cannot connect directly
+fall back to the transit buffer. Browsers have WebRTC built in; the Rust
+runner and the Python SDK would use `webrtc-rs`. The received blob is checked
+against the signed hash exactly as one from the relay.
+
+### Storage: no database
+
+Sessions are short-lived, independent of each other and append-only, and the
+server never queries across them. That fits a directory per session far
+better than a database server plus an object store:
+
+```
+$AIRLOCK_DATA/
+  LOCK                         flock'd by the running server; a second server on the same dir refuses to start
+  sessions/<session_id>/
+    manifest.json              signed manifest, canonical JSON, exactly as received
+    log.jsonl                  append-only events, one canonical JSON object per line:
+                                 {seq, ts_ms, type: join | item | ack | evict | reseed | job_state | approve | reject | revoke | close, ...}
+    blobs/<item_id>            ciphertext, exactly as uploaded; deleted on eviction
+```
+
+- **In-memory index.** Each session keeps its participants, item envelopes,
+  job states and runner presence in memory, rebuilt from `log.jsonl` at
+  startup. An envelope is a few hundred bytes, so even thousands of items cost
+  little RAM. Ciphertext is never held in memory: uploads stream to disk and
+  downloads stream from disk.
+- **Write order.** Stream the blob to `blobs/.<id>.tmp`, fsync, rename to
+  `blobs/<id>`, then append the log line and fsync it, then broadcast on SSE.
+  A crash can leave only an orphaned blob with no log line; startup deletes
+  those. A log line never points at a missing blob.
+- **Concurrency.** One process owns the data dir (`LOCK`). Each session has
+  its own async mutex, so writers to different sessions never contend. Job
+  routing ("mark one runner busy atomically") is a check-and-set under that
+  mutex.
+- **Eviction timers** are rebuilt from the log at startup: an item whose
+  hold has passed, or whose recipients have all acked, is evicted
+  immediately.
+- **What is not persisted.** Runner presence, heartbeats and SSE
+  subscriptions live in memory only. After a restart, runners and clients
+  reconnect and re-subscribe from their last seen `seq`.
+- **Purge.** Each session arms a timer for `expires_at`; startup also sweeps
+  expired sessions. Purging renames the directory to `.trash/<id>` and deletes
+  it in the background, so purge is instant and needs no cron job.
+- **Audit export.** It is `log.jsonl` itself, which already holds only
+  envelopes, hashes and events, never ciphertext.
+- **SSE fan-out** is an in-process broadcast per session
+  (`tokio::sync::broadcast`).
+
+Storage sits behind two small traits, `SessionLog` and `BlobStore`. v1 ships
+only the filesystem implementations. An object-store `BlobStore` can be added
+later without changing the API.
+
+### Cost controls
+
+Server configuration, so none of it changes the frozen protocol. The server
+refuses a manifest or an upload that exceeds a limit.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `AIRLOCK_MAX_TTL` | 24 h | Rejects manifests that live longer, although the protocol allows 30 days. The web UI defaults to 1 h. |
+| `AIRLOCK_MAX_ITEM_BYTES` | 25 MiB | A manifest's `max_item_bytes` may not exceed it. |
+| `AIRLOCK_BLOB_HOLD` | 1 h | Longest a blob stays on the relay after upload, delivered or not. |
+| `AIRLOCK_BLOB_GRACE` | 5 min | How long a blob stays after its last recipient acked, for late joiners. |
+| `AIRLOCK_MAX_SESSION_BYTES` | 200 MiB | Ciphertext a session may have held on the relay at once; uploads past it get `413`. |
+| `AIRLOCK_MAX_SESSION_TRANSFER` | 1 GiB | Total bytes uploaded plus downloaded per session, the bandwidth cap; past it, `429`. |
+| `AIRLOCK_MAX_ITEMS` | 5 000 | Items per session. |
+| `AIRLOCK_IDLE_TTL` | 2 h | Purges a session early after this long with no new items or joins. |
+| `AIRLOCK_MAX_SESSIONS_PER_IP` | 20 | Active sessions per creator IP. |
+| `AIRLOCK_MAX_SESSIONS` | 1 000 | Active sessions in total. |
+| `AIRLOCK_DISK_HIGH_WATERMARK` | 90 % | Above this volume usage, new sessions and uploads get `507`. |
+
+The worst case disk use is therefore bounded by
+`MAX_SESSIONS × MAX_SESSION_BYTES`, and the realistic case is far lower:
+blobs are usually gone minutes after upload, once delivered. Bandwidth is
+bounded by `MAX_SESSIONS × MAX_SESSION_TRANSFER`, and the hold limit means a
+blob is never downloaded for longer than an hour. Content-level savings such as dedupe or
+compression are not possible on the server: every item is encrypted under its
+own key.
 
 ### Deployment
 
 - One static musl binary in a `FROM scratch` (or distroless) image, with the
-  built web SPA embedded via `rust-embed`. `docker compose` for dev (server +
-  Postgres + MinIO).
-- Kubernetes: Deployment + Service + Ingress, a CronJob or in-process worker
-  for purge; a Helm chart under `deploy/helm` once the API settles.
-- Config via env (`AIRLOCK_DATABASE_URL`, `AIRLOCK_BLOB_URL`,
-  `AIRLOCK_PUBLIC_URL`, `AIRLOCK_MAX_ITEM_BYTES`).
+  built web SPA embedded via `rust-embed`. It needs one writable directory and
+  nothing else, so local dev is just `airlock-server --data ./data`.
+- **Persistent mode** (default): the data dir is a small persistent volume.
+  Sessions survive restarts and redeploys.
+- **Ephemeral mode** (`--ephemeral`): the data dir is a temp dir or `tmpfs`
+  and is wiped at start. No storage to pay for at all; a restart ends every
+  open session, which is acceptable for hour-long sessions.
+- Serving blobs from the same machine uses the host's bundled bandwidth, not
+  per-request object-store fees or metered egress.
+- **Bring your own relay.** Which relay a session uses is simply the base URL
+  in its invite links, so any user can run `airlock-server` themselves: on a
+  small VM, or in ephemeral mode next to their runner behind a tunnel. They
+  then pay their own disk and bandwidth, with their own limits. The hosted
+  relay keeps tight free-tier caps and points heavy users here. Self-hosting
+  is the largest single cost shift, and the code path is identical.
+- Kubernetes: a single-replica StatefulSet with one PVC (or an `emptyDir` in
+  ephemeral mode), plus a Service and Ingress. Purge is in-process, so there
+  is no CronJob.
+- **Scaling later, still without a database.** Sessions share nothing, so
+  more capacity means more instances, each owning its own sessions, with the
+  ingress routing by the `session_id` in the path (consistent hashing). New
+  sessions go to the least-loaded instance; the session id stays the shard
+  key. This is a v2 item and changes no API.
+- Config via env (`AIRLOCK_DATA`, `AIRLOCK_PUBLIC_URL`, plus the cost
+  controls above).
 
 ---
 
@@ -446,10 +590,16 @@ the four design screens: landing, new session, live session, runner console.
   (session creation, certificates, item encrypt/decrypt/sign/verify). No
   JavaScript crypto library is used. The fragment is parsed once and kept in
   memory only; never written to storage or sent in requests.
-- The owner's `O.priv` and `K` live in memory for the tab's lifetime; the
-  **owner link** (`#r=owner&k=…&ok=…`) is shown once at creation so the owner
+- The owner seed and `K` live in memory for the tab's lifetime; the
+  **owner link** (`#v=1&r=owner&ok=…`) is shown once at creation so the owner
   can reopen the session later. "My sessions" in v1 is a localStorage list of
   session ids + names, not an account.
+- **Local history.** The browser keeps each session's envelopes and blobs in
+  IndexedDB exactly as received, so they are still ciphertext at rest. Opening
+  the invite link again supplies the key to decrypt them. The tab acks each
+  item once stored, answers `blob.wanted` by re-seeding from its cache, and
+  offers "Clear local history" per session. Browser storage quotas apply; when
+  one is hit, the oldest sessions' blobs are dropped first.
 - Viewers: Markdown (markdown-it + DOMPurify), image preview (re-encoded on
   send), ZIP manifest (zip.js, listing only), Python (Shiki/Prism highlighting),
   job detail (status, signature, hashes, result bundle).
@@ -483,6 +633,12 @@ CLI (`airlock …`, Rust, same binary as the runner): `session
 create|close|invite`, `send text|file`, `run <file.py>
 [--runner|--label|--any]`, `runner join`, `watch`.
 
+**Local cache.** The SDK, CLI and runner keep a cache that mirrors the
+relay's layout, `~/.cache/airlock/<session_id>/` with `log.jsonl` and
+`blobs/`, holding ciphertext as received. They ack after writing to it,
+answer `blob.wanted` from it, and delete a session's cache when it expires
+(`Session.join(url, cache_dir=…)` overrides the location).
+
 MCP server (`python -m airlock.mcp`, or `airlock-mcp` from the wheel): tools `send_text`, `send_file`, `list_runners`,
 `run_python`, `get_result`, `list_items`, so any MCP-capable agent can use a
 session without writing code.
@@ -500,6 +656,7 @@ session without writing code.
 | Malicious inputs (zip, image, md) | Traversal, bombs, XSS | Zip validator; image re-encode; Markdown HTML stripped and sanitised |
 | Replay / cross-session reuse | Reuse a signed job elsewhere | Signatures cover `session_id` and item `id`; per-item HKDF keys include `session_id`; server rejects duplicate ids |
 | Lost invite link | Full role access | Short expiry by default; server-side role revoke; close & purge |
+| Anyone re-seeding an evicted blob | Upload bytes for an item id | Accepted only if SHA-256 matches the author-signed envelope; counted against the session transfer cap |
 
 Out of scope for v1: side channels on shared hosts, a compromised sender
 machine, and metadata privacy from the relay (who talks to whom and when).
@@ -514,7 +671,7 @@ airlock/
   crates/
     airlock-core/           protocol types, canonical JSON, crypto, certs, validators (zip/md/image),
                             embedded job shim, test vectors (generated into docs/protocol.md)
-    airlock-server/         axum app, sqlx storage, object_store blobs, SSE, routing, purge, embedded web
+    airlock-server/         axum app, file-backed session logs and blobs, SSE, routing, purge, embedded web
     airlock/                the `airlock` binary: runner (+ backends/local|docker|k8s) and CLI
   bindings/
     python/                 PyO3 crate → `airlock-core` wheel (maturin)
@@ -523,7 +680,7 @@ airlock/
     airlock-agent/          SDK (airlock/), MCP server; depends on the airlock-core wheel, bundles the binary
   web/                      Vite + React + TS SPA; uses @airlock/core; built output embedded into airlock-server
   deploy/
-    docker/                 Dockerfiles (server, runtime base image), compose.yaml
+    docker/                 Dockerfiles (server, runtime base image)
     k8s/                    runner Deployment + RBAC + NetworkPolicy examples; server manifests
   docs/
     DESIGN.md               this document
@@ -549,12 +706,11 @@ format churn is where Rust is slowest.
 | # | Deliverable | Done when |
 |---|---|---|
 | M0 | **Protocol freeze.** `docs/protocol.md` (manifest, certs, item envelope, job/result payloads) and generated test vectors; `airlock-core` crate implementing it; PyO3 wheel and wasm package passing the same vectors; CI building wheels, wasm and static binaries | vectors round-trip in Rust, Python and the browser; a protocol change requires a version bump |
-| M1 | **Relay mode.** Rust server (sessions, participants, items, SSE, expiry purge) + Python SDK + minimal web timeline, all four content types | two SDK processes exchange text, md, zip and image through a compose deployment; the browser renders them |
+| M1 | **Relay mode.** Rust server with file-backed storage (sessions, participants, items, SSE, expiry purge, ack and evict-on-delivery, cost controls) + Python SDK with local cache + minimal web timeline with IndexedDB history, all four content types | two SDK processes exchange text, md, zip and image through one `airlock-server --data ./data` process; the browser renders them; blobs leave the relay once both sides acked; a restart in persistent mode keeps the session |
 | M2 | **Execute mode.** Runner with **local** (Linux sandboxed) and **docker** backends, routing, approval, results with `/out`, runner console page | the design's `summarize.py` scenario runs end to end on docker with network off |
 | M3 | **kubernetes** backend, runtime image build/push, RBAC + NetworkPolicy manifests, Helm chart | same scenario on `kind` |
-| M4 | New-session and live-session pages to design parity, full CLI, MCP server, audit export, role revoke | a non-coding user can create a session, hand out links, approve a runner and read results |
-
----
+| M4 | New-session and live-session pages to design parity, full CLI, MCP server, audit export, role revoke, re-seeding evicted blobs | a non-coding user can create a session, hand out links, approve a runner and read results; a late joiner gets an evicted file from a peer's cache |
+| v2 | Direct peer-to-peer file transfer over WebRTC (signaling via the relay, STUN only, relay buffer as fallback); sharding across relay instances by session id | files between two online peers never touch the relay |
 
 ---
 
@@ -562,8 +718,8 @@ format churn is where Rust is slowest.
 
 1. **Hosted vs self-hosted first.** The design uses `airlock.dev`. The code is
    the same; the difference is whether M1 ships a public relay (needs abuse
-   limits: per-IP session creation caps, total bytes per session) or a
-   `docker compose up` story. Recommendation: self-hosted first, hosted once M2
+   limits, now covered by the cost controls in §7) or a single-binary
+   self-hosted story. Recommendation: self-hosted first, hosted once M2
    lands.
 2. **Owner persistence.** Owner = holder of the owner link, remembered in
    localStorage. Acceptable for v1? Accounts are a v2 item.
@@ -575,3 +731,11 @@ format churn is where Rust is slowest.
    warn in v1.
 5. **Item size ceiling.** 25 MB single-blob in v1; chunked upload when someone
    needs more.
+6. **Ephemeral or persistent by default.** Ephemeral mode removes storage cost
+   entirely but ends sessions on every restart or deploy. Proposed:
+   persistent by default, ephemeral as a flag.
+7. **Delivery versus availability.** Evicting blobs after delivery cuts
+   storage to minutes per file, but a participant who was offline for longer
+   than `AIRLOCK_BLOB_HOLD`, or joins later, depends on a peer being online to
+   re-seed. Proposed: accept this; the owner can raise the hold on a
+   self-hosted relay.
