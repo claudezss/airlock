@@ -55,6 +55,19 @@ const fmtBytes = (n) => (n < 1024 ? `${n} B` : n < MB ? `${(n / 1024).toFixed(1)
 const hhmm = (ms) => new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 const initials = (name) => (name.split(/[^\p{L}\p{N}]+/u).filter(Boolean).slice(0, 2).map((w) => w[0]).join("") || "?").toUpperCase();
 
+// One polite live region for job and runner transitions.
+let liveTimer;
+let liveQueue = [];
+function announce(msg) {
+  liveQueue.push(msg);
+  clearTimeout(liveTimer);
+  liveTimer = setTimeout(() => {
+    const live = document.getElementById("live");
+    if (live) live.textContent = liveQueue.join(". ");
+    liveQueue = [];
+  }, 100);
+}
+
 function deadEnd(title, cause) {
   show(el("div", { class: "panel stack dead-end", role: "alert" },
     el("h1", {}, title), el("p", { class: "muted" }, cause),
@@ -196,17 +209,18 @@ function landing() {
     el("p", { class: "muted" }, "Network access is always off and runners return their output files."));
   const pyBox = types.querySelector('input[value="py"]');
   const isExecute = () => form.elements.mode.value === "execute";
+  const pyNote = el("p", { class: "muted hint-text", hidden: true, id: "py-note" }, "Python is always allowed in Execute sessions: jobs are Python.");
+  pyBox.setAttribute("aria-describedby", "py-note");
   const syncMode = () => {
     jobBox.hidden = !isExecute();
+    pyNote.hidden = !isExecute();
+    pyBox.disabled = isExecute();
     if (isExecute()) pyBox.checked = true;
   };
   mode.addEventListener("change", syncMode);
-  pyBox.addEventListener("change", () => {
-    if (isExecute()) pyBox.checked = true;
-  });
   const err = el("p", { class: "error", role: "alert" });
   const create = el("button", { class: "primary cta", type: "submit" }, "Create session");
-  const fields = el("fieldset", { class: "stack" }, mode, jobBox, ttl, types, sizeField);
+  const fields = el("fieldset", { class: "stack" }, mode, jobBox, ttl, types, pyNote, sizeField);
   const aside = el("aside", { class: "panel stack" },
     el("h2", {}, "Invites"),
     el("p", { class: "muted" }, "Invite links appear here once the session exists. Each one carries a role and the session key."));
@@ -335,7 +349,8 @@ async function sessionView() {
   }
   const me = ac.publicKey(identity.seed);
   const s = { sid, inv, manifest, signed, identity, me, participants: new Map(), items: new Map(), evicted: new Set(),
-    lastSeq: -1, closed: null, jobs: new Map(), results: new Map(), runners: [], picked: new Set() };
+    lastSeq: -1, closed: null, jobs: new Map(), results: new Map(), runners: [], picked: new Set(), approvedList: null,
+    said: new Map(), announce: false, jobErrors: new Map(), runnerErrors: new Map(), runnerSeen: new Map(), open: new Set() };
   buildSessionLayout(s);
 
   // Cached history first, then catch up, then stream. Blobs missing locally
@@ -356,13 +371,14 @@ async function sessionView() {
   } catch (e) {
     if (e.status === 404 || e.status === 410) return s.render.closed("it is no longer on the relay");
   }
+  s.announce = true;
   streamLoop(s);
 }
 
 function buildSessionLayout(s) {
   const { sid, inv, manifest, identity } = s;
   app.classList.add("wide");
-  const timeline = el("div", { class: "timeline", role: "log", "aria-live": "polite", "aria-relevant": "additions" },
+  const timeline = el("div", { class: "timeline", role: "log", "aria-live": "off", "aria-label": "Session timeline" },
     el("div", { class: "pill" }, `you opened the session · keys stay in this browser`),
     el("p", { class: "empty" }, "No messages yet. Items appear here as soon as someone sends one."));
   const people = el("ul", { class: "people" });
@@ -370,7 +386,7 @@ function buildSessionLayout(s) {
   const canSend = ["owner", "sender"].includes(inv.role);
 
   // composer
-  const status = el("p", { class: "status", role: "status" });
+  const status = el("p", { class: "status", role: "alert" });
   const text = el("textarea", { id: "msg", rows: 2, placeholder: "Message the session…" });
   const file = el("input", { type: "file", id: "file", class: "sr-only", accept: Object.keys(FILE_TYPES).join(",") });
   const pending = el("span", { class: "pending-file", hidden: true });
@@ -413,8 +429,7 @@ function buildSessionLayout(s) {
         text.value = "";
       }
     } catch (e) {
-      status.textContent = e.code === "no_runner_available" ? "No runner available · the job was not queued"
-        : `Not sent: ${e.message || e}`;
+      status.textContent = e.final ? e.message : `Not sent: ${e.message || e}`;
     } finally {
       sendBtn.disabled = !!s.closed;
     }
@@ -439,12 +454,14 @@ function buildSessionLayout(s) {
     : el("div", { class: "panel readonly" }, `You joined as ${inv.role}. You can read this session but not post to it.`);
 
   // rail
+  const closeErr = el("p", { class: "error", role: "alert" });
   const closeBtn = inv.role === "owner" ? el("button", { class: "danger", type: "button", onclick: async () => {
     if (!confirm("Close the session and purge it from the relay for everyone?")) return;
+    closeErr.textContent = "";
     try {
       await api("POST", `/v1/sessions/${sid}/close`, { token: identity.token });
     } catch (e) {
-      alert(`Could not close: ${e.message}`);
+      closeErr.textContent = `Could not close: ${e.message}`;
     }
   } }, "Close & purge") : null;
   const invites = inv.role === "owner" ? el("details", {},
@@ -457,13 +474,13 @@ function buildSessionLayout(s) {
   const runnerNote = el("p", { class: "muted" });
   const rail = el("aside", { class: "rail" },
     el("section", {}, el("h2", {}, "Participants"), people),
-    execute ? el("section", { class: "stack", "aria-label": "Runner console" }, el("h2", {}, "Runners"), runnerList, runnerNote) : null,
+    execute ? el("section", { class: "stack", id: "runner-console", tabindex: -1, "aria-label": "Runner console" }, el("h2", {}, "Runners"), runnerList, runnerNote) : null,
     el("section", {}, el("h2", {}, "Allowed types"), el("div", { class: "chips" }, manifest.allowed_types.map((t) => el("span", { class: "chip" }, t)))),
     el("section", { class: "stack" }, el("h2", {}, "Session"),
       el("p", { class: "mono muted" }, sid),
       el("p", { class: "muted" }, `Expires ${new Date(manifest.expires_at_ms).toLocaleString()}`),
       el("p", { class: "muted" }, `Files up to ${fmtBytes(manifest.max_item_bytes)}`),
-      invites, closeBtn),
+      invites, closeBtn, closeErr),
     el("section", { class: "stack" }, el("h2", {}, "This browser"),
       el("p", { class: "muted" }, "Received items are kept here, still encrypted, so they survive the relay deleting them."),
       el("button", { type: "button", onclick: async () => {
@@ -474,7 +491,22 @@ function buildSessionLayout(s) {
         await clearSession(sid);
         location.reload();
       } }, "Clear local history")));
-  show(el("div", { class: "session" }, rail, el("div", { class: "main-col" }, banner, timeline, composer)));
+  // Owners see pending runner approvals above the timeline; on narrow
+  // screens the rail (and the runner console) sits below it.
+  const approvalText = el("span", {});
+  const approvalBanner = el("div", { class: "banner approval", hidden: true }, approvalText,
+    el("button", { type: "button", class: "small primary", onclick: () => {
+      const sec = document.getElementById("runner-console");
+      sec?.scrollIntoView({ block: "start" });
+      (sec?.querySelector("button.primary") || sec)?.focus({ preventScroll: true });
+    } }, "Review runners"));
+  show(el("div", { class: "session" }, rail, el("div", { class: "main-col" }, approvalBanner, banner, timeline, composer)));
+  // The sticky composer must not cover the newest card when it scrolls into view.
+  if (canSend && typeof ResizeObserver !== "undefined") {
+    const wrap = document.querySelector(".composer-wrap");
+    new ResizeObserver(() => document.documentElement.style.setProperty("--composer-h", `${Math.ceil(wrap.getBoundingClientRect().height)}px`))
+      .observe(wrap);
+  }
 
   // header
   document.getElementById("title").hidden = false;
@@ -513,6 +545,11 @@ function buildSessionLayout(s) {
         el("span", { class: "key", title: "Key fingerprint" }, ac.fingerprint(p.participant_pub).slice(0, 4))))),
     item: (it) => {
       const stick = nearBottom();
+      // Files an accepted result lists live only inside that result.
+      if (it.kind === "file" && it.status === "ok" && claimedBy(s, it)) {
+        document.getElementById(`item-${it.id}`)?.remove();
+        return;
+      }
       // A result with a known job lives inside the job's card.
       const host = hostJob(s, it);
       if (host) {
@@ -520,14 +557,26 @@ function buildSessionLayout(s) {
         it = host;
       }
       const node = renderItem(s, it);
+      node.dataset.seq = it.seq;
       const old = document.getElementById(`item-${it.id}`);
       if (old) old.replaceWith(node);
-      else timeline.append(node);
+      else {
+        const next = [...timeline.children].find((n) => n.dataset?.seq !== undefined && Number(n.dataset.seq) > it.seq);
+        if (next) next.before(node);
+        else timeline.append(node);
+      }
       if (stick && !old) node.scrollIntoView({ block: "end" });
+      settle(s, it);
+      if (it.kind === "job") announceJob(s, it);
+      else if (!old && s.announce && it.status === "ok" && it.author !== s.me && (it.kind === "text" || it.kind === "file"))
+        announce(`${it.authorName}: ${it.kind === "text" ? it.meta.text : it.meta.name}`);
       jobUi?.refresh();
     },
     runners: () => {
       renderRunners(s, runnerList, runnerNote);
+      const n = s.runners.filter((r) => !r.approved && !r.rejected).length;
+      approvalBanner.hidden = !(inv.role === "owner" && n && !s.closed);
+      approvalText.textContent = `${n} runner${n === 1 ? "" : "s"} awaiting approval`;
       jobUi?.refresh();
     },
     scroll: () => timeline.lastElementChild?.scrollIntoView({ block: "end" }),
@@ -536,6 +585,7 @@ function buildSessionLayout(s) {
       banner.textContent = `This session is closed: ${reason}. Its history stays in this browser until you clear it.`;
       for (const c of [sendBtn, text, file, closeBtn]) if (c) c.disabled = true;
       attach.setAttribute("aria-disabled", "true");
+      approvalBanner.hidden = true;
       if (invites) invites.hidden = true;
       tick();
     },
@@ -655,6 +705,7 @@ async function receive(s, seq, envelope, fetchBlob, attempt = 0) {
     s.results.set(it.meta.job.id, list);
   }
   s.render.item(it);
+  if (it.kind === "event" && it.role === "owner" && ["runner_approve", "runner_reject"].includes(it.meta?.event)) approvalsChanged(s);
 }
 
 function renderItem(s, it) {
@@ -687,7 +738,10 @@ function renderItem(s, it) {
   const m = it.meta;
   if (m.type === "event") return renderEvent(s, it, meta);
   if (m.type === "text") card.append(el("p", {}, m.text));
-  else if (m.type === "file") appendFileView(card, it);
+  else if (m.type === "file") {
+    if (it.role === "runner") card.append(el("p", { class: "note" }, `Output file from runner ${it.authorName}, not listed by an accepted result.`));
+    appendFileView(card, it);
+  }
   else if (m.type === "job") renderJob(s, it, card);
   else if (m.type === "result") {
     const chk = resultCheck(s, it);
@@ -722,21 +776,62 @@ function appendFileView(card, it) {
 
 // ---------- execute mode: jobs, results, events ----------
 const short = (id) => String(id).slice(0, 6);
-const memberName = (s, pub) => s.participants.get(pub)?.display_name || s.runners.find((r) => r.pub === pub)?.name || "unknown";
-const REASONS = {
-  not_available: "No runner available · not queued",
-  runner_unresponsive: "The runner did not respond in time",
-  runner_lost: "The runner went offline",
-  runner_left: "The runner left",
-  runner_rejected: "The runner was rejected",
-  cancelled: "Cancelled before it started",
-};
+const memberName = (s, pub) => s.runners.find((r) => r.pub === pub)?.name || s.participants.get(pub)?.display_name || "unknown";
 const STATUS_LABELS = { completed: "completed", refused: "refused", timed_out: "timed out", cancelled: "cancelled", failed: "failed" };
+
+// A completed run is only a success with exit 0.
+function outcome(m) {
+  if (m.status === "completed") {
+    if (m.exit_code === 0) return { text: "completed", bad: false };
+    return { text: Number.isInteger(m.exit_code) ? `failed · exit ${m.exit_code}` : "failed", bad: true };
+  }
+  return { text: STATUS_LABELS[m.status] || m.status, bad: true };
+}
 
 function targetText(t) {
   if (t?.type === "runner") return `runner ${t.name}`;
   if (t?.type === "labels") return `labels: ${t.labels.join(", ")}`;
   return "any idle runner";
+}
+
+// "failed · runner-01 not available · not queued" (DESIGN §6, protocol §13).
+function notAvailableText(tgt) {
+  if (tgt?.type === "runner") return `failed · ${tgt.name} not available · not queued`;
+  if (tgt?.type === "labels") return `failed · no runner with ${tgt.labels.join(",")} · not queued`;
+  return "failed · no runner available · not queued";
+}
+
+function failureText(s, tgt, st) {
+  if (st.reason === "not_available") return notAvailableText(tgt);
+  if (st.reason === "cancelled") return "cancelled";
+  const name = (st.runner ? memberName(s, st.runner) : null) || (tgt?.type === "runner" ? tgt.name : null) || "the runner";
+  const tail = { runner_unresponsive: "did not claim it", runner_lost: "went offline", runner_left: "left", runner_rejected: "was rejected" }[st.reason];
+  return tail ? `failed · ${name} ${tail}` : `failed${st.reason ? ` · ${st.reason}` : ""}`;
+}
+
+// Verified runner_approve events from the owner, minus any runner the owner
+// rejected (a rejection is final). undefined when approval is not required.
+function approvedRunners(s) {
+  if (!s.manifest.job_limits?.approve_runners) return undefined;
+  if (s.approvedList) return s.approvedList;
+  const approved = new Set();
+  const rejected = new Set();
+  for (const it of [...s.items.values()].sort((a, b) => a.seq - b.seq)) {
+    if (it.kind !== "event" || it.status !== "ok" || it.role !== "owner" || it.meta?.type !== "event" || !it.meta.participant_pub) continue;
+    if (it.meta.event === "runner_reject") rejected.add(it.meta.participant_pub);
+    else if (it.meta.event === "runner_approve") approved.add(it.meta.participant_pub);
+  }
+  s.approvedList = [...approved].filter((k) => !rejected.has(k));
+  return s.approvedList;
+}
+
+// Approvals changed: results that arrived earlier are checked again.
+function approvalsChanged(s) {
+  s.approvedList = null;
+  for (const it of s.items.values()) if (it.kind === "result") delete it.check;
+  for (const it of [...s.items.values()]) {
+    if (it.status === "ok" && (it.kind === "result" || (it.kind === "file" && it.role === "runner"))) s.render.item(it);
+  }
 }
 
 // The job card that should show this result, when its job is in the timeline.
@@ -746,20 +841,50 @@ function hostJob(s, it) {
   return job && job.status === "ok" && job.kind === "job" ? job : null;
 }
 
-// Cached: does this result belong to its job, per the protocol checks?
+// Cached: does this result belong to its job and come from an approved runner?
 function resultCheck(s, r) {
   if (r.check) return r.check;
+  if (r.role !== "runner") return { ok: false, error: "the author is not a runner" };
+  const approved = approvedRunners(s);
+  if (approved && !approved.includes(r.author)) return { ok: false, error: "the author is not an approved runner" };
   const job = s.items.get(r.meta.job?.id);
   if (!job || job.status !== "ok" || !job.ref) return { ok: true, unbound: true };
   let chk;
   try {
-    ac.checkResultForJob(JSON.stringify(job.ref), JSON.stringify(job.meta), r.author, JSON.stringify(r.meta));
+    ac.checkResultForJob(JSON.stringify(job.ref), JSON.stringify(job.meta), r.author, JSON.stringify(r.meta),
+      approved === undefined ? undefined : JSON.stringify(approved));
     chk = { ok: true };
   } catch (e) {
     chk = { ok: false, error: String(e.message || e).replace(/^\w+Error: /, "") };
   }
   r.check = chk;
   return chk;
+}
+
+// The accepted result that lists this file as an output, if any.
+function claimedBy(s, f) {
+  if (f.role !== "runner") return null;
+  for (const list of s.results.values()) {
+    for (const r of list) {
+      if (r.status !== "ok" || r.author !== f.author || !resultCheck(s, r).ok) continue;
+      if ((r.meta.out_files || []).some((o) => o.item?.id === f.id)) return r;
+    }
+  }
+  return null;
+}
+
+// After a card is drawn: drop standalone copies of what it now contains.
+function settle(s, it) {
+  const rs = it.kind === "job" ? s.results.get(it.id) || [] : it.kind === "result" ? [it] : [];
+  for (const r of rs) {
+    if (r.status !== "ok") continue;
+    if (it.kind === "job") document.getElementById(`item-${r.id}`)?.remove();
+    if (!resultCheck(s, r).ok) continue;
+    for (const o of r.meta.out_files || []) {
+      const f = s.items.get(o.item?.id);
+      if (f && f.author === r.author) document.getElementById(`item-${f.id}`)?.remove();
+    }
+  }
 }
 
 function rejectedResult(reason) {
@@ -774,17 +899,17 @@ function logBlock(label, text, truncated) {
 
 function renderResult(s, r, extra = "") {
   const m = r.meta;
-  const bad = m.status !== "completed";
+  const out = outcome(m);
   const parts = [];
   if (m.exit_code !== null && m.exit_code !== undefined) parts.push(`exit ${m.exit_code}`);
   parts.push(`${(m.wall_ms / 1000).toFixed(2)} s`, `${m.peak_mem_mb} MB peak`);
   const files = m.out_files || [];
   return el("div", { class: "result", id: `result-${r.id}` },
     el("div", { class: "result-head" },
-      el("span", { class: `state ${bad ? "bad" : "good"}` }, STATUS_LABELS[m.status] || m.status),
+      el("span", { class: `state ${out.bad ? "bad" : "good"}` }, out.text),
       el("span", { class: "mono muted" }, parts.join(" · ")),
       extra ? el("span", { class: "chip" }, extra) : null),
-    m.reason ? el("p", { class: "note" }, `Reason: ${m.reason}`) : null,
+    m.reason ? el("p", { class: "note" }, m.reason) : null,
     logBlock("stdout", m.stdout, m.stdout_truncated), logBlock("stderr", m.stderr, m.stderr_truncated),
     files.length ? el("div", { class: "outfiles" }, el("div", { class: "logname" }, `Output files (${files.length})`),
       files.map((f) => renderOutFile(s, f))) : null);
@@ -803,68 +928,102 @@ function renderOutFile(s, f) {
     return box;
   }
   appendFileView(box, fi);
-  box.append(el("button", { type: "button", class: "small link", onclick: () => {
-    document.getElementById(`item-${fi.id}`)?.scrollIntoView({ block: "center" });
-  } }, "Show in timeline"));
   return box;
+}
+
+const sha256Hex = async (text) => {
+  const d = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
+  return [...d].map((b) => b.toString(16).padStart(2, "0")).join("");
+};
+
+// Keep a disclosure open across re-renders of its card.
+function keepOpen(s, key, details) {
+  if (s.open.has(key)) details.open = true;
+  details.addEventListener("toggle", () => (details.open ? s.open.add(key) : s.open.delete(key)));
+  return details;
+}
+
+// State of a job for its card and for announcements.
+function jobStatus(s, it) {
+  const st = s.jobs.get(it.id);
+  const entries = [];
+  let accepted = null;
+  for (const r of s.results.get(it.id) || []) {
+    if (r.status !== "ok") continue;
+    const chk = resultCheck(s, r);
+    if (!chk.ok) entries.push({ r, error: chk.error });
+    else if (!accepted) {
+      accepted = r;
+      entries.push({ r });
+    } else entries.push({ r, dup: true });
+  }
+  let text;
+  let bad = false;
+  if (accepted) ({ text, bad } = outcome(accepted.meta));
+  else if (st?.state === "failed") {
+    text = failureText(s, it.meta.target, st);
+    bad = text !== "cancelled";
+  } else if (st?.state === "done") text = "done · waiting for the result";
+  else text = st?.state || "submitted";
+  const runner = st?.runner ? memberName(s, st.runner) : null;
+  return { st, entries, accepted, text, tone: bad ? "bad" : accepted ? "good" : text === "cancelled" ? "bad" : "run", runner };
+}
+
+function announceJob(s, it) {
+  const { text, runner } = jobStatus(s, it);
+  const prev = s.said.get(it.id);
+  if (prev === text) return;
+  s.said.set(it.id, text);
+  if (!s.announce || (prev === undefined && text === "submitted")) return;
+  announce(`${it.meta.filename}${runner ? ` on ${runner}` : ""}: ${text}`);
 }
 
 function renderJob(s, it, card) {
   const m = it.meta;
-  const st = s.jobs.get(it.id);
-  const results = s.results.get(it.id) || [];
-  let accepted = null;
-  const rendered = [];
-  for (const r of results) {
-    if (r.status !== "ok") continue;
-    const chk = resultCheck(s, r);
-    if (!chk.ok) rendered.push(rejectedResult(chk.error));
-    else if (!accepted) {
-      accepted = r;
-      rendered.push(renderResult(s, r));
-    } else rendered.push(renderResult(s, r, "ignored: duplicate"));
-  }
-  let stateText;
-  let tone = "run";
-  if (accepted) {
-    const done = accepted.meta.status === "completed";
-    stateText = done ? "done" : STATUS_LABELS[accepted.meta.status] || accepted.meta.status;
-    tone = done ? "good" : "bad";
-  } else if (st?.state === "failed") {
-    stateText = REASONS[st.reason] || `failed${st.reason ? `: ${st.reason}` : ""}`;
-    tone = "bad";
-  } else if (st?.state === "done") stateText = "done (waiting for the result)";
-  else if (st) stateText = st.state;
-  else stateText = "submitted";
-  const runnerName = st?.runner ? memberName(s, st.runner) : null;
+  const { st, entries, accepted, text, tone, runner } = jobStatus(s, it);
+  const rendered = entries.map((e) => (e.error ? rejectedResult(e.error) : renderResult(s, e.r, e.dup ? "ignored: duplicate" : "")));
   const lines = m.code.split("\n");
   const code = el("pre", {}, m.code);
   const files = (m.files || []).map((ref) => s.items.get(ref.id)?.meta?.name || `item ${short(ref.id)}`);
   const active = !accepted && (st?.state === "assigned" || st?.state === "running");
   const canCancel = active && (s.inv.role === "owner" || it.author === s.me);
+  const codeHash = el("span", { class: "mono" }, "computing…");
+  (it.codeSha ||= sha256Hex(m.code)).then((h) => (codeHash.textContent = h), () => (codeHash.textContent = "unavailable"));
+  const am = accepted?.meta;
+  const details = keepOpen(s, `details:${it.id}`, el("details", { class: "codebox" }, el("summary", {}, "Details"),
+    el("dl", { class: "jobmeta" },
+      el("dt", {}, "Job id"), el("dd", { class: "mono" }, it.id),
+      el("dt", {}, "Code SHA-256"), el("dd", {}, codeHash),
+      am?.code_sha256 ? el("dt", {}, "Result code") : null, am?.code_sha256 ? el("dd", { class: "mono" }, am.code_sha256) : null,
+      am?.input_sha256 ? el("dt", {}, "Result inputs") : null, am?.input_sha256 ? el("dd", { class: "mono" }, am.input_sha256) : null)));
+  const err = s.jobErrors.get(it.id);
   card.append(
-    el("div", { class: "file-head" }, el("span", { class: "chip type" }, "job"), el("span", { class: "fname", title: m.filename }, m.filename),
-      el("span", { class: `state ${tone}` }, stateText),
+    el("div", { class: "file-head job-head" }, el("span", { class: "chip type" }, "job"), el("span", { class: "fname", title: m.filename }, m.filename),
+      el("span", { class: "mono muted jobid", title: it.id }, `#${short(it.id)}`),
+      el("span", { class: `state ${tone}` }, text),
       canCancel ? el("button", { type: "button", class: "small danger", onclick: (ev) => cancelJob(s, it, ev.currentTarget) }, "Cancel") : null),
+    ...(err ? [el("p", { class: "note error", role: "alert" }, err)] : []),
     el("dl", { class: "jobmeta" },
       el("dt", {}, "Target"), el("dd", {}, targetText(m.target)),
-      runnerName ? el("dt", {}, "Runner") : null, runnerName ? el("dd", {}, runnerName) : null,
+      runner ? el("dt", {}, "Runner") : null, runner ? el("dd", {}, runner) : null,
       el("dt", {}, "Limits"), el("dd", {}, `${m.runtime} · ${m.timeout_s} s${m.memory_mb ? ` · ${m.memory_mb} MB` : ""}`),
       files.length ? el("dt", {}, "Inputs") : null, files.length ? el("dd", {}, files.join(", ")) : null),
     lines.length > 12
-      ? el("details", { class: "codebox" }, el("summary", {}, `Code · ${lines.length} lines`), code)
+      ? keepOpen(s, `code:${it.id}`, el("details", { class: "codebox" }, el("summary", {}, `Code · ${lines.length} lines`), code))
       : code,
+    details,
     ...rendered);
 }
 
 async function cancelJob(s, it, btn) {
   btn.disabled = true;
+  s.jobErrors.delete(it.id);
   try {
     await sendPayload(s, "event", null, { type: "event", event: "job_cancel", job: it.ref }, new Uint8Array());
     await api("POST", `/v1/sessions/${s.sid}/jobs/${it.id}/cancel`, { token: s.identity.token });
   } catch (e) {
-    btn.disabled = false;
-    alert(`Could not cancel: ${e.message || e}`);
+    s.jobErrors.set(it.id, `Could not cancel: ${e.message || e}`);
+    s.render.item(it);
   }
 }
 
@@ -907,6 +1066,13 @@ async function pollRunners(s) {
         console.warn("ignoring unverifiable runner", err);
       }
     }
+    const first = !s.runnersLoaded;
+    for (const x of list) {
+      const label = x.rejected ? "rejected" : x.approved ? "approved" : "awaiting approval";
+      if (!first && s.announce && s.runnerSeen.get(x.pub) !== label) announce(`Runner ${x.name}: ${label}`);
+      s.runnerSeen.set(x.pub, label);
+    }
+    s.runnersLoaded = true;
     s.runners = list;
     s.approvalRequired = !!r.approval_required;
     s.render.runners();
@@ -931,25 +1097,30 @@ function renderRunners(s, list, note) {
   list.replaceChildren(...s.runners.map((r) => {
     const approval = r.rejected ? "rejected" : r.approved ? "approved" : "awaiting approval";
     const owner = s.inv.role === "owner";
+    const live = r.rejected ? "rejected" : !r.approved ? "awaiting approval" : r.online ? (r.job ? `busy · #${short(r.job)}` : "idle") : "offline";
+    const dot = r.rejected ? "" : !r.approved ? "wait" : r.online ? "on" : "";
+    const err = s.runnerErrors.get(r.pub);
     return el("li", { class: `runner${r.rejected ? " is-rejected" : ""}` },
       el("div", { class: "rhead" },
-        el("span", { class: `dot ${r.online ? "on" : ""}`, "aria-hidden": "true" }),
+        el("span", { class: `dot ${dot}`, "aria-hidden": "true" }),
         el("strong", { class: "name" }, r.name),
-        el("span", { class: "sub" }, r.online ? (r.job ? `busy · ${short(r.job)}` : "idle") : "offline")),
+        el("span", { class: "sub" }, live)),
       el("div", { class: "sub" }, `${r.sandbox} · ${r.host}`),
       r.labels.length ? el("div", { class: "chips" }, r.labels.map((l) => el("span", { class: "chip" }, l))) : null,
       el("div", { class: "chips" },
         el("span", { class: `chip approval ${r.rejected ? "bad" : r.approved ? "good" : "wait"}` }, approval),
-        r.networkUnblocked ? el("span", { class: "chip warn", title: "This runner's sandbox cannot block network access" }, "⚠ network not blocked") : null),
+        r.networkUnblocked && !r.rejected ? el("span", { class: "chip warn", title: "This runner's sandbox cannot block network access" }, "⚠ network not blocked") : null),
       owner && !r.rejected ? el("div", { class: "row" },
         r.approved ? null : el("button", { type: "button", class: "small primary", onclick: (ev) => decideRunner(s, r, true, ev.currentTarget) }, "Approve"),
-        el("button", { type: "button", class: "small danger", onclick: (ev) => decideRunner(s, r, false, ev.currentTarget) }, "Reject")) : null);
+        el("button", { type: "button", class: "small danger", onclick: (ev) => decideRunner(s, r, false, ev.currentTarget) }, "Reject")) : null,
+      err ? el("p", { class: "error", role: "alert" }, err) : null);
   }));
 }
 
 async function decideRunner(s, r, approve, btn) {
   if (!approve && !confirm(`Reject runner ${r.name}? It is removed from the session and its job fails.`)) return;
   btn.disabled = true;
+  s.runnerErrors.delete(r.pub);
   try {
     const meta = approve ? { type: "event", event: "runner_approve", participant_pub: r.pub }
       : { type: "event", event: "runner_reject", participant_pub: r.pub, reason: null };
@@ -957,7 +1128,8 @@ async function decideRunner(s, r, approve, btn) {
     await api("POST", `/v1/sessions/${s.sid}/runners/${encodeURIComponent(r.pub)}/${approve ? "approve" : "reject"}`, { token: s.identity.token });
     await pollRunners(s);
   } catch (e) {
-    alert(`Could not ${approve ? "approve" : "reject"} the runner: ${e.message || e}`);
+    s.runnerErrors.set(r.pub, `Could not ${approve ? "approve" : "reject"} the runner: ${e.message || e}`);
+    s.render.runners();
   } finally {
     btn.disabled = false;
   }
@@ -973,16 +1145,22 @@ function buildJobPanel(s, text, file) {
   const target = el("select", { id: "job-target" });
   const labels = el("input", { type: "text", id: "job-labels", placeholder: "gpu, cpu", autocomplete: "off", "aria-label": "Runner labels" });
   const labelField = el("div", { class: "stack field", hidden: true }, el("label", { for: "job-labels" }, "Labels"), labels);
-  const timeout = el("input", { type: "number", id: "job-timeout", min: 1, max: lim.timeout_s, step: 1, value: lim.timeout_s });
+  const timeout = el("input", { type: "number", id: "job-timeout", min: 1, max: lim.timeout_s, step: 1, value: lim.timeout_s,
+    title: `1 to ${lim.timeout_s} seconds` });
   const files = el("div", { class: "pickfiles" });
+  const filesSummary = el("summary", {}, "Input files · none selected");
   const status = el("p", { class: "muted hint-text" });
   const panel = el("div", { class: "jobpanel", hidden: true },
     el("div", { class: "jobrow" },
       el("div", { class: "stack field" }, el("label", { for: "job-target" }, "Target"), target),
-      labelField,
-      el("div", { class: "stack field narrow" }, el("label", { for: "job-timeout" }, `Timeout (s, max ${lim.timeout_s})`), timeout)),
-    el("fieldset", {}, el("legend", {}, "Input files from this session"), files),
+      el("div", { class: "stack field narrow" }, el("label", { for: "job-timeout" }, "Timeout (s)"), timeout),
+      labelField),
+    el("details", { class: "inputfiles" }, filesSummary, files),
     status);
+  const countPicked = () => {
+    const n = s.picked.size;
+    filesSummary.textContent = `Input files · ${n ? `${n} selected` : "none selected"}`;
+  };
   const toggle = el("button", { type: "button", class: "small", "aria-pressed": "false", onclick: () => {
     on = !on;
     toggle.setAttribute("aria-pressed", String(on));
@@ -991,9 +1169,9 @@ function buildJobPanel(s, text, file) {
     optsSig = "";
     filesSig = null;
     text.placeholder = on ? "Python code to run (or attach a .py file)…" : "Message the session…";
-    if (sendBtn) sendBtn.textContent = on ? "Run job" : "Send";
+    if (sendBtn) sendBtn.textContent = on ? "Send job" : "Send";
     refresh();
-  } }, "Run as job");
+  } }, "Send as job");
   target.addEventListener("change", () => (labelField.hidden = target.value !== "labels"));
 
   function refresh() {
@@ -1012,6 +1190,7 @@ function buildJobPanel(s, text, file) {
     target.value = [...target.options].some((o) => o.value === cur) ? cur : "any";
     labelField.hidden = target.value !== "labels";
     const cands = [...s.items.values()].filter((i) => i.kind === "file" && i.status === "ok" && i.ref).sort((a, b) => a.seq - b.seq);
+    countPicked();
     const fsig = cands.map((i) => i.id).join("|");
     if (fsig === filesSig) return;
     filesSig = fsig;
@@ -1019,6 +1198,7 @@ function buildJobPanel(s, text, file) {
       el("input", { type: "checkbox", checked: s.picked.has(i.id), onchange: (ev) => {
         if (ev.target.checked) s.picked.add(i.id);
         else s.picked.delete(i.id);
+        countPicked();
       } }), `${i.meta.name}`, el("span", { class: "ext" }, i.subkind))) : [el("span", { class: "muted hint-text" }, "No files in the timeline yet.")]));
   }
 
@@ -1040,9 +1220,11 @@ function buildJobPanel(s, text, file) {
     let tgt;
     if (target.value === "any") tgt = { type: "any" };
     else if (target.value === "labels") {
-      const ls = labels.value.split(",").map((x) => x.trim()).filter(Boolean);
-      if (!ls.length || ls.length > 16 || !ls.every((l) => /^[a-z0-9][a-z0-9._-]{0,62}$/.test(l)))
-        throw new Error("labels are comma-separated, lowercase letters, digits, . _ -");
+      const ls = labels.value.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+      if (!ls.length) throw new Error("enter at least one label, such as gpu");
+      if (ls.length > 16) throw new Error("use at most 16 labels");
+      const bad = ls.find((l) => !/^[a-z0-9][a-z0-9._-]{0,62}$/.test(l));
+      if (bad) throw new Error(`"${bad.slice(0, 20)}" is not a valid label: use letters, digits, . _ - (up to 63, starting with a letter or digit)`);
       tgt = { type: "labels", labels: ls };
     } else {
       const r = s.runners.find((x) => `runner:${x.pub}` === target.value);
@@ -1051,7 +1233,14 @@ function buildJobPanel(s, text, file) {
     }
     const refs = [...s.picked].map((id) => s.items.get(id)?.ref).filter(Boolean);
     const meta = { type: "job", filename, code, runtime: lim.runtime, timeout_s: t, memory_mb: null, files: refs, requirements: [], target: tgt };
-    await sendPayload(s, "job", "py", meta, new Uint8Array(), { path: "jobs", headers: { "Airlock-Target": JSON.stringify(tgt) } });
+    try {
+      await sendPayload(s, "job", "py", meta, new Uint8Array(), { path: "jobs", headers: { "Airlock-Target": JSON.stringify(tgt) } });
+    } catch (e) {
+      if (e.code !== "no_runner_available") throw e;
+      const err = new Error(notAvailableText(tgt));
+      err.final = true;
+      throw err;
+    }
     s.picked.clear();
     refresh();
     return true;
