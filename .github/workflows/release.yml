@@ -15,6 +15,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      # Only release commits that reached main (and so passed CI).
+      - run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
       # The package version comes from the Rust workspace; the tag must match it.
       - run: |
           python3 - <<'EOF'
@@ -32,11 +36,11 @@ jobs:
     strategy:
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64 }
-          - { os: ubuntu-latest, target: aarch64 }
-          - { os: macos-latest, target: x86_64 }
-          - { os: macos-latest, target: aarch64 }
-          - { os: windows-latest, target: x64 }
+          - { os: ubuntu-latest, target: x86_64, native: true }
+          - { os: ubuntu-latest, target: aarch64, native: false }
+          - { os: macos-latest, target: x86_64, native: false }
+          - { os: macos-latest, target: aarch64, native: true }
+          - { os: windows-latest, target: x64, native: true }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
@@ -45,6 +49,11 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist
           manylinux: auto
+      # Install the wheel and load the Rust core, where the runner can run it.
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        if: matrix.native
+      - if: matrix.native
+        run: uv run --isolated --no-project --find-links python/airlox/dist --with airlox python -c "import airlox, airlox._core as c; print('airlox core', c.PROTOCOL_VERSION)"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist-${{ matrix.os }}-${{ matrix.target }}

@@ -6,6 +6,6 @@ __pycache__/
 *.so
 /bindings/wasm/pkg/
 /web/pkg/
-/bindings/python/dist/
+/python/airlox/dist/
 node_modules/
 .DS_Store
