@@ -150,6 +150,14 @@ function inviteRow(name, url, hint) {
     el("div", { class: "head" }, el("strong", {}, name), hint ? el("span", { class: "muted" }, hint) : null), box);
 }
 
+// Runner invites come with the command that uses them. The shown command
+// carries the masked link; Copy always copies the full link.
+function runnerInviteRow(url) {
+  return el("div", { class: "stack" }, inviteRow("Runner", url, "your sandboxed machine"),
+    el("p", { class: "muted hint-text" }, "Run on the runner host: ",
+      el("code", {}, `airlock runner join --invite '${maskInvite(url)}' --name runner-01 --sandbox docker`)));
+}
+
 // ---------- new session ----------
 function landing() {
   const radio = (name, value, label, checked, extra = {}) =>
@@ -158,8 +166,8 @@ function landing() {
     el("div", { class: "mode" },
       el("label", { class: "option" }, el("input", { type: "radio", name: "mode", value: "relay", checked: true }),
         el("strong", {}, "Relay"), el("span", {}, "Share messages and files")),
-      el("label", { class: "option" }, el("input", { type: "radio", name: "mode", value: "execute", disabled: true }),
-        el("strong", {}, "Execute"), el("span", {}, "Run Python on runners · coming in M2"))));
+      el("label", { class: "option" }, el("input", { type: "radio", name: "mode", value: "execute" }),
+        el("strong", {}, "Execute"), el("span", {}, "Run Python on runners you approve"))));
   const ttl = el("fieldset", {}, el("legend", {}, "Expires after"),
     el("div", { class: "options" },
       radio("ttl", 900000, "15 min", false), radio("ttl", 3600000, "1 hour", true), radio("ttl", 86400000, "24 hours", false)));
@@ -170,9 +178,35 @@ function landing() {
   const size = el("input", { type: "number", id: "size", min: 1, max: MAX_ITEM_MB, step: 1, value: MAX_ITEM_MB });
   const sizeField = el("div", { class: "stack" }, el("label", { for: "size" }, el("strong", {}, "Max file size")),
     el("div", { class: "size" }, size, el("span", { class: "muted" }, "MB")));
+  const lim = {
+    runtime: el("input", { type: "text", id: "j-runtime", value: "python3.12", autocomplete: "off" }),
+    timeout: el("input", { type: "number", id: "j-timeout", min: 1, max: 3600, step: 1, value: 30 }),
+    memory: el("input", { type: "number", id: "j-memory", min: 32, max: 65536, step: 1, value: 512 }),
+    packages: el("input", { type: "text", id: "j-packages", placeholder: "numpy, pandas", autocomplete: "off" }),
+    approve: el("input", { type: "checkbox", id: "j-approve", checked: true }),
+  };
+  const field = (id, label, input, hint) => el("div", { class: "stack field" }, el("label", { for: id }, el("strong", {}, label)), input,
+    hint ? el("span", { class: "muted hint-text" }, hint) : null);
+  const jobBox = el("fieldset", { class: "stack", hidden: true }, el("legend", {}, "Job limits"),
+    el("div", { class: "limits" },
+      field("j-runtime", "Runtime", lim.runtime), field("j-timeout", "Timeout (seconds)", lim.timeout, "1 to 3600"),
+      field("j-memory", "Memory (MB)", lim.memory, "32 to 65536")),
+    field("j-packages", "Packages", lim.packages, "Comma-separated. Only these can be requested by jobs."),
+    el("label", { class: "option check" }, lim.approve, "Require owner approval for runners"),
+    el("p", { class: "muted" }, "Network access is always off and runners return their output files."));
+  const pyBox = types.querySelector('input[value="py"]');
+  const isExecute = () => form.elements.mode.value === "execute";
+  const syncMode = () => {
+    jobBox.hidden = !isExecute();
+    if (isExecute()) pyBox.checked = true;
+  };
+  mode.addEventListener("change", syncMode);
+  pyBox.addEventListener("change", () => {
+    if (isExecute()) pyBox.checked = true;
+  });
   const err = el("p", { class: "error", role: "alert" });
   const create = el("button", { class: "primary cta", type: "submit" }, "Create session");
-  const fields = el("fieldset", { class: "stack" }, mode, ttl, types, sizeField);
+  const fields = el("fieldset", { class: "stack" }, mode, jobBox, ttl, types, sizeField);
   const aside = el("aside", { class: "panel stack" },
     el("h2", {}, "Invites"),
     el("p", { class: "muted" }, "Invite links appear here once the session exists. Each one carries a role and the session key."));
@@ -183,12 +217,30 @@ function landing() {
     const fd = new FormData(form);
     const allowed = fd.getAll("type");
     const mb = Number(size.value);
+    const execute = isExecute();
+    if (execute && !allowed.includes("py")) allowed.push("py");
     if (!allowed.length) return (err.textContent = "Pick at least one content type.");
+    let job_limits = null;
+    if (execute) {
+      const timeout_s = Number(lim.timeout.value);
+      const memory_mb = Number(lim.memory.value);
+      const runtime = lim.runtime.value.trim();
+      if (!/^python3\.\d{1,2}$/.test(runtime)) return (err.textContent = "Runtime must look like python3.12.");
+      if (!Number.isInteger(timeout_s) || timeout_s < 1 || timeout_s > 3600) return (err.textContent = "Timeout must be 1 to 3600 seconds.");
+      if (!Number.isInteger(memory_mb) || memory_mb < 32 || memory_mb > 65536) return (err.textContent = "Memory must be 32 to 65536 MB.");
+      const packages = [];
+      for (const raw of lim.packages.value.split(",").map((x) => x.trim()).filter(Boolean)) {
+        if (!/^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(raw)) return (err.textContent = `"${raw}" is not a valid package name.`);
+        const norm = raw.toLowerCase().replace(/[-_.]+/g, "-");
+        if (!packages.includes(norm)) packages.push(norm);
+      }
+      job_limits = { runtime, timeout_s, memory_mb, network: false, packages, return_out: true, approve_runners: lim.approve.checked };
+    }
     if (!Number.isInteger(mb) || mb < 1 || mb > MAX_ITEM_MB) return (err.textContent = `Max file size must be 1 to ${MAX_ITEM_MB} MB.`);
     create.disabled = true;
     try {
-      const params = { mode: "relay", created_at_ms: Date.now(), ttl_ms: Number(fd.get("ttl")), allowed_types: allowed,
-        max_item_bytes: mb * MB, job_limits: null };
+      const params = { mode: execute ? "execute" : "relay", created_at_ms: Date.now(), ttl_ms: Number(fd.get("ttl")), allowed_types: allowed,
+        max_item_bytes: mb * MB, job_limits };
       const s = ac.createSession(JSON.stringify(params), undefined);
       const { session_id } = await (await api("POST", "/v1/sessions", { body: s.signedManifest })).json();
       fields.disabled = true;
@@ -202,6 +254,7 @@ function landing() {
         inviteRow("Owner", owner, "you · keep it private"),
         inviteRow("Sender", ac.memberInvite(base, s.ownerSeed, "sender"), "your code agent"),
         inviteRow("Observer", ac.memberInvite(base, s.ownerSeed, "observer"), "read-only, optional"),
+        execute ? runnerInviteRow(ac.memberInvite(base, s.ownerSeed, "runner")) : null,
         el("div", { class: "row" },
           el("a", { class: "button primary cta", href: owner }, "Open session"),
           el("button", { type: "button", onclick: () => location.reload() }, "Create another")));
@@ -282,7 +335,7 @@ async function sessionView() {
   }
   const me = ac.publicKey(identity.seed);
   const s = { sid, inv, manifest, signed, identity, me, participants: new Map(), items: new Map(), evicted: new Set(),
-    lastSeq: -1, closed: null };
+    lastSeq: -1, closed: null, jobs: new Map(), results: new Map(), runners: [], picked: new Set() };
   buildSessionLayout(s);
 
   // Cached history first, then catch up, then stream. Blobs missing locally
@@ -322,6 +375,8 @@ function buildSessionLayout(s) {
   const file = el("input", { type: "file", id: "file", class: "sr-only", accept: Object.keys(FILE_TYPES).join(",") });
   const pending = el("span", { class: "pending-file", hidden: true });
   const sendBtn = el("button", { class: "primary", type: "submit" }, "Send");
+  const execute = manifest.mode === "execute";
+  const jobUi = canSend && execute ? buildJobPanel(s, text, file) : null;
   const attach = el("label", { class: "button icon-btn", for: "file", title: "Attach a file", "aria-label": "Attach a file" }, svg(ICON_CLIP));
   const showPending = () => {
     const f = file.files?.[0];
@@ -333,11 +388,20 @@ function buildSessionLayout(s) {
       } }, "✕"));
   };
   file.addEventListener("change", showPending);
+  if (jobUi) jobUi.setSend(sendBtn);
   const submit = async () => {
     if (sendBtn.disabled) return;
     sendBtn.disabled = true;
     status.textContent = "";
     try {
+      if (jobUi?.active()) {
+        if (await jobUi.submit()) {
+          file.value = "";
+          showPending();
+          text.value = "";
+        }
+        return;
+      }
       if (file.files?.[0]) {
         await sendFile(s, file.files[0]);
         file.value = "";
@@ -349,7 +413,8 @@ function buildSessionLayout(s) {
         text.value = "";
       }
     } catch (e) {
-      status.textContent = `Not sent: ${e.message || e}`;
+      status.textContent = e.code === "no_runner_available" ? "No runner available · the job was not queued"
+        : `Not sent: ${e.message || e}`;
     } finally {
       sendBtn.disabled = !!s.closed;
     }
@@ -366,8 +431,9 @@ function buildSessionLayout(s) {
         submit();
       } },
         el("div", { class: "composer" },
+          jobUi?.panel,
           el("label", { for: "msg", class: "sr-only" }, "Message the session"), text,
-          el("div", { class: "toolbar" }, attach, file, pending,
+          el("div", { class: "toolbar" }, attach, file, pending, jobUi?.toggle,
             el("span", { class: "hint" }, navigator.platform.startsWith("Mac") ? "⌘↵ to send" : "Ctrl+↵ to send"), sendBtn)),
         status)
     : el("div", { class: "panel readonly" }, `You joined as ${inv.role}. You can read this session but not post to it.`);
@@ -385,9 +451,13 @@ function buildSessionLayout(s) {
     el("summary", {}, "Invites"),
     el("div", { class: "stack" },
       inviteRow("Sender", ac.memberInvite(location.origin, inv.roleSeed, "sender"), "your code agent"),
-      inviteRow("Observer", ac.memberInvite(location.origin, inv.roleSeed, "observer"), "read-only"))) : null;
+      inviteRow("Observer", ac.memberInvite(location.origin, inv.roleSeed, "observer"), "read-only"),
+      execute ? runnerInviteRow(ac.memberInvite(location.origin, inv.roleSeed, "runner")) : null)) : null;
+  const runnerList = el("ul", { class: "runners" });
+  const runnerNote = el("p", { class: "muted" });
   const rail = el("aside", { class: "rail" },
     el("section", {}, el("h2", {}, "Participants"), people),
+    execute ? el("section", { class: "stack", "aria-label": "Runner console" }, el("h2", {}, "Runners"), runnerList, runnerNote) : null,
     el("section", {}, el("h2", {}, "Allowed types"), el("div", { class: "chips" }, manifest.allowed_types.map((t) => el("span", { class: "chip" }, t)))),
     el("section", { class: "stack" }, el("h2", {}, "Session"),
       el("p", { class: "mono muted" }, sid),
@@ -431,6 +501,7 @@ function buildSessionLayout(s) {
   const timer = setInterval(tick, 1000);
   tick();
 
+  if (execute) runnerLoop(s);
   const nearBottom = () => window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 160;
   s.render = {
     people: () => people.replaceChildren(...[...s.participants.values()].map((p) =>
@@ -442,11 +513,22 @@ function buildSessionLayout(s) {
         el("span", { class: "key", title: "Key fingerprint" }, ac.fingerprint(p.participant_pub).slice(0, 4))))),
     item: (it) => {
       const stick = nearBottom();
+      // A result with a known job lives inside the job's card.
+      const host = hostJob(s, it);
+      if (host) {
+        document.getElementById(`item-${it.id}`)?.remove();
+        it = host;
+      }
       const node = renderItem(s, it);
       const old = document.getElementById(`item-${it.id}`);
       if (old) old.replaceWith(node);
       else timeline.append(node);
       if (stick && !old) node.scrollIntoView({ block: "end" });
+      jobUi?.refresh();
+    },
+    runners: () => {
+      renderRunners(s, runnerList, runnerNote);
+      jobUi?.refresh();
     },
     scroll: () => timeline.lastElementChild?.scrollIntoView({ block: "end" }),
     closed: (reason) => {
@@ -484,6 +566,12 @@ async function applyEvent(s, ev, { fetch, record }) {
       it.status = "evicted";
       s.render.item(it);
     }
+  } else if (ev.kind === "job") {
+    s.jobs.set(ev.data.job, ev.data);
+    const it = s.items.get(ev.data.job);
+    if (it) s.render.item(it);
+  } else if (ev.kind === "runner") {
+    if (record) pollRunners(s);
   } else if (ev.kind === "left") {
     const p = s.participants.get(ev.data.participant_pub);
     if (p) {
@@ -542,6 +630,7 @@ async function receive(s, seq, envelope, fetchBlob, attempt = 0) {
   try {
     const out = ac.openChecked(s.signed, author.cert, s.inv.sessionKey, envelope, blob);
     Object.assign(it, { role: out.role, meta: JSON.parse(out.meta), body: out.body });
+    if (it.kind === "file" || it.kind === "job") it.ref = JSON.parse(ac.itemRef(envelope, blob));
   } catch (e) {
     Object.assign(it, { status: "rejected", error: explain(e), detail: String(e.message || e) });
     return s.render.item(it);
@@ -559,6 +648,11 @@ async function receive(s, seq, envelope, fetchBlob, attempt = 0) {
       fetch(`/v1/sessions/${s.sid}/items/${h.id}/ack`, { method: "POST", headers: { Authorization: `Bearer ${s.identity.token}` } })
         .catch(() => {});
     }
+  }
+  if (it.kind === "result" && it.meta?.job?.id) {
+    const list = s.results.get(it.meta.job.id) || [];
+    if (!list.some((r) => r.id === it.id)) list.push(it);
+    s.results.set(it.meta.job.id, list);
   }
   s.render.item(it);
 }
@@ -591,35 +685,385 @@ function renderItem(s, it) {
     return node;
   }
   const m = it.meta;
+  if (m.type === "event") return renderEvent(s, it, meta);
   if (m.type === "text") card.append(el("p", {}, m.text));
-  else if (m.type === "file") {
-    const blobUrl = URL.createObjectURL(new Blob([it.body], { type: m.mime }));
-    card.append(el("div", { class: "file-head" },
-      el("span", { class: "chip type" }, it.subkind),
-      el("span", { class: "fname", title: m.name }, m.name),
-      el("span", { class: "size" }, fmtBytes(it.body.length)),
-      el("a", { class: "button small", href: blobUrl, download: m.name }, "Download")));
-    if (it.subkind === "image") card.append(el("img", { src: blobUrl, alt: m.name }));
-    else if (it.subkind === "zip") {
-      try {
-        const entries = JSON.parse(ac.inspectZip(it.body));
-        const files = entries.filter((e) => !e.is_dir);
-        card.append(el("ul", { class: "ziplist" }, entries.map((e) =>
-          el("li", {}, el("span", {}, e.is_dir ? `${e.path}/` : e.path), el("span", {}, e.is_dir ? "" : fmtBytes(e.size))))),
-          el("div", { class: "zipnote" }, `${files.length} file${files.length === 1 ? "" : "s"} · paths and sizes checked`));
-      } catch (e) {
-        card.append(el("p", { class: "error" }, String(e.message || e)));
-      }
-    } else card.append(el("pre", {}, new TextDecoder().decode(it.body)));
+  else if (m.type === "file") appendFileView(card, it);
+  else if (m.type === "job") renderJob(s, it, card);
+  else if (m.type === "result") {
+    const chk = resultCheck(s, it);
+    card.append(chk.ok ? renderResult(s, it) : rejectedResult(chk.error));
+    if (!chk.ok) node.classList.add("rejected");
   } else card.append(el("pre", {}, JSON.stringify(m, null, 2)));
   if (it.note) card.append(el("p", { class: "note" }, it.note));
   return node;
 }
 
+function appendFileView(card, it) {
+  const m = it.meta;
+  const blobUrl = URL.createObjectURL(new Blob([it.body], { type: m.mime }));
+  card.append(el("div", { class: "file-head" },
+    el("span", { class: "chip type" }, it.subkind),
+    el("span", { class: "fname", title: m.name }, m.name),
+    el("span", { class: "size" }, fmtBytes(it.body.length)),
+    el("a", { class: "button small", href: blobUrl, download: m.name }, "Download")));
+  if (it.subkind === "image") card.append(el("img", { src: blobUrl, alt: m.name }));
+  else if (it.subkind === "zip") {
+    try {
+      const entries = JSON.parse(ac.inspectZip(it.body));
+      const files = entries.filter((e) => !e.is_dir);
+      card.append(el("ul", { class: "ziplist" }, entries.map((e) =>
+        el("li", {}, el("span", {}, e.is_dir ? `${e.path}/` : e.path), el("span", {}, e.is_dir ? "" : fmtBytes(e.size))))),
+        el("div", { class: "zipnote" }, `${files.length} file${files.length === 1 ? "" : "s"} · paths and sizes checked`));
+    } catch (e) {
+      card.append(el("p", { class: "error" }, String(e.message || e)));
+    }
+  } else card.append(el("pre", {}, new TextDecoder().decode(it.body)));
+}
+
+// ---------- execute mode: jobs, results, events ----------
+const short = (id) => String(id).slice(0, 6);
+const memberName = (s, pub) => s.participants.get(pub)?.display_name || s.runners.find((r) => r.pub === pub)?.name || "unknown";
+const REASONS = {
+  not_available: "No runner available · not queued",
+  runner_unresponsive: "The runner did not respond in time",
+  runner_lost: "The runner went offline",
+  runner_left: "The runner left",
+  runner_rejected: "The runner was rejected",
+  cancelled: "Cancelled before it started",
+};
+const STATUS_LABELS = { completed: "completed", refused: "refused", timed_out: "timed out", cancelled: "cancelled", failed: "failed" };
+
+function targetText(t) {
+  if (t?.type === "runner") return `runner ${t.name}`;
+  if (t?.type === "labels") return `labels: ${t.labels.join(", ")}`;
+  return "any idle runner";
+}
+
+// The job card that should show this result, when its job is in the timeline.
+function hostJob(s, it) {
+  if (it.kind !== "result" || it.status !== "ok") return null;
+  const job = s.items.get(it.meta?.job?.id);
+  return job && job.status === "ok" && job.kind === "job" ? job : null;
+}
+
+// Cached: does this result belong to its job, per the protocol checks?
+function resultCheck(s, r) {
+  if (r.check) return r.check;
+  const job = s.items.get(r.meta.job?.id);
+  if (!job || job.status !== "ok" || !job.ref) return { ok: true, unbound: true };
+  let chk;
+  try {
+    ac.checkResultForJob(JSON.stringify(job.ref), JSON.stringify(job.meta), r.author, JSON.stringify(r.meta));
+    chk = { ok: true };
+  } catch (e) {
+    chk = { ok: false, error: String(e.message || e).replace(/^\w+Error: /, "") };
+  }
+  r.check = chk;
+  return chk;
+}
+
+function rejectedResult(reason) {
+  return el("div", {}, el("p", { class: "note error" }, `✕ Result not accepted: ${reason}`));
+}
+
+function logBlock(label, text, truncated) {
+  if (!text && !truncated) return null;
+  return el("div", { class: "logblock" }, el("div", { class: "logname" }, label, truncated ? el("span", { class: "chip" }, "truncated") : null),
+    el("pre", {}, text || "(empty)"));
+}
+
+function renderResult(s, r, extra = "") {
+  const m = r.meta;
+  const bad = m.status !== "completed";
+  const parts = [];
+  if (m.exit_code !== null && m.exit_code !== undefined) parts.push(`exit ${m.exit_code}`);
+  parts.push(`${(m.wall_ms / 1000).toFixed(2)} s`, `${m.peak_mem_mb} MB peak`);
+  const files = m.out_files || [];
+  return el("div", { class: "result", id: `result-${r.id}` },
+    el("div", { class: "result-head" },
+      el("span", { class: `state ${bad ? "bad" : "good"}` }, STATUS_LABELS[m.status] || m.status),
+      el("span", { class: "mono muted" }, parts.join(" · ")),
+      extra ? el("span", { class: "chip" }, extra) : null),
+    m.reason ? el("p", { class: "note" }, `Reason: ${m.reason}`) : null,
+    logBlock("stdout", m.stdout, m.stdout_truncated), logBlock("stderr", m.stderr, m.stderr_truncated),
+    files.length ? el("div", { class: "outfiles" }, el("div", { class: "logname" }, `Output files (${files.length})`),
+      files.map((f) => renderOutFile(s, f))) : null);
+}
+
+function renderOutFile(s, f) {
+  const fi = s.items.get(f.item?.id);
+  const box = el("div", { class: "outfile" });
+  if (!fi || fi.status !== "ok" || fi.kind !== "file") {
+    box.append(el("div", { class: "file-head" }, el("span", { class: "fname" }, f.name), el("span", { class: "size" }, fmtBytes(f.size)),
+      el("span", { class: "muted" }, fi?.status === "evicted" ? "removed from the relay" : "not in this timeline")));
+    return box;
+  }
+  if (!fi.ref || fi.ref.blob_sha256 !== f.item.blob_sha256) {
+    box.append(el("p", { class: "note error" }, `✕ ${f.name}: the file does not match the runner's result`));
+    return box;
+  }
+  appendFileView(box, fi);
+  box.append(el("button", { type: "button", class: "small link", onclick: () => {
+    document.getElementById(`item-${fi.id}`)?.scrollIntoView({ block: "center" });
+  } }, "Show in timeline"));
+  return box;
+}
+
+function renderJob(s, it, card) {
+  const m = it.meta;
+  const st = s.jobs.get(it.id);
+  const results = s.results.get(it.id) || [];
+  let accepted = null;
+  const rendered = [];
+  for (const r of results) {
+    if (r.status !== "ok") continue;
+    const chk = resultCheck(s, r);
+    if (!chk.ok) rendered.push(rejectedResult(chk.error));
+    else if (!accepted) {
+      accepted = r;
+      rendered.push(renderResult(s, r));
+    } else rendered.push(renderResult(s, r, "ignored: duplicate"));
+  }
+  let stateText;
+  let tone = "run";
+  if (accepted) {
+    const done = accepted.meta.status === "completed";
+    stateText = done ? "done" : STATUS_LABELS[accepted.meta.status] || accepted.meta.status;
+    tone = done ? "good" : "bad";
+  } else if (st?.state === "failed") {
+    stateText = REASONS[st.reason] || `failed${st.reason ? `: ${st.reason}` : ""}`;
+    tone = "bad";
+  } else if (st?.state === "done") stateText = "done (waiting for the result)";
+  else if (st) stateText = st.state;
+  else stateText = "submitted";
+  const runnerName = st?.runner ? memberName(s, st.runner) : null;
+  const lines = m.code.split("\n");
+  const code = el("pre", {}, m.code);
+  const files = (m.files || []).map((ref) => s.items.get(ref.id)?.meta?.name || `item ${short(ref.id)}`);
+  const active = !accepted && (st?.state === "assigned" || st?.state === "running");
+  const canCancel = active && (s.inv.role === "owner" || it.author === s.me);
+  card.append(
+    el("div", { class: "file-head" }, el("span", { class: "chip type" }, "job"), el("span", { class: "fname", title: m.filename }, m.filename),
+      el("span", { class: `state ${tone}` }, stateText),
+      canCancel ? el("button", { type: "button", class: "small danger", onclick: (ev) => cancelJob(s, it, ev.currentTarget) }, "Cancel") : null),
+    el("dl", { class: "jobmeta" },
+      el("dt", {}, "Target"), el("dd", {}, targetText(m.target)),
+      runnerName ? el("dt", {}, "Runner") : null, runnerName ? el("dd", {}, runnerName) : null,
+      el("dt", {}, "Limits"), el("dd", {}, `${m.runtime} · ${m.timeout_s} s${m.memory_mb ? ` · ${m.memory_mb} MB` : ""}`),
+      files.length ? el("dt", {}, "Inputs") : null, files.length ? el("dd", {}, files.join(", ")) : null),
+    lines.length > 12
+      ? el("details", { class: "codebox" }, el("summary", {}, `Code · ${lines.length} lines`), code)
+      : code,
+    ...rendered);
+}
+
+async function cancelJob(s, it, btn) {
+  btn.disabled = true;
+  try {
+    await sendPayload(s, "event", null, { type: "event", event: "job_cancel", job: it.ref }, new Uint8Array());
+    await api("POST", `/v1/sessions/${s.sid}/jobs/${it.id}/cancel`, { token: s.identity.token });
+  } catch (e) {
+    btn.disabled = false;
+    alert(`Could not cancel: ${e.message || e}`);
+  }
+}
+
+// Signed events render as one line.
+function renderEvent(s, it, meta) {
+  const m = it.meta;
+  const who = it.authorName;
+  let text;
+  if (m.event === "runner_approve") text = `${who} approved runner ${memberName(s, m.participant_pub)}`;
+  else if (m.event === "runner_reject") text = `${who} rejected runner ${memberName(s, m.participant_pub)}${m.reason ? ` · ${m.reason}` : ""}`;
+  else if (m.event === "job_cancel") {
+    const j = s.items.get(m.job?.id);
+    text = `${who} cancelled job ${j?.meta?.filename || short(m.job?.id || "")}`;
+  } else if (m.event === "session_close") text = `${who} closed the session`;
+  else text = `${who} posted an event`;
+  const ownerOnly = m.event !== "job_cancel";
+  const suspect = ownerOnly && it.role !== "owner";
+  return el("article", { class: `item evline${suspect ? " rejected" : ""}`, id: `item-${it.id}` },
+    el("div", { class: "pill" }, suspect ? `✕ ignored: ${text} (not from the owner)` : text, " · ", hhmm(it.created)));
+}
+
+// ---------- runner console ----------
+// Runner details come only from a verified signed join, never from the
+// relay's unsigned fields.
+async function pollRunners(s) {
+  if (s.polling || s.closed) return;
+  s.polling = true;
+  try {
+    const r = await (await api("GET", `/v1/sessions/${s.sid}/runners`, { token: s.identity.token })).json();
+    const list = [];
+    for (const e of r.runners) {
+      try {
+        ac.verifyJoin(e.signed_join, s.signed);
+        const j = JSON.parse(e.signed_join).join;
+        if (j.cert.cert.participant_pub !== e.participant_pub || j.cert.cert.role !== "runner" || !j.runner) continue;
+        list.push({ pub: e.participant_pub, name: j.runner.name, labels: j.runner.labels, host: j.runner.host, sandbox: j.runner.sandbox,
+          networkUnblocked: !!j.runner.network_unblocked, online: !!e.online, job: e.job, rejected: !!e.rejected,
+          approved: !!e.approved || !r.approval_required });
+      } catch (err) {
+        console.warn("ignoring unverifiable runner", err);
+      }
+    }
+    s.runners = list;
+    s.approvalRequired = !!r.approval_required;
+    s.render.runners();
+  } catch (e) {
+    if (e.status === 404 || e.status === 410 || e.status === 401) s.closed ||= "gone";
+  } finally {
+    s.polling = false;
+  }
+}
+
+function runnerLoop(s) {
+  const tick = () => {
+    if (!s.closed && document.visibilityState === "visible") pollRunners(s);
+  };
+  tick();
+  setInterval(tick, 3000);
+  document.addEventListener("visibilitychange", tick);
+}
+
+function renderRunners(s, list, note) {
+  note.textContent = s.runners.length ? "" : "No runners yet. Hand out the runner invite from Invites.";
+  list.replaceChildren(...s.runners.map((r) => {
+    const approval = r.rejected ? "rejected" : r.approved ? "approved" : "awaiting approval";
+    const owner = s.inv.role === "owner";
+    return el("li", { class: `runner${r.rejected ? " is-rejected" : ""}` },
+      el("div", { class: "rhead" },
+        el("span", { class: `dot ${r.online ? "on" : ""}`, "aria-hidden": "true" }),
+        el("strong", { class: "name" }, r.name),
+        el("span", { class: "sub" }, r.online ? (r.job ? `busy · ${short(r.job)}` : "idle") : "offline")),
+      el("div", { class: "sub" }, `${r.sandbox} · ${r.host}`),
+      r.labels.length ? el("div", { class: "chips" }, r.labels.map((l) => el("span", { class: "chip" }, l))) : null,
+      el("div", { class: "chips" },
+        el("span", { class: `chip approval ${r.rejected ? "bad" : r.approved ? "good" : "wait"}` }, approval),
+        r.networkUnblocked ? el("span", { class: "chip warn", title: "This runner's sandbox cannot block network access" }, "⚠ network not blocked") : null),
+      owner && !r.rejected ? el("div", { class: "row" },
+        r.approved ? null : el("button", { type: "button", class: "small primary", onclick: (ev) => decideRunner(s, r, true, ev.currentTarget) }, "Approve"),
+        el("button", { type: "button", class: "small danger", onclick: (ev) => decideRunner(s, r, false, ev.currentTarget) }, "Reject")) : null);
+  }));
+}
+
+async function decideRunner(s, r, approve, btn) {
+  if (!approve && !confirm(`Reject runner ${r.name}? It is removed from the session and its job fails.`)) return;
+  btn.disabled = true;
+  try {
+    const meta = approve ? { type: "event", event: "runner_approve", participant_pub: r.pub }
+      : { type: "event", event: "runner_reject", participant_pub: r.pub, reason: null };
+    await sendPayload(s, "event", null, meta, new Uint8Array());
+    await api("POST", `/v1/sessions/${s.sid}/runners/${encodeURIComponent(r.pub)}/${approve ? "approve" : "reject"}`, { token: s.identity.token });
+    await pollRunners(s);
+  } catch (e) {
+    alert(`Could not ${approve ? "approve" : "reject"} the runner: ${e.message || e}`);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ---------- composer: run as job ----------
+function buildJobPanel(s, text, file) {
+  const lim = s.manifest.job_limits;
+  let on = false;
+  let sendBtn;
+  let optsSig = "";
+  let filesSig = null;
+  const target = el("select", { id: "job-target" });
+  const labels = el("input", { type: "text", id: "job-labels", placeholder: "gpu, cpu", autocomplete: "off", "aria-label": "Runner labels" });
+  const labelField = el("div", { class: "stack field", hidden: true }, el("label", { for: "job-labels" }, "Labels"), labels);
+  const timeout = el("input", { type: "number", id: "job-timeout", min: 1, max: lim.timeout_s, step: 1, value: lim.timeout_s });
+  const files = el("div", { class: "pickfiles" });
+  const status = el("p", { class: "muted hint-text" });
+  const panel = el("div", { class: "jobpanel", hidden: true },
+    el("div", { class: "jobrow" },
+      el("div", { class: "stack field" }, el("label", { for: "job-target" }, "Target"), target),
+      labelField,
+      el("div", { class: "stack field narrow" }, el("label", { for: "job-timeout" }, `Timeout (s, max ${lim.timeout_s})`), timeout)),
+    el("fieldset", {}, el("legend", {}, "Input files from this session"), files),
+    status);
+  const toggle = el("button", { type: "button", class: "small", "aria-pressed": "false", onclick: () => {
+    on = !on;
+    toggle.setAttribute("aria-pressed", String(on));
+    toggle.classList.toggle("on", on);
+    panel.hidden = !on;
+    optsSig = "";
+    filesSig = null;
+    text.placeholder = on ? "Python code to run (or attach a .py file)…" : "Message the session…";
+    if (sendBtn) sendBtn.textContent = on ? "Run job" : "Send";
+    refresh();
+  } }, "Run as job");
+  target.addEventListener("change", () => (labelField.hidden = target.value !== "labels"));
+
+  function refresh() {
+    if (!on) return;
+    const cur = target.value;
+    const opts = [el("option", { value: "any" }, "Any idle runner"), el("option", { value: "labels" }, "Labels…")];
+    for (const r of s.runners) {
+      if (r.rejected) continue;
+      opts.push(el("option", { value: `runner:${r.pub}` }, `${r.name}${r.online ? "" : " (offline)"}${r.approved ? "" : " (not approved)"}`));
+    }
+    const sig = s.runners.map((r) => `${r.pub}${r.name}${r.online}${r.approved}${r.rejected}`).join("|");
+    if (sig !== optsSig) {
+      optsSig = sig;
+      target.replaceChildren(...opts);
+    }
+    target.value = [...target.options].some((o) => o.value === cur) ? cur : "any";
+    labelField.hidden = target.value !== "labels";
+    const cands = [...s.items.values()].filter((i) => i.kind === "file" && i.status === "ok" && i.ref).sort((a, b) => a.seq - b.seq);
+    const fsig = cands.map((i) => i.id).join("|");
+    if (fsig === filesSig) return;
+    filesSig = fsig;
+    files.replaceChildren(...(cands.length ? cands.map((i) => el("label", { class: "option check" },
+      el("input", { type: "checkbox", checked: s.picked.has(i.id), onchange: (ev) => {
+        if (ev.target.checked) s.picked.add(i.id);
+        else s.picked.delete(i.id);
+      } }), `${i.meta.name}`, el("span", { class: "ext" }, i.subkind))) : [el("span", { class: "muted hint-text" }, "No files in the timeline yet.")]));
+  }
+
+  async function submit() {
+    const f = file.files?.[0];
+    let filename = "main.py";
+    let code;
+    if (f) {
+      if (!/\.py$/i.test(f.name)) throw new Error("attach a .py file, or write the code in the message box");
+      filename = f.name;
+      code = new TextDecoder("utf-8", { fatal: true }).decode(await f.arrayBuffer());
+    } else {
+      code = text.value;
+      if (!code.trim()) throw new Error("attach a .py file or write code in the message box");
+    }
+    if (new TextEncoder().encode(code).length > MB) throw new Error("the code is over 1 MiB");
+    const t = Number(timeout.value);
+    if (!Number.isInteger(t) || t < 1 || t > lim.timeout_s) throw new Error(`timeout must be 1 to ${lim.timeout_s} seconds`);
+    let tgt;
+    if (target.value === "any") tgt = { type: "any" };
+    else if (target.value === "labels") {
+      const ls = labels.value.split(",").map((x) => x.trim()).filter(Boolean);
+      if (!ls.length || ls.length > 16 || !ls.every((l) => /^[a-z0-9][a-z0-9._-]{0,62}$/.test(l)))
+        throw new Error("labels are comma-separated, lowercase letters, digits, . _ -");
+      tgt = { type: "labels", labels: ls };
+    } else {
+      const r = s.runners.find((x) => `runner:${x.pub}` === target.value);
+      if (!r) throw new Error("that runner is gone");
+      tgt = { type: "runner", participant_pub: r.pub, name: r.name };
+    }
+    const refs = [...s.picked].map((id) => s.items.get(id)?.ref).filter(Boolean);
+    const meta = { type: "job", filename, code, runtime: lim.runtime, timeout_s: t, memory_mb: null, files: refs, requirements: [], target: tgt };
+    await sendPayload(s, "job", "py", meta, new Uint8Array(), { path: "jobs", headers: { "Airlock-Target": JSON.stringify(tgt) } });
+    s.picked.clear();
+    refresh();
+    return true;
+  }
+
+  return { panel, toggle, refresh, submit, active: () => on, setSend: (b) => (sendBtn = b) };
+}
+
 // ---------- sending ----------
-async function sendPayload(s, kind, subkind, meta, body) {
-  const needed = kind === "text" ? "text" : subkind;
-  if (!s.manifest.allowed_types.includes(needed)) throw new Error(`${needed} is not allowed in this session`);
+async function sendPayload(s, kind, subkind, meta, body, { path = "items", headers = {} } = {}) {
+  const needed = kind === "text" ? "text" : kind === "event" || kind === "result" ? null : subkind;
+  if (needed && !s.manifest.allowed_types.includes(needed)) throw new Error(`${needed} is not allowed in this session`);
   const payload = ac.encodePayload(JSON.stringify(meta), body);
   if (payload.length > s.manifest.max_item_bytes) throw new Error(`too large: the limit is ${fmtBytes(s.manifest.max_item_bytes)}`);
   const item = { id: ac.newItemId(), session_id: s.sid, kind, subkind, created_at_ms: Date.now(), refs: [] };
@@ -630,8 +1074,9 @@ async function sendPayload(s, kind, subkind, meta, body) {
   frame.set(env, 4);
   frame.set(out.blob, 4 + env.length);
   await idbPut("blobs", [s.sid, item.id], out.blob);
-  await api("POST", `/v1/sessions/${s.sid}/items`, { token: s.identity.token, body: frame,
-    headers: { "Content-Type": "application/octet-stream" } });
+  await api("POST", `/v1/sessions/${s.sid}/${path}`, { token: s.identity.token, body: frame,
+    headers: { "Content-Type": "application/octet-stream", ...headers } });
+  return item.id;
 }
 
 async function sendFile(s, f) {
