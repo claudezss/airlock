@@ -329,7 +329,9 @@ are added in M2 and do not change anything below.
 and join are the canonical JSON strings defined above, sent as-is and capped
 at 256 KiB. Authenticated calls carry `Authorization: Bearer <token>`. The
 token is returned by join, never appears in a URL, and the relay stores only
-its SHA-256. Errors are `{"error": <code>, "message": <text>}`.
+its SHA-256. A token is valid until its participant leaves or the session
+ends. Errors are `{"error": <code>, "message": <text>}`. A request body that
+sends nothing for 30 seconds is answered with `408`.
 
 | Method and path | Auth | Body | Success |
 |---|---|---|---|
@@ -337,7 +339,8 @@ its SHA-256. Errors are `{"error": <code>, "message": <text>}`.
 | `POST /v1/sessions` | none | signed manifest | `201 {"session_id", "expires_at_ms"}` |
 | `GET /v1/sessions/{id}` | none | none | `200 {"signed_manifest"}` |
 | `POST /v1/sessions/{id}/participants` | none | signed join request | `201 {"token", "participant_pub", "role", "seq"}` |
-| `GET /v1/sessions/{id}/participants` | bearer | none | `200 {"participants": [participant…]}` |
+| `POST /v1/sessions/{id}/leave` | bearer | none | `204`; the token stops working |
+| `GET /v1/sessions/{id}/participants` | bearer | none | `200 {"participants": [participant…]}`, excluding those who left |
 | `GET /v1/sessions/{id}/events?after=N` | bearer | none | `200 {"events": [event…]}` with `seq > N`; omit `after` for all |
 | `GET /v1/sessions/{id}/stream` | bearer | none | SSE, see below |
 | `POST /v1/sessions/{id}/items` | bearer | upload frame | `201 {"id", "seq"}` |
@@ -348,11 +351,18 @@ its SHA-256. Errors are `{"error": <code>, "message": <text>}`.
 **Create.** The relay verifies the manifest signature, requires
 `created_at_ms` within 5 minutes of its clock, and applies its own caps on
 TTL, item size and session count. The session id is derived from the owner
-key, so a second create with the same key is `409`.
+key, so a second create with the same key is `409`. A session that was closed
+or purged before its expiry cannot be created again until that expiry
+(`410 closed`): its signed manifest is public, and re-creating it would revive
+old invites.
 
 **Join.** The relay runs the join verification of §5. Runners are refused in
-relay-mode sessions. A participant who loses its token joins again with a new
-key; the old participant stays in the log.
+relay-mode sessions. Each participant key joins once: signed joins are
+published to every participant in `participant` events, so a second join with
+the same key is `409` rather than a fresh token for whoever replayed it. A
+participant who loses its token joins again with a new key; the old
+participant stays in the log. A participant that is done calls `leave`, so
+the relay stops waiting for its acks.
 
 **Upload frame.** The item body is a single binary stream:
 
@@ -365,7 +375,9 @@ participant, runs the header policy of §8 with that participant's
 certificate, streams the blob to disk while hashing it, and accepts the item
 only if the blob length equals the header's ciphertext length and the
 signature verifies over the received SHA-256. The recipients are every other
-participant joined at that moment.
+participant joined and not departed at that moment. An item whose header
+`size` exceeds the manifest's `max_item_bytes` is `413`, decided from the
+envelope before any blob byte is read.
 
 **Events.** Every accepted change is one line in the session log, and each
 public event carries that line's `seq`. Events are `{"seq", "kind", "data"}`:
@@ -374,24 +386,31 @@ public event carries that line's `seq`. Events are `{"seq", "kind", "data"}`:
 |---|---|
 | `participant` | `{participant_pub, role, display_name, kind, runner, signed_join}` |
 | `item` | `{envelope, blob_len, blob_present}` |
+| `left` | `{participant_pub}`: no longer a recipient; its token is revoked |
 | `evicted` | `{item}`: the blob left the relay; the envelope stays |
 | `closed` | `{reason}`: the last event of a session |
 
-Clients must verify each `signed_join` themselves (§5) and look up an item's
-author certificate from those verified joins, never from relay metadata.
+Clients must verify each `signed_join` themselves (§5) and take a
+participant's key, role, display name and certificate from the verified join,
+never from the event's unsigned copies of those fields. Every event is
+durable before it is sent, so a sequence number is never reused.
 
 **Stream.** `GET /stream` is Server-Sent Events with `id: <seq>`,
 `event: <kind>` and `data: <event data JSON>`. It first replays every event
 after `Last-Event-ID` (or all events when the header is absent), then streams
 live ones. It ends after `closed`, on server shutdown, or when the client
-falls too far behind; clients reconnect with `Last-Event-ID`. Browsers use
+falls too far behind; clients reconnect with `Last-Event-ID`. A participant
+may hold 4 streams at once; a fifth is `429`. Browsers use
 `fetch` rather than `EventSource` so the token stays in a header.
 
 **Delivery and eviction.** A recipient acks an item only after it has stored
 the ciphertext locally. The relay deletes a blob once every recipient has
 acked and a short grace period has passed, or when the hold limit expires,
-whichever comes first. After that `GET …/blob` is `410 evicted`, and
-clients show the item as delivered but unavailable.
+whichever comes first. A recipient that leaves stops counting. After that
+`GET …/blob` is `410 evicted`, and clients show the item as delivered but
+unavailable. A download that fails for any other reason (network, `429`,
+`5xx`) is retried; clients must not record the item as received or ack it
+until its blob is stored.
 
 **Error codes.**
 
@@ -401,8 +420,14 @@ clients show the item as delivered but unavailable.
 | 401 | `unauthorized` | missing or unknown bearer token |
 | 403 | `forbidden` | role, author or content policy not allowed |
 | 404 | `not_found` | no such session or item |
-| 409 | `conflict` | duplicate session or item id |
-| 410 | `closed`, `evicted` | session closed, or blob already delivered |
-| 413 | `too_large` | envelope, item or session storage limit |
-| 429 | `limit` | relay, address, participant, item or transfer limit |
+| 408 | `timeout` | request body stalled or upload too slow |
+| 409 | `conflict` | duplicate session, item id, or participant key |
+| 410 | `closed`, `evicted` | session closed (or closed and not re-creatable), or blob already delivered |
+| 413 | `too_large` | body, envelope, item, session storage or session history limit |
+| 429 | `limit` | relay, address, participant, stream, item or transfer limit |
 | 507 | `storage_full` | relay disk above its high watermark |
+
+**Address limits.** The per-address session limit counts IPv4 addresses
+individually and IPv6 addresses per /64. Behind a reverse proxy
+(`--trust-proxy`), the address is the last `X-Forwarded-For` entry, the one
+the proxy appended; earlier entries are client-controlled and ignored.

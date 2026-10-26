@@ -15,7 +15,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use axum::Router;
 use tokio::sync::watch;
@@ -24,17 +23,12 @@ use tokio::task::JoinHandle;
 pub use config::Config;
 use store::Store;
 
-/// Request body limit for JSON endpoints. Item uploads stream and are
-/// bounded by the manifest and relay limits instead.
-const JSON_BODY_LIMIT: usize = 256 * 1024;
-
 pub fn router(state: api::AppState) -> Router {
-    let json_routes = Router::new()
-        .route("/v1/sessions", post(api::create_session))
-        .route("/v1/sessions/{id}/participants", post(api::join).get(api::participants))
-        .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT));
     Router::new()
         .route("/v1/health", get(api::health))
+        .route("/v1/sessions", post(api::create_session))
+        .route("/v1/sessions/{id}/participants", post(api::join).get(api::participants))
+        .route("/v1/sessions/{id}/leave", post(api::leave))
         .route("/v1/sessions/{id}", get(api::get_session))
         .route("/v1/sessions/{id}/close", post(api::close_session))
         .route("/v1/sessions/{id}/events", get(api::events))
@@ -45,7 +39,6 @@ pub fn router(state: api::AppState) -> Router {
         .route("/", get(web::index))
         .route("/s/{id}", get(web::session_page))
         .route("/assets/{*path}", get(web::asset))
-        .merge(json_routes)
         .with_state(state)
 }
 
@@ -96,7 +89,7 @@ pub async fn start(cfg: Config) -> std::io::Result<Running> {
         loop {
             tick.tick().await;
             let Some(store) = weak.upgrade() else { break };
-            store.sweep(util::now_ms());
+            let _ = tokio::task::spawn_blocking(move || store.sweep(util::now_ms())).await;
         }
     });
 

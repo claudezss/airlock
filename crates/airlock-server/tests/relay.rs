@@ -93,7 +93,7 @@ struct Member {
     token: String,
 }
 
-async fn join(env: &Env, s: &Sess, role: Role, name: &str) -> Member {
+fn join_body(s: &Sess, role: Role, name: &str) -> (Keypair, String) {
     let kp = Keypair::generate();
     let cert = issue_cert(&s.secrets.role_keypair(role), &s.id, role, kp.public(), now_ms()).unwrap();
     let j = sign_join(
@@ -109,13 +109,16 @@ async fn join(env: &Env, s: &Sess, role: Role, name: &str) -> Member {
         },
     )
     .unwrap();
-    let r = env
-        .http
-        .post(env.url(&format!("/v1/sessions/{}/participants", s.id)))
-        .body(canon(&j))
-        .send()
-        .await
-        .unwrap();
+    (kp, canon(&j))
+}
+
+async fn post_join(env: &Env, s: &Sess, body: String) -> reqwest::Response {
+    env.http.post(env.url(&format!("/v1/sessions/{}/participants", s.id))).body(body).send().await.unwrap()
+}
+
+async fn join(env: &Env, s: &Sess, role: Role, name: &str) -> Member {
+    let (kp, body) = join_body(s, role, name);
+    let r = post_join(env, s, body).await;
     assert_eq!(r.status(), StatusCode::CREATED, "{}", r.text().await.unwrap());
     let v: Value = r.json().await.unwrap();
     Member { kp, token: v["token"].as_str().unwrap().to_string() }
@@ -508,4 +511,183 @@ async fn partial_log_line_is_dropped_on_load() {
     assert_eq!(post(&env, &s, &sender, frame(&item)).await.status(), StatusCode::CREATED);
     env.restart(|_| {}).await;
     assert_eq!(events(&env, &s, &owner).await.len(), 3);
+}
+
+async fn error_code(r: reqwest::Response) -> (StatusCode, String) {
+    let status = r.status();
+    let v: Value = r.json().await.expect("error bodies are JSON");
+    (status, v["error"].as_str().unwrap_or_default().to_string())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signed_join_cannot_be_replayed() {
+    let env = Env::new().await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let (_, owner_join) = join_body(&s, Role::Owner, "owner");
+    assert_eq!(post_join(&env, &s, owner_join.clone()).await.status(), StatusCode::CREATED);
+    let observer = join(&env, &s, Role::Observer, "observer").await;
+    // The owner's signed join is public to every participant.
+    let evs = events(&env, &s, &observer).await;
+    let published = evs.iter().find(|e| e["data"]["role"] == "owner").unwrap()["data"]["signed_join"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(published, owner_join);
+    let r = post_join(&env, &s, published).await;
+    assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "conflict".into()));
+    // No extra log line or event was written.
+    assert_eq!(events(&env, &s, &observer).await.len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn leaving_revokes_the_token_and_releases_deliveries() {
+    let env = Env::new().await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let stale = join(&env, &s, Role::Observer, "old browser").await;
+    let sender = join(&env, &s, Role::Sender, "sender").await;
+    let item = seal_text(&s, &sender, "for owner and the stale observer");
+    let id = item.envelope.header.id.clone();
+    assert_eq!(post(&env, &s, &sender, frame(&item)).await.status(), StatusCode::CREATED);
+    ack(&env, &s, &owner, &id).await;
+    // The stale observer never acks, so the blob is held...
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(blob(&env, &s, &owner, &id).await.status(), StatusCode::OK);
+    // ...until it leaves.
+    let r = env
+        .http
+        .post(env.url(&format!("/v1/sessions/{}/leave", s.id)))
+        .bearer_auth(&stale.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    assert!(eventually(|| async { blob(&env, &s, &owner, &id).await.status() == StatusCode::GONE }).await);
+    let r = env
+        .http
+        .get(env.url(&format!("/v1/sessions/{}/events", s.id)))
+        .bearer_auth(&stale.token)
+        .send()
+        .await;
+    assert_eq!(r.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert!(events(&env, &s, &owner).await.iter().any(|e| e["kind"] == "left"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn closed_sessions_cannot_be_recreated() {
+    let mut env = Env::new().await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let r = env
+        .http
+        .post(env.url(&format!("/v1/sessions/{}/close", s.id)))
+        .bearer_auth(&owner.token)
+        .send()
+        .await;
+    assert_eq!(r.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(error_code(create(&env, &s).await).await, (StatusCode::GONE, "closed".into()));
+    env.restart(|_| {}).await;
+    assert_eq!(create(&env, &s).await.status(), StatusCode::GONE);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_uploads_still_count_against_transfer() {
+    let env = Env::with(|c| c.max_session_transfer = 500).await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let sender = join(&env, &s, Role::Sender, "sender").await;
+    let blob_len = seal_text(&s, &sender, &"x".repeat(150)).blob.len();
+    assert!(blob_len * 2 <= 500 && blob_len * 3 > 500, "{blob_len}");
+    for _ in 0..2 {
+        let mut item = seal_text(&s, &sender, &"x".repeat(150));
+        let last = item.blob.len() - 1;
+        item.blob[last] ^= 1;
+        assert_eq!(post(&env, &s, &sender, frame(&item)).await.status(), StatusCode::BAD_REQUEST);
+    }
+    // Two failed uploads were charged; a third, valid one would pass the cap.
+    let ok = seal_text(&s, &sender, &"y".repeat(150));
+    assert_eq!(post(&env, &s, &sender, frame(&ok)).await.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_history_and_item_size_limits() {
+    let env = Env::with(|c| c.max_log_bytes = 6000).await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let sender = join(&env, &s, Role::Sender, "sender").await;
+    let mut accepted = 0;
+    let last = loop {
+        let r = post(&env, &s, &sender, frame(&seal_text(&s, &sender, "hi"))).await;
+        if r.status() != StatusCode::CREATED {
+            break r;
+        }
+        accepted += 1;
+        assert!(accepted < 50, "log cap never applied");
+    };
+    assert!(accepted > 0);
+    assert_eq!(error_code(last).await, (StatusCode::PAYLOAD_TOO_LARGE, "too_large".into()));
+    let (_, body) = join_body(&s, Role::Observer, "late");
+    assert_eq!(post_join(&env, &s, body).await.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    // An item over the manifest's max_item_bytes is 413, not 403.
+    let s2 = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s2).await;
+    let sender2 = join(&env, &s2, Role::Sender, "sender").await;
+    // The relay decides from the signed header alone, so send just the envelope.
+    let big = seal_text(&s2, &sender2, &"z".repeat(1024 * 1024 + 1));
+    let mut head_only = frame(&big);
+    head_only.truncate(head_only.len() - big.blob.len());
+    assert_eq!(error_code(post(&env, &s2, &sender2, head_only).await).await.0, StatusCode::PAYLOAD_TOO_LARGE);
+    // Oversized JSON bodies get the JSON error shape.
+    let r = env.http.post(env.url("/v1/sessions")).body("x".repeat(300 * 1024)).send().await.unwrap();
+    assert_eq!(error_code(r).await, (StatusCode::PAYLOAD_TOO_LARGE, "too_large".into()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn streams_per_participant_are_capped() {
+    let env = Env::new().await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let m = join(&env, &s, Role::Observer, "observer").await;
+    let open = || {
+        env.http.get(env.url(&format!("/v1/sessions/{}/stream", s.id))).bearer_auth(m.token.clone()).send()
+    };
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        let r = open().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        held.push(r);
+    }
+    assert_eq!(open().await.unwrap().status(), StatusCode::TOO_MANY_REQUESTS);
+    held.pop();
+    assert!(eventually(|| async { open().await.unwrap().status() == StatusCode::OK }).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn per_address_limit_uses_the_proxy_hop() {
+    let env = Env::with(|c| {
+        c.trust_proxy = true;
+        c.max_sessions_per_ip = 1;
+    })
+    .await;
+    let send = |s: &Sess, xff: &str| {
+        env.http
+            .post(env.url("/v1/sessions"))
+            .header("x-forwarded-for", xff)
+            .body(s.manifest_json.clone())
+            .send()
+    };
+    // The client controls the left entries; the proxy appends the real address.
+    let a = new_session(Mode::Relay, 60_000);
+    assert_eq!(send(&a, "1.1.1.1, 203.0.113.7").await.unwrap().status(), StatusCode::CREATED);
+    let b = new_session(Mode::Relay, 60_000);
+    assert_eq!(send(&b, "2.2.2.2, 203.0.113.7").await.unwrap().status(), StatusCode::TOO_MANY_REQUESTS);
+    // IPv6 addresses in one /64 share a bucket.
+    let c = new_session(Mode::Relay, 60_000);
+    assert_eq!(send(&c, "2001:db8:1:2::1").await.unwrap().status(), StatusCode::CREATED);
+    let d = new_session(Mode::Relay, 60_000);
+    assert_eq!(send(&d, "2001:db8:1:2:ffff::9").await.unwrap().status(), StatusCode::TOO_MANY_REQUESTS);
 }

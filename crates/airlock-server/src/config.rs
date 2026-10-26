@@ -20,7 +20,8 @@ pub struct Config {
     pub ephemeral: bool,
     #[arg(long, env = "AIRLOCK_LISTEN", default_value = "127.0.0.1:8080")]
     pub listen: SocketAddr,
-    /// Take the client address from X-Forwarded-For (only behind a trusted proxy).
+    /// Take the client address from the last X-Forwarded-For entry, which the
+    /// proxy in front of the relay appends. Only set this behind such a proxy.
     #[arg(long, env = "AIRLOCK_TRUST_PROXY")]
     pub trust_proxy: bool,
 
@@ -38,7 +39,10 @@ pub struct Config {
     pub max_session_transfer: u64,
     #[arg(long, env = "AIRLOCK_MAX_ITEMS", default_value_t = 5000)]
     pub max_items: usize,
-    /// Purge a session after this long without new items or joins.
+    /// Session log size (joins and item envelopes). Bounds per-session memory.
+    #[arg(long, env = "AIRLOCK_MAX_LOG_BYTES", default_value = "4MiB", value_parser = parse_size)]
+    pub max_log_bytes: u64,
+    /// Purge a session after this long without joins, items, acks or downloads.
     #[arg(long = "idle-ttl", env = "AIRLOCK_IDLE_TTL", default_value = "2h", value_parser = parse_duration_ms)]
     pub idle_ttl_ms: u64,
     #[arg(long, env = "AIRLOCK_MAX_SESSIONS_PER_IP", default_value_t = 20)]

@@ -2,9 +2,9 @@
 
 Mirrors the relay's layout: the events as received and each blob as
 ciphertext. The session key is never written here; reopening the invite
-supplies it. ``identity.json`` holds this client's participant seed and relay
-token so it rejoins as the same participant, and is readable only by the
-current user.
+supplies it. ``identity-<role>.json`` holds this client's participant seed and
+relay token for that role so it rejoins as the same participant, and is
+readable only by the current user.
 """
 
 from __future__ import annotations
@@ -47,14 +47,18 @@ class Cache:
         os.chmod(self.dir, 0o700)
 
     # identity --------------------------------------------------------
-    def load_identity(self) -> Optional[dict]:
-        p = self.dir / "identity.json"
+    def load_identity(self, role: str) -> Optional[dict]:
+        p = self.dir / f"identity-{role}.json"
         return json.loads(p.read_text()) if p.exists() else None
 
-    def save_identity(self, identity: dict) -> None:
-        _write_atomic(self.dir / "identity.json", json.dumps(identity).encode())
+    def save_identity(self, role: str, identity: dict) -> None:
+        _write_atomic(self.dir / f"identity-{role}.json", json.dumps(identity).encode())
 
     # manifest --------------------------------------------------------
+    def load_manifest(self) -> Optional[str]:
+        p = self.dir / "manifest.json"
+        return p.read_text() if p.exists() else None
+
     def save_manifest(self, signed_manifest_json: str) -> None:
         _write_atomic(self.dir / "manifest.json", signed_manifest_json.encode(), 0o644)
 

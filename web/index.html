@@ -11,10 +11,14 @@
 <body>
 <header class="top">
   <a href="/" class="brand" aria-label="Airlock home">
-    <svg width="22" height="22" viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="3" width="22" height="22" rx="3"></rect><path d="M10 3v22M18 3v22"></path></svg>
+    <svg width="26" height="26" viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="3" width="22" height="22" rx="3"></rect><path d="M10 3v22M18 3v22"></path><circle cx="14" cy="14" r="2" fill="currentColor" stroke="none"></circle></svg>
     <span>Airlock</span>
   </a>
-  <span id="badge" class="badge" hidden></span>
+  <div id="title" class="title" hidden><span id="title-name"></span><span id="title-sub" class="mono muted"></span></div>
+  <div class="top-right">
+    <span id="badge" class="badge" hidden><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1.5"></rect><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"></path></svg><span id="badge-text">E2E sealed</span></span>
+    <span id="expiry" class="expiry mono" hidden></span>
+  </div>
 </header>
 <main id="app"><p class="muted">Loading…</p></main>
 <noscript><p class="wrap">Airlock needs JavaScript and WebAssembly.</p></noscript>

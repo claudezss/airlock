@@ -23,3 +23,9 @@ pub fn random_suffix() -> String {
     OsRng.fill_bytes(&mut b);
     hex(&b)
 }
+
+pub fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut b = [0u8; N];
+    OsRng.fill_bytes(&mut b);
+    b
+}
