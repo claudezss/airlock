@@ -47,8 +47,15 @@ pub struct Conn {
 impl Conn {
     async fn join(&self) -> Result<Session> {
         let root = self.cache_dir.clone().unwrap_or_else(default_cache_root);
-        let me = Profile { display_name: self.display_name.clone(), description: self.description.clone() };
-        Session::join(&client::http()?, &self.invite, &me, &root).await
+        let me = Profile::new(&self.display_name, self.description.as_deref());
+        let s = Session::join(&client::http()?, &self.invite, &me, &root).await?;
+        if !s.joined_now && me.description.is_some() && s.my_description() != me.description.as_deref() {
+            eprintln!(
+                "note: you already joined this session with this invite; your description stays as it was \
+                 (it is fixed at the first join)"
+            );
+        }
+        Ok(s)
     }
 }
 
@@ -176,7 +183,7 @@ pub async fn session(cmd: SessionCmd) -> Result<()> {
                 job_limits,
             };
             let root = a.cache_dir.clone().unwrap_or_else(default_cache_root);
-            let me = Profile { display_name: a.display_name.clone(), description: a.description.clone() };
+            let me = Profile::new(&a.display_name, a.description.as_deref());
             let s = Session::create(&client::http()?, &a.relay, new, &me, &root).await?;
             print_invites(&s, a.json, true, a.owner_invite_file.as_deref())
         }

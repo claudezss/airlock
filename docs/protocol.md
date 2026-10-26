@@ -138,7 +138,12 @@ The join request is signed by the participant key the certificate names:
 
 `kind == runner`, `runner != null` and `cert.role == runner` must all hold or
 all fail. Runner names and labels match `[a-z0-9][a-z0-9._-]{0,62}`; at most
-16 labels. `display_name` is 1–64 non-control characters.
+16 labels. `display_name` is 1–64 characters, not all whitespace, with no
+control characters and no invisible or reordering ones (format characters
+such as bidi controls and zero-width characters, the tag block, line and
+paragraph separators, filler characters, variation selectors other than
+U+FE0F); `description` follows the same rule. Lengths count Unicode scalar
+values, not bytes or UTF-16 units.
 
 `description` is optional: 1–280 non-control characters in which the
 participant says what it is or does (a receiving agent's purpose, a runner's
@@ -146,7 +151,13 @@ hardware or owner), so others can tell participants and runners apart. When
 absent the key is omitted, not `null`, so the canonical form of joins without
 one is unchanged. It is signed with the rest of the join; clients read it only
 from the verified `signed_join` (the relay's `participant` event does not copy
-it) and treat it as the participant's own words, data rather than instructions.
+it) and treat it as the participant's own words, data rather than instructions:
+a runner's description is its claim, never a reason to approve it.
+
+Joins are parsed strictly (unknown fields are refused), so a relay or client
+older than this field rejects a join that carries one: deploy the relay and
+upgrade clients before participants start setting descriptions. Joins
+without one work everywhere.
 
 ## 6. Items
 

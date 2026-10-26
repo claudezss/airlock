@@ -231,7 +231,7 @@ class Session:
                 "session_id": sid,
                 "cert": json.loads(cert),
                 "display_name": display_name,
-                "description": description,
+                "description": (description or "").strip() or None,
                 "kind": "sdk",
                 "runner": None,
                 "created_at_ms": _now_ms(),

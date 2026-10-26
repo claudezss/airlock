@@ -352,6 +352,16 @@ pub struct Profile {
     pub description: Option<String>,
 }
 
+impl Profile {
+    /// An empty or blank description (an empty `AIRLOX_DESCRIPTION=`) means none.
+    pub fn new(display_name: &str, description: Option<&str>) -> Profile {
+        Profile {
+            display_name: display_name.to_string(),
+            description: description.map(str::trim).filter(|d| !d.is_empty()).map(String::from),
+        }
+    }
+}
+
 /// What a new session allows.
 pub struct NewSession {
     pub mode: Mode,
@@ -383,6 +393,9 @@ pub struct Session {
     last_seq: Option<u64>,
     /// Why the session is over, once it is.
     pub closed: Option<String>,
+    /// This process joined as a new participant (no cached identity), so
+    /// the name and description it gave are the ones others see.
+    pub joined_now: bool,
 }
 
 impl Session {
@@ -449,6 +462,7 @@ impl Session {
         if !offline {
             cache.save_manifest(&signed)?;
         }
+        let joined_now = identity.is_none();
         let identity = match identity {
             Some(i) => i,
             None => {
@@ -508,6 +522,7 @@ impl Session {
             unacked: HashSet::new(),
             last_seq: None,
             closed: None,
+            joined_now,
         };
         let cached = s.cache.events();
         s.evicted = cached
@@ -546,6 +561,12 @@ impl Session {
         self.relay.post_raw("/close", vec![], &[]).await?;
         self.closed = Some("closed by owner".into());
         Ok(())
+    }
+
+    /// The description this participant joined with (fixed at its first
+    /// join), as the others see it.
+    pub fn my_description(&self) -> Option<&str> {
+        self.participants.get(&self.me).and_then(|p| p.description.as_deref())
     }
 
     pub fn participants(&self) -> Vec<Participant> {
