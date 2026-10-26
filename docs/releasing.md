@@ -39,19 +39,23 @@ instead.
 
 ## Setup (once)
 
-- An npm organization `airlox`, which owns the `@airlox` scope of the
-  platform packages, and the unscoped `airlox` package name.
 - A GitHub environment `release` (Settings → Environments) limited to `v*`
   tags, with required reviewers if more than one person can push tags, and a
   tag ruleset that limits who may create `v*` tags. The publish jobs run in
-  it, so its secrets reach only them:
-  - `PYPI_TOKEN`: a PyPI API token scoped to the `airlox` project.
-  - `NPM_TOKEN`: a granular npm access token with read and write access to
-    `airlox` and `@airlox/*` only. Not a classic "automation" token, which
-    skips two-factor authentication for everything the account can publish.
-
-  After the first release, PyPI and npm trusted publishing (this repository,
-  `release.yml`, environment `release`) can replace both tokens.
+  it.
+- PyPI: `PYPI_TOKEN`, a PyPI API token scoped to the `airlox` project, as a
+  secret of the `release` environment. (PyPI trusted publishing can replace
+  it.)
+- npm: trusted publishing, with no token. npm can no longer publish with tokens
+  that skip two-factor authentication (from early 2027), and it can trust a
+  workflow only for packages that already exist, so:
+  1. Join or create the npm organization `airlox`, which owns the `@airlox`
+     scope, with two-factor authentication on.
+  2. `sh packaging/npm/bootstrap.sh claim` publishes a 0.0.1 placeholder of
+     `airlox` and each `@airlox/<os>-<cpu>`, holding the names.
+  3. Just before tagging the first release (a new trust lapses unless it
+     publishes within two days), `sh packaging/npm/bootstrap.sh trust` lets
+     `release.yml` in the `release` environment publish all six.
 - The MCP registry needs no secret: the workflow logs in with the repository's
   GitHub OIDC token, which grants the `io.github.claudezss/*` namespace.
 

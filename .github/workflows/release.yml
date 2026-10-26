@@ -4,7 +4,7 @@ name: release
 # (build.yml) and publish it: the wheels and sdist to PyPI, the npm packages,
 # a GitHub release with the binaries and the MCPB bundle, and then the MCP
 # registry entry that names all three. Nothing is published unless every
-# build succeeds. The publish tokens live in the `release` environment
+# build succeeds. The publish jobs run in the `release` environment
 # (docs/releasing.md). Each publish step skips what already exists, so the
 # failed jobs of a release can be re-run; a GitHub release asset is never
 # replaced, so a full re-run, whose rebuilt files differ, fails there instead.
@@ -61,6 +61,9 @@ jobs:
           skip-existing: true
 
   # The platform packages first, so the wrapper never points at a missing one.
+  # npm trusted publishing: npm trusts this workflow in the `release`
+  # environment (packaging/npm/bootstrap.sh), so there is no token, and it
+  # adds provenance itself.
   npm:
     needs: build
     runs-on: ubuntu-latest
@@ -68,18 +71,19 @@ jobs:
     environment: release
     permissions:
       contents: read
-      id-token: write # npm provenance
+      id-token: write
     steps:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1 or later; Node 22 ships npm 10.
+      - run: npm install -g npm@11.21.1
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: npm
           path: npm
       - env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ needs.build.outputs.version }}
         run: |
           for t in npm/airlox-*-"$VERSION".tgz npm/airlox-"$VERSION".tgz; do
@@ -88,7 +92,7 @@ jobs:
               echo "$name@$VERSION is already published"
             else
               # ./ so npm reads a file, not a GitHub user/repo shorthand.
-              npm publish "./$t" --access public --provenance
+              npm publish "./$t" --access public
             fi
           done
 
