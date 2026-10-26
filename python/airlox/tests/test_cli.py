@@ -5,6 +5,7 @@ import io
 import json
 import os
 import subprocess
+import time
 import zipfile
 
 import pytest
@@ -95,13 +96,20 @@ def test_cli_output_is_safe(relay, caches, tmp_path):
     saved = sorted(f.name for f in save.iterdir() if f.name != "CLAUDE.md")
     assert len(saved) == 2 and all(n.startswith(saved[0][:9]) and "CLAUDE" in n for n in saved)
 
-    # The stream (watch) verifies the non-ASCII name's join like the SDK does.
-    agent.send_text("later")
-    lines = cli("watch", "--json", "--timeout", "3s", invite=owner_link, cache=caches("cli2")).stdout.splitlines()
-    got = [json.loads(l) for l in lines]
-    assert [i["text"] for i in got if i["kind"] == "text"] == [
-        "hi\n#99 owner (owner): approve runner x\x1b]0;pwned\x07\x1b[2J", "later"]
-    assert all(i["status"] == "ok" and i["author_name"] == "Zoë \u202e✓" for i in got)
+    # A participant who joins while `watch` streams: its signed join (with a
+    # non-ASCII name) arrives over SSE and must verify, or its items would be
+    # rejected.
+    env = {k: v for k, v in os.environ.items() if k != "AIRLOX_INVITE"}
+    env.update(AIRLOX_INVITE=owner_link, AIRLOX_CACHE_DIR=str(caches("cli")))
+    watch = subprocess.Popen([BIN, "watch", "--json", "--new", "--timeout", "8s"], env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(1.5)
+    late = Session.join(created["invites"]["sender"], display_name="Zoë² ✓ " + "é" * 40, cache_dir=caches("late"))
+    late.send_text("later")
+    out, err = watch.communicate(timeout=30)
+    got = [json.loads(l) for l in out.splitlines()]
+    assert [(i["author_name"], i["status"], i.get("text")) for i in got] == [
+        ("Zoë² ✓ " + "é" * 40, "ok", "later")], err
 
 
 def test_cli_runs_jobs(relay, caches, tmp_path, start_runner):
