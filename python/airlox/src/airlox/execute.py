@@ -3,7 +3,7 @@
 The relay routes jobs but cannot read them; what counts is signed. A
 runner's identity comes from its verified join, its approval from the
 owner's signed ``runner_approve`` event, and a job's outcome from the
-runner's signed result, bound to the job by ``airlox_core``.
+runner's signed result, bound to the job by ``airlox._core``.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
 
-import airlox_core as ac
+from . import _core as ac
 
 if TYPE_CHECKING:
     from .session import Item, Session

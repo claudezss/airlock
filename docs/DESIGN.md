@@ -54,7 +54,7 @@ canvas (landing, live session, new session, runner console).
 | `airlox-core`: protocol, crypto, validators, job shim | **Rust** | `ed25519-dalek`, `aes-gcm`, `hkdf`, `sha2`, `serde` + canonical JSON; bindings via **PyO3** (Python wheel) and **wasm-bindgen** (browser) |
 | Relay server (API, SSE, storage, purge) | **Rust** | `axum` + `tokio`, `tower` middleware; storage is plain files (append-only session logs + blob files), **no database** |
 | `airlox` binary: runner, CLI | **Rust** | `tokio`, `reqwest` (SSE), `bollard` (Docker), `kube` (Kubernetes), `nix` + Landlock + seccomp for the local backend |
-| SDK and MCP server (`pip install airlox`) | **Python 3.12+** | thin orchestration over the `airlox-core` wheel; `httpx`, `mcp`; the wheel also bundles the `airlox` binary |
+| SDK and MCP server (`pip install airlox`) | **Python 3.12+** | thin orchestration over the Rust core compiled into the same wheel (`airlox._core`); `httpx`, `mcp`; the wheel also bundles the `airlox` binary |
 | Web UI (static SPA served by the server) | **TypeScript** | Vite + React, `airlox-core` wasm for all crypto, markdown-it + DOMPurify, zip.js |
 
 Rust owns everything that touches keys, signatures, sandboxes or the wire.
@@ -687,9 +687,10 @@ it at design parity in M4.
 
 ## 9. SDK, CLI, MCP
 
-One Python package, `airlox`, importable as `airlox`. It depends on
-the `airlox-core` wheel (PyO3) for every cryptographic and protocol
-operation and adds only HTTP plumbing and ergonomics. The wheel also ships the
+One Python package, `airlox`, importable as `airlox`. Its wheel contains
+the Rust core as the extension module `airlox._core` (PyO3), which does every
+cryptographic and protocol operation; the Python side adds only HTTP plumbing
+and ergonomics. The wheel also ships the
 static `airlox` binary so `pip install airlox` puts `airlox runner
 join` on `PATH`; the same binary is downloadable standalone.
 
@@ -757,10 +758,10 @@ airlox/
     airlox-server/         axum app, file-backed session logs and blobs, SSE, routing, purge, embedded web
     airlox/                the `airlox` binary: runner (+ backends/local|docker|k8s) and CLI
   bindings/
-    python/                 PyO3 crate → `airlox-core` wheel (maturin)
-    wasm/                   wasm-bindgen crate → `@airlox/core` npm package (wasm-pack)
+    python/                 PyO3 crate → `airlox._core`, built into the `airlox` wheel (maturin)
+    wasm/                   wasm-bindgen crate → the web UI's wasm module
   python/
-    airlox/          SDK (airlox/), MCP server; depends on the airlox-core wheel, bundles the binary
+    airlox/          SDK (airlox/), MCP server; the maturin project for the `airlox` wheel, bundles the binary
   web/                      browser UI embedded into airlox-server (M1: plain JS timeline; M4: Vite + React + TS SPA)
   deploy/
     docker/                 Dockerfiles (server, runtime base image)

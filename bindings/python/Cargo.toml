@@ -1,13 +1,13 @@
 [package]
 name = "airlox-core-py"
-description = "Python bindings for airlox-core"
+description = "Python bindings for airlox-core: the airlox._core extension module"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
 [lib]
-name = "airlox_core"
+name = "_core"
 crate-type = ["cdylib"]
 
 [dependencies]

@@ -12,7 +12,7 @@
         print(item.author_name, item.kind, item.text or item.name)
 """
 
-from airlox_core import AirloxError, DecryptError, PolicyError, SignatureError, ValidationError
+from ._core import AirloxError, DecryptError, PolicyError, SignatureError, ValidationError
 
 from .execute import Job, JobTimeout, NoRunnerAvailable, OutFile, Result, Runner
 from .session import Item, RelayError, Session

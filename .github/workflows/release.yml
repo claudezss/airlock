@@ -1,7 +1,8 @@
 name: release
 
-# Push a tag `vX.Y.Z` (matching the workspace version) to build every wheel and
-# publish `airlox-core` and `airlox` to PyPI.
+# Push a tag `vX.Y.Z` (matching the workspace version) to build the `airlox`
+# wheels and sdist and publish them to PyPI. Nothing is uploaded unless every
+# build succeeds.
 on:
   push:
     tags: ["v*"]
@@ -14,20 +15,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      # The tag, the Rust workspace, the SDK and its airlox-core pin must agree.
+      # The package version comes from the Rust workspace; the tag must match it.
       - run: |
           python3 - <<'EOF'
           import os, sys, tomllib
           tag = os.environ["GITHUB_REF_NAME"].removeprefix("v")
           rust = tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"]
-          sdk = tomllib.load(open("python/airlox/pyproject.toml", "rb"))["project"]
-          pin = [d for d in sdk["dependencies"] if d.startswith("airlox-core")]
-          print(f"tag={tag} rust={rust} sdk={sdk['version']} pin={pin}")
-          if not (tag == rust == sdk["version"] and pin == [f"airlox-core=={tag}"]):
-              sys.exit("version mismatch")
+          print(f"tag={tag} version={rust}")
+          if tag != rust:
+              sys.exit("the tag does not match workspace.package.version")
           EOF
 
-  core-wheels:
+  wheels:
     needs: version
     runs-on: ${{ matrix.os }}
     strategy:
@@ -42,44 +41,32 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
-          working-directory: bindings/python
+          working-directory: python/airlox
           target: ${{ matrix.target }}
           args: --release --out dist
           manylinux: auto
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: dist-core-${{ matrix.os }}-${{ matrix.target }}
-          path: bindings/python/dist
+          name: dist-${{ matrix.os }}-${{ matrix.target }}
+          path: python/airlox/dist
 
-  core-sdist:
+  sdist:
     needs: version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
-          working-directory: bindings/python
+          working-directory: python/airlox
           command: sdist
           args: --out dist
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: dist-core-sdist
-          path: bindings/python/dist
-
-  sdk:
-    needs: version
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
-      - run: uv build python/airlox --out-dir dist
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: dist-sdk
-          path: dist
+          name: dist-sdist
+          path: python/airlox/dist
 
   publish:
-    needs: [core-wheels, core-sdist, sdk]
+    needs: [wheels, sdist]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4

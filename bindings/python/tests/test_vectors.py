@@ -8,7 +8,7 @@ import zipfile
 
 import pytest
 
-import airlox_core as ac
+from airlox import _core as ac
 
 VEC = json.loads(
     (pathlib.Path(__file__).parents[3] / "crates/airlox-core/vectors/v1.json").read_text()

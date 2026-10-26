@@ -1,6 +1,6 @@
 """Sessions: create, join, send, receive.
 
-All cryptography and validation happens in ``airlox_core`` (Rust). This
+All cryptography and validation happens in ``airlox._core`` (Rust). This
 module is HTTP plumbing, the local cache, and ergonomics.
 """
 
@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Union
 
-import airlox_core as ac
+from . import _core as ac
 import httpx
 
 from .cache import Cache, default_root

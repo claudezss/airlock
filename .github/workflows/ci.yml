@@ -57,10 +57,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
-          working-directory: bindings/python
+          working-directory: python/airlox
           args: --release --out dist
           manylinux: auto
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: wheels-${{ matrix.os }}
-          path: bindings/python/dist
+          path: python/airlox/dist
