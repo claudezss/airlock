@@ -26,7 +26,7 @@ submit jobs and show signed results. Kubernetes is next (M3).
 | `crates/airlox-core/vectors/v1.json` | Conformance vectors every implementation must pass |
 | `crates/airlox-server` | The relay: file-backed sessions, SSE, ack and evict-on-delivery, cost controls, job routing, embedded web UI |
 | `crates/airlox` | The `airlox` binary: `airlox runner join` with docker and local sandboxes |
-| `bindings/python` | PyO3 module `airlox_core` (abi3 wheel, Python 3.9+) |
+| `bindings/python` | PyO3 crate built into the `airlox` wheel as `airlox._core` (abi3, Python 3.9+) |
 | `bindings/wasm` | wasm-bindgen package for browsers and Node |
 | `python/airlox` | Python SDK `airlox` with a local ciphertext cache |
 | `web` | Browser UI (plain JS over the wasm package): sessions, timeline, runner console, jobs |
@@ -117,15 +117,15 @@ Docker daemon is available), and the wasm tests in Node.
 
 ## Releasing
 
-PyPI releases come from CI (`.github/workflows/release.yml`), never from a
-laptop. Set the same version in `Cargo.toml` (`workspace.package.version`),
-`python/airlox/pyproject.toml` (`version` and the `airlox-core==` pin), then
-push a matching tag:
+Releases come from CI (`.github/workflows/release.yml`), never from a laptop.
+PyPI gets one package, `airlox`: the SDK with the Rust core compiled in as
+`airlox._core`. Its version is `workspace.package.version` in `Cargo.toml`;
+bump it, then push a matching tag:
 
 ```bash
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-The workflow checks that the versions agree, builds `airlox-core` wheels for
-Linux (x86_64, aarch64), macOS (x86_64, arm64) and Windows plus its sdist,
-builds the `airlox` SDK, and uploads them all with the `PYPI_TOKEN` secret.
+The workflow checks the tag against that version, builds abi3 wheels for Linux
+(x86_64, aarch64), macOS (x86_64, arm64) and Windows plus an sdist, and uploads
+them with the `PYPI_TOKEN` secret only if every build succeeded.

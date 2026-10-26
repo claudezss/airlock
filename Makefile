@@ -21,9 +21,8 @@ VENV := $(CURDIR)/.venv
 
 python:
 	[ -d $(VENV) ] || uv venv -q --python 3.12 $(VENV)
-	VIRTUAL_ENV=$(VENV) uv pip install -q pytest httpx hatchling editables
-	cd bindings/python && VIRTUAL_ENV=$(VENV) maturin develop -q --uv
-	VIRTUAL_ENV=$(VENV) uv pip install -q --no-deps --no-build-isolation -e python/airlox
+	VIRTUAL_ENV=$(VENV) uv pip install -q pytest httpx
+	cd python/airlox && VIRTUAL_ENV=$(VENV) maturin develop -q --uv
 
 server:
 	cargo build -q -p airlox-server
@@ -56,4 +55,4 @@ vectors:
 
 clean:
 	cargo clean
-	rm -rf $(VENV) bindings/python/.venv bindings/wasm/pkg web/pkg
+	rm -rf $(VENV) bindings/wasm/pkg web/pkg

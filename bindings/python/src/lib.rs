@@ -1,4 +1,5 @@
-//! Python bindings: a one-to-one wrapper over `airlox_core::api`.
+//! Python bindings: a one-to-one wrapper over `airlox_core::api`, built as
+//! the `airlox._core` extension module inside the `airlox` wheel.
 //!
 //! Structured values are JSON strings; secrets and blobs are `bytes`.
 //! Errors raise `AirloxError` or one of its subclasses.
@@ -9,11 +10,11 @@ use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-create_exception!(airlox_core, AirloxError, PyException, "Any airlox-core failure.");
-create_exception!(airlox_core, SignatureError, AirloxError, "A signature did not verify.");
-create_exception!(airlox_core, DecryptError, AirloxError, "Decryption failed (wrong key or tampered data).");
-create_exception!(airlox_core, PolicyError, AirloxError, "The session policy forbids this.");
-create_exception!(airlox_core, ValidationError, AirloxError, "Malformed or unsafe input.");
+create_exception!(airlox, AirloxError, PyException, "Any Airlox protocol or crypto failure.");
+create_exception!(airlox, SignatureError, AirloxError, "A signature did not verify.");
+create_exception!(airlox, DecryptError, AirloxError, "Decryption failed (wrong key or tampered data).");
+create_exception!(airlox, PolicyError, AirloxError, "The session policy forbids this.");
+create_exception!(airlox, ValidationError, AirloxError, "Malformed or unsafe input.");
 
 fn err(e: Error) -> PyErr {
     let msg = e.to_string();
@@ -260,7 +261,8 @@ fn shim_source() -> &'static str {
 }
 
 #[pymodule]
-fn airlox_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+#[pyo3(name = "_core")]
+fn core_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
     m.add("PROTOCOL_VERSION", ::airlox_core::PROTOCOL_VERSION)?;
     m.add("AirloxError", py.get_type::<AirloxError>())?;
