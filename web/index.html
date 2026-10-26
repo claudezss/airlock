@@ -221,7 +221,7 @@ print(result.exit_code, result.stdout)</pre>
       <div class="lp-tile"><h3>Role-scoped invites</h3><p>Owner, sender, observer and runner links carry different rights, and each role's key is fixed in the manifest the owner signed.</p></div>
       <div class="lp-tile"><h3>Signed items</h3><p>Each participant gets a per-session keypair. Every message, file and job is signed, so a runner only executes jobs from a sender or the owner.</p></div>
       <div class="lp-tile"><h3>Sandboxed execution</h3><p>Code never runs on the relay, only on runners the receiver started on their own machines. The Docker sandbox gives each job no network by default, memory and time limits, a read-only root and dropped capabilities.</p></div>
-      <div class="lp-tile"><h3>Short-lived by default</h3><p>Sessions expire on a timer you set and the relay purges them. It keeps no database and nothing after a session ends.</p></div>
+      <div class="lp-tile"><h3>Short-lived by default</h3><p>Sessions expire on a timer you set, or last until you close them, and the relay purges them. It keeps no database and nothing after a session ends.</p></div>
       <div class="lp-tile"><h3>Owner approval</h3><p>Execute sessions can require the owner to approve each runner before it receives any work.</p></div>
     </div>
   </div>
