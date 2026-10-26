@@ -17,18 +17,27 @@ Every push to `main` runs `.github/workflows/deploy.yml`:
 1. builds the image from `Dockerfile` (a static `airlox-server` with the web UI
    embedded, about 12 MB, running as a non-root user) and pushes
    `ghcr.io/claudezss/airlox-server:sha-<commit>` and `:latest`;
-2. connects as `deploy@<droplet>` and runs `airlox-deploy <commit>`. That
-   fetches `deploy/docker-compose.yml` and `deploy/Caddyfile` at the same
-   commit, pulls the image, restarts, and checks
-   `https://$AIRLOX_DOMAIN/v1/health`. If the new version is not healthy it
-   puts the previous image back and the workflow fails.
+2. connects as `deploy@<droplet>` and runs `airlox-deploy <commit>`, which:
+   - refuses a commit that is not on `main`, and skips one that does not
+     contain the commit already deployed (so two quick merges can't end with
+     the older one live);
+   - pulls the image first, then installs `deploy/docker-compose.yml` and
+     `deploy/Caddyfile` from that commit;
+   - restarts (the relay shuts down cleanly on SIGTERM) and checks
+     `/v1/health` through Caddy on the host, with the real certificate, and
+     that the new image is the one running;
+   - if that fails, restores the previous image and files, and the workflow
+     fails.
 
-Pull requests only build the image. To redeploy `main`, run the workflow by
-hand from the Actions tab. Deploys never run concurrently.
+Pull requests, and manual runs on other branches, only build the image. To
+redeploy `main`, run the workflow by hand from the Actions tab. Deploys never
+overlap: the workflow serializes them and the script holds a lock.
 
 The `deploy` user's SSH key is restricted to that one command (no shell, no
-port forwarding), and the registry token it receives is valid only for the
-duration of the workflow run.
+port forwarding). That command still deploys whatever compose file is on
+`main`, as a user in the `docker` group (root-equivalent on the host), so
+`main` (protected by the repository rulesets) is what the host trusts. The
+registry token the script receives is valid only for the workflow run.
 
 ## Setting up a Droplet
 
@@ -46,9 +55,11 @@ On a fresh Ubuntu 24.04 Droplet with your SSH key:
    ```
 
    This installs Docker, a firewall (22, 80 and 443 only), 1 GB of swap,
-   automatic security updates, `/usr/local/bin/airlox-deploy`, and the
-   restricted `deploy` user. It is safe to re-run (for example to change the
-   domain).
+   automatic security updates (rebooting at 04:30 UTC when a kernel update
+   needs it; sessions survive), `/usr/local/bin/airlox-deploy`, and the
+   restricted `deploy` user. Re-run it to change the domain or to install a
+   changed `airlox-deploy` (deploys don't update the script itself); leave out
+   the key to keep the current one.
 3. In the repository's `production` environment (Settings → Environments),
    which only `main` may deploy to, add:
 
@@ -64,8 +75,9 @@ On a fresh Ubuntu 24.04 Droplet with your SSH key:
 
 ## Operating it
 
-Everything lives in `/opt/airlox` (`docker-compose.yml`, `Caddyfile`, and
-`.env` with `AIRLOX_DOMAIN` and the current `AIRLOX_IMAGE`). As root:
+Everything lives in `/opt/airlox`: `docker-compose.yml`, `caddy/Caddyfile`,
+and `.env` with `AIRLOX_DOMAIN` and the deployed `AIRLOX_IMAGE` and
+`AIRLOX_SHA`. As root:
 
 ```bash
 cd /opt/airlox && docker compose logs -f airlox     # relay logs

@@ -12,11 +12,35 @@ async fn main() -> std::io::Result<()> {
     let running = airlox_server::start(cfg).await?;
     let shutdown = running_shutdown_handle(&running);
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        stop_signal().await;
         tracing::info!("shutting down");
         shutdown();
     });
     running.wait().await
+}
+
+/// Ctrl-C, or SIGTERM: what `docker stop` and systemd send. As PID 1 in a
+/// container nothing else would end the process before the SIGKILL.
+async fn stop_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn running_shutdown_handle(r: &airlox_server::Running) -> impl FnOnce() + Send + 'static {

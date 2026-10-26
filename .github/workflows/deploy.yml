@@ -2,8 +2,8 @@ name: deploy
 
 # Every push to main builds the relay image, pushes it to
 # ghcr.io/claudezss/airlox-server and deploys it to the Droplet (see
-# docs/deploy.md). Pull requests only build the image, to catch a broken
-# Dockerfile before merge. Run it by hand to redeploy main.
+# docs/deploy.md). Pull requests, and manual runs on other branches, only build
+# the image. Run it by hand on main to redeploy.
 on:
   push:
     branches: [main]
@@ -25,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - if: github.event_name != 'pull_request'
+      - if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
@@ -35,7 +35,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
           tags: |
             ${{ env.IMAGE }}:sha-${{ github.sha }}
             ${{ env.IMAGE }}:latest
@@ -57,7 +57,8 @@ jobs:
       cancel-in-progress: false
     steps:
       # The deploy key can only run airlox-deploy on the host (a forced
-      # command); the registry token goes over stdin for the image pull.
+      # command), which deploys only commits on main and never an older one
+      # than what runs; the registry token goes over stdin for the image pull.
       - env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
@@ -69,4 +70,5 @@ jobs:
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           printf '%s' "$GHCR_TOKEN" | ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=yes "deploy@$DEPLOY_HOST" "$GITHUB_SHA"
+            -o StrictHostKeyChecking=yes -o ServerAliveInterval=30 \
+            "deploy@$DEPLOY_HOST" "$GITHUB_SHA"

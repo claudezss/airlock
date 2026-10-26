@@ -2,7 +2,7 @@
 # The relay image: a static airlox-server with the web UI (and its wasm core)
 # embedded, on an empty base. Build: docker build -t airlox-server .
 
-FROM rust:1.88-bookworm AS build
+FROM rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS build
 RUN apt-get update && apt-get install -y --no-install-recommends musl-tools \
     && rm -rf /var/lib/apt/lists/*
 
@@ -38,6 +38,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp "target/$target/release/airlox-server" /out/
 
 FROM scratch
+LABEL org.opencontainers.image.source=https://github.com/claudezss/airlox \
+      org.opencontainers.image.description="Airlox relay" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0"
 COPY --from=build /out/airlox-server /airlox-server
 COPY --from=build --chown=65532:65532 /out/data /data
 USER 65532:65532
