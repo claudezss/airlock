@@ -43,7 +43,7 @@ fn negative_invites(secrets: &SessionSecrets) -> Result<Value> {
         {"name": "plain_http", "url": good.replace("https://", "http://")},
         {"name": "owner_link_with_member_key", "url": format!("{owner}&k=AAAA")},
         {"name": "owner_seed_for_other_session", "url": forged_owner},
-        {"name": "short_session_id", "url": good.replace(&secrets.session_id(), "ak_aaaaaaaaaaaa")},
+        {"name": "short_session_id", "url": good.replace(&secrets.session_id(), "ax_aaaaaaaaaaaa")},
     ]))
 }
 

@@ -300,7 +300,7 @@ mod tests {
     fn new(kind: ItemKind, subkind: Option<ContentType>) -> NewItem {
         NewItem {
             id: "AAAAAAAAAAAAAAAAAAAAAA".into(),
-            session_id: "ak_aaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            session_id: "ax_aaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             kind,
             subkind,
             created_at_ms: 5,

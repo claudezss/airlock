@@ -5,9 +5,14 @@ build-backend = "maturin"
 [project]
 name = "airlox-core"
 description = "Airlox protocol core: crypto, wire formats and validators (Rust, via PyO3)"
+readme = "README.md"
 requires-python = ">=3.9"
 dynamic = ["version"]
 classifiers = ["Programming Language :: Rust", "Programming Language :: Python :: 3"]
+
+[project.urls]
+Homepage = "https://github.com/claudezss/airlox"
+Source = "https://github.com/claudezss/airlox"
 
 [tool.maturin]
 module-name = "airlox_core"

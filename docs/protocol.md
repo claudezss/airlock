@@ -38,7 +38,7 @@ The owner generates a 32-byte **owner seed**. Everything else derives from it:
 | session key `K` | `HKDF(salt="airlox/v1", ikm=owner_seed, info="session-key", L=32)` |
 | role seed for R ∈ {sender, runner, observer} | `HKDF(salt="airlox/v1", ikm=owner_seed, info="role:" + R, L=32)` |
 | role keypair | Ed25519 key from seed = role seed |
-| session id | `"ak_" + base32_lower(SHA-256(owner_pub)[0..16])` (26 characters, 128 bits) |
+| session id | `"ax_" + base32_lower(SHA-256(owner_pub)[0..16])` (26 characters, 128 bits) |
 
 `base32_lower` is RFC 4648 base32 with the alphabet `a-z2-7`, no padding.
 Rotating `K` therefore means a new owner seed, i.e. a new session. Member
@@ -51,7 +51,7 @@ links pin the manifest only through the session id, which is why it carries
 {
   "manifest": {
     "v": 1,
-    "session_id": "ak_kzdvvj2umnduyauf35o36k6kw4",
+    "session_id": "ax_kzdvvj2umnduyauf35o36k6kw4",
     "owner_pub": "<b64 32>",
     "roles": { "sender": "<b64>", "runner": "<b64>", "observer": "<b64>" },
     "mode": "relay" | "execute",
