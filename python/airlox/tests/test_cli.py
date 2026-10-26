@@ -167,6 +167,7 @@ def test_cli_runs_jobs(relay, caches, tmp_path, start_runner):
     failing.write_text("import sys\nprint('bad input', file=sys.stderr)\nsys.exit(7)\n")
     job = json.loads(cli("run", "--no-wait", "--json", failing, invite=sender, cache=caches("cli")).stdout)["job"]
     p = cli("result", job, "--wait", "60s", "--json", invite=sender, cache=caches("cli"), check=False)
+    assert p.stdout, p.stderr
     res = json.loads(p.stdout)
     assert p.returncode == 7 and res["exit_code"] == 7 and res["signed"] and "bad input" in res["stderr"]
 
