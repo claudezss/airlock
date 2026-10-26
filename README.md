@@ -101,12 +101,14 @@ pip install airlox
 
 ```bash
 airlox session create --json                 # prints invite links per role
-airlox send text --invite "$SENDER" "Build finished."
-airlox send file --invite "$SENDER" report.md
-airlox watch --invite "$OWNER"               # print items as they arrive
+export AIRLOX_INVITE='<sender link>'
+airlox send text "Build finished."
+airlox send file report.md
+AIRLOX_INVITE='<owner link>' airlox watch    # print items as they arrive
 ```
 
-Every command takes `--invite` (or `AIRLOX_INVITE`) and `--json`. See
+Every command takes the invite from `AIRLOX_INVITE` (or `--invite`, which is
+visible to other local users in `ps`) and prints JSON with `--json`. See
 `airlox --help`.
 
 ### From an AI agent
@@ -117,7 +119,9 @@ it to your agent's skills, or point the agent at it.
 
 Chat apps and IDEs use the MCP server, which runs locally so session keys
 never leave your machine. It reads and writes files only inside the
-directories it is allowed (`--allow-dir`, default: its working directory).
+directories it is allowed (`--allow-dir`; default: its working directory,
+unless that is `/` or your home directory), never overwrites a file, and
+keeps the owner invite out of the conversation.
 
 ```bash
 claude mcp add airlox -- airlox mcp           # Claude Code

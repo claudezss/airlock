@@ -228,7 +228,8 @@ impl View {
             return Ok(Some(b));
         }
         let Some(env) = self.envelopes.get(id) else { bail!("unknown item {id}") };
-        let Some(blob) = self.relay.blob(id).await? else { return Ok(None) };
+        let limit = (self.manifest.max_item_bytes as usize).saturating_add(airlox_core::item::BLOB_OVERHEAD);
+        let Some(blob) = self.relay.blob(id, limit).await? else { return Ok(None) };
         // Only keep bytes that match the author's signature.
         api::verify_item(env, &blob)?;
         write_atomic(&path, &blob, 0o600)?;

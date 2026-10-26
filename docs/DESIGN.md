@@ -692,9 +692,9 @@ it at design parity in M4.
 One Python package, `airlox`, importable as `airlox`. Its wheel contains
 the Rust core as the extension module `airlox._core` (PyO3), which does every
 cryptographic and protocol operation; the Python side adds only HTTP plumbing
-and ergonomics. The wheel also ships the
-static `airlox` binary so `pip install airlox` puts `airlox runner
-join` on `PATH`; the same binary is downloadable standalone.
+and ergonomics. The wheel is to also ship the static `airlox` binary, so
+that `pip install airlox` puts `airlox` on `PATH` (see Distribution below;
+until then the binary comes from `cargo install`).
 
 ```python
 from airlox import Session
@@ -712,8 +712,16 @@ CLI (`airlox …`, Rust, same binary as the runner): `session
 create|invites|info|close`, `send text|file`, `run <file.py>
 [--runner|--label] [--input …] [--out-dir]`, `result`, `cancel`, `items`,
 `watch`, `runner join|list|approve|reject`, and `mcp`. Every command takes the
-invite as `--invite` or `AIRLOX_INVITE` and prints JSON with `--json`; `run`
-exits with the job's exit code. The CLI is a port of the SDK's session logic
+invite as `--invite` or `AIRLOX_INVITE` (preferred: arguments are visible to
+other local users in `ps`) and prints JSON with `--json`. `run` and `result`
+exit with the job's exit code when the runner signed one, 1 when the job
+produced none (timeout, out of memory, cancelled, failed on the relay; the
+JSON `status` and `reason` tell these apart) and 75 when no result arrived
+before `--wait` ran out. Text output escapes control and bidi characters, so
+participant-chosen names, messages and job output cannot forge lines or
+drive the terminal. Received files are saved as `<id prefix>-<name>` and job
+out files under their names, but only images and `out.zip`; nothing is ever
+written over an existing file or through a link. The CLI is a port of the SDK's session logic
 (`crates/airlox/src/session.rs`) over the same core, with the same cache, so
 the SDK, the CLI and the MCP server act as one participant per invite.
 
@@ -735,14 +743,19 @@ Chat apps and IDEs without a shell use the MCP server, `airlox mcp` (stdio,
 the official Rust SDK `rmcp`): tools `create_session`, `join_session`,
 `session_info`, `get_invites`, `send_text`, `send_file`, `list_items`,
 `save_file`, `list_runners`, `approve_runner`, `reject_runner`, `run_python`,
-`get_result`, `close_session`. It reads and writes files only inside
-`--allow-dir` directories (default: its working directory), because other
-participants' messages reach the model, and labels everything participants
-wrote as data. There is deliberately no hosted (remote) MCP endpoint: it would
+`get_result`, `close_session`. Because other participants' messages reach the
+model, it reads and writes files only inside `--allow-dir` directories
+(default: its working directory, unless that is `/` or the home directory),
+never in hidden directories or the session cache, saves received files as the
+CLI does, labels everything participants wrote as data, and keeps the owner
+invite out of the conversation (it goes to a 0600 file for the user). Each
+session has its own lock, so a tool waiting for a job or new items does not
+block the others. There is deliberately no hosted (remote) MCP endpoint: it would
 need the session keys, which would give the relay operator plaintext. The MCP
 server always runs on the user's machine.
 
-Distribution: one static `airlox` binary per platform, published to npm (a
+Distribution (planned for the next release; today `cargo install`): one
+static `airlox` binary per platform, published to npm (a
 wrapper package with per-platform binary packages and no install scripts, so
 `npx -y airlox@<version> mcp` works in any MCP client config), inside the
 `airlox` PyPI wheel (`uvx airlox`), as an MCPB bundle for one-click install in

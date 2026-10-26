@@ -4,6 +4,7 @@
 
 mod cli;
 mod client;
+mod files;
 mod job;
 mod mcp;
 mod runner;

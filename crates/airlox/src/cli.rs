@@ -16,6 +16,7 @@ use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 
 use crate::client;
+use crate::files::{clean_line, clean_text, out_file_name, safe_name, save_new};
 use crate::session::{
     default_cache_root, file_type, Item, JobSpec, NewSession, NoRunnerAvailable, Outcome, Session, Status,
     Target, DEFAULT_TYPES, FILE_TYPES_HELP,
@@ -56,15 +57,15 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let (n, unit) = s.split_at(split);
     let n: u64 = n.parse().map_err(|_| format!("bad duration {s:?}"))?;
-    let ms = match unit.trim() {
-        "ms" => n,
-        "" | "s" => n * 1000,
-        "m" => n * 60_000,
-        "h" => n * 3_600_000,
-        "d" => n * 86_400_000,
+    let unit_ms: u64 = match unit.trim() {
+        "ms" => 1,
+        "" | "s" => 1000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
         _ => return Err(format!("bad duration {s:?}: use s, m, h or d")),
     };
-    Ok(Duration::from_millis(ms))
+    n.checked_mul(unit_ms).map(Duration::from_millis).ok_or_else(|| format!("duration {s:?} is too long"))
 }
 
 // -------------------------------------------------------------- session --
@@ -144,7 +145,10 @@ pub async fn session(cmd: SessionCmd) -> Result<()> {
                 mode: if a.execute { Mode::Execute } else { Mode::Relay },
                 ttl_ms: a.ttl.as_millis() as u64,
                 allowed_types: a.types.clone(),
-                max_item_bytes: a.max_item_mb * 1024 * 1024,
+                max_item_bytes: a
+                    .max_item_mb
+                    .checked_mul(1024 * 1024)
+                    .context("--max-item-mb is too large")?,
                 job_limits,
             };
             let root = a.cache_dir.clone().unwrap_or_else(default_cache_root);
@@ -192,10 +196,11 @@ pub async fn session(cmd: SessionCmd) -> Result<()> {
                 }
                 println!("participants:");
                 for p in s.participants() {
-                    println!("  {:<20} {:<9}{}", p.display_name, p.role, if p.left { " (left)" } else { "" });
+                    let name = clean_line(&p.display_name);
+                    println!("  {name:<20} {:<9}{}", p.role, if p.left { " (left)" } else { "" });
                 }
                 if let Some(c) = &s.closed {
-                    println!("closed: {c}");
+                    println!("closed: {}", clean_line(c));
                 }
             }
             Ok(())
@@ -291,7 +296,16 @@ pub async fn send(cmd: SendCmd) -> Result<()> {
             let mut s = conn.join().await?;
             let mut sent = Vec::new();
             for p in &paths {
-                let r = send_path(&mut s, p).await?;
+                let r = match send_path(&mut s, p).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        // Say what already went out before failing.
+                        if conn.json {
+                            print_json(&json!({"sent": sent, "failed": p, "error": format!("{e:#}")}));
+                        }
+                        return Err(e.context(format!("sending {}", p.display())));
+                    }
+                };
                 if !conn.json {
                     println!("sent {} as {}", p.display(), r["id"].as_str().unwrap_or_default());
                 }
@@ -447,44 +461,49 @@ async fn finish(
     } else {
         print_outcome(&r, &saved, out_dir.is_none());
     }
-    Ok(match (r.signed, r.exit_code) {
-        (true, Some(c)) => c.clamp(0, 255) as i32,
+    Ok(exit_status(&r))
+}
+
+/// The process exit status for an outcome: the job's own exit code when the
+/// runner signed one, else 1 (timed out, out of memory, cancelled, or failed
+/// on the relay; `--json` tells these apart).
+fn exit_status(r: &Outcome) -> i32 {
+    match (r.signed, r.exit_code) {
+        (true, Some(c)) if r.status == "completed" || c != 0 => c.clamp(0, 255) as i32,
         _ => 1,
-    })
+    }
 }
 
-fn safe_name(name: &str) -> Option<&str> {
-    let n = Path::new(name).file_name()?.to_str()?;
-    (!n.starts_with('.') && n == name).then_some(n)
-}
-
-fn save_out_files(r: &Outcome, dir: &Path) -> Result<Vec<String>> {
-    std::fs::create_dir_all(dir)?;
+/// Save a job's out files into `dir`, never over an existing file. Only
+/// the names runners produce (top-level images, `out.zip`) are saved.
+pub fn save_out_files(r: &Outcome, dir: &Path) -> Result<Vec<String>> {
     let mut saved = Vec::new();
     for f in &r.out_files {
-        let (Some(data), Some(name)) = (&f.data, safe_name(&f.name)) else { continue };
-        let p = dir.join(name);
-        std::fs::write(&p, data)?;
-        saved.push(p.display().to_string());
+        let Some(data) = &f.data else { continue };
+        let Some(name) = out_file_name(&f.name) else {
+            eprintln!("   not saving out file {:?}: not an image or out.zip", clean_line(&f.name));
+            continue;
+        };
+        saved.push(save_new(dir, name, data)?.display().to_string());
     }
     Ok(saved)
 }
 
 fn print_outcome(r: &Outcome, saved: &[String], hint: bool) {
     if !r.stdout.is_empty() {
-        print!("{}", r.stdout);
+        print!("{}", clean_text(&r.stdout));
         if !r.stdout.ends_with('\n') {
             println!();
         }
     }
     if !r.stderr.is_empty() {
-        eprint!("{}", r.stderr);
+        eprint!("{}", clean_text(&r.stderr));
         if !r.stderr.ends_with('\n') {
             eprintln!();
         }
     }
     let code = r.exit_code.map(|c| format!("exit {c}")).unwrap_or_else(|| "no exit code".into());
-    let reason = r.reason.as_deref().map(|x| format!(" ({x})")).unwrap_or_default();
+    let reason = r.reason.as_deref().map(|x| format!(" ({})", clean_line(x))).unwrap_or_default();
     let signed = if r.signed { "signed by the runner" } else { "reported by the relay, unsigned" };
     eprintln!("── {} · {code}{reason} · {} ms · {signed}", r.status, r.wall_ms);
     if r.stdout_truncated || r.stderr_truncated {
@@ -493,11 +512,12 @@ fn print_outcome(r: &Outcome, saved: &[String], hint: bool) {
     for p in saved {
         eprintln!("   saved {p}");
     }
-    let unsaved: Vec<_> = r.out_files.iter().filter(|f| f.data.is_some()).map(|f| f.name.as_str()).collect();
+    let unsaved: Vec<_> =
+        r.out_files.iter().filter(|f| f.data.is_some()).map(|f| clean_line(&f.name)).collect();
     if hint && !unsaved.is_empty() {
         eprintln!("   out files: {} (save them with --out-dir)", unsaved.join(", "));
     }
-    let gone: Vec<_> = r.out_files.iter().filter(|f| f.data.is_none()).map(|f| f.name.as_str()).collect();
+    let gone: Vec<_> = r.out_files.iter().filter(|f| f.data.is_none()).map(|f| clean_line(&f.name)).collect();
     if !gone.is_empty() {
         eprintln!("   left the relay before they were fetched: {}", gone.join(", "));
     }
@@ -547,7 +567,10 @@ pub struct WatchArgs {
 }
 
 /// One item as JSON: the verified header fields plus readable content.
-pub fn item_json(i: &Item) -> Value {
+/// Markdown and Python files are inlined up to `max_content` bytes. A result
+/// that is not a valid answer to its job (wrong runner, not approved) is
+/// shown without its output.
+pub fn item_json(s: &Session, i: &Item, max_content: Option<usize>) -> Value {
     let mut v = json!({
         "seq": i.seq,
         "id": i.id,
@@ -571,7 +594,13 @@ pub fn item_json(i: &Item) -> Value {
             v["mime"] = m["mime"].clone();
             v["size"] = json!(i.body.len());
             if i.subkind.as_deref() == Some("md") || i.subkind.as_deref() == Some("py") {
-                v["content"] = json!(String::from_utf8_lossy(&i.body));
+                match max_content {
+                    Some(max) if i.body.len() > max => {
+                        v["content_omitted"] =
+                            json!(format!("larger than {max} bytes; save the file to read it"));
+                    }
+                    _ => v["content"] = json!(String::from_utf8_lossy(&i.body)),
+                }
             }
         }
         "job" => {
@@ -582,6 +611,12 @@ pub fn item_json(i: &Item) -> Value {
         }
         "result" => {
             v["job"] = m["job"]["id"].clone();
+            let valid = s.result_is_valid(i);
+            v["valid"] = json!(valid);
+            if !valid {
+                v["error"] = json!("not a valid result for this job: wrong or unapproved runner");
+                return v;
+            }
             for k in ["status", "exit_code", "reason", "stdout", "stderr", "wall_ms"] {
                 v[k] = m[k].clone();
             }
@@ -594,58 +629,76 @@ pub fn item_json(i: &Item) -> Value {
     v
 }
 
-fn item_line(i: &Item) -> String {
-    let who =
-        format!("{} ({})", i.author_name.as_deref().unwrap_or("?"), i.author_role.as_deref().unwrap_or("?"));
+/// One item as a line of text. Everything a participant chose (names, text,
+/// file names) goes through `clean_line`, so it cannot forge other lines or
+/// drive the terminal.
+fn item_line(s: &Session, i: &Item) -> String {
+    let who = format!(
+        "{} ({})",
+        clean_line(i.author_name.as_deref().unwrap_or("?")),
+        i.author_role.as_deref().unwrap_or("?")
+    );
     let what = match i.status {
         Status::Ok => match i.kind.as_str() {
-            "text" => i.text().unwrap_or_default().to_string(),
-            "file" => format!("file {} ({} bytes)", i.name().unwrap_or("?"), i.body.len()),
+            "text" => clean_line(i.text().unwrap_or_default()),
+            "file" => format!("file {} ({} bytes)", clean_line(i.name().unwrap_or("?")), i.body.len()),
             "job" => {
                 let m = i.meta.as_ref();
-                format!("job {} → {}", m.map(|m| m["filename"].as_str().unwrap_or("?")).unwrap_or("?"), i.id)
+                let name = m.map(|m| m["filename"].as_str().unwrap_or("?")).unwrap_or("?");
+                format!("job {} → {}", clean_line(name), i.id)
             }
+            "result" if !s.result_is_valid(i) => "result REJECTED: wrong or unapproved runner".into(),
             "result" => {
                 let m = i.meta.as_ref().unwrap();
-                format!(
+                clean_line(&format!(
                     "result for {}: {} exit {}",
                     m["job"]["id"].as_str().unwrap_or("?"),
                     m["status"].as_str().unwrap_or("?"),
                     m["exit_code"]
-                )
+                ))
             }
-            "event" => format!("event {}", i.meta.as_ref().unwrap()["event"].as_str().unwrap_or("?")),
-            k => k.to_string(),
+            "event" => {
+                format!("event {}", clean_line(i.meta.as_ref().unwrap()["event"].as_str().unwrap_or("?")))
+            }
+            k => clean_line(k),
         },
-        Status::Evicted => format!("{} (left the relay before it was fetched)", i.kind),
-        Status::Pending => format!("{} (not fetched yet)", i.kind),
-        Status::Rejected => format!("{} REJECTED: {}", i.kind, i.error.as_deref().unwrap_or("?")),
+        Status::Evicted => format!("{} (left the relay before it was fetched)", clean_line(&i.kind)),
+        Status::Pending => format!("{} (not fetched yet)", clean_line(&i.kind)),
+        Status::Rejected => {
+            format!("{} REJECTED: {}", clean_line(&i.kind), clean_line(i.error.as_deref().unwrap_or("?")))
+        }
     };
     format!("#{:<4} {who}: {what}", i.seq)
 }
 
-fn save_item(i: &Item, dir: Option<&Path>) -> Result<Option<String>> {
-    let (Some(dir), Some(name)) = (dir, i.name()) else { return Ok(None) };
-    if i.status != Status::Ok {
-        return Ok(None);
-    }
-    let Some(name) = safe_name(name) else { return Ok(None) };
-    std::fs::create_dir_all(dir)?;
-    let p = dir.join(format!("{}-{name}", &i.id[..i.id.len().min(8)]));
-    std::fs::write(&p, &i.body)?;
-    Ok(Some(p.display().to_string()))
+/// Save a received file as `<id prefix>-<name>` in `dir`, so a participant
+/// cannot pick the name of a file that matters (`CLAUDE.md`, `conftest.py`),
+/// and never over an existing file.
+pub fn save_item(i: &Item, dir: &Path) -> Result<PathBuf> {
+    let name = i.name().filter(|_| i.status == Status::Ok).context("the item is not an available file")?;
+    let name = safe_name(name).context("the file's name is not safe to save")?;
+    save_new(dir, &format!("{}-{name}", &i.id[..i.id.len().min(8)]), &i.body)
 }
 
-fn emit(i: &Item, a: &ItemsArgs) -> Result<()> {
-    let saved = save_item(i, a.save.as_deref())?;
+fn emit(s: &Session, i: &Item, a: &ItemsArgs) -> Result<()> {
+    let saved = match &a.save {
+        Some(dir) if i.name().is_some() && i.status == Status::Ok => match save_item(i, dir) {
+            Ok(p) => Some(p.display().to_string()),
+            Err(e) => {
+                eprintln!("not saving item {}: {e:#}", i.id);
+                None
+            }
+        },
+        _ => None,
+    };
     if a.conn.json {
-        let mut v = item_json(i);
+        let mut v = item_json(s, i, None);
         if let Some(p) = saved {
             v["saved"] = json!(p);
         }
         println!("{}", serde_json::to_string(&v)?);
     } else {
-        println!("{}", item_line(i));
+        println!("{}", item_line(s, i));
         if let Some(p) = saved {
             println!("       saved {p}");
         }
@@ -657,8 +710,8 @@ fn emit(i: &Item, a: &ItemsArgs) -> Result<()> {
 pub async fn items(a: ItemsArgs) -> Result<()> {
     let mut s = a.conn.join().await?;
     s.sync().await?;
-    for i in s.items().to_vec() {
-        emit(&i, &a)?;
+    for i in s.items() {
+        emit(&s, i, &a)?;
     }
     Ok(())
 }
@@ -668,18 +721,18 @@ pub async fn watch(a: WatchArgs) -> Result<()> {
     let mut s = a.items.conn.join().await?;
     s.sync().await?;
     if !a.new {
-        for i in s.items().to_vec() {
-            emit(&i, &a.items)?;
+        for i in s.items() {
+            emit(&s, i, &a.items)?;
         }
     }
     let args = &a.items;
-    s.stream(a.timeout, &mut |i| {
-        emit(i, args)?;
+    s.stream(a.timeout, &mut |s, i| {
+        emit(s, i, args)?;
         Ok(true)
     })
     .await?;
     if let Some(c) = &s.closed {
-        eprintln!("session ended: {c}");
+        eprintln!("session ended: {}", clean_line(c));
     }
     Ok(())
 }
@@ -709,7 +762,14 @@ pub async fn runner_list(conn: Conn) -> Result<()> {
             "idle"
         };
         let net = if r.network_unblocked { " · cannot block network" } else { "" };
-        println!("{:<20} {:<18} {} on {} [{}]{net}", r.name, state, r.sandbox, r.host, r.labels.join(","));
+        println!(
+            "{:<20} {:<18} {} on {} [{}]{net}",
+            clean_line(&r.name),
+            state,
+            clean_line(&r.sandbox),
+            clean_line(&r.host),
+            clean_line(&r.labels.join(","))
+        );
     }
     Ok(())
 }
@@ -720,7 +780,7 @@ pub async fn runner_approve(conn: Conn, name: String) -> Result<()> {
     if conn.json {
         print_json(&json!({"approved": r}));
     } else {
-        println!("approved {} ({} on {})", r.name, r.sandbox, r.host);
+        println!("approved {} ({} on {})", clean_line(&r.name), clean_line(&r.sandbox), clean_line(&r.host));
     }
     Ok(())
 }
@@ -731,7 +791,7 @@ pub async fn runner_reject(conn: Conn, name: String, reason: Option<String>) -> 
     if conn.json {
         print_json(&json!({"rejected": r}));
     } else {
-        println!("rejected {}", r.name);
+        println!("rejected {}", clean_line(&r.name));
     }
     Ok(())
 }

@@ -93,9 +93,13 @@ impl Cache {
         Ok(Cache { dir })
     }
 
-    fn load_identity(&self, role: &str) -> Option<Identity> {
-        let b = fs::read(self.dir.join(format!("identity-{role}.json"))).ok()?;
-        serde_json::from_slice(&b).ok()
+    /// The cached identity for `role`. A damaged file is an error rather than
+    /// a reason to join again as someone new.
+    fn load_identity(&self, role: &str) -> Result<Option<Identity>> {
+        let path = self.dir.join(format!("identity-{role}.json"));
+        let Ok(b) = fs::read(&path) else { return Ok(None) };
+        let id = serde_json::from_slice(&b).with_context(|| format!("{} is damaged", path.display()))?;
+        Ok(Some(id))
     }
 
     fn save_identity(&self, role: &str, id: &Identity) -> Result<()> {
@@ -386,7 +390,7 @@ impl Session {
         let role = info.role;
         Cache::sweep_expired(cache_root);
         let cache = Cache::open(cache_root, &sid)?;
-        let identity = cache.load_identity(role.as_str());
+        let identity = cache.load_identity(role.as_str())?;
         let (signed, offline) = match client::get_manifest(http, &base, &sid).await {
             Ok(s) => (s, false),
             Err(e) if matches!(status_of(&e), Some(404 | 410)) => match (cache.load_manifest(), &identity) {
@@ -585,13 +589,13 @@ impl Session {
     }
 
     /// Runners in the session: names and labels from each verified join,
-    /// approval from the owner's signed events.
+    /// approval from the owner's signed events and manifest. The relay's
+    /// listing only says who is online, busy or turned away.
     pub async fn runners(&mut self) -> Result<Vec<Runner>> {
-        self.limits()?;
+        let required = self.limits()?.approve_runners;
         self.sync().await?;
         let listing = self.relay.get_json("/runners").await?;
         let approvals = self.signed_approvals();
-        let required = listing["approval_required"].as_bool().unwrap_or(true);
         let mut out = Vec::new();
         for r in listing["runners"].as_array().cloned().unwrap_or_default() {
             let Some(raw) = r["signed_join"].as_str() else { continue };
@@ -679,7 +683,11 @@ impl Session {
         let (id, _, _, frame) = self.seal("job", Some("py"), &meta, b"", vec![])?;
         match self.relay.post_raw("/jobs", frame, &[("Airlox-Target", target.to_string())]).await {
             Ok(resp) => {
-                let v: Value = resp.json().await.unwrap_or(Value::Null);
+                let v: Value = client::read_capped(resp, 64 << 10)
+                    .await
+                    .ok()
+                    .and_then(|b| serde_json::from_slice(&b).ok())
+                    .unwrap_or(Value::Null);
                 Ok((id, v["runner"].as_str().map(String::from)))
             }
             Err(e) => match e.downcast_ref::<RelayError>() {
@@ -708,11 +716,23 @@ impl Session {
         self.relay.get_json(&format!("/jobs/{job}")).await
     }
 
-    /// The job's signed outcome, once it and its out files have arrived.
-    pub fn result(&self, job: &str) -> Option<Outcome> {
-        let job_item = self.get(job).filter(|i| i.kind == "job" && i.status == Status::Ok)?;
-        let job_meta = job_item.meta.as_ref()?.to_string();
-        let job_ref = job_item.item_ref.to_string();
+    /// Whether a result item is a valid answer to the job it names: posted by
+    /// a runner the job could go to (approved, when the manifest requires it)
+    /// and bound to that job.
+    pub fn result_is_valid(&self, item: &Item) -> bool {
+        let Some(m) = item.meta.as_ref() else { return false };
+        if item.kind != "result" || item.status != Status::Ok || item.author_role.as_deref() != Some("runner")
+        {
+            return false;
+        }
+        let Some(job_item) = m["job"]["id"]
+            .as_str()
+            .and_then(|j| self.get(j))
+            .filter(|i| i.kind == "job" && i.status == Status::Ok)
+        else {
+            return false;
+        };
+        let Some(job_meta) = job_item.meta.as_ref() else { return false };
         let approved = match self.manifest.job_limits.as_ref() {
             Some(l) if l.approve_runners => {
                 let mut v: Vec<String> =
@@ -722,24 +742,22 @@ impl Session {
             }
             _ => None,
         };
+        api::check_result_for_job(
+            &job_item.item_ref.to_string(),
+            &job_meta.to_string(),
+            &item.author,
+            &m.to_string(),
+            approved.as_deref(),
+        )
+        .is_ok()
+    }
+
+    /// The job's signed outcome, once it and its out files have arrived.
+    pub fn result(&self, job: &str) -> Option<Outcome> {
         for item in &self.items {
             let Some(m) = item.meta.as_ref() else { continue };
-            if item.kind != "result" || item.status != Status::Ok || m["job"]["id"] != job {
+            if item.kind != "result" || m["job"]["id"] != job || !self.result_is_valid(item) {
                 continue;
-            }
-            if item.author_role.as_deref() != Some("runner") {
-                continue;
-            }
-            if api::check_result_for_job(
-                &job_ref,
-                &job_meta,
-                &item.author,
-                &m.to_string(),
-                approved.as_deref(),
-            )
-            .is_err()
-            {
-                continue; // not a valid answer to this job
             }
             let mut outs = Vec::new();
             for o in m["out_files"].as_array().cloned().unwrap_or_default() {
@@ -781,32 +799,45 @@ impl Session {
     pub async fn wait(&mut self, job: &str, timeout: Option<Duration>) -> Result<Option<Outcome>> {
         let deadline = timeout.map(|t| Instant::now() + t);
         loop {
-            self.sync().await?;
-            if let Some(r) = self.result(job) {
+            if let Some(r) = self.poll_job(job).await? {
                 return Ok(Some(r));
-            }
-            let st = self.job_state(job).await?;
-            if st["state"] == "failed" {
-                // A runner that ran the job may still post its result.
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                self.sync().await?;
-                if let Some(r) = self.result(job) {
-                    return Ok(Some(r));
-                }
-                let reason = st["reason"].as_str().map(String::from);
-                let status = if reason.as_deref() == Some("cancelled") { "cancelled" } else { "failed" };
-                return Ok(Some(Outcome::unsigned(
-                    job,
-                    status,
-                    reason,
-                    st["runner"].as_str().map(String::from),
-                )));
             }
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 return Ok(None);
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
+    }
+
+    /// One look at a job: its outcome if it has one. Network trouble and a
+    /// busy relay count as "not yet", so long waits survive them.
+    pub async fn poll_job(&mut self, job: &str) -> Result<Option<Outcome>> {
+        match self.sync().await {
+            Err(e) if is_transient(&e) => return Ok(None),
+            r => r?,
+        };
+        if let Some(r) = self.result(job) {
+            return Ok(Some(r));
+        }
+        if self.closed.is_some() {
+            bail!("the session ended before job {job} finished");
+        }
+        let st = match self.job_state(job).await {
+            Err(e) if is_transient(&e) => return Ok(None),
+            r => r?,
+        };
+        if st["state"] != "failed" {
+            return Ok(None);
+        }
+        // A runner that ran the job may still post its result.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = self.sync().await;
+        if let Some(r) = self.result(job) {
+            return Ok(Some(r));
+        }
+        let reason = st["reason"].as_str().map(String::from);
+        let status = if reason.as_deref() == Some("cancelled") { "cancelled" } else { "failed" };
+        Ok(Some(Outcome::unsigned(job, status, reason, st["runner"].as_str().map(String::from))))
     }
 
     /// `participant_pub -> approved?` from the owner's signed events. A
@@ -873,7 +904,7 @@ impl Session {
     pub async fn stream(
         &mut self,
         timeout: Option<Duration>,
-        on_item: &mut (dyn FnMut(&Item) -> Result<bool> + Send),
+        on_item: &mut (dyn FnMut(&Session, &Item) -> Result<bool> + Send),
     ) -> Result<()> {
         let deadline = timeout.map(|t| Instant::now() + t);
         let left = |d: Option<Instant>| d.map(|d| d.saturating_duration_since(Instant::now()));
@@ -882,7 +913,7 @@ impl Session {
                 return Ok(());
             }
             for i in self.retry().await? {
-                if !on_item(&self.items[i])? {
+                if !on_item(self, &self.items[i])? {
                     return Ok(());
                 }
             }
@@ -904,7 +935,13 @@ impl Session {
                 let wait = left(deadline).unwrap_or(Duration::from_secs(60)).min(Duration::from_secs(60));
                 let chunk = match tokio::time::timeout(wait, body.next()).await {
                     Err(_) => break, // quiet: reconnect, or stop at the deadline
-                    Ok(None) | Ok(Some(Err(_))) => break,
+                    Ok(None) | Ok(Some(Err(_))) => {
+                        // Dropped: pause before reconnecting, so a relay that
+                        // keeps hanging up does not get a tight loop.
+                        let pause = left(deadline).unwrap_or(Duration::MAX).min(Duration::from_secs(1));
+                        tokio::time::sleep(pause).await;
+                        break;
+                    }
                     Ok(Some(Ok(c))) => c,
                 };
                 for ev in parser.push(&chunk) {
@@ -915,7 +952,7 @@ impl Session {
                         "data": serde_json::from_str::<Value>(&ev.data).unwrap_or(Value::Null),
                     });
                     if let Some(i) = self.apply(&ev, true, true).await? {
-                        if self.items[i].status != Status::Pending && !on_item(&self.items[i])? {
+                        if self.items[i].status != Status::Pending && !on_item(self, &self.items[i])? {
                             return Ok(());
                         }
                     }
@@ -1031,10 +1068,21 @@ impl Session {
         }
     }
 
+    /// The largest blob an item in this session can have.
+    fn blob_limit(&self) -> usize {
+        (self.manifest.max_item_bytes as usize).saturating_add(airlox_core::item::BLOB_OVERHEAD)
+    }
+
     async fn receive(&mut self, seq: u64, envelope: String, fetch: bool) -> Result<Option<usize>> {
         let parsed: Value = serde_json::from_str(&envelope).context("item envelope is not JSON")?;
         let h = &parsed["header"];
         let id = h["id"].as_str().unwrap_or_default().to_string();
+        // The id names a cache file; anything but a well-formed id is the
+        // relay's invention and is dropped before it touches the disk.
+        if !airlox_core::item::is_item_id(&id) {
+            tracing::debug!("dropped an item with a malformed id");
+            return Ok(None);
+        }
         if self.get(&id).is_some_and(|i| i.status != Status::Pending) {
             return Ok(None);
         }
@@ -1086,7 +1134,7 @@ impl Session {
                 item.status = Status::Pending;
                 return Ok(Some(finish(self, item)));
             }
-            None => match self.relay.blob(&id).await {
+            None => match self.relay.blob(&id, self.blob_limit()).await {
                 Ok(Some(b)) => {
                     fresh = true;
                     b
@@ -1099,7 +1147,13 @@ impl Session {
                     item.status = Status::Pending;
                     return Ok(Some(finish(self, item)));
                 }
-                Err(e) => return Err(e),
+                Err(e) if status_of(&e).is_some() => return Err(e),
+                Err(e) => {
+                    // Not a refusal but a bad answer (too large): the item is unusable.
+                    item.status = Status::Rejected;
+                    item.error = Some(format!("{e:#}"));
+                    return Ok(Some(finish(self, item)));
+                }
             },
         };
         match api::open_checked(&self.signed_manifest, &author.cert, &self.key, &envelope, &blob) {
