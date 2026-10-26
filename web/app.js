@@ -70,10 +70,15 @@ addEventListener("beforeunload", (ev) => {
 // empty the page when it is hidden, and start over if it comes back.
 let invitesCreated = false;
 addEventListener("pagehide", () => {
-  if (invitesCreated) app.replaceChildren();
+  if (!invitesCreated) return;
+  invitesShown = false; // the page is gone; a restore must not prompt on leaving
+  app.replaceChildren();
 });
 addEventListener("pageshow", (ev) => {
-  if (ev.persisted && invitesCreated) location.reload();
+  if (ev.persisted && invitesCreated) {
+    invitesShown = false;
+    location.reload();
+  }
 });
 const show = (...nodes) => app.replaceChildren(...nodes);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -200,6 +205,20 @@ function runnerInviteRow(url) {
       el("code", {}, `airlox runner join --invite '${maskInvite(url)}' --name runner-01 --sandbox docker`)));
 }
 
+// Open the session as its owner without ever putting the key in a URL the
+// browser could keep in history: hand the fragment to the session page through
+// sessionStorage, the same place takeInvite() keeps it.
+function openOwnerSession(link) {
+  invitesShown = false;
+  const u = new URL(link);
+  try {
+    sessionStorage.setItem(`invite:${u.pathname}`, u.hash.slice(1));
+    location.assign(u.pathname);
+  } catch {
+    location.assign(link);
+  }
+}
+
 // ---------- new session (the create flow, at /new) ----------
 function newSession() {
   const radio = (name, value, label, checked, extra = {}) =>
@@ -301,7 +320,7 @@ function newSession() {
         ...(execute ? [runnerInviteRow(ac.memberInvite(base, s.ownerSeed, "runner"))] : []),
         el("div", { class: "row" },
           // A button, not a link: the owner key must not show in the status bar on hover.
-          el("button", { class: "primary cta", type: "button", onclick: () => { invitesShown = false; location.assign(owner); } }, "Open session"),
+          el("button", { class: "primary cta", type: "button", onclick: () => openOwnerSession(owner) }, "Open session"),
           el("button", { type: "button", onclick: () => { invitesShown = false; location.reload(); } }, "Create another")));
       heading.focus();
       invitesShown = true;
