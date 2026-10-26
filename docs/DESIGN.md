@@ -752,7 +752,9 @@ the official Rust SDK `rmcp`): tools `create_session`, `join_session`,
 `get_result`, `close_session`. Because other participants' messages reach the
 model, it reads and writes files only inside `--allow-dir` directories
 (default: its working directory, unless that is `/` or the home directory),
-never in hidden directories or the session cache, saves received files as the
+never in hidden directories, the session cache or the owner-invite
+directory, and refuses `/`, the home directory or a parent of it as an allowed
+directory, saves received files as the
 CLI does, labels everything participants wrote as data, and never returns the
 owner invite (with `--owner-invite-dir` it is saved to a 0600 file for the
 user). Joining a session does not change the default session, so a
@@ -763,7 +765,9 @@ need the session keys, which would give the relay operator plaintext. The MCP
 server always runs on the user's machine.
 
 Distribution: one `airlox` binary per platform (macOS arm64 and x64, Linux
-arm64 and x64 as static musl binaries, Windows x64), built and smoke-tested by
+arm64 and x64 as static musl binaries, Windows x64 with the C runtime linked
+in; on Windows only the client and the MCP server, since the runner's
+sandboxes need macOS or Linux), built and smoke-tested by
 `.github/workflows/build.yml` and published on a version tag by
 `release.yml`. Each one ships:
 - on npm: a wrapper package `airlox` whose `bin` runs the binary from a
@@ -771,12 +775,14 @@ arm64 and x64 as static musl binaries, Windows x64), built and smoke-tested by
   by `os` and `cpu`), with no install scripts, so `npx -y airlox@<version>
   mcp` works in any MCP client config;
 - inside the `airlox` PyPI wheel for its platform, installed as a script
-  (`uvx airlox`);
+  (`uvx airlox`; the sdist, which pip falls back to where there is no wheel,
+  has no binary);
 - on GitHub releases, archived with `SHA256SUMS`;
 - in an MCPB bundle for one-click install in Claude Desktop (a universal
   macOS binary and Windows x64; the bundle asks for the working folder and an
   optional owner-links folder, and passes settings left blank as empty
-  `AIRLOX_*` variables, which the binary treats as unset);
+  `AIRLOX_*` variables, which the binary treats as unset, except an empty
+  relay, which is an error rather than a fallback to the public one);
 - in the MCP registry, as `io.github.claudezss/airlox` naming all three
   packages.
 

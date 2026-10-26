@@ -56,7 +56,7 @@ function npm(version, bins, out) {
       ...common,
       os: [os],
       cpu: [cpu],
-      files: ["bin"],
+      files: ["bin", "LICENSE-*"],
       preferUnplugged: true,
     });
     wrapper.optionalDependencies[name] = version;

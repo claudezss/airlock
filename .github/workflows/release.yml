@@ -4,8 +4,10 @@ name: release
 # (build.yml) and publish it: the wheels and sdist to PyPI, the npm packages,
 # a GitHub release with the binaries and the MCPB bundle, and then the MCP
 # registry entry that names all three. Nothing is published unless every
-# build succeeds. Each publish step skips what already exists, so a failed
-# release can be re-run.
+# build succeeds. The publish tokens live in the `release` environment
+# (docs/releasing.md). Each publish step skips what already exists, so the
+# failed jobs of a release can be re-run; a GitHub release asset is never
+# replaced, so a full re-run, whose rebuilt files differ, fails there instead.
 on:
   push:
     tags: ["v*"]
@@ -45,6 +47,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    environment: release
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -62,6 +65,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    environment: release
     permissions:
       contents: read
       id-token: write # npm provenance
@@ -83,7 +87,8 @@ jobs:
             if npm view "$name@$VERSION" version > /dev/null 2>&1; then
               echo "$name@$VERSION is already published"
             else
-              npm publish "$t" --access public --provenance
+              # ./ so npm reads a file, not a GitHub user/repo shorthand.
+              npm publish "./$t" --access public --provenance
             fi
           done
 
@@ -124,15 +129,28 @@ jobs:
           cp "mcpb/airlox-$VERSION.mcpb" release/
           (cd release && sha256sum * > SHA256SUMS)
           cat release/SHA256SUMS
+      # Upload what is missing; an asset already there must be identical,
+      # since PyPI, npm and the registry entry's bundle hash may already
+      # describe it.
       - env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          if gh release view "$TAG" > /dev/null 2>&1; then
-            gh release upload "$TAG" release/* --clobber
-          else
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
             gh release create "$TAG" release/* --verify-tag --title "$TAG" --generate-notes
+            exit 0
           fi
+          have=$(gh release view "$TAG" --json assets -q '.assets[].name')
+          mkdir published
+          for f in release/*; do
+            name=${f#release/}
+            if printf '%s\n' "$have" | grep -qxF "$name"; then
+              gh release download "$TAG" -p "$name" -D published
+              cmp "$f" "published/$name" || { echo "::error::$name differs from the published asset"; exit 1; }
+            else
+              gh release upload "$TAG" "$f"
+            fi
+          done
 
   # The registry checks that each package exists and names this server (npm's
   # mcpName, the PyPI README's mcp-name, the bundle's URL), so this runs last.

@@ -91,10 +91,14 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
+/// `~/.cache/airlox`, as the Python SDK's cache (so they share one), which on
+/// Windows is under the user profile. Identities live here, so the temporary
+/// directory, which gets cleaned, is a last resort.
 pub fn default_cache_root() -> PathBuf {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .or_else(|| home.map(|h| PathBuf::from(h).join(".cache")))
         .unwrap_or_else(std::env::temp_dir);
     base.join("airlox")
 }

@@ -1,0 +1,8 @@
+{
+  "name": "airlox-mcpb-tool",
+  "private": true,
+  "description": "The MCPB CLI that validates and packs the bundle, locked so a build installs exactly these packages",
+  "devDependencies": {
+    "@anthropic-ai/mcpb": "2.1.2"
+  }
+}

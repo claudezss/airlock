@@ -9,7 +9,7 @@
   "license": "MIT OR Apache-2.0",
   "mcpName": "io.github.claudezss/airlox",
   "bin": { "airlox": "bin/airlox.js" },
-  "files": ["bin"],
+  "files": ["bin", "LICENSE-*"],
   "engines": { "node": ">=18" },
   "optionalDependencies": {}
 }

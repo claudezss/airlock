@@ -1,0 +1,4 @@
+# cargo-zigbuild and the zig it runs, for the static Linux builds
+# (.github/workflows/build.yml), pinned by hash.
+cargo-zigbuild==0.23.4 --hash=sha256:0a149a2a07b9513d422efa9cc23e1add9741f08abe86845fa418eaeb4cca7931
+ziglang==0.15.2 --hash=sha256:806316453d1ede7174ed3fefb8e5348154629089c3bb5fe812dfd0e172fac130
