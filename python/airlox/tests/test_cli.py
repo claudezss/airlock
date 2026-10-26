@@ -405,3 +405,28 @@ def test_mcp_server(relay, caches, tmp_path, start_runner):
         assert agent.closed
     finally:
         mcp.close()
+
+
+def test_cli_reseeds_evicted_files(relay, caches, tmp_path):
+    owner = Session.create(relay.url, cache_dir=caches("owner"))
+    plan = tmp_path / "plan.md"
+    plan.write_text("# Plan\n")
+    cli("send", "file", plan, invite=owner.invites["sender"], cache=caches("sender"))
+    # The only recipient stores and acks it, so the relay deletes the blob.
+    owner.items()
+    deadline = time.monotonic() + 10
+    while not owner._evicted:
+        assert time.monotonic() < deadline, "the relay never evicted the blob"
+        time.sleep(0.1)
+        owner.sync()
+
+    def late_files():
+        out = cli("items", "--json", invite=owner.invites["observer"], cache=caches("late")).stdout
+        return [i for i in map(json.loads, out.splitlines()) if i["kind"] == "file"]
+
+    # A late joiner sees it evicted and asks for it; the sender's CLI, which
+    # holds it, uploads it on its next command; the late joiner then has it.
+    assert [f["status"] for f in late_files()] == ["evicted"]
+    cli("items", "--json", invite=owner.invites["sender"], cache=caches("sender"))
+    (f,) = late_files()
+    assert (f["status"], f["name"]) == ("ok", "plan.md")

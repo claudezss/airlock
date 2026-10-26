@@ -151,11 +151,19 @@ impl Cache {
         Ok(())
     }
 
+    /// Blob files are named by item id only; ids come from the relay, and
+    /// anything else could name another file.
     fn read_blob(&self, id: &str) -> Option<Vec<u8>> {
+        if !airlox_core::item::is_item_id(id) {
+            return None;
+        }
         fs::read(self.dir.join("blobs").join(id)).ok()
     }
 
     fn write_blob(&self, id: &str, blob: &[u8]) -> Result<()> {
+        if !airlox_core::item::is_item_id(id) {
+            bail!("not an item id: {id:?}");
+        }
         write_atomic(&self.dir.join("blobs").join(id), blob, 0o600)
     }
 
@@ -189,7 +197,9 @@ pub enum Status {
     Ok,
     /// The blob could not be fetched yet (network, busy relay); retried later.
     Pending,
-    /// The relay deleted the blob before this client fetched it.
+    /// The relay deleted the blob before this client fetched it. The
+    /// client asks the participants holding it to upload it again, and
+    /// fetches it if one does.
     Evicted,
     /// Failed verification or policy; see `error`.
     Rejected,
@@ -391,6 +401,12 @@ pub struct Session {
     index: HashMap<String, usize>,
     envelopes: HashMap<String, String>,
     evicted: HashSet<String>,
+    /// Evicted items this client asked holders for.
+    wanted: HashSet<String>,
+    /// Evicted items others asked for, which this client may hold.
+    asked: HashSet<String>,
+    /// Evicted items back on the relay, to fetch.
+    reseeded: HashSet<String>,
     unacked: HashSet<String>,
     last_seq: Option<u64>,
     /// Why the session is over, once it is.
@@ -521,17 +537,25 @@ impl Session {
             index: HashMap::new(),
             envelopes: HashMap::new(),
             evicted: HashSet::new(),
+            wanted: HashSet::new(),
+            asked: HashSet::new(),
+            reseeded: HashSet::new(),
             unacked: HashSet::new(),
             last_seq: None,
             closed: None,
             joined_now,
         };
+        // Which blobs the relay lacks now, so replayed items without a
+        // cached blob come out evicted rather than pending.
         let cached = s.cache.events();
-        s.evicted = cached
-            .iter()
-            .filter(|e| e["kind"] == "evicted")
-            .filter_map(|e| e["data"]["item"].as_str().map(String::from))
-            .collect();
+        for e in &cached {
+            let Some(id) = e["data"]["item"].as_str() else { continue };
+            match e["kind"].as_str() {
+                Some("evicted") => s.evicted.insert(id.to_string()),
+                Some("reseeded") => s.evicted.remove(id),
+                _ => false,
+            };
+        }
         for ev in &cached {
             s.apply(ev, false, false).await?;
         }
@@ -998,7 +1022,91 @@ impl Session {
                 }
             }
         }
+        self.trade_blobs().await;
+        out.extend(self.fetch_reseeded().await?);
         Ok(out)
+    }
+
+    /// Fetch the items whose blobs were re-seeded; other pending downloads
+    /// wait for the next retry.
+    async fn fetch_reseeded(&mut self) -> Result<Vec<usize>> {
+        let mut out = Vec::new();
+        for id in std::mem::take(&mut self.reseeded) {
+            let Some(&i) = self.index.get(&id) else { continue };
+            if self.items[i].status != Status::Pending {
+                continue;
+            }
+            let (seq, env) = (self.items[i].seq, self.envelopes.get(&id).cloned().unwrap_or_default());
+            if let Some(i) = self.receive(seq, env, true).await? {
+                if self.items[i].status != Status::Pending {
+                    out.push(i);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Re-seeding: ask holders for evicted items this participant never
+    /// got, and upload the blobs others asked for that this cache holds.
+    /// The relay takes an upload only if it matches the author's signed
+    /// hash, so a cached blob is safe to offer.
+    async fn trade_blobs(&mut self) {
+        if self.closed.is_some() {
+            return;
+        }
+        for id in self.asked.clone() {
+            let Some(blob) = self.cache.read_blob(&id) else {
+                self.asked.remove(&id);
+                continue;
+            };
+            match self.relay.reseed(&id, blob).await {
+                Err(e) if is_transient(&e) => {}
+                r => {
+                    if let Err(e) = r {
+                        tracing::debug!(item = %id, "re-seed refused: {e:#}");
+                    }
+                    self.asked.remove(&id);
+                }
+            }
+        }
+        let evicted: Vec<String> = self
+            .items
+            .iter()
+            .filter(|i| i.status == Status::Evicted && i.author != self.me && !self.wanted.contains(&i.id))
+            .map(|i| i.id.clone())
+            .collect();
+        for id in evicted {
+            match self.relay.want(&id).await {
+                Ok(true) => {
+                    self.wanted.insert(id);
+                }
+                // Already back: fetch it. It stays wanted, so a relay that
+                // says present but then serves 410 gets asked once per sync.
+                Ok(false) => {
+                    self.reappeared(&id);
+                    self.wanted.insert(id);
+                }
+                // Too many open, or a busy relay: ask again on a later sync.
+                Err(e) if is_transient(&e) => break,
+                Err(e) => {
+                    tracing::debug!(item = %id, "want refused: {e:#}");
+                    self.wanted.insert(id);
+                }
+            }
+        }
+    }
+
+    /// An evicted blob is on the relay again: fetch it on the next retry.
+    fn reappeared(&mut self, id: &str) {
+        self.evicted.remove(id);
+        self.wanted.remove(id);
+        self.asked.remove(id);
+        if let Some(&i) = self.index.get(id) {
+            if self.items[i].status == Status::Evicted {
+                self.items[i].status = Status::Pending;
+                self.reseeded.insert(id.to_string());
+            }
+        }
     }
 
     /// Call `on_item` for each item as it arrives over the event stream,
@@ -1015,6 +1123,7 @@ impl Session {
             if left(deadline) == Some(Duration::ZERO) {
                 return Ok(());
             }
+            self.trade_blobs().await;
             for i in self.retry().await? {
                 if !on_item(self, &self.items[i])? {
                     return Ok(());
@@ -1047,7 +1156,9 @@ impl Session {
                     }
                     Ok(Some(Ok(c))) => c,
                 };
+                let mut trade = false;
                 for ev in parser.push(&chunk) {
+                    trade |= matches!(ev.event.as_str(), "want" | "reseeded" | "evicted");
                     let seq = ev.id.as_deref().and_then(|s| s.parse::<u64>().ok());
                     let ev = json!({
                         "seq": seq,
@@ -1061,6 +1172,14 @@ impl Session {
                     }
                     if self.closed.is_some() || left(deadline) == Some(Duration::ZERO) {
                         return Ok(());
+                    }
+                }
+                if trade {
+                    self.trade_blobs().await;
+                    for i in self.fetch_reseeded().await? {
+                        if !on_item(self, &self.items[i])? {
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -1122,6 +1241,20 @@ impl Session {
                             self.items[i].status = Status::Evicted;
                         }
                     }
+                }
+            }
+            "want" => {
+                // Only live wants: replayed ones were answered or expired.
+                // Only for an item this client verified, never a name the relay made up.
+                if let (true, Some(id), Some(by)) = (fetch, data["item"].as_str(), data["by"].as_str()) {
+                    if by != self.me && self.get(id).is_some_and(|i| i.status == Status::Ok) {
+                        self.asked.insert(id.to_string());
+                    }
+                }
+            }
+            "reseeded" => {
+                if let Some(id) = data["item"].as_str() {
+                    self.reappeared(id);
                 }
             }
             "left" => {

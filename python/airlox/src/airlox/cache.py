@@ -20,6 +20,8 @@ from typing import Iterator, Optional
 
 # Session ids as the core defines them: "ax_" and 26 base32 characters.
 _SESSION_ID = re.compile(r"ax_[a-z2-7]{26}")
+# An item id (16 bytes, base64url): the only names blob files may have.
+_ITEM_ID = re.compile(r"[A-Za-z0-9_-]{22}")
 
 
 def default_root() -> Path:
@@ -86,10 +88,15 @@ class Cache:
 
     # blobs -----------------------------------------------------------
     def read_blob(self, item_id: str) -> Optional[bytes]:
+        # Ids reach here from the relay; anything else could name another file.
+        if not _ITEM_ID.fullmatch(item_id):
+            return None
         p = self.dir / "blobs" / item_id
         return p.read_bytes() if p.exists() else None
 
     def write_blob(self, item_id: str, blob: bytes) -> None:
+        if not _ITEM_ID.fullmatch(item_id):
+            raise ValueError(f"not an item id: {item_id!r}")
         _write_atomic(self.dir / "blobs" / item_id, blob)
 
     def delete(self) -> None:

@@ -29,8 +29,8 @@ use tokio::sync::{broadcast, watch};
 
 use crate::error::{ApiError, ApiResult};
 use crate::store::{
-    sync_dir, CreateError, Event, Inner, JobState, Rec, Session, Store, MAX_PARTICIPANTS,
-    MAX_STREAMS_PER_PARTICIPANT,
+    sync_dir, CreateError, Event, Inner, JobState, Rec, Session, Store, MAX_OPEN_WANTS, MAX_PARTICIPANTS,
+    MAX_STREAMS_PER_PARTICIPANT, MAX_WANTS,
 };
 use crate::util::{new_token, now_ms, random_suffix, sha256_hex};
 
@@ -519,7 +519,23 @@ pub(crate) async fn receive_upload(
         }
     };
 
-    let tmp_path = s.dir.join("blobs").join(format!(".{item_id}.{}.tmp", random_suffix()));
+    let first = Bytes::copy_from_slice(&buf[4 + n..]);
+    let tmp_path = receive_blob(s, &env, blob_len, first, chunks, &mut reservation).await?;
+    Ok(Upload { env_json, env, blob_len, tmp_path, reservation })
+}
+
+/// Stream a blob (`first`, then the rest of the body) to a temp file in the
+/// session's blob directory, checking its length and its SHA-256 against
+/// the signed envelope. Returns the temp file's path.
+async fn receive_blob(
+    s: &Session,
+    env: &ItemEnvelope,
+    blob_len: u64,
+    first: Bytes,
+    mut chunks: BodyDataStream,
+    reservation: &mut Reservation,
+) -> ApiResult<std::path::PathBuf> {
+    let tmp_path = s.dir.join("blobs").join(format!(".{}.{}.tmp", env.header.id, random_suffix()));
     // A steady trickle still has to finish: allow two minutes plus 16 KiB/s.
     let deadline = Duration::from_secs(120 + blob_len / (16 * 1024));
     let mut written: u64 = 0;
@@ -531,7 +547,7 @@ pub(crate) async fn receive_upload(
             .await
             .map_err(closed_if_missing)?;
         let mut hasher = Sha256::new();
-        let mut chunk = Bytes::copy_from_slice(&buf[4 + n..]);
+        let mut chunk = first;
         loop {
             written += chunk.len() as u64;
             if written > blob_len {
@@ -559,7 +575,7 @@ pub(crate) async fn receive_upload(
         let _ = tokio::fs::remove_file(&tmp_path).await;
         return Err(e);
     }
-    Ok(Upload { env_json, env, blob_len, tmp_path, reservation })
+    Ok(tmp_path)
 }
 
 /// Move the blob into place and append the item to the log. `then` runs
@@ -735,6 +751,138 @@ pub async fn ack(
             s.append(&mut g, Rec::Ack { item, by: who })?;
         }
         Ok(())
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /v1/sessions/:id/items/:item/want` — ask the participants still
+/// holding an evicted blob to upload it again. Only for a participant that
+/// never received it; rate-limited per participant.
+pub async fn want(
+    State(st): State<AppState>,
+    Path((id, item)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    item_path_ok(&item)?;
+    let s = session(&st, &id)?;
+    let (who, _) = auth(&s, &headers)?;
+    let max_log = st.store.cfg.max_log_bytes;
+    blocking(move || {
+        let mut g = s.lock();
+        if g.closed {
+            return Err(ApiError::gone("closed", "session is closed"));
+        }
+        let r = g.items.get(&item).ok_or_else(|| ApiError::not_found("no such item"))?;
+        if r.blob_present || g.pending.contains(&item) {
+            return Err(ApiError::conflict_code("present", "the blob is on the relay; download it"));
+        }
+        if r.acked.contains(&who) {
+            return Err(ApiError::forbidden("you have already received this item"));
+        }
+        g.prune_wants(now_ms());
+        if g.wants.get(&item).is_some_and(|w| w.contains_key(&who)) {
+            return Ok((StatusCode::ACCEPTED, Json(json!({"open": true}))));
+        }
+        if g.open_wants(&who) >= MAX_OPEN_WANTS {
+            return Err(ApiError::limit("too many open wants; wait for some to be answered"));
+        }
+        if g.want_counts.get(&who).copied().unwrap_or(0) >= MAX_WANTS {
+            return Err(ApiError::limit("this participant has asked for too many blobs"));
+        }
+        if g.log_len() + LOG_LINE_OVERHEAD > max_log {
+            return Err(ApiError::too_large("session history limit reached"));
+        }
+        s.append(&mut g, Rec::Want { item, by: who })?;
+        Ok((StatusCode::ACCEPTED, Json(json!({"open": true}))))
+    })
+    .await
+}
+
+/// `PUT /v1/sessions/:id/items/:item/blob` — re-seed an evicted blob: the
+/// raw ciphertext, accepted only while a want for it is open and it is
+/// absent, and only if its SHA-256 matches the author-signed envelope.
+pub async fn reseed(
+    State(st): State<AppState>,
+    Path((id, item)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Body,
+) -> ApiResult<StatusCode> {
+    item_path_ok(&item)?;
+    let s = session(&st, &id)?;
+    let (who, _) = auth(&s, &headers)?;
+    if !st.store.disk_ok() {
+        return Err(ApiError::storage_full());
+    }
+    let cfg = st.store.cfg.clone();
+    let (env, mut reservation) = {
+        let mut g = s.lock();
+        let r = g.items.get(&item).ok_or_else(|| ApiError::not_found("no such item"))?;
+        if r.blob_present || g.pending.contains(&item) {
+            return Err(ApiError::conflict_code("present", "the blob is on the relay or being uploaded"));
+        }
+        let blob_len = r.blob_len;
+        g.prune_wants(now_ms());
+        if !g.wants.get(&item).is_some_and(|w| w.keys().any(|k| *k != who)) {
+            return Err(ApiError::conflict_code("not_wanted", "no one is waiting for this blob"));
+        }
+        let env_json = g
+            .item_event(&item)
+            .and_then(|e| e.data["envelope"].as_str().map(str::to_string))
+            .ok_or_else(|| ApiError::internal("item without its envelope"))?;
+        let env: ItemEnvelope = parse_canonical(&env_json, "item envelope")?;
+        if g.held_bytes + g.pending_bytes + blob_len > cfg.max_session_bytes {
+            return Err(ApiError::too_large("session would exceed its storage limit; wait for deliveries"));
+        }
+        if g.transfer_bytes + blob_len > cfg.max_session_transfer {
+            return Err(ApiError::limit("session transfer limit reached"));
+        }
+        g.pending.insert(item.clone());
+        g.pending_bytes += blob_len;
+        g.transfer_bytes += blob_len;
+        let res = Reservation {
+            session: s.clone(),
+            id: item.clone(),
+            bytes: blob_len,
+            received: 0,
+            committed: false,
+        };
+        (env, res)
+    };
+    let blob_len = reservation.bytes;
+    let tmp_path =
+        receive_blob(&s, &env, blob_len, Bytes::new(), body.into_data_stream(), &mut reservation).await?;
+    blocking(move || {
+        let final_path = s.blob_path(&item);
+        let commit = || -> ApiResult<()> {
+            std::fs::rename(&tmp_path, &final_path).map_err(closed_if_missing)?;
+            sync_dir(final_path.parent().expect("blob has a parent")).map_err(closed_if_missing)?;
+            let mut g = s.lock();
+            if g.closed {
+                return Err(ApiError::gone("closed", "session is closed"));
+            }
+            g.pending.remove(&item);
+            g.pending_bytes -= blob_len;
+            // Applying the Reseed record charges the transfer for real.
+            g.transfer_bytes -= blob_len;
+            reservation.committed = true;
+            if let Err(e) = s.append(&mut g, Rec::Reseed { item: item.clone(), by: who }) {
+                g.transfer_bytes += blob_len;
+                g.pending.insert(item.clone());
+                g.pending_bytes += blob_len;
+                reservation.committed = false;
+                reservation.received = blob_len;
+                return Err(e.into());
+            }
+            Ok(())
+        };
+        let r = commit();
+        if r.is_err() && !reservation.committed {
+            let _ = std::fs::remove_file(&tmp_path);
+            let _ = std::fs::remove_file(&final_path);
+        }
+        drop(reservation);
+        r
     })
     .await?;
     Ok(StatusCode::NO_CONTENT)

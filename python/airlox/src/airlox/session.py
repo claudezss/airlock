@@ -79,7 +79,9 @@ class Item:
     body: Optional[bytes] = None
     #: ``ok``; ``pending`` (the blob could not be fetched yet: a network
     #: error or a busy relay; retried on the next ``sync`` or ``stream``);
-    #: ``evicted`` (removed from the relay before this client fetched it); or
+    #: ``evicted`` (removed from the relay before this client fetched it; the
+    #: client asks the participants holding it to upload it again, and fetches
+    #: it if one does); or
     #: ``rejected`` (failed verification or policy, see ``error``).
     status: str = "ok"
     error: Optional[str] = None
@@ -138,11 +140,20 @@ class Session:
         self._order: List[str] = []
         self._envelopes: Dict[str, str] = {}
         self._evicted: set = set()
+        self._wanted: set = set()  # evicted items this client asked holders for
+        self._asked: set = set()  # evicted items others asked for, which this cache may hold
+        self._reseeded: set = set()  # evicted items back on the relay, to fetch
         self._unacked: set = set()
         self._last_seq = -1
         self.closed: Optional[str] = None
         cached = list(cache.events())
-        self._evicted = {ev["data"]["item"] for ev in cached if ev["kind"] == "evicted"}
+        # Which blobs the relay lacks now, so replayed items without a cached
+        # blob come out evicted rather than pending.
+        for ev in cached:
+            if ev["kind"] == "evicted":
+                self._evicted.add(ev["data"]["item"])
+            elif ev["kind"] == "reseeded":
+                self._evicted.discard(ev["data"]["item"])
         for ev in cached:
             self._apply(ev, fetch=False, record=False)
 
@@ -510,6 +521,9 @@ class Session:
                 return out
             raise
         out += [i for i in (self._apply(e) for e in evs) if i is not None and i.status != "pending"]
+        self._trade_blobs()
+        if self._reseeded:
+            out += self._retry(set(self._reseeded))  # back on the relay: fetch them now
         return out
 
     def items(self) -> List[Item]:
@@ -532,6 +546,7 @@ class Session:
             if self._last_seq >= 0:
                 headers["Last-Event-ID"] = str(self._last_seq)
             read = 60.0 if remaining is None else max(0.1, min(60.0, remaining))
+            self._trade_blobs()
             yield from self._retry()
             try:
                 with self._http.stream(
@@ -550,6 +565,10 @@ class Session:
                         item = self._apply(ev)
                         if item is not None and item.status != "pending":
                             yield item
+                        if ev["kind"] in ("want", "reseeded", "evicted"):
+                            self._trade_blobs()
+                            if self._reseeded:
+                                yield from self._retry(set(self._reseeded))
                         if self.closed:
                             return
                         if deadline is not None and time.monotonic() >= deadline:
@@ -602,6 +621,14 @@ class Session:
             pending = self._items.get(data["item"])
             if pending is not None and pending.status == "pending":
                 pending.status = "evicted"
+        elif kind == "want":
+            # Only live wants: replayed ones were answered or expired.
+            # Only for an item this client verified, never a name the relay made up.
+            known = self._items.get(data.get("item"))
+            if fetch and data.get("by") != self.participant_pub and known is not None and known.status == "ok":
+                self._asked.add(data["item"])
+        elif kind == "reseeded":
+            self._reappeared(data["item"])
         elif kind == "left":
             p = self._participants.get(data.get("participant_pub"))
             if p is not None:
@@ -613,10 +640,55 @@ class Session:
         self._last_seq = max(self._last_seq, seq)
         return item
 
-    def _retry(self) -> List[Item]:
-        """Retry pending downloads and unsent acks."""
+    def _trade_blobs(self) -> None:
+        """Re-seeding: ask holders for evicted items this participant never
+        got, and upload the blobs others asked for that this cache holds. The
+        relay takes an upload only if it matches the author's signed hash, so
+        a cached blob is safe to offer."""
+        if self.closed:
+            return
+        auth = {"Authorization": f"Bearer {self._token}"}
+        for item_id in list(self._asked):
+            blob = self._cache.read_blob(item_id)
+            if blob is not None:
+                try:
+                    r = self._http.put(self._url(f"/items/{item_id}/blob"), headers=auth, content=blob)
+                except httpx.TransportError:
+                    continue
+                if r.status_code == 429 or r.status_code >= 500:
+                    continue
+            self._asked.discard(item_id)
+        for item_id in [i for i in self._order if self._items[i].status == "evicted"]:
+            if item_id in self._wanted or self._items[item_id].author == self.participant_pub:
+                continue
+            try:
+                r = self._http.post(self._url(f"/items/{item_id}/want"), headers=auth)
+            except httpx.TransportError:
+                return
+            if r.status_code == 429 or r.status_code >= 500:
+                return  # too many open, or a busy relay: ask again on a later sync
+            if r.status_code == 409 and r.json().get("error") == "present":
+                self._reappeared(item_id)  # already back: fetch it
+            self._wanted.add(item_id)
+
+    def _reappeared(self, item_id: str) -> None:
+        """An evicted blob is on the relay again: fetch it on the next retry."""
+        self._evicted.discard(item_id)
+        self._wanted.discard(item_id)
+        self._asked.discard(item_id)
+        item = self._items.get(item_id)
+        if item is not None and item.status == "evicted":
+            item.status = "pending"
+            self._reseeded.add(item_id)
+
+    def _retry(self, only: Optional[set] = None) -> List[Item]:
+        """Retry pending downloads (or just those in ``only``) and unsent acks."""
         out = []
-        for item_id in [i for i in self._order if self._items[i].status == "pending"]:
+        if only is None:
+            self._reseeded.clear()
+        else:
+            self._reseeded -= only
+        for item_id in [i for i in self._order if self._items[i].status == "pending" and (only is None or i in only)]:
             item = self._receive(self._items[item_id].seq, self._envelopes[item_id], True)
             if item is not None and item.status != "pending":
                 out.append(item)

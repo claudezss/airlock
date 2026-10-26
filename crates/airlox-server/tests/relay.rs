@@ -486,3 +486,98 @@ async fn per_address_limit_uses_the_proxy_hop() {
     let d = new_session(Mode::Relay, 60_000);
     assert_eq!(send(&d, "2001:db8:1:2:ffff::9").await.unwrap().status(), StatusCode::TOO_MANY_REQUESTS);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn evicted_blobs_are_reseeded_for_late_joiners() {
+    let mut env = Env::new().await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let sender = join(&env, &s, Role::Sender, "sender").await;
+    let item = seal_text(&s, &sender, "for whoever comes later");
+    let id = item.envelope.header.id.clone();
+    post(&env, &s, &sender, frame(&item)).await;
+    ack(&env, &s, &owner, &id).await;
+    assert!(eventually(|| async { blob(&env, &s, &owner, &id).await.status() == StatusCode::GONE }).await);
+
+    let late = join(&env, &s, Role::Observer, "late").await;
+    let gone = blob(&env, &s, &late, &id).await;
+    assert_eq!(gone.status(), StatusCode::GONE);
+    // A 410 is cacheable by default; this one must not be, since it can change.
+    assert_eq!(gone.headers()["cache-control"], "no-store");
+    // Nobody asked yet, so a holder cannot push the blob back.
+    let r = reseed(&env, &s, &sender, &id, item.blob.clone()).await;
+    assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "not_wanted".into()));
+    // Only a participant that never received the item may ask.
+    assert_eq!(want(&env, &s, &owner, &id).await.status(), StatusCode::FORBIDDEN);
+    assert_eq!(want(&env, &s, &late, &id).await.status(), StatusCode::ACCEPTED);
+    assert_eq!(want(&env, &s, &late, &id).await.status(), StatusCode::ACCEPTED);
+    let wants: Vec<Value> =
+        events(&env, &s, &sender).await.into_iter().filter(|e| e["kind"] == "want").collect();
+    assert_eq!(wants.len(), 1, "asking again while open adds no event");
+    assert_eq!(wants[0]["data"]["item"], id.as_str());
+
+    // The want survives a restart.
+    env.restart(|_| {}).await;
+    // Bytes that do not match the author's signed hash are refused.
+    let mut forged = item.blob.clone();
+    forged[0] ^= 1;
+    assert_eq!(reseed(&env, &s, &sender, &id, forged).await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        reseed(&env, &s, &sender, &id, item.blob[1..].to_vec()).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(blob(&env, &s, &late, &id).await.status(), StatusCode::GONE);
+    // The asker cannot answer its own want.
+    let r = reseed(&env, &s, &late, &id, item.blob.clone()).await;
+    assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "not_wanted".into()));
+
+    let r = reseed(&env, &s, &sender, &id, item.blob.clone()).await;
+    assert_eq!(r.status(), StatusCode::NO_CONTENT, "{}", r.text().await.unwrap());
+    let evs = events(&env, &s, &late).await;
+    assert!(evs.iter().any(|e| e["kind"] == "reseeded" && e["data"]["item"] == id.as_str()));
+    assert_eq!(blob(&env, &s, &late, &id).await.bytes().await.unwrap().to_vec(), item.blob);
+    // The first upload closed the want.
+    let r = reseed(&env, &s, &sender, &id, item.blob.clone()).await;
+    assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "present".into()));
+    let r = want(&env, &s, &late, &id).await;
+    assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "present".into()));
+
+    // Once the asker acks, the re-seeded blob goes again.
+    ack(&env, &s, &late, &id).await;
+    assert!(eventually(|| async { blob(&env, &s, &late, &id).await.status() == StatusCode::GONE }).await);
+    assert_eq!(want(&env, &s, &late, &id).await.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wants_are_rate_limited() {
+    let env = Env::with(|c| c.blob_hold_ms = 200).await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let _owner = join(&env, &s, Role::Owner, "owner").await;
+    let sender = join(&env, &s, Role::Sender, "sender").await;
+    let mut ids = Vec::new();
+    for n in 0..17 {
+        let item = seal_text(&s, &sender, &format!("note {n}"));
+        ids.push(item.envelope.header.id.clone());
+        post(&env, &s, &sender, frame(&item)).await;
+    }
+    let late = join(&env, &s, Role::Observer, "late").await;
+    let last = ids.last().unwrap().clone();
+    assert!(eventually(|| async { blob(&env, &s, &late, &last).await.status() == StatusCode::GONE }).await);
+    for id in &ids[..16] {
+        assert_eq!(want(&env, &s, &late, id).await.status(), StatusCode::ACCEPTED);
+    }
+    assert_eq!(want(&env, &s, &late, &last).await.status(), StatusCode::TOO_MANY_REQUESTS);
+    // Leaving drops a participant's wants, so nobody can answer them.
+    let r = env
+        .http
+        .post(env.url(&format!("/v1/sessions/{}/leave", s.id)))
+        .bearer_auth(&late.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    let r = reseed(&env, &s, &sender, &ids[0], vec![0; 4]).await;
+    assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "not_wanted".into()));
+}

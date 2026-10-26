@@ -502,7 +502,9 @@ A blob stays on the relay only until its recipients have it.
   and allowed only for items the asker has not acked; and re-seeded bytes
   count against the session transfer cap and get a fresh, short hold. If no
   holder is online, the UI shows the file as "delivered and removed from the
-  relay".
+  relay". The SDK, the CLI, the MCP server and the web UI ask for evicted
+  items they never got and answer wants from their caches whenever they
+  sync, and only for items they verified themselves (protocol.md §12).
 - This needs no protocol change: blob location and lifetime are relay
   behaviour, and integrity already rests on the signed blob hash.
 

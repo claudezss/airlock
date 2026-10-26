@@ -5,7 +5,7 @@
 //! $DATA/ip.key                     secret for hashing client addresses
 //! $DATA/sessions/<id>/manifest.json
 //! $DATA/sessions/<id>/log.jsonl    append-only, replayed at startup
-//! $DATA/sessions/<id>/blobs/<item> ciphertext until evicted
+//! $DATA/sessions/<id>/blobs/<item> ciphertext until evicted (or re-seeded)
 //! $DATA/tombstones/<id>            closed sessions that must not be re-created
 //! $DATA/trash/                     purged sessions awaiting deletion
 //! ```
@@ -35,6 +35,13 @@ use crate::util::{now_ms, random_bytes, random_suffix};
 pub const MAX_PARTICIPANTS: usize = 64;
 /// Concurrent SSE streams per participant.
 pub const MAX_STREAMS_PER_PARTICIPANT: usize = 4;
+/// How long a `want` stays open for holders to answer.
+pub const WANT_TTL_MS: u64 = 10 * 60 * 1000;
+/// Open wants per participant, and wants per participant over the session.
+pub const MAX_OPEN_WANTS: usize = 16;
+pub const MAX_WANTS: u32 = 1024;
+/// The longest a re-seeded blob stays (capped by the blob hold).
+pub const RESEED_HOLD_MS: u64 = 10 * 60 * 1000;
 const EVENT_BUFFER: usize = 1024;
 
 /// One state change. Serialized as a line of `log.jsonl`.
@@ -62,6 +69,16 @@ pub enum Rec {
     },
     Evict {
         item: String,
+    },
+    /// A participant that never got an evicted blob asked holders for it.
+    Want {
+        item: String,
+        by: String,
+    },
+    /// A holder uploaded an evicted blob again, for the open wants.
+    Reseed {
+        item: String,
+        by: String,
     },
     Close {
         reason: String,
@@ -189,6 +206,10 @@ pub struct Inner {
     pub jobs: HashMap<String, JobRec>,
     pub presence: HashMap<String, Presence>,
     evictions: BTreeMap<u64, Vec<String>>,
+    /// Open wants: item → (participant → when asked).
+    pub wants: HashMap<String, HashMap<String, u64>>,
+    /// Wants each participant has made.
+    pub want_counts: HashMap<String, u32>,
     hold_ms: u64,
     grace_ms: u64,
     /// Whether runners need the owner's approval before they get jobs.
@@ -223,6 +244,10 @@ impl Inner {
     /// Stop counting `who` as a recipient and revoke its token.
     fn depart(&mut self, who: &str, ts: u64) {
         self.tokens.retain(|_, pk| pk != who);
+        for w in self.wants.values_mut() {
+            w.remove(who);
+        }
+        self.wants.retain(|_, w| !w.is_empty());
         // Stop waiting for this participant on blobs still held.
         let waiting: Vec<String> = self
             .items
@@ -374,6 +399,32 @@ impl Inner {
                 }
                 Ok(self.push_event(line.seq, "evicted", json!({"item": item})))
             }
+            Rec::Want { item, by } => {
+                self.wants.entry(item.clone()).or_default().insert(by.clone(), ts);
+                *self.want_counts.entry(by.clone()).or_default() += 1;
+                self.last_activity_ms = self.last_activity_ms.max(ts);
+                Ok(self.push_event(line.seq, "want", json!({"item": item, "by": by})))
+            }
+            Rec::Reseed { item, by } => {
+                // The wanters become the blob's recipients: it goes once they
+                // have all acked, or when its short hold ends.
+                let wanters: HashSet<String> =
+                    self.wants.remove(item).map(|w| w.into_keys().collect()).unwrap_or_default();
+                let hold = self.hold_ms.min(RESEED_HOLD_MS);
+                if let Some(r) = self.items.get_mut(item) {
+                    if !r.blob_present {
+                        r.blob_present = true;
+                        self.held_bytes += r.blob_len;
+                        self.transfer_bytes += r.blob_len;
+                    }
+                    r.recipients = wanters;
+                    r.evict_at = ts.saturating_add(hold);
+                    self.evictions.entry(r.evict_at).or_default().push(item.clone());
+                }
+                self.check_delivered(item, ts);
+                self.last_activity_ms = self.last_activity_ms.max(ts);
+                Ok(self.push_event(line.seq, "reseeded", json!({"item": item, "by": by})))
+            }
             Rec::Close { reason } => {
                 self.closed = true;
                 Ok(self.push_event(line.seq, "closed", json!({"reason": reason})))
@@ -417,6 +468,19 @@ impl Inner {
 
     pub fn approve_runners(&self) -> bool {
         self.approve_runners
+    }
+
+    /// Drop wants older than `WANT_TTL_MS`.
+    pub fn prune_wants(&mut self, now: u64) {
+        for w in self.wants.values_mut() {
+            w.retain(|_, ts| now.saturating_sub(*ts) < WANT_TTL_MS);
+        }
+        self.wants.retain(|_, w| !w.is_empty());
+    }
+
+    /// How many wants `who` has open.
+    pub fn open_wants(&self, who: &str) -> usize {
+        self.wants.values().filter(|w| w.contains_key(who)).count()
     }
 
     /// The `item` event carrying this item's envelope.
@@ -474,6 +538,8 @@ impl Session {
             jobs: HashMap::new(),
             presence: HashMap::new(),
             evictions: BTreeMap::new(),
+            wants: HashMap::new(),
+            want_counts: HashMap::new(),
             hold_ms: cfg.blob_hold_ms,
             grace_ms: cfg.blob_grace_ms,
             approve_runners,
