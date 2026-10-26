@@ -53,7 +53,7 @@ pub fn generate() -> Result<Value> {
     let params = SessionParams {
         mode: Mode::Execute,
         created_at_ms: 1_761_400_000_000,
-        ttl_ms: 3_600_000,
+        ttl_ms: Some(3_600_000),
         allowed_types: vec![
             ContentType::Text,
             ContentType::Py,

@@ -165,8 +165,12 @@ pub struct CreateParams {
     /// Allow running Python on runners (execute mode).
     #[serde(default)]
     pub execute: bool,
-    /// Session lifetime in minutes (default 60).
+    /// Session lifetime in minutes (default 60, at most 30 days).
     pub ttl_minutes: Option<u64>,
+    /// A session that never expires: it lasts until it is closed (if the
+    /// relay allows it). Overrides ttl_minutes.
+    #[serde(default)]
+    pub never_expires: bool,
     /// execute: packages jobs may use, e.g. ["pandas"].
     #[serde(default)]
     pub packages: Vec<String>,
@@ -412,8 +416,10 @@ should have that role. The owner link is never returned.")]
         &self,
         Parameters(p): Parameters<CreateParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let Some(ttl_ms) = p.ttl_minutes.unwrap_or(60).max(1).checked_mul(60_000) else {
-            return fail("ttl_minutes is too large");
+        let ttl_ms = match p.ttl_minutes.unwrap_or(60).max(1).checked_mul(60_000) {
+            _ if p.never_expires => None,
+            Some(t) => Some(t),
+            None => return fail("ttl_minutes is too large"),
         };
         let new = NewSession {
             mode: if p.execute { Mode::Execute } else { Mode::Relay },

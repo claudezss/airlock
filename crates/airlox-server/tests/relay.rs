@@ -268,6 +268,9 @@ async fn creation_limits() {
     .await;
     let too_long = new_session(Mode::Relay, 120_000);
     assert_eq!(create(&env, &too_long).await.status(), StatusCode::BAD_REQUEST);
+    // A relay with a lifetime limit takes no session that never expires.
+    let forever = new_session_ttl(Mode::Relay, None);
+    assert_eq!(error_code(create(&env, &forever).await).await, (StatusCode::BAD_REQUEST, "ttl".into()));
     assert_eq!(create(&env, &new_session(Mode::Relay, 30_000)).await.status(), StatusCode::CREATED);
     assert_eq!(create(&env, &new_session(Mode::Relay, 30_000)).await.status(), StatusCode::TOO_MANY_REQUESTS);
     // A non-canonical manifest is rejected before anything else.
@@ -743,4 +746,86 @@ async fn a_stalled_reseed_does_not_hold_off_other_holders() {
     let r = stalled.await.unwrap().unwrap();
     assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "present".into()));
     assert_eq!(blob(&env, &s, &late, &id).await.bytes().await.unwrap().to_vec(), item.blob);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sessions_that_never_expire_have_their_own_idle_limit() {
+    let mut env = Env::with(|c| {
+        c.idle_ttl_ms = 300;
+        c.idle_ttl_unexpiring_ms = 1_500;
+    })
+    .await;
+    let brief = new_session(Mode::Relay, 3_600_000);
+    let forever = new_session_ttl(Mode::Relay, None);
+    assert_eq!(create(&env, &brief).await.status(), StatusCode::CREATED);
+    let r = create(&env, &forever).await;
+    assert_eq!(r.status(), StatusCode::CREATED);
+    assert_eq!(r.json::<Value>().await.unwrap()["expires_at_ms"], Value::Null);
+    async fn info(env: &Env, id: &str) -> StatusCode {
+        env.http.get(env.url(&format!("/v1/sessions/{id}"))).send().await.unwrap().status()
+    }
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(info(&env, &brief.id).await, StatusCode::NOT_FOUND);
+    assert_eq!(info(&env, &forever.id).await, StatusCode::OK);
+    // It survives a restart, and goes once idle for its own, longer limit.
+    env.restart(|c| {
+        c.idle_ttl_ms = 300;
+        c.idle_ttl_unexpiring_ms = 1_500;
+    })
+    .await;
+    assert_eq!(info(&env, &forever.id).await, StatusCode::OK);
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert_eq!(info(&env, &forever.id).await, StatusCode::NOT_FOUND);
+    // A closed or purged session that never expires cannot be re-created.
+    assert_eq!(create(&env, &forever).await.status(), StatusCode::GONE);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn uploads_from_one_address_share_a_storage_cap_across_sessions() {
+    let mut env = Env::with(|c| c.max_bytes_per_ip = 6_000).await;
+    let a = new_session(Mode::Relay, 3_600_000);
+    let b = new_session_ttl(Mode::Relay, None);
+    create(&env, &a).await;
+    create(&env, &b).await;
+    let a_owner = join(&env, &a, Role::Owner, "owner").await;
+    let a_sender = join(&env, &a, Role::Sender, "sender").await;
+    let b_owner = join(&env, &b, Role::Owner, "owner").await;
+    let b_sender = join(&env, &b, Role::Sender, "sender").await;
+    let first = seal_text(&a, &a_sender, &"a".repeat(4_000));
+    let first_id = first.envelope.header.id.clone();
+    assert_eq!(post(&env, &a, &a_sender, frame(&first)).await.status(), StatusCode::CREATED);
+    // The same address, another session: over the cap while the first is held.
+    let second = seal_text(&b, &b_sender, &"b".repeat(4_000));
+    let r = post(&env, &b, &b_sender, frame(&second)).await;
+    assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE, "{}", r.text().await.unwrap());
+    // The count survives a restart.
+    env.restart(|c| c.max_bytes_per_ip = 6_000).await;
+    let r = post(&env, &b, &b_sender, frame(&second)).await;
+    assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    // Once the first is delivered and evicted, there is room again.
+    ack(&env, &a, &a_owner, &first_id).await;
+    assert!(
+        eventually(|| async { blob(&env, &a, &a_owner, &first_id).await.status() == StatusCode::GONE }).await
+    );
+    assert_eq!(post(&env, &b, &b_sender, frame(&second)).await.status(), StatusCode::CREATED);
+    // Closing a session gives back what it held.
+    let c = new_session(Mode::Relay, 3_600_000);
+    create(&env, &c).await;
+    let c_sender = join(&env, &c, Role::Sender, "sender").await;
+    let third = seal_text(&c, &c_sender, &"c".repeat(4_000));
+    assert_eq!(post(&env, &c, &c_sender, frame(&third)).await.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let r = env
+        .http
+        .post(env.url(&format!("/v1/sessions/{}/close", b.id)))
+        .bearer_auth(&b_owner.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    assert!(
+        eventually(|| async {
+            post(&env, &c, &c_sender, frame(&third)).await.status() == StatusCode::CREATED
+        })
+        .await
+    );
 }

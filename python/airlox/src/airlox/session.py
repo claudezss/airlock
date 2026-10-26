@@ -168,7 +168,7 @@ class Session:
         relay: str,
         *,
         mode: str = "relay",
-        ttl: Union[int, float, str] = "1h",
+        ttl: Union[int, float, str, None] = "1h",
         allowed_types: Iterable[str] = DEFAULT_TYPES,
         max_item_bytes: int = 25 * 1024 * 1024,
         job_limits: Optional[dict] = None,
@@ -176,11 +176,14 @@ class Session:
         description: Optional[str] = None,
         cache_dir: Optional[Union[str, Path]] = None,
     ) -> "Session":
-        """Create a session on ``relay`` and join it as the owner."""
+        """Create a session on ``relay`` and join it as the owner. ``ttl`` is
+        seconds or a duration such as ``"30m"`` (at most 30 days); ``None``
+        or ``"never"`` makes a session that lasts until it is closed, if the
+        relay allows it."""
         params = {
             "mode": mode,
             "created_at_ms": _now_ms(),
-            "ttl_ms": _duration_ms(ttl),
+            "ttl_ms": None if ttl is None or ttl == "never" else _duration_ms(ttl),
             "allowed_types": list(allowed_types),
             "max_item_bytes": max_item_bytes,
             "job_limits": job_limits,

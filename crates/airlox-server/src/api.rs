@@ -152,16 +152,23 @@ pub async fn create_session(
     let m = &signed.manifest;
     let cfg = &st.store.cfg;
     let now = now_ms();
-    if m.created_at_ms > now + MAX_CLOCK_SKEW_MS || m.expires_at_ms <= now {
+    if m.created_at_ms > now + MAX_CLOCK_SKEW_MS || m.expires_at_ms.is_some_and(|e| e <= now) {
         return Err(ApiError::bad_request(
             "clock",
             "created_at_ms must be about now and expires_at_ms in the future",
         ));
     }
-    if m.expires_at_ms - m.created_at_ms > cfg.max_ttl_ms || m.expires_at_ms > now + cfg.max_ttl_ms {
+    let too_long = match m.expires_at_ms {
+        Some(e) => e - m.created_at_ms > cfg.max_ttl_ms || e > now.saturating_add(cfg.max_ttl_ms),
+        None => cfg.max_ttl_ms != u64::MAX,
+    };
+    if too_long {
         return Err(ApiError::bad_request(
             "ttl",
-            format!("this relay allows sessions of at most {} ms", cfg.max_ttl_ms),
+            format!(
+                "this relay allows sessions of at most {} ms, and none that never expire",
+                cfg.max_ttl_ms
+            ),
         ));
     }
     if m.max_item_bytes > cfg.max_item_bytes {
@@ -425,6 +432,8 @@ struct Reservation {
     bytes: u64,
     received: u64,
     committed: bool,
+    /// The uploader's address hash, charged `bytes` in the relay-wide usage.
+    ip_hash: String,
 }
 
 impl Drop for Reservation {
@@ -434,8 +443,25 @@ impl Drop for Reservation {
             g.pending.remove(&self.id);
             g.pending_bytes -= self.bytes;
             g.transfer_bytes -= self.bytes - self.received.min(self.bytes);
+            g.usage.sub(Some(&self.ip_hash), self.bytes);
         }
     }
+}
+
+/// The address an upload comes from, as `IpUsage` counts it.
+pub(crate) fn uploader(st: &AppState, headers: &HeaderMap, peer: SocketAddr) -> String {
+    st.store.ip_hash(&client_bucket(st, headers, peer))
+}
+
+/// Charge an upload to its address, within `max_bytes_per_ip`.
+fn charge_ip(g: &Inner, ip_hash: &str, bytes: u64, cap: u64) -> ApiResult<()> {
+    if g.usage.try_add(ip_hash, bytes, cap) {
+        return Ok(());
+    }
+    Err(ApiError::too_large(format!(
+        "uploads from this address already hold {} bytes on this relay, the most it allows; wait for deliveries",
+        g.usage.get(ip_hash)
+    )))
 }
 
 fn closed_if_missing(e: std::io::Error) -> ApiError {
@@ -460,11 +486,13 @@ pub(crate) struct Upload {
 /// envelope against the author and header policy, and stream the blob to a
 /// temp file while hashing it. `header_ok` decides which items this endpoint
 /// takes, from the verified header.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn receive_upload(
     st: &AppState,
     s: &Arc<Session>,
     who: &str,
     role: Role,
+    ip_hash: String,
     body: Body,
     header_ok: impl FnOnce(&ItemHeader) -> ApiResult<()>,
 ) -> ApiResult<Upload> {
@@ -528,6 +556,7 @@ pub(crate) async fn receive_upload(
         if g.transfer_bytes + blob_len > cfg.max_session_transfer {
             return Err(ApiError::limit("session transfer limit reached"));
         }
+        charge_ip(&g, &ip_hash, blob_len, cfg.max_bytes_per_ip)?;
         g.pending.insert(item_id.clone());
         g.pending_bytes += blob_len;
         g.transfer_bytes += blob_len;
@@ -537,6 +566,7 @@ pub(crate) async fn receive_upload(
             bytes: blob_len,
             received: 0,
             committed: false,
+            ip_hash,
         }
     };
 
@@ -627,14 +657,23 @@ pub(crate) fn commit_upload<T>(
         let recipients: Vec<String> = g.active_participants().filter(|k| *k != who).cloned().collect();
         g.pending.remove(&reservation.id);
         g.pending_bytes -= blob_len;
-        // Applying the Item record charges the transfer for real.
+        // Applying the Item record charges the transfer and address usage for real.
         g.transfer_bytes -= blob_len;
+        let ip_hash = reservation.ip_hash.clone();
+        g.usage.sub(Some(&ip_hash), blob_len);
         reservation.committed = true;
-        let rec = Rec::Item { envelope: env_json, recipients, blob_len, blob_sha256: Some(blob_sha256) };
+        let rec = Rec::Item {
+            envelope: env_json,
+            recipients,
+            blob_len,
+            blob_sha256: Some(blob_sha256),
+            ip_hash: Some(ip_hash.clone()),
+        };
         let seq = match s.append(&mut g, rec) {
             Ok(ev) => ev.map(|e| e.seq).unwrap_or_default(),
             Err(e) => {
                 g.transfer_bytes += blob_len;
+                g.usage.add(Some(&ip_hash), blob_len);
                 reservation.committed = false;
                 // Reservation::drop releases pending; it re-locks, so drop the guard first.
                 g.pending.insert(reservation.id.clone());
@@ -659,6 +698,7 @@ pub(crate) fn commit_upload<T>(
 /// Jobs go through `POST /jobs` instead, so every job gets routed.
 pub async fn post_item(
     State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(id): Path<String>,
     headers: HeaderMap,
     body: Body,
@@ -667,7 +707,8 @@ pub async fn post_item(
     let (who, role) = auth(&s, &headers)?;
     let s2 = s.clone();
     let who2 = who.clone();
-    let up = receive_upload(&st, &s, &who, role, body, |h| {
+    let ip_hash = uploader(&st, &headers, peer);
+    let up = receive_upload(&st, &s, &who, role, ip_hash, body, |h| {
         if h.kind == ItemKind::Job {
             return Err(ApiError::forbidden("submit jobs with POST /jobs"));
         }
@@ -845,6 +886,7 @@ pub async fn want(
 /// stalled uploader cannot hold the others off.
 pub async fn reseed(
     State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path((id, item)): Path<(String, String)>,
     headers: HeaderMap,
     body: Body,
@@ -852,6 +894,7 @@ pub async fn reseed(
     item_path_ok(&item)?;
     let s = session(&st, &id)?;
     let (who, _) = auth(&s, &headers)?;
+    let ip_hash = uploader(&st, &headers, peer);
     if !st.store.disk_ok() {
         return Err(ApiError::storage_full());
     }
@@ -888,6 +931,7 @@ pub async fn reseed(
         if g.transfer_bytes + blob_len > cfg.max_session_transfer {
             return Err(ApiError::limit("session transfer limit reached"));
         }
+        charge_ip(&g, &ip_hash, blob_len, cfg.max_bytes_per_ip)?;
         g.pending.insert(key.clone());
         g.pending_bytes += blob_len;
         g.transfer_bytes += blob_len;
@@ -897,6 +941,7 @@ pub async fn reseed(
             bytes: blob_len,
             received: 0,
             committed: false,
+            ip_hash,
         };
         (env, res)
     };
@@ -935,9 +980,13 @@ pub async fn reseed(
             g.pending_bytes -= blob_len;
             // Applying the Reseed record charges the transfer for real.
             g.transfer_bytes -= blob_len;
+            let ip_hash = reservation.ip_hash.clone();
+            g.usage.sub(Some(&ip_hash), blob_len);
             reservation.committed = true;
-            if let Err(e) = s.append(&mut g, Rec::Reseed { item: item.clone(), by: who.clone() }) {
+            let rec = Rec::Reseed { item: item.clone(), by: who.clone(), ip_hash: Some(ip_hash.clone()) };
+            if let Err(e) = s.append(&mut g, rec) {
                 g.transfer_bytes += blob_len;
+                g.usage.add(Some(&ip_hash), blob_len);
                 g.pending.insert(key.clone());
                 g.pending_bytes += blob_len;
                 reservation.committed = false;

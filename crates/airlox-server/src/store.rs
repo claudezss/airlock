@@ -68,6 +68,10 @@ pub enum Rec {
         /// covers; absent in logs written before it was recorded.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         blob_sha256: Option<String>,
+        /// The uploader's address hash, whose per-address storage the blob
+        /// counts against while it is held. Never exported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ip_hash: Option<String>,
     },
     Ack {
         item: String,
@@ -88,6 +92,8 @@ pub enum Rec {
     Reseed {
         item: String,
         by: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ip_hash: Option<String>,
     },
     /// The owner revoked a role: its participants are cut off and its
     /// invite admits no one.
@@ -188,8 +194,63 @@ pub struct RunnerMsg {
     pub data: Value,
 }
 
+/// Bytes held or being uploaded per uploader address hash, over every
+/// session, for `max_bytes_per_ip`. Sessions add and remove their blobs as
+/// they apply records, and give everything back when they are dropped.
+#[derive(Default)]
+pub struct IpUsage(std::sync::Mutex<HashMap<String, u64>>);
+
+impl IpUsage {
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, u64>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn get(&self, ip: &str) -> u64 {
+        self.map().get(ip).copied().unwrap_or(0)
+    }
+
+    /// Add `n` bytes for `ip` unless that would pass `cap`.
+    pub fn try_add(&self, ip: &str, n: u64, cap: u64) -> bool {
+        let mut m = self.map();
+        let used = m.entry(ip.to_string()).or_default();
+        if used.saturating_add(n) > cap {
+            return false;
+        }
+        *used += n;
+        true
+    }
+
+    pub fn add(&self, ip: Option<&str>, n: u64) {
+        if let Some(ip) = ip {
+            *self.map().entry(ip.to_string()).or_default() += n;
+        }
+    }
+
+    pub fn sub(&self, ip: Option<&str>, n: u64) {
+        let Some(ip) = ip else { return };
+        let mut m = self.map();
+        if let Some(used) = m.get_mut(ip) {
+            *used = used.saturating_sub(n);
+            if *used == 0 {
+                m.remove(ip);
+            }
+        }
+    }
+}
+
+impl Drop for Inner {
+    /// A purged or unloaded session no longer holds its blobs.
+    fn drop(&mut self) {
+        for r in self.items.values().filter(|r| r.blob_present) {
+            self.usage.sub(r.ip_hash.as_deref(), r.blob_len);
+        }
+    }
+}
+
 pub struct ItemRec {
     pub seq: u64,
+    /// The address hash whose storage the held blob counts against.
+    pub ip_hash: Option<String>,
     pub author: String,
     pub recipients: HashSet<String>,
     pub acked: HashSet<String>,
@@ -226,6 +287,8 @@ pub struct Inner {
     pub wanted_items: HashMap<String, HashSet<String>>,
     /// Roles the owner revoked.
     pub revoked: HashSet<Role>,
+    /// Held bytes per uploader address, shared by every session.
+    pub usage: Arc<IpUsage>,
     hold_ms: u64,
     grace_ms: u64,
     /// Whether runners need the owner's approval before they get jobs.
@@ -319,7 +382,7 @@ impl Inner {
                 self.last_activity_ms = self.last_activity_ms.max(ts);
                 Ok(self.push_event(line.seq, "participant", public))
             }
-            Rec::Item { envelope, recipients, blob_len, .. } => {
+            Rec::Item { envelope, recipients, blob_len, ip_hash, .. } => {
                 let env: ItemEnvelope =
                     parse_canonical(envelope, "item envelope").map_err(|e| e.to_string())?;
                 let id = env.header.id.clone();
@@ -328,6 +391,7 @@ impl Inner {
                     id.clone(),
                     ItemRec {
                         seq: line.seq,
+                        ip_hash: ip_hash.clone(),
                         author: env.header.author.to_b64(),
                         recipients: recipients.iter().cloned().collect(),
                         acked: HashSet::new(),
@@ -339,6 +403,7 @@ impl Inner {
                 self.evictions.entry(evict_at).or_default().push(id);
                 self.held_bytes += blob_len;
                 self.transfer_bytes += blob_len;
+                self.usage.add(ip_hash.as_deref(), *blob_len);
                 self.last_activity_ms = self.last_activity_ms.max(ts);
                 Ok(self.push_event(
                     line.seq,
@@ -411,6 +476,7 @@ impl Inner {
                     if r.blob_present {
                         r.blob_present = false;
                         self.held_bytes -= r.blob_len;
+                        self.usage.sub(r.ip_hash.as_deref(), r.blob_len);
                     }
                 }
                 Ok(self.push_event(line.seq, "evicted", json!({"item": item})))
@@ -421,7 +487,7 @@ impl Inner {
                 self.last_activity_ms = self.last_activity_ms.max(ts);
                 Ok(self.push_event(line.seq, "want", json!({"item": item, "by": by})))
             }
-            Rec::Reseed { item, by } => {
+            Rec::Reseed { item, by, ip_hash } => {
                 // The wanters become the blob's recipients: it goes once they
                 // have all acked, or when its short hold ends. Expired wants
                 // are dropped here too, so a replay matches what happened live.
@@ -441,6 +507,8 @@ impl Inner {
                         r.blob_present = true;
                         self.held_bytes += r.blob_len;
                         self.transfer_bytes += r.blob_len;
+                        r.ip_hash = ip_hash.clone();
+                        self.usage.add(ip_hash.as_deref(), r.blob_len);
                     }
                     r.recipients = wanters;
                     r.evict_at = ts.saturating_add(hold);
@@ -562,7 +630,13 @@ fn invalid(e: impl std::fmt::Display) -> io::Error {
 }
 
 impl Session {
-    fn new_inner(log: File, log_len: u64, cfg: &Config, signed: &SignedManifest) -> Inner {
+    fn new_inner(
+        log: File,
+        log_len: u64,
+        cfg: &Config,
+        signed: &SignedManifest,
+        usage: Arc<IpUsage>,
+    ) -> Inner {
         let m = &signed.manifest;
         let approve_runners =
             m.mode == Mode::Execute && m.job_limits.as_ref().is_none_or(|l| l.approve_runners);
@@ -589,6 +663,7 @@ impl Session {
             wants: HashMap::new(),
             wanted_items: HashMap::new(),
             revoked: HashSet::new(),
+            usage,
             hold_ms: cfg.blob_hold_ms,
             grace_ms: cfg.blob_grace_ms,
             approve_runners,
@@ -602,6 +677,7 @@ impl Session {
         manifest_json: String,
         ip_hash: String,
         cfg: &Config,
+        usage: Arc<IpUsage>,
     ) -> io::Result<Session> {
         fs::create_dir(dir.join("blobs"))?;
         let tmp = dir.join(".manifest.json.tmp");
@@ -616,7 +692,7 @@ impl Session {
         if let Some(parent) = dir.parent() {
             sync_dir(parent)?;
         }
-        let mut inner = Self::new_inner(log, 0, cfg, &signed);
+        let mut inner = Self::new_inner(log, 0, cfg, &signed, usage);
         inner.last_activity_ms = now_ms();
         let (tx, _) = broadcast::channel(EVENT_BUFFER);
         let (runner_tx, _) = broadcast::channel(EVENT_BUFFER);
@@ -636,7 +712,7 @@ impl Session {
         Ok(s)
     }
 
-    fn load(dir: PathBuf, cfg: &Config) -> io::Result<Session> {
+    fn load(dir: PathBuf, cfg: &Config, usage: Arc<IpUsage>) -> io::Result<Session> {
         let manifest_json = fs::read_to_string(dir.join("manifest.json"))?;
         let signed = SignedManifest::from_json(&manifest_json).map_err(invalid)?;
         let id = signed.manifest.session_id.clone();
@@ -653,7 +729,7 @@ impl Session {
             log.set_len(valid as u64)?;
             log.seek(SeekFrom::End(0))?;
         }
-        let mut inner = Self::new_inner(log, valid as u64, cfg, &signed);
+        let mut inner = Self::new_inner(log, valid as u64, cfg, &signed, usage);
         for line in raw[..valid].split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
             let line: LogLine = serde_json::from_slice(line).map_err(invalid)?;
             if line.seq != inner.next_seq {
@@ -858,7 +934,7 @@ impl Session {
                     set("actor", json!(by));
                     set("item", json!(item));
                 }
-                Rec::Reseed { item, by } => {
+                Rec::Reseed { item, by, .. } => {
                     set("action", json!("reseed"));
                     set("actor", json!(by));
                     set("item", json!(item));
@@ -953,6 +1029,8 @@ pub struct Store {
     sessions: RwLock<HashMap<String, Arc<Session>>>,
     /// Closed sessions and their manifest expiry: refused if re-created.
     tombstones: Mutex<HashMap<String, u64>>,
+    /// Held and in-flight bytes per uploader address, over all sessions.
+    pub usage: Arc<IpUsage>,
     ip_key: [u8; 32],
     #[cfg(unix)]
     _lock: nix::fcntl::Flock<File>,
@@ -1018,6 +1096,7 @@ impl Store {
             trash_dir,
             sessions: RwLock::new(HashMap::new()),
             tombstones: Mutex::new(HashMap::new()),
+            usage: Arc::default(),
             ip_key,
             #[cfg(unix)]
             _lock: lock,
@@ -1041,7 +1120,7 @@ impl Store {
             if !path.is_dir() {
                 continue;
             }
-            match Session::load(path.clone(), &cfg) {
+            match Session::load(path.clone(), &cfg, store.usage.clone()) {
                 Ok(s) if s.signed.manifest.is_expired(now) || s.lock().closed => store.trash(&path),
                 Ok(s) => {
                     store
@@ -1126,13 +1205,15 @@ impl Store {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(CreateError::Exists),
             Err(e) => return Err(e.into()),
         }
-        let s = match Session::create(dir.clone(), signed, manifest_json, ip_hash, &self.cfg) {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                let _ = fs::remove_dir_all(&dir);
-                return Err(e.into());
-            }
-        };
+        let s =
+            match Session::create(dir.clone(), signed, manifest_json, ip_hash, &self.cfg, self.usage.clone())
+            {
+                Ok(s) => Arc::new(s),
+                Err(e) => {
+                    let _ = fs::remove_dir_all(&dir);
+                    return Err(e.into());
+                }
+            };
         self.sessions.write().unwrap_or_else(|e| e.into_inner()).insert(id, s.clone());
         Ok(s)
     }
@@ -1150,7 +1231,9 @@ impl Store {
     }
 
     fn tombstone(&self, s: &Session) {
-        let until = s.signed.manifest.expires_at_ms;
+        // Anyone holding the signed manifest could re-create the session, so
+        // one that never expires keeps its tombstone for good.
+        let until = s.signed.manifest.expires_at_ms.unwrap_or(u64::MAX);
         if until <= now_ms() {
             return;
         }
@@ -1195,9 +1278,13 @@ impl Store {
                 self.purge(&s.id, "expired");
                 continue;
             }
+            let idle_ttl = match s.signed.manifest.expires_at_ms {
+                Some(_) => self.cfg.idle_ttl_ms,
+                None => self.cfg.idle_ttl_unexpiring_ms,
+            };
             let idle = {
                 let g = s.lock();
-                g.pending.is_empty() && now.saturating_sub(g.last_activity_ms) >= self.cfg.idle_ttl_ms
+                g.pending.is_empty() && now.saturating_sub(g.last_activity_ms) >= idle_ttl
             };
             if idle {
                 self.purge(&s.id, "idle");

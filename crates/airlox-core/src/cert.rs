@@ -256,7 +256,7 @@ mod tests {
             .manifest(&SessionParams {
                 mode: Mode::Execute,
                 created_at_ms: 1,
-                ttl_ms: 1000,
+                ttl_ms: Some(1000),
                 allowed_types: vec![ContentType::Py],
                 max_item_bytes: 1024,
                 job_limits: Some(JobLimits::default()),
