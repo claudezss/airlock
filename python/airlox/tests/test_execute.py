@@ -90,6 +90,34 @@ def test_unapproved_runners_get_nothing_then_summarize_runs(execute):
     assert owner.items() and any(i.kind == "result" for i in owner.items())
 
 
+def test_idle_runner_still_sees_its_approval(execute):
+    # The relay keeps a blob only until every recipient has it. If the
+    # runner were not a recipient of its own approval event, the sender's
+    # ack would let the relay drop it (after the 200 ms grace) before the
+    # idle runner's next sync, and every job would be refused.
+    owner, agent, runner = execute
+    owner.approve_runner("runner-01")
+    wait_runner(agent, "runner-01", lambda r: r.approved)
+    time.sleep(1.5)
+    res = agent.run_python("print('ok')", runner="runner-01").wait(timeout=60)
+    assert res.ok and res.stdout.strip() == "ok", (res, runner.output())
+
+
+def test_job_arriving_just_before_the_signed_approval_runs(execute):
+    # approve_runner approves on the relay, then posts the signed event: a
+    # job routed in between waits briefly for that event instead of being
+    # refused.
+    owner, agent, runner = execute
+    [r] = owner.runners()
+    owner._req("POST", f"/runners/{r.participant_pub}/approve")
+    job = agent.run_python("print('ok')", labels=["cpu"])
+    time.sleep(1.0)
+    owner._send("event", None, {"type": "event", "event": "runner_approve", "participant_pub": r.participant_pub},
+                b"", [])
+    res = job.wait(timeout=60)
+    assert res.ok and res.stdout.strip() == "ok", (res, runner.output())
+
+
 def test_refusals_timeouts_and_cancels(execute):
     owner, agent, runner = execute
     owner.approve_runner("runner-01")

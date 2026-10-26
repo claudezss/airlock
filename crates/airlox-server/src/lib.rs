@@ -63,14 +63,11 @@ pub struct Running {
 }
 
 impl Running {
-    /// Stop accepting, end open streams, and release the data directory.
+    /// Stop accepting, end open streams, and release the data directory:
+    /// when this returns, another server can open it.
     pub async fn stop(self) -> std::io::Result<()> {
         let _ = self.shutdown.send(true);
-        let r = self.server.await.map_err(std::io::Error::other)?;
-        self.sweeper.abort();
-        let _ = self.sweeper.await;
-        drop(self.store);
-        r
+        self.wait().await
     }
 
     /// A handle that triggers the same shutdown as [`Running::stop`].
@@ -78,12 +75,33 @@ impl Running {
         self.shutdown.clone()
     }
 
-    /// Wait until the server exits (after a shutdown signal).
+    /// Wait until the server exits (after a shutdown signal) and has
+    /// released the data directory.
     pub async fn wait(self) -> std::io::Result<()> {
-        let r = self.server.await.map_err(std::io::Error::other)?;
-        self.sweeper.abort();
-        r
+        let r = self.server.await.map_err(std::io::Error::other);
+        // The server may also end on its own (an I/O error): stop the
+        // sweeper either way.
+        let _ = self.shutdown.send(true);
+        let _ = self.sweeper.await;
+        release(self.store).await;
+        r?
     }
+}
+
+/// Drop the last handle on the store, which releases the data directory's
+/// lock. Request handlers that outlived the server's shutdown may still hold
+/// a handle for a moment; wait for them rather than leave the lock behind.
+async fn release(store: Arc<Store>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while Arc::strong_count(&store) > 1 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if Arc::strong_count(&store) > 1 {
+        tracing::warn!(
+            "the data directory is still in use after shutdown; its lock is released when that ends"
+        );
+    }
+    drop(store);
 }
 
 /// Open the store, start the sweeper, and serve on `cfg.listen`.
@@ -94,12 +112,17 @@ pub async fn start(cfg: Config) -> std::io::Result<Running> {
 
     let weak = Arc::downgrade(&store);
     let interval = Duration::from_millis(cfg.sweep_interval_ms.max(10));
+    let mut stopping = rx.clone();
     let sweeper = tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            tick.tick().await;
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = stopping.wait_for(|v| *v) => break,
+            }
             let Some(store) = weak.upgrade() else { break };
+            // Awaited, not detached: the sweep holds the store until it ends.
             let _ = tokio::task::spawn_blocking(move || store.sweep(util::now_ms())).await;
         }
     });

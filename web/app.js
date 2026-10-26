@@ -1163,7 +1163,9 @@ function renderRunners(s, list, note) {
         el("span", { class: `chip approval ${r.rejected ? "bad" : r.approved ? "good" : "wait"}` }, approval),
         r.networkUnblocked && !r.rejected ? el("span", { class: "chip warn", title: "This runner's sandbox cannot block network access" }, "⚠ network not blocked") : null),
       owner && !r.rejected ? el("div", { class: "row" },
-        r.approved ? null : el("button", { type: "button", class: "small primary", onclick: (ev) => decideRunner(s, r, true, ev.currentTarget) }, "Approve"),
+        // Kept after a failed approval: the relay may say approved while the
+        // signed approval never got posted, and the owner must be able to retry.
+        r.approved && !err ? null : el("button", { type: "button", class: "small primary", onclick: (ev) => decideRunner(s, r, true, ev.currentTarget) }, "Approve"),
         el("button", { type: "button", class: "small danger", onclick: (ev) => decideRunner(s, r, false, ev.currentTarget) }, "Reject")) : null,
       err ? el("p", { class: "error", role: "alert" }, err) : null);
   }));
@@ -1176,8 +1178,12 @@ async function decideRunner(s, r, approve, btn) {
   try {
     const meta = approve ? { type: "event", event: "runner_approve", participant_pub: r.pub }
       : { type: "event", event: "runner_reject", participant_pub: r.pub, reason: null };
+    const relay = () => api("POST", `/v1/sessions/${s.sid}/runners/${encodeURIComponent(r.pub)}/${approve ? "approve" : "reject"}`, { token: s.identity.token });
+    // Approve on the relay first: a runner awaiting approval is not a
+    // recipient, so the relay would not keep the signed event for it.
+    if (approve) await relay();
     await sendPayload(s, "event", null, meta, new Uint8Array());
-    await api("POST", `/v1/sessions/${s.sid}/runners/${encodeURIComponent(r.pub)}/${approve ? "approve" : "reject"}`, { token: s.identity.token });
+    if (!approve) await relay();
     await pollRunners(s);
   } catch (e) {
     s.runnerErrors.set(r.pub, `Could not ${approve ? "approve" : "reject"} the runner: ${e.message || e}`);
