@@ -126,6 +126,12 @@ fn verify_join(signed_join_json: &str, signed_manifest_json: &str) -> PyResult<(
     api::verify_join(signed_join_json, signed_manifest_json).map_err(err)
 }
 
+/// The role certificate inside a signed join request, as canonical JSON.
+#[pyfunction]
+fn join_cert(signed_join_json: &str) -> PyResult<String> {
+    api::join_cert(signed_join_json).map_err(err)
+}
+
 #[pyfunction]
 fn new_item_id() -> String {
     api::new_item_id()
@@ -258,6 +264,7 @@ fn airlock_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(verify_cert, m)?)?;
     m.add_function(wrap_pyfunction!(sign_join, m)?)?;
     m.add_function(wrap_pyfunction!(verify_join, m)?)?;
+    m.add_function(wrap_pyfunction!(join_cert, m)?)?;
     m.add_function(wrap_pyfunction!(new_item_id, m)?)?;
     m.add_function(wrap_pyfunction!(seal_item, m)?)?;
     m.add_function(wrap_pyfunction!(verify_item, m)?)?;

@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 *.so
 /bindings/wasm/pkg/
+/web/pkg/
 /bindings/python/dist/
 node_modules/
 .DS_Store

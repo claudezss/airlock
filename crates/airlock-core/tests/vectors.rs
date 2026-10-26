@@ -86,6 +86,8 @@ fn invites_certs_join() {
     let j: SignedJoinRequest = serde_json::from_value(v["join"]["signed"].clone()).unwrap();
     j.verify(&m.manifest).unwrap();
     assert_eq!(canonical_json(&j.join).unwrap(), st(&v["join"]["canonical"]).as_bytes());
+    let cert_json = api::join_cert(st(&v["join"]["signed_canonical"])).unwrap();
+    assert_eq!(api::verify_cert(&cert_json, st(&v["manifest"]["signed_canonical"])).unwrap(), "runner");
     for n in v["negative_invites"].as_array().unwrap() {
         assert!(Invite::parse(st(&n["url"])).is_err(), "{}", n["name"]);
     }

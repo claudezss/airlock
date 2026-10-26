@@ -1,0 +1,124 @@
+//! Server configuration: flags with `AIRLOCK_*` environment fallbacks.
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use clap::Parser;
+
+#[derive(Parser, Debug, Clone)]
+#[command(
+    name = "airlock-server",
+    version,
+    about = "Airlock relay: a transit buffer for encrypted agent sessions"
+)]
+pub struct Config {
+    /// Data directory: one subdirectory per session.
+    #[arg(long, env = "AIRLOCK_DATA", default_value = "./airlock-data")]
+    pub data: PathBuf,
+    /// Wipe the data directory at start; nothing survives a restart.
+    #[arg(long, env = "AIRLOCK_EPHEMERAL")]
+    pub ephemeral: bool,
+    #[arg(long, env = "AIRLOCK_LISTEN", default_value = "127.0.0.1:8080")]
+    pub listen: SocketAddr,
+    /// Take the client address from X-Forwarded-For (only behind a trusted proxy).
+    #[arg(long, env = "AIRLOCK_TRUST_PROXY")]
+    pub trust_proxy: bool,
+
+    /// Longest session lifetime accepted.
+    #[arg(long = "max-ttl", env = "AIRLOCK_MAX_TTL", default_value = "24h", value_parser = parse_duration_ms)]
+    pub max_ttl_ms: u64,
+    /// Largest per-item limit a manifest may set.
+    #[arg(long, env = "AIRLOCK_MAX_ITEM_BYTES", default_value = "25MiB", value_parser = parse_size)]
+    pub max_item_bytes: u64,
+    /// Ciphertext a session may have held on the relay at once.
+    #[arg(long, env = "AIRLOCK_MAX_SESSION_BYTES", default_value = "200MiB", value_parser = parse_size)]
+    pub max_session_bytes: u64,
+    /// Total bytes uploaded plus downloaded per session.
+    #[arg(long, env = "AIRLOCK_MAX_SESSION_TRANSFER", default_value = "1GiB", value_parser = parse_size)]
+    pub max_session_transfer: u64,
+    #[arg(long, env = "AIRLOCK_MAX_ITEMS", default_value_t = 5000)]
+    pub max_items: usize,
+    /// Purge a session after this long without new items or joins.
+    #[arg(long = "idle-ttl", env = "AIRLOCK_IDLE_TTL", default_value = "2h", value_parser = parse_duration_ms)]
+    pub idle_ttl_ms: u64,
+    #[arg(long, env = "AIRLOCK_MAX_SESSIONS_PER_IP", default_value_t = 20)]
+    pub max_sessions_per_ip: usize,
+    #[arg(long, env = "AIRLOCK_MAX_SESSIONS", default_value_t = 1000)]
+    pub max_sessions: usize,
+    /// Refuse new sessions and uploads above this volume usage (percent).
+    #[arg(long, env = "AIRLOCK_DISK_HIGH_WATERMARK", default_value_t = 90)]
+    pub disk_high_watermark: u8,
+    /// Longest a blob stays on the relay after upload.
+    #[arg(long = "blob-hold", env = "AIRLOCK_BLOB_HOLD", default_value = "1h", value_parser = parse_duration_ms)]
+    pub blob_hold_ms: u64,
+    /// How long a blob stays after its last recipient acked.
+    #[arg(long = "blob-grace", env = "AIRLOCK_BLOB_GRACE", default_value = "5m", value_parser = parse_duration_ms)]
+    pub blob_grace_ms: u64,
+    /// How often expiry, idle and eviction timers are checked.
+    #[arg(long = "sweep-interval", env = "AIRLOCK_SWEEP_INTERVAL", default_value = "1s", value_parser = parse_duration_ms)]
+    pub sweep_interval_ms: u64,
+}
+
+impl Config {
+    /// Defaults with the given data directory, for embedding and tests.
+    pub fn with_data(data: impl Into<PathBuf>) -> Self {
+        let mut c = Config::parse_from(["airlock-server"]);
+        c.data = data.into();
+        c
+    }
+}
+
+/// `1500ms`, `30s`, `5m`, `24h`, `7d`.
+pub fn parse_duration_ms(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let n: u64 = num.parse().map_err(|_| format!("bad duration {s:?}"))?;
+    let mult = match unit {
+        "ms" => 1,
+        "s" | "" => 1000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => return Err(format!("bad duration unit in {s:?} (use ms, s, m, h, d)")),
+    };
+    n.checked_mul(mult).ok_or_else(|| format!("duration {s:?} too large"))
+}
+
+/// `1024`, `64KiB`, `25MiB`, `1GiB` (also `KB`/`MB`/`GB` as powers of 1000).
+pub fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let n: u64 = num.parse().map_err(|_| format!("bad size {s:?}"))?;
+    let mult: u64 = match unit {
+        "" | "B" => 1,
+        "KiB" => 1 << 10,
+        "MiB" => 1 << 20,
+        "GiB" => 1 << 30,
+        "KB" => 1_000,
+        "MB" => 1_000_000,
+        "GB" => 1_000_000_000,
+        _ => return Err(format!("bad size unit in {s:?} (use B, KiB, MiB, GiB)")),
+    };
+    n.checked_mul(mult).ok_or_else(|| format!("size {s:?} too large"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_units() {
+        assert_eq!(parse_duration_ms("1500ms").unwrap(), 1500);
+        assert_eq!(parse_duration_ms("5m").unwrap(), 300_000);
+        assert_eq!(parse_duration_ms("24h").unwrap(), 86_400_000);
+        assert!(parse_duration_ms("5 weeks").is_err());
+        assert_eq!(parse_size("25MiB").unwrap(), 25 << 20);
+        assert_eq!(parse_size("1GiB").unwrap(), 1 << 30);
+        assert!(parse_size("1TiB").is_err());
+        let c = Config::with_data("/tmp/x");
+        assert_eq!(c.blob_hold_ms, 3_600_000);
+        assert_eq!(c.max_session_bytes, 200 << 20);
+    }
+}

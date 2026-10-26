@@ -193,9 +193,36 @@ pub fn item_key(session_key: &[u8; 32], session_id: &str, item_id: &str) -> [u8;
 }
 
 fn sig_message(header_bytes: &[u8], blob: &[u8]) -> Vec<u8> {
+    sig_message_digest(header_bytes, &sha256(blob))
+}
+
+fn sig_message_digest(header_bytes: &[u8], blob_sha256: &[u8; 32]) -> Vec<u8> {
     let mut m = header_bytes.to_vec();
-    m.extend_from_slice(&sha256(blob));
+    m.extend_from_slice(blob_sha256);
     m
+}
+
+impl ItemEnvelope {
+    /// The checks a relay can run while streaming: header shape, the blob
+    /// length implied by `size`, and the author's signature over the header
+    /// and the blob's SHA-256. The blob itself never needs to be in memory.
+    pub fn verify_blob_digest(&self, blob_len: u64, blob_sha256: &[u8; 32]) -> Result<()> {
+        let h = &self.header;
+        h.validate()?;
+        if blob_len != h.blob_len()? {
+            return Err(Error::invalid("item", "blob length does not match header size"));
+        }
+        h.author
+            .verify(ctx::ITEM, &sig_message_digest(&h.canonical_bytes()?, blob_sha256), &self.sig)
+            .map_err(|_| Error::Signature("item not signed by its author"))
+    }
+}
+
+impl ItemHeader {
+    /// Exact ciphertext length: `size + 28`.
+    pub fn blob_len(&self) -> Result<u64> {
+        self.size.checked_add(BLOB_OVERHEAD as u64).ok_or_else(|| Error::invalid("item", "size overflow"))
+    }
 }
 
 pub fn seal(session_key: &[u8; 32], author: &Keypair, new: NewItem, payload: &[u8]) -> Result<SealedItem> {
@@ -244,18 +271,7 @@ impl SealedItem {
 
     /// Checks the server can run: header shape, blob length, author signature.
     pub fn verify(&self) -> Result<()> {
-        let h = &self.envelope.header;
-        h.validate()?;
-        let expected = h
-            .size
-            .checked_add(BLOB_OVERHEAD as u64)
-            .ok_or_else(|| Error::invalid("item", "size overflow"))?;
-        if self.blob.len() as u64 != expected {
-            return Err(Error::invalid("item", "blob length does not match header size"));
-        }
-        h.author
-            .verify(ctx::ITEM, &sig_message(&h.canonical_bytes()?, &self.blob), &self.envelope.sig)
-            .map_err(|_| Error::Signature("item not signed by its author"))
+        self.envelope.verify_blob_digest(self.blob.len() as u64, &self.blob_sha256())
     }
 
     /// Verify, then decrypt. Returns the plaintext payload.
@@ -327,6 +343,16 @@ mod tests {
         let forged = SealedItem { envelope: ItemEnvelope { header: h, sig }, blob: s.blob.clone() };
         forged.verify().unwrap();
         assert_eq!(forged.open(&k), Err(Error::Decrypt));
+    }
+
+    #[test]
+    fn digest_verification_matches_full_verification() {
+        let k = [1u8; 32];
+        let a = Keypair::from_seed(&[2u8; 32]);
+        let s = seal(&k, &a, new(ItemKind::Text, None), b"streamed").unwrap();
+        s.envelope.verify_blob_digest(s.blob.len() as u64, &s.blob_sha256()).unwrap();
+        assert!(s.envelope.verify_blob_digest(s.blob.len() as u64 + 1, &s.blob_sha256()).is_err());
+        assert!(s.envelope.verify_blob_digest(s.blob.len() as u64, &[0u8; 32]).is_err());
     }
 
     #[test]

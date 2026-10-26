@@ -126,6 +126,14 @@ pub fn verify_join(signed_join_json: &str, signed_manifest_json: &str) -> Result
     j.verify(&m.manifest)
 }
 
+/// The role certificate inside a signed join request, as canonical JSON.
+/// Clients use it with [`check_header`] and [`open_checked`] after
+/// [`verify_join`] has accepted the join.
+pub fn join_cert(signed_join_json: &str) -> Result<String> {
+    let j: SignedJoinRequest = parse_canonical(signed_join_json, "join request")?;
+    json(&j.join.cert)
+}
+
 pub fn new_item_id() -> String {
     crate::item::new_item_id()
 }

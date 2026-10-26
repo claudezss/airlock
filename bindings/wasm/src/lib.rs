@@ -128,6 +128,12 @@ pub fn verify_join(signed_join_json: &str, signed_manifest_json: &str) -> R<()> 
     api::verify_join(signed_join_json, signed_manifest_json).map_err(err)
 }
 
+/// The role certificate inside a signed join request, as canonical JSON.
+#[wasm_bindgen(js_name = joinCert)]
+pub fn join_cert(signed_join_json: &str) -> R<String> {
+    api::join_cert(signed_join_json).map_err(err)
+}
+
 #[wasm_bindgen(js_name = newItemId)]
 pub fn new_item_id() -> String {
     api::new_item_id()
