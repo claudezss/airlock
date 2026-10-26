@@ -1,6 +1,15 @@
 // Airlox web client (M1 timeline). All cryptography runs in the
 // airlox-core WebAssembly module; the relay only sees ciphertext.
-import init, * as ac from "/assets/pkg/airlox_core_wasm.js";
+// The WebAssembly core is loaded on demand so the landing page renders even if
+// it (or IndexedDB) is unavailable; only /#new and /s/<id> need them.
+let ac;
+let corePromise;
+const loadCore = () =>
+  (corePromise ??= (async () => {
+    const m = await import("/assets/pkg/airlox_core_wasm.js");
+    await m.default();
+    ac = m;
+  })());
 
 const MB = 1024 * 1024;
 const MAX_ITEM_MB = 25;
@@ -49,6 +58,14 @@ function svg(paths, size = 18) {
 }
 const ICON_CLIP = ["M21 11.5l-8.5 8.5a5 5 0 0 1-7-7L14 4.5a3.3 3.3 0 0 1 4.7 4.7L10.2 17.7a1.7 1.7 0 0 1-2.4-2.4L15.5 7.6"];
 const app = document.getElementById("app");
+// Invite links are shown once and kept nowhere; warn before the page that
+// shows them is closed or reloaded.
+let invitesShown = false;
+addEventListener("beforeunload", (ev) => {
+  if (!invitesShown) return;
+  ev.preventDefault();
+  ev.returnValue = "";
+});
 const show = (...nodes) => app.replaceChildren(...nodes);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const fmtBytes = (n) => (n < 1024 ? `${n} B` : n < MB ? `${(n / 1024).toFixed(1)} KB` : `${(n / MB).toFixed(1)} MB`);
@@ -85,15 +102,18 @@ function explain(err) {
 }
 
 // ---------- IndexedDB: identity, events and ciphertext blobs ----------
-const db = await new Promise((res, rej) => {
-  const r = indexedDB.open("airlox", 1);
-  r.onupgradeneeded = () => {
-    for (const s of ["identity", "events", "blobs"]) r.result.createObjectStore(s);
-  };
-  r.onsuccess = () => res(r.result);
-  r.onerror = () => rej(r.error);
-});
-function tx(store, mode, fn) {
+let dbPromise;
+const openDb = () =>
+  (dbPromise ??= new Promise((res, rej) => {
+    const r = indexedDB.open("airlox", 1);
+    r.onupgradeneeded = () => {
+      for (const s of ["identity", "events", "blobs"]) r.result.createObjectStore(s);
+    };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  }));
+async function tx(store, mode, fn) {
+  const db = await openDb();
   return new Promise((res, rej) => {
     const t = db.transaction(store, mode);
     const req = fn(t.objectStore(store));
@@ -271,9 +291,10 @@ function newSession() {
         inviteRow("Observer", ac.memberInvite(base, s.ownerSeed, "observer"), "read-only, optional"),
         execute ? runnerInviteRow(ac.memberInvite(base, s.ownerSeed, "runner")) : null,
         el("div", { class: "row" },
-          el("a", { class: "button primary cta", href: owner }, "Open session"),
-          el("button", { type: "button", onclick: () => location.reload() }, "Create another")));
+          el("a", { class: "button primary cta", href: owner, onclick: () => (invitesShown = false) }, "Open session"),
+          el("button", { type: "button", onclick: () => { invitesShown = false; location.reload(); } }, "Create another")));
       heading.focus();
+      invitesShown = true;
     } catch (e) {
       err.textContent = `Could not create the session: ${e.message || e}`;
       create.disabled = false;
@@ -1338,15 +1359,22 @@ async function streamLoop(s) {
 
 // ---------- landing page and routing at / ----------
 // "/" shows the landing page; "/#new" shows the create-session form. Other
-// fragments on "/" are in-page anchors. Invites live under /s/<id>.
+// fragments on "/" are in-page anchors. Invites live under /s/<id>. The
+// landing page needs nothing but this file; the form waits for the core.
 let homeView = null;
-function route(initial) {
+let homeScroll = 0;
+async function route(initial) {
   const view = location.hash === "#new" ? "new" : "home";
   if (view === homeView) return;
+  // Leaving the form after invites were created would lose them for good:
+  // stay on the invite panel (the unload guard covers closing the tab).
+  if (invitesShown) return;
+  if (homeView === "home") homeScroll = scrollY;
   homeView = view;
   const home = view === "home";
   document.body.classList.toggle("landing", home);
   document.getElementById("site-nav").hidden = !home;
+  document.getElementById("site-foot").hidden = !home;
   app.classList.toggle("wide", home);
   document.title = home ? "Airlox · Secure sessions for code and LLM agents" : "New session · Airlox";
   if (home) {
@@ -1356,8 +1384,14 @@ function route(initial) {
       target = location.hash.length > 1 ? document.getElementById(decodeURIComponent(location.hash.slice(1))) : null;
     } catch {}
     if (target) target.scrollIntoView();
-    else if (!initial) scrollTo(0, 0);
+    else scrollTo(0, initial ? 0 : homeScroll);
   } else {
+    try {
+      await loadCore();
+    } catch (e) {
+      return deadEnd("Airlox failed to start", String(e.message || e));
+    }
+    if (homeView !== view) return; // navigated away while loading
     newSession();
     scrollTo(0, 0);
     const h1 = app.querySelector("h1");
@@ -1369,13 +1403,14 @@ function route(initial) {
 }
 
 // ---------- boot ----------
-try {
-  await init();
-  if (location.pathname.startsWith("/s/")) await sessionView();
-  else {
-    route(true);
-    addEventListener("hashchange", () => route(false));
+if (location.pathname.startsWith("/s/")) {
+  try {
+    await loadCore();
+    await sessionView();
+  } catch (e) {
+    deadEnd("Airlox failed to start", String(e.message || e));
   }
-} catch (e) {
-  deadEnd("Airlox failed to start", String(e.message || e));
+} else {
+  addEventListener("hashchange", () => route(false));
+  await route(true);
 }
