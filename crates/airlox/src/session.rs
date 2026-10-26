@@ -638,13 +638,16 @@ impl Session {
         }
     }
 
-    /// Let a runner take jobs (owner only): a signed `runner_approve` event
-    /// for runners and senders to verify, plus the relay's copy.
+    /// Let a runner take jobs (owner only): the relay's approval, then a
+    /// signed `runner_approve` event for runners and senders to verify. In
+    /// that order: a runner awaiting approval is not a recipient, so the relay
+    /// would not keep the event for it, and a runner that fetched it late
+    /// would never see its own approval.
     pub async fn approve_runner(&mut self, which: &str) -> Result<Runner> {
         let r = self.runner(which).await?;
+        self.relay.post_raw(&format!("/runners/{}/approve", r.participant_pub), vec![], &[]).await?;
         let meta = json!({"type": "event", "event": "runner_approve", "participant_pub": r.participant_pub});
         self.send("event", None, meta, vec![], vec![]).await?;
-        self.relay.post_raw(&format!("/runners/{}/approve", r.participant_pub), vec![], &[]).await?;
         Ok(r)
     }
 
