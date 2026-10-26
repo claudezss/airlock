@@ -1,9 +1,20 @@
+{
+	servers {
+		# Slow clients may not hold a connection open sending headers. Bodies
+		# and event streams are long-lived; the relay times those itself.
+		timeouts {
+			read_header 10s
+		}
+	}
+}
+
 {$AIRLOX_DOMAIN} {
 	# No response compression: event streams must reach clients unbuffered.
 	reverse_proxy airlox:8080 {
 		flush_interval -1
 	}
 	header Strict-Transport-Security "max-age=31536000"
+	header X-Content-Type-Options nosniff
 }
 
 www.{$AIRLOX_DOMAIN} {

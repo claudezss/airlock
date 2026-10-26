@@ -1,0 +1,17 @@
+# Weekly update PRs for what the relay and releases are built from: pinned
+# actions, the Docker base images (pinned by digest) and Rust crates.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directories: [/, /deploy]
+    schedule:
+      interval: weekly
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
