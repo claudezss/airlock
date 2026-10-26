@@ -151,6 +151,12 @@ impl View {
                 let env_json = data["envelope"].as_str().context("item without envelope")?.to_string();
                 let env: ItemEnvelope = parse_canonical(&env_json, "item envelope")?;
                 let h = env.header.clone();
+                // The id names a cache file and goes into URLs: only a
+                // well-formed one, before anything touches the disk.
+                if !airlox_core::item::is_item_id(&h.id) {
+                    tracing::warn!("ignoring an item with a malformed id");
+                    return Ok(());
+                }
                 self.envelopes.insert(h.id.clone(), env_json);
                 if h.author == self.me {
                     return Ok(());
@@ -179,6 +185,10 @@ impl View {
             "job" => {
                 // Unless it is ours to run, we will not need the job's blob.
                 let job = data["job"].as_str().unwrap_or_default().to_string();
+                if !airlox_core::item::is_item_id(&job) {
+                    tracing::warn!("ignoring a job event with a malformed id");
+                    return Ok(());
+                }
                 let ours = data["runner"].as_str() == Some(self.me.to_b64().as_str());
                 let active = matches!(data["state"].as_str(), Some("assigned" | "running"));
                 if !(ours && active) {
@@ -223,12 +233,16 @@ impl View {
     /// The item's ciphertext: from the cache, else from the relay (and then
     /// cached). `None` if it left the relay before we fetched it.
     pub async fn cached_blob(&mut self, id: &str) -> Result<Option<Vec<u8>>> {
+        if !airlox_core::item::is_item_id(id) {
+            bail!("malformed item id");
+        }
         let path = self.blob_path(id);
         if let Ok(b) = fs::read(&path) {
             return Ok(Some(b));
         }
         let Some(env) = self.envelopes.get(id) else { bail!("unknown item {id}") };
-        let Some(blob) = self.relay.blob(id).await? else { return Ok(None) };
+        let limit = (self.manifest.max_item_bytes as usize).saturating_add(airlox_core::item::BLOB_OVERHEAD);
+        let Some(blob) = self.relay.blob(id, limit).await? else { return Ok(None) };
         // Only keep bytes that match the author's signature.
         api::verify_item(env, &blob)?;
         write_atomic(&path, &blob, 0o600)?;

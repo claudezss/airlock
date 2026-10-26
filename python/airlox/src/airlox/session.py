@@ -101,6 +101,9 @@ class Item:
         return self.meta.get("mime") if self.meta and self.kind == "file" else None
 
 
+#: Largest believable gap between consecutive event sequence numbers.
+MAX_SEQ_JUMP = 10_000
+
 class Session:
     """A participant's view of one session."""
 
@@ -196,6 +199,15 @@ class Session:
         Cache.sweep_expired(root)
         cache = Cache(root, sid)
         identity = cache.load_identity(role)
+        # The cached token belongs to the relay that issued it: an invite with
+        # this session's keys but another relay (an altered link) must not
+        # receive it.
+        bound = (identity or {}).get("base_url")
+        if bound and bound != relay.rstrip("/"):
+            raise ValueError(
+                f"this invite names relay {relay!r} but you joined session {sid} on {bound!r}; "
+                "refusing to send your token to another relay (the link may have been altered)"
+            )
         offline = False
         try:
             signed = _check(http.get(f"{relay}/v1/sessions/{sid}")).json()["signed_manifest"]
@@ -222,7 +234,10 @@ class Session:
             }
             signed_join = ac.sign_join(seed, json.dumps(join))
             resp = _check(http.post(f"{relay}/v1/sessions/{sid}/participants", content=signed_join)).json()
-            identity = {"participant_seed": seed.hex(), "token": resp["token"], "role": role}
+            identity = {"participant_seed": seed.hex(), "token": resp["token"], "role": role, "base_url": relay.rstrip("/")}
+            cache.save_identity(role, identity)
+        elif not bound:
+            identity = {**identity, "base_url": relay.rstrip("/")}
             cache.save_identity(role, identity)
         session = cls(
             relay=relay,
@@ -546,6 +561,10 @@ class Session:
 
     def _apply(self, ev: dict, *, fetch: bool = True, record: bool = True) -> Optional[Item]:
         seq = ev["seq"]
+        # A wild jump would make every later event look old, and the cache
+        # would keep it (as the Rust client does: drop it unrecorded).
+        if seq > max(self._last_seq, 0) + MAX_SEQ_JUMP:
+            return None
         if record and seq <= self._last_seq:
             return None
         kind, data = ev["kind"], ev["data"]

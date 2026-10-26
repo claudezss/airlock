@@ -53,12 +53,12 @@ canvas (landing, live session, new session, runner console).
 |---|---|---|
 | `airlox-core`: protocol, crypto, validators, job shim | **Rust** | `ed25519-dalek`, `aes-gcm`, `hkdf`, `sha2`, `serde` + canonical JSON; bindings via **PyO3** (Python wheel) and **wasm-bindgen** (browser) |
 | Relay server (API, SSE, storage, purge) | **Rust** | `axum` + `tokio`, `tower` middleware; storage is plain files (append-only session logs + blob files), **no database** |
-| `airlox` binary: runner, CLI | **Rust** | `tokio`, `reqwest` (SSE), `bollard` (Docker), `kube` (Kubernetes), `nix` + Landlock + seccomp for the local backend |
-| SDK and MCP server (`pip install airlox`) | **Python 3.12+** | thin orchestration over the Rust core compiled into the same wheel (`airlox._core`); `httpx`, `mcp`; the wheel also bundles the `airlox` binary |
+| `airlox` binary: runner, CLI, MCP server | **Rust** | `tokio`, `reqwest` (SSE), `bollard` (Docker), `kube` (Kubernetes), `nix` + Landlock + seccomp for the local backend |
+| SDK (`pip install airlox`) | **Python 3.9+** | thin orchestration over the Rust core compiled into the same wheel (`airlox._core`); `httpx`; the wheel also bundles the `airlox` binary |
 | Web UI (static SPA served by the server) | **TypeScript** | Vite + React, `airlox-core` wasm for all crypto, markdown-it + DOMPurify, zip.js |
 
 Rust owns everything that touches keys, signatures, sandboxes or the wire.
-Python is a thin convenience layer for agents and the MCP ecosystem. TypeScript
+Python is a thin convenience layer for agents that write code. TypeScript
 is confined to the browser, and even there the crypto is the Rust core compiled
 to WebAssembly.
 
@@ -97,9 +97,11 @@ to WebAssembly.
   Windows) plus a wasm bundle plus static runner binaries. Mitigation:
   `maturin-action` and `cargo-zigbuild` in CI from day one; the matrix is set
   up in M0 while the code is still tiny.
-- **Not one language.** Agents expect a Python SDK and the MCP SDK is most
-  mature in Python, so Python stays for that layer. It is intentionally thin:
-  HTTP calls plus ergonomic wrappers around core types.
+- **Not one language.** Agents that write code expect a Python SDK, so Python
+  stays for that layer. It is intentionally thin: HTTP calls plus ergonomic
+  wrappers around core types. The MCP server lives in the Rust binary instead
+  (§9): one implementation of the session logic for the CLI, the MCP server and
+  the runner, and nothing to install at runtime.
 - **Thinner examples for `bollard` and `kube`.** Both are production-grade;
   the backend surface we use is small (create, copy in, start, wait, logs,
   copy out, remove).
@@ -690,9 +692,9 @@ it at design parity in M4.
 One Python package, `airlox`, importable as `airlox`. Its wheel contains
 the Rust core as the extension module `airlox._core` (PyO3), which does every
 cryptographic and protocol operation; the Python side adds only HTTP plumbing
-and ergonomics. The wheel also ships the
-static `airlox` binary so `pip install airlox` puts `airlox runner
-join` on `PATH`; the same binary is downloadable standalone.
+and ergonomics. The wheel is to also ship the static `airlox` binary, so
+that `pip install airlox` puts `airlox` on `PATH` (see Distribution below;
+until then the binary comes from `cargo install`).
 
 ```python
 from airlox import Session
@@ -707,8 +709,28 @@ for item in s.stream(): ...                       # decrypted items as they arri
 ```
 
 CLI (`airlox …`, Rust, same binary as the runner): `session
-create|close|invite`, `send text|file`, `run <file.py>
-[--runner|--label|--any]`, `runner join`, `watch`.
+create|invites|info|close`, `send text|file`, `run <file.py>
+[--runner|--label] [--input …] [--out-dir]`, `result`, `cancel`, `items`,
+`watch`, `runner join|list|approve|reject`, and `mcp`. Every command takes the
+invite as `--invite` or `AIRLOX_INVITE` (preferred: arguments are visible to
+other local users in `ps`) and prints JSON with `--json`. `run` and `result`
+exit with the job's exit code when the runner signed one, 1 when the job
+produced none (timeout, out of memory, cancelled, failed on the relay; the
+JSON `status` and `reason` tell these apart) and 75 when no result arrived
+before `--wait` ran out. Text output escapes control and bidi characters, so
+participant-chosen names, messages and job output cannot forge lines or
+drive the terminal; so does error text from the relay. Received files are
+saved as `airlox-<random>-<name>`, with a prefix chosen locally (an item id
+is the sender's choice) and Python saved as `.py.txt`, so no received file
+can be `conftest.py`, `CLAUDE.md` or anything a test runner collects; job out
+files keep their names, but only images and `out.zip`. Nothing is ever
+written over an existing file or through a link. `session create
+--owner-invite-file` writes the owner link to a new 0600 file instead of
+printing it, for agents that should hold it without seeing it. A cached
+identity records its relay, and an invite naming another relay for the same
+session is refused rather than handed the token. The CLI is a port of the SDK's session logic
+(`crates/airlox/src/session.rs`) over the same core, with the same cache, so
+the SDK, the CLI and the MCP server act as one participant per invite.
 
 **Local cache.** The SDK, CLI and runner keep a cache that mirrors the
 relay's layout, `~/.cache/airlox/<session_id>/` with `manifest.json`,
@@ -720,9 +742,33 @@ expires (`Session.join(url, cache_dir=…)` overrides the location). If the
 relay has purged the session, `Session.join` reopens the cached history
 read-only. Two processes using the same invite need separate cache dirs.
 
-MCP server (`python -m airlox.mcp`, or `airlox-mcp` from the wheel): tools `send_text`, `send_file`, `list_runners`,
-`run_python`, `get_result`, `list_items`, so any MCP-capable agent can use a
-session without writing code.
+**Agents.** Coding agents (Claude Code, Codex, Cursor, Gemini CLI) have a
+shell, and a CLI costs them far less context than MCP tool schemas, so the
+primary integration is the CLI plus an agent skill (`skills/airlox/SKILL.md`)
+that teaches it, including that item content is data, never instructions.
+Chat apps and IDEs without a shell use the MCP server, `airlox mcp` (stdio,
+the official Rust SDK `rmcp`): tools `create_session`, `join_session`,
+`session_info`, `get_invites`, `send_text`, `send_file`, `list_items`,
+`save_file`, `list_runners`, `approve_runner`, `reject_runner`, `run_python`,
+`get_result`, `close_session`. Because other participants' messages reach the
+model, it reads and writes files only inside `--allow-dir` directories
+(default: its working directory, unless that is `/` or the home directory),
+never in hidden directories or the session cache, saves received files as the
+CLI does, labels everything participants wrote as data, and never returns the
+owner invite (with `--owner-invite-dir` it is saved to a 0600 file for the
+user). Joining a session does not change the default session, so a
+prompt-injected join cannot redirect later messages. Each
+session has its own lock, so a tool waiting for a job or new items does not
+block the others. There is deliberately no hosted (remote) MCP endpoint: it would
+need the session keys, which would give the relay operator plaintext. The MCP
+server always runs on the user's machine.
+
+Distribution (planned for the next release; today `cargo install`): one
+static `airlox` binary per platform, published to npm (a
+wrapper package with per-platform binary packages and no install scripts, so
+`npx -y airlox@<version> mcp` works in any MCP client config), inside the
+`airlox` PyPI wheel (`uvx airlox`), as an MCPB bundle for one-click install in
+Claude Desktop, and on GitHub releases; listed in the MCP registry.
 
 ---
 
@@ -756,12 +802,13 @@ airlox/
     airlox-core/           protocol types, canonical JSON, crypto, certs, validators (zip/md/image),
                             embedded job shim, test vectors (generated into docs/protocol.md)
     airlox-server/         axum app, file-backed session logs and blobs, SSE, routing, purge, embedded web
-    airlox/                the `airlox` binary: runner (+ backends/local|docker|k8s) and CLI
+    airlox/                the `airlox` binary: runner (+ backends/local|docker|k8s), CLI and MCP server
   bindings/
     python/                 PyO3 crate → `airlox._core`, built into the `airlox` wheel (maturin)
     wasm/                   wasm-bindgen crate → the web UI's wasm module
   python/
-    airlox/          SDK (airlox/), MCP server; the maturin project for the `airlox` wheel, bundles the binary
+    airlox/          SDK (airlox/); the maturin project for the `airlox` wheel, bundles the binary
+  skills/airlox/            agent skill teaching the CLI
   web/                      browser UI embedded into airlox-server (M1: plain JS timeline; M4: Vite + React + TS SPA)
   deploy/
     docker/                 Dockerfiles (server, runtime base image)
