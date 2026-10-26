@@ -80,6 +80,14 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(code.clamp(0, 255) as u8);
         }
     }
+    // An empty AIRLOX_* variable counts as unset, so a launcher that fills in
+    // every setting (an MCPB bundle's optional fields) leaves out the ones the
+    // user left blank.
+    for (k, v) in std::env::vars_os() {
+        if v.is_empty() && k.to_str().is_some_and(|k| k.starts_with("AIRLOX_")) {
+            std::env::remove_var(k);
+        }
+    }
     let cli = Cli::parse();
     tracing_subscriber::fmt()
         .with_env_filter(

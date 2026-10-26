@@ -60,8 +60,9 @@ pub struct McpArgs {
     pub cache_dir: Option<PathBuf>,
     /// Save the owner invite of each session this server creates to
     /// `<dir>/<session>.txt` (mode 0600), for you to open in a browser or the
-    /// CLI. Without it the owner link is kept nowhere.
-    #[arg(long)]
+    /// CLI. Without it the owner link is kept nowhere. The tools may not read
+    /// files in it, even inside an allowed directory.
+    #[arg(long, env = "AIRLOX_OWNER_INVITE_DIR")]
     pub owner_invite_dir: Option<PathBuf>,
 }
 
@@ -321,7 +322,8 @@ impl Airlox {
             .components()
             .any(|c| matches!(c, Component::Normal(n) if n.to_string_lossy().starts_with('.')));
         let cache = self.cache_root.canonicalize().unwrap_or_else(|_| self.cache_root.clone());
-        if hidden || resolved.starts_with(&cache) {
+        let owner = self.owner_invite_dir.as_deref().is_some_and(|d| resolved.starts_with(d));
+        if hidden || owner || resolved.starts_with(&cache) {
             anyhow::bail!("{p} is in a hidden or protected directory");
         }
         Ok(resolved)
@@ -733,6 +735,14 @@ fn allow_dirs(given: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
 
 pub async fn serve(a: McpArgs) -> anyhow::Result<()> {
     let allow = allow_dirs(&a.allow_dirs)?;
+    // Resolved now, so the file tools can refuse it whatever path names it.
+    let owner_invite_dir = match &a.owner_invite_dir {
+        Some(d) => {
+            std::fs::create_dir_all(d)?;
+            Some(d.canonicalize().map_err(|e| anyhow::anyhow!("--owner-invite-dir {}: {e}", d.display()))?)
+        }
+        None => None,
+    };
     let http = client::http()?;
     let cache_root = a.cache_dir.clone().unwrap_or_else(default_cache_root);
     let server = Airlox {
@@ -741,7 +751,7 @@ pub async fn serve(a: McpArgs) -> anyhow::Result<()> {
         relay: a.relay.trim_end_matches('/').to_string(),
         me: Profile::new(&a.display_name, a.description.as_deref()),
         cache_root,
-        owner_invite_dir: a.owner_invite_dir,
+        owner_invite_dir,
         allow: Arc::new(allow),
         tool_router: Airlox::tool_router(),
     };

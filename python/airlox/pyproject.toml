@@ -21,7 +21,9 @@ Source = "https://github.com/claudezss/airlox"
 test = ["pytest>=8"]
 
 # One wheel: the pure-Python SDK in src/airlox plus the Rust protocol core
-# (bindings/python) as the extension module airlox._core.
+# (bindings/python) as the extension module airlox._core. Release builds also
+# add the `airlox` binary as a script by appending `data = "airlox.data"`
+# (.github/workflows/build.yml), so keep this table last.
 [tool.maturin]
 manifest-path = "../../bindings/python/Cargo.toml"
 python-source = "src"

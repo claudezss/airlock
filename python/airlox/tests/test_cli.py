@@ -216,11 +216,11 @@ def test_cli_runs_jobs(relay, caches, tmp_path, start_runner, runner_cache):
 class Mcp:
     """An `airlox mcp` process spoken to over JSON-RPC on stdio."""
 
-    def __init__(self, relay_url, cache, allow, invite=None, extra=()):
+    def __init__(self, relay_url, cache, allow, invite=None, extra=(), env=None):
         args = [BIN, "mcp", "--relay", relay_url, "--cache-dir", str(cache), "--allow-dir", str(allow), *extra]
         if invite:
             args += ["--invite", invite]
-        env = {k: v for k, v in os.environ.items() if k != "AIRLOX_INVITE"}
+        env = {**{k: v for k, v in os.environ.items() if k != "AIRLOX_INVITE"}, **(env or {})}
         self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                      text=True, env=env, cwd=allow)
         self.n = 0
@@ -265,6 +265,29 @@ class McpToolError(Exception):
     pass
 
 
+def test_mcp_owner_invites_in_the_work_dir(relay, caches, tmp_path):
+    # As an MCPB bundle starts it: owner links saved inside the allowed
+    # directory, and every optional setting passed, empty when left blank.
+    work = tmp_path / "work"
+    work.mkdir()
+    blank = {"AIRLOX_NAME": "", "AIRLOX_DESCRIPTION": "", "AIRLOX_INVITE": "",
+             "AIRLOX_OWNER_INVITE_DIR": str(work / "links")}
+    mcp = Mcp(relay.url, caches("mcp"), work, env=blank)
+    try:
+        s = mcp.call("create_session")
+        owner_file = s["owner_invite_file"]
+        assert os.path.dirname(owner_file) == str(work / "links")
+        assert [p["display_name"] for p in mcp.call("session_info")["participants"]] == ["mcp"]
+        # The model cannot send the owner link anywhere, by any path to it.
+        for path in [owner_file, os.path.relpath(owner_file, work), "links/../links/" + os.path.basename(owner_file)]:
+            with pytest.raises(McpToolError, match="protected"):
+                mcp.call("send_file", path=path)
+        with pytest.raises(McpToolError, match="protected"):
+            mcp.call("save_file", item="x", dir="links")
+    finally:
+        mcp.close()
+
+
 def test_mcp_server(relay, caches, tmp_path, start_runner):
     work = tmp_path / "work"
     work.mkdir()
@@ -276,6 +299,9 @@ def test_mcp_server(relay, caches, tmp_path, start_runner):
         tools = {t["name"] for t in mcp.rpc("tools/list")["tools"]}
         assert {"create_session", "join_session", "send_text", "send_file", "list_items", "list_runners",
                 "run_python", "get_result", "save_file"} <= tools
+        # The MCPB bundle lists the tools for Claude Desktop's install page.
+        manifest = json.loads((REPO / "packaging/mcpb/manifest.json").read_text())
+        assert {t["name"] for t in manifest["tools"]} == tools
 
         s = mcp.call("create_session", execute=True)
         invites = s["invites"]

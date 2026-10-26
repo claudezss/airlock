@@ -9,3 +9,4 @@ __pycache__/
 /python/airlox/dist/
 node_modules/
 .DS_Store
+python/airlox/airlox.data/

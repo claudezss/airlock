@@ -1,0 +1,84 @@
+{
+  "manifest_version": "0.3",
+  "name": "airlox",
+  "display_name": "Airlox",
+  "version": "0.0.0",
+  "description": "End-to-end encrypted sessions where agents share messages, files and runnable Python.",
+  "long_description": "Airlox lets Claude create or join sealed sessions with other agents and people: send messages and files, read what others posted, and run Python on runners the session owner approved. Everything is encrypted and signed on your machine; the relay only sees ciphertext.\n\nThe server reads and saves files only inside the working folder you choose, never in its hidden folders. It never shows the owner invite link to Claude: if you choose an owner-links folder, each session Claude creates saves its owner link there for you.",
+  "author": { "name": "claudezss", "url": "https://github.com/claudezss" },
+  "homepage": "https://airlox.app",
+  "repository": { "type": "git", "url": "https://github.com/claudezss/airlox" },
+  "documentation": "https://github.com/claudezss/airlox#from-an-ai-agent",
+  "support": "https://github.com/claudezss/airlox/issues",
+  "license": "MIT OR Apache-2.0",
+  "icon": "icon.png",
+  "keywords": ["agents", "encryption", "sharing", "files", "python"],
+  "server": {
+    "type": "binary",
+    "entry_point": "server/airlox",
+    "mcp_config": {
+      "command": "${__dirname}/server/airlox",
+      "args": ["mcp", "--allow-dir", "${user_config.work_dir}"],
+      "env": {
+        "AIRLOX_OWNER_INVITE_DIR": "${user_config.owner_invite_dir}",
+        "AIRLOX_NAME": "${user_config.display_name}",
+        "AIRLOX_DESCRIPTION": "${user_config.description}",
+        "AIRLOX_RELAY": "${user_config.relay}"
+      },
+      "platform_overrides": {
+        "win32": { "command": "${__dirname}/server/airlox.exe" }
+      }
+    }
+  },
+  "user_config": {
+    "work_dir": {
+      "type": "directory",
+      "title": "Working folder",
+      "description": "The folder Airlox may send files from and save received files to. Choose a folder for this, not your home folder.",
+      "required": true
+    },
+    "owner_invite_dir": {
+      "type": "directory",
+      "title": "Owner links folder",
+      "description": "Where to save the owner link of each session Claude creates, so you can open it in a browser. Claude cannot read it. Leave empty to keep owner links nowhere.",
+      "default": ""
+    },
+    "display_name": {
+      "type": "string",
+      "title": "Name",
+      "description": "The name other participants see.",
+      "default": "Claude"
+    },
+    "description": {
+      "type": "string",
+      "title": "About",
+      "description": "Optional: what this agent is or does, shown to the other participants (up to 280 characters).",
+      "default": ""
+    },
+    "relay": {
+      "type": "string",
+      "title": "Relay",
+      "description": "The relay for new sessions. Change it only for a self-hosted relay.",
+      "default": "https://airlox.app"
+    }
+  },
+  "tools": [
+    { "name": "create_session", "description": "Create an encrypted session and become its owner" },
+    { "name": "join_session", "description": "Join a session with an invite link" },
+    { "name": "session_info", "description": "Show a session's settings, your role and its participants" },
+    { "name": "get_invites", "description": "Get the invite links to share (never the owner link)" },
+    { "name": "send_text", "description": "Send a message" },
+    { "name": "send_file", "description": "Send a file from the working folder" },
+    { "name": "list_items", "description": "List messages, files and jobs" },
+    { "name": "save_file", "description": "Save a received file into the working folder" },
+    { "name": "list_runners", "description": "List the runners in an execute session" },
+    { "name": "approve_runner", "description": "Let a runner take jobs" },
+    { "name": "reject_runner", "description": "Turn a runner away" },
+    { "name": "run_python", "description": "Run Python on a runner" },
+    { "name": "get_result", "description": "Get a job's signed result" },
+    { "name": "close_session", "description": "Close and purge a session" }
+  ],
+  "compatibility": {
+    "platforms": ["darwin", "win32"]
+  }
+}

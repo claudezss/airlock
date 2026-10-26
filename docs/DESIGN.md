@@ -692,9 +692,8 @@ it at design parity in M4.
 One Python package, `airlox`, importable as `airlox`. Its wheel contains
 the Rust core as the extension module `airlox._core` (PyO3), which does every
 cryptographic and protocol operation; the Python side adds only HTTP plumbing
-and ergonomics. The wheel is to also ship the static `airlox` binary, so
-that `pip install airlox` puts `airlox` on `PATH` (see Distribution below;
-until then the binary comes from `cargo install`).
+and ergonomics. The wheel also ships the `airlox` binary, so `pip install
+airlox` puts `airlox` on `PATH` (see Distribution below).
 
 ```python
 from airlox import Session
@@ -763,12 +762,23 @@ block the others. There is deliberately no hosted (remote) MCP endpoint: it woul
 need the session keys, which would give the relay operator plaintext. The MCP
 server always runs on the user's machine.
 
-Distribution (planned for the next release; today `cargo install`): one
-static `airlox` binary per platform, published to npm (a
-wrapper package with per-platform binary packages and no install scripts, so
-`npx -y airlox@<version> mcp` works in any MCP client config), inside the
-`airlox` PyPI wheel (`uvx airlox`), as an MCPB bundle for one-click install in
-Claude Desktop, and on GitHub releases; listed in the MCP registry.
+Distribution: one `airlox` binary per platform (macOS arm64 and x64, Linux
+arm64 and x64 as static musl binaries, Windows x64), built and smoke-tested by
+`.github/workflows/build.yml` and published on a version tag by
+`release.yml`. Each one ships:
+- on npm: a wrapper package `airlox` whose `bin` runs the binary from a
+  per-platform package (`@airlox/<os>-<cpu>`, an optional dependency limited
+  by `os` and `cpu`), with no install scripts, so `npx -y airlox@<version>
+  mcp` works in any MCP client config;
+- inside the `airlox` PyPI wheel for its platform, installed as a script
+  (`uvx airlox`);
+- on GitHub releases, archived with `SHA256SUMS`;
+- in an MCPB bundle for one-click install in Claude Desktop (a universal
+  macOS binary and Windows x64; the bundle asks for the working folder and an
+  optional owner-links folder, and passes settings left blank as empty
+  `AIRLOX_*` variables, which the binary treats as unset);
+- in the MCP registry, as `io.github.claudezss/airlox` naming all three
+  packages.
 
 ---
 
@@ -809,6 +819,7 @@ airlox/
   python/
     airlox/          SDK (airlox/); the maturin project for the `airlox` wheel, bundles the binary
   skills/airlox/            agent skill teaching the CLI
+  packaging/                npm wrapper, MCPB manifest, MCP registry entry and the script that stages them
   web/                      browser UI embedded into airlox-server (M1: plain JS timeline; M4: Vite + React + TS SPA)
   deploy/
     docker/                 Dockerfiles (server, runtime base image)
