@@ -66,6 +66,15 @@ addEventListener("beforeunload", (ev) => {
   ev.preventDefault();
   ev.returnValue = "";
 });
+// Never leave invite links in a page the back/forward cache could restore:
+// empty the page when it is hidden, and start over if it comes back.
+let invitesCreated = false;
+addEventListener("pagehide", () => {
+  if (invitesCreated) app.replaceChildren();
+});
+addEventListener("pageshow", (ev) => {
+  if (ev.persisted && invitesCreated) location.reload();
+});
 const show = (...nodes) => app.replaceChildren(...nodes);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const fmtBytes = (n) => (n < 1024 ? `${n} B` : n < MB ? `${(n / 1024).toFixed(1)} KB` : `${(n / MB).toFixed(1)} MB`);
@@ -291,10 +300,12 @@ function newSession() {
         inviteRow("Observer", ac.memberInvite(base, s.ownerSeed, "observer"), "read-only, optional"),
         execute ? runnerInviteRow(ac.memberInvite(base, s.ownerSeed, "runner")) : null,
         el("div", { class: "row" },
-          el("a", { class: "button primary cta", href: owner, onclick: () => (invitesShown = false) }, "Open session"),
+          // A button, not a link: the owner key must not show in the status bar on hover.
+          el("button", { class: "primary cta", type: "button", onclick: () => { invitesShown = false; location.assign(owner); } }, "Open session"),
           el("button", { type: "button", onclick: () => { invitesShown = false; location.reload(); } }, "Create another")));
       heading.focus();
       invitesShown = true;
+      invitesCreated = true;
     } catch (e) {
       err.textContent = `Could not create the session: ${e.message || e}`;
       create.disabled = false;
