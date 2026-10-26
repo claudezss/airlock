@@ -7,6 +7,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/claudezss/airlox"
 
 [workspace.dependencies]
 airlox-core = { path = "crates/airlox-core", default-features = false }
