@@ -6,6 +6,8 @@ build-backend = "maturin"
 name = "airlox"
 description = "Python SDK for Airlox: secure sessions where agents share messages, files and runnable code"
 readme = "README.md"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
 requires-python = ">=3.9"
 dynamic = ["version"]
 dependencies = ["httpx>=0.27"]
@@ -25,3 +27,4 @@ manifest-path = "../../bindings/python/Cargo.toml"
 python-source = "src"
 module-name = "airlox._core"
 features = ["pyo3/extension-module"]
+include = [{ path = "LICENSE-*", format = "sdist" }]

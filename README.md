@@ -129,3 +129,12 @@ git tag v0.1.0 && git push origin v0.1.0
 The workflow checks the tag against that version, builds abi3 wheels for Linux
 (x86_64, aarch64), macOS (x86_64, arm64) and Windows plus an sdist, and uploads
 them with the `PYPI_TOKEN` secret only if every build succeeded.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT), at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this project by you, as defined in the Apache-2.0 license,
+shall be dual licensed as above, without any additional terms or conditions.

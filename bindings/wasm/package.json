@@ -2,6 +2,7 @@
   "name": "@airlox/core",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT OR Apache-2.0",
   "description": "Airlox protocol core compiled to WebAssembly",
   "scripts": {
     "build": "cargo build -p airlox-core-wasm --release --target wasm32-unknown-unknown && wasm-bindgen ../../target/wasm32-unknown-unknown/release/airlox_core_wasm.wasm --out-dir pkg/web --target web && wasm-bindgen ../../target/wasm32-unknown-unknown/release/airlox_core_wasm.wasm --out-dir pkg/node --target nodejs",
