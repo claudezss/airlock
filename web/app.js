@@ -401,7 +401,7 @@ async function sessionView() {
   }
   const me = ac.publicKey(identity.seed);
   const s = { sid, inv, manifest, signed, identity, me, participants: new Map(), items: new Map(), evicted: new Set(),
-    lastSeq: -1, closed: null, jobs: new Map(), results: new Map(), runners: [], picked: new Set(), approvedList: null,
+    lastSeq: -1, closed: null, jobs: new Map(), results: new Map(), runners: [], picked: new Set(), decisions: null,
     said: new Map(), announce: false, jobErrors: new Map(), runnerErrors: new Map(), runnerSeen: new Map(), open: new Set() };
   buildSessionLayout(s);
 
@@ -593,7 +593,8 @@ function buildSessionLayout(s) {
         el("span", { class: "dot", "aria-hidden": "true" }),
         el("div", { class: "who" },
           el("div", { class: "name" }, p.display_name, p.participant_pub === s.me ? el("span", { class: "you" }, "you") : null),
-          el("div", { class: "sub" }, `${p.role} · ${p.kind}${p.left ? " · left" : ""}`)),
+          el("div", { class: "sub" }, `${p.role} · ${p.kind}${p.left ? " · left" : ""}`),
+          p.description ? el("div", { class: "desc", title: "Their own description, not verified" }, el("span", { class: "claim" }, "says "), p.description) : null),
         el("span", { class: "key", title: "Key fingerprint" }, ac.fingerprint(p.participant_pub).slice(0, 4))))),
     item: (it) => {
       const stick = nearBottom();
@@ -626,7 +627,7 @@ function buildSessionLayout(s) {
     },
     runners: () => {
       renderRunners(s, runnerList, runnerNote);
-      const n = s.runners.filter((r) => !r.approved && !r.rejected).length;
+      const n = s.runners.filter((r) => !r.approved && !r.rejected && !r.relayOnly).length;
       approvalBanner.hidden = !(inv.role === "owner" && n && !s.closed);
       approvalText.textContent = `${n} runner${n === 1 ? "" : "s"} awaiting approval`;
       jobUi?.refresh();
@@ -654,7 +655,7 @@ async function applyEvent(s, ev, { fetch, record }) {
       const j = JSON.parse(ev.data.signed_join).join;
       const c = j.cert.cert;
       s.participants.set(c.participant_pub, { participant_pub: c.participant_pub, role: c.role,
-        display_name: j.display_name, kind: j.kind, cert: ac.joinCert(ev.data.signed_join) });
+        display_name: j.display_name, description: j.description, kind: j.kind, cert: ac.joinCert(ev.data.signed_join) });
       s.render.people();
     } catch (e) {
       console.warn("ignoring unverifiable participant", e);
@@ -861,11 +862,10 @@ function failureText(s, tgt, st) {
   return tail ? `failed · ${name} ${tail}` : `failed${st.reason ? ` · ${st.reason}` : ""}`;
 }
 
-// Verified runner_approve events from the owner, minus any runner the owner
-// rejected (a rejection is final). undefined when approval is not required.
-function approvedRunners(s) {
-  if (!s.manifest.job_limits?.approve_runners) return undefined;
-  if (s.approvedList) return s.approvedList;
+// The owner's verified runner_approve and runner_reject events: who is
+// approved (minus anyone rejected: a rejection is final) and who is rejected.
+function signedDecisions(s) {
+  if (s.decisions) return s.decisions;
   const approved = new Set();
   const rejected = new Set();
   for (const it of [...s.items.values()].sort((a, b) => a.seq - b.seq)) {
@@ -873,13 +873,19 @@ function approvedRunners(s) {
     if (it.meta.event === "runner_reject") rejected.add(it.meta.participant_pub);
     else if (it.meta.event === "runner_approve") approved.add(it.meta.participant_pub);
   }
-  s.approvedList = [...approved].filter((k) => !rejected.has(k));
-  return s.approvedList;
+  s.decisions = { approved: [...approved].filter((k) => !rejected.has(k)), rejected };
+  return s.decisions;
+}
+
+// Runners with the owner's signed approval; undefined when approval is not required.
+function approvedRunners(s) {
+  if (!s.manifest.job_limits?.approve_runners) return undefined;
+  return signedDecisions(s).approved;
 }
 
 // Approvals changed: results that arrived earlier are checked again.
 function approvalsChanged(s) {
-  s.approvedList = null;
+  s.decisions = null;
   for (const it of s.items.values()) if (it.kind === "result") delete it.check;
   for (const it of [...s.items.values()]) {
     if (it.status === "ok" && (it.kind === "result" || (it.kind === "file" && it.role === "runner"))) s.render.item(it);
@@ -1111,22 +1117,24 @@ async function pollRunners(s) {
         ac.verifyJoin(e.signed_join, s.signed);
         const j = JSON.parse(e.signed_join).join;
         if (j.cert.cert.participant_pub !== e.participant_pub || j.cert.cert.role !== "runner" || !j.runner) continue;
-        list.push({ pub: e.participant_pub, name: j.runner.name, labels: j.runner.labels, host: j.runner.host, sandbox: j.runner.sandbox,
-          networkUnblocked: !!j.runner.network_unblocked, online: !!e.online, job: e.job, rejected: !!e.rejected,
-          approved: !!e.approved || !r.approval_required });
+        list.push({ pub: e.participant_pub, name: j.runner.name, description: j.description, labels: j.runner.labels,
+          host: j.runner.host, sandbox: j.runner.sandbox,
+          networkUnblocked: !!j.runner.network_unblocked, online: !!e.online, job: e.job,
+          ...runnerStatus(s, e) });
       } catch (err) {
         console.warn("ignoring unverifiable runner", err);
       }
     }
     const first = !s.runnersLoaded;
     for (const x of list) {
-      const label = x.rejected ? "rejected" : x.approved ? "approved" : "awaiting approval";
+      // relayOnly counts as approved here, so the signed approval decrypting
+      // after the first poll is not announced as a change.
+      const label = x.rejected ? "rejected" : x.approved || x.relayOnly ? "approved" : "awaiting approval";
       if (!first && s.announce && s.runnerSeen.get(x.pub) !== label) announce(`Runner ${x.name}: ${label}`);
       s.runnerSeen.set(x.pub, label);
     }
     s.runnersLoaded = true;
     s.runners = list;
-    s.approvalRequired = !!r.approval_required;
     s.render.runners();
   } catch (e) {
     if (e.status === 404 || e.status === 410 || e.status === 401) s.closed ||= "gone";
@@ -1144,12 +1152,24 @@ function runnerLoop(s) {
   document.addEventListener("visibilitychange", tick);
 }
 
+// A runner's approval as the owner signed it (and whether approval is
+// required, from the signed manifest), never the relay's unsigned listing.
+// `relayOnly`: the relay says approved but no signed approval is readable
+// here (it may have left the relay before this browser joined).
+function runnerStatus(s, e) {
+  const signed = approvedRunners(s);
+  const rejected = !!e.rejected || signedDecisions(s).rejected.has(e.participant_pub);
+  if (signed === undefined) return { rejected, approved: !rejected, relayOnly: false };
+  const approved = !rejected && signed.includes(e.participant_pub);
+  return { rejected, approved, relayOnly: !rejected && !approved && !!e.approved };
+}
+
 function renderRunners(s, list, note) {
   note.textContent = s.runners.length ? "" : "No runners yet. Hand out the runner invite from Invites.";
   list.replaceChildren(...s.runners.map((r) => {
-    const approval = r.rejected ? "rejected" : r.approved ? "approved" : "awaiting approval";
+    const approval = r.rejected ? "rejected" : r.approved ? "approved" : r.relayOnly ? "approved by relay · no signed approval here" : "awaiting approval";
     const owner = s.inv.role === "owner";
-    const live = r.rejected ? "rejected" : !r.approved ? "awaiting approval" : r.online ? (r.job ? `busy · #${short(r.job)}` : "idle") : "offline";
+    const live = r.rejected ? "rejected" : !r.approved && !r.relayOnly ? "awaiting approval" : r.online ? (r.job ? `busy · #${short(r.job)}` : "idle") : "offline";
     const dot = r.rejected ? "" : !r.approved ? "wait" : r.online ? "on" : "";
     const err = s.runnerErrors.get(r.pub);
     return el("li", { class: `runner${r.rejected ? " is-rejected" : ""}` },
@@ -1158,6 +1178,7 @@ function renderRunners(s, list, note) {
         el("strong", { class: "name" }, r.name),
         el("span", { class: "sub" }, live)),
       el("div", { class: "sub" }, `${r.sandbox} · ${r.host}`),
+      r.description ? el("div", { class: "desc", title: "The runner's own description, not verified" }, el("span", { class: "claim" }, "says "), r.description) : null,
       r.labels.length ? el("div", { class: "chips" }, r.labels.map((l) => el("span", { class: "chip" }, l))) : null,
       el("div", { class: "chips" },
         el("span", { class: `chip approval ${r.rejected ? "bad" : r.approved ? "good" : "wait"}` }, approval),

@@ -232,6 +232,9 @@ pub struct Participant {
     pub participant_pub: String,
     pub role: String,
     pub display_name: String,
+    /// What the participant says it is or does: its own words, signed, so
+    /// data to read rather than instructions.
+    pub description: Option<String>,
     pub kind: String,
     #[serde(skip)]
     cert: String,
@@ -242,6 +245,8 @@ pub struct Participant {
 pub struct Runner {
     pub participant_pub: String,
     pub name: String,
+    /// The runner's own description from its signed join.
+    pub description: Option<String>,
     pub labels: Vec<String>,
     pub host: String,
     pub sandbox: String,
@@ -341,6 +346,24 @@ impl Outcome {
 
 // -------------------------------------------------------------- session --
 
+/// How this client presents itself when it joins: a display name and an
+/// optional description (what it is or does), both shown to the others.
+#[derive(Clone, Debug, Default)]
+pub struct Profile {
+    pub display_name: String,
+    pub description: Option<String>,
+}
+
+impl Profile {
+    /// An empty or blank description (an empty `AIRLOX_DESCRIPTION=`) means none.
+    pub fn new(display_name: &str, description: Option<&str>) -> Profile {
+        Profile {
+            display_name: display_name.trim().to_string(),
+            description: description.map(str::trim).filter(|d| !d.is_empty()).map(String::from),
+        }
+    }
+}
+
 /// What a new session allows.
 pub struct NewSession {
     pub mode: Mode,
@@ -372,6 +395,9 @@ pub struct Session {
     last_seq: Option<u64>,
     /// Why the session is over, once it is.
     pub closed: Option<String>,
+    /// This process joined as a new participant (no cached identity), so
+    /// the name and description it gave are the ones others see.
+    pub joined_now: bool,
 }
 
 impl Session {
@@ -380,7 +406,7 @@ impl Session {
         http: &reqwest::Client,
         relay: &str,
         new: NewSession,
-        display_name: &str,
+        me: &Profile,
         cache_root: &Path,
     ) -> Result<Session> {
         let relay = relay.trim_end_matches('/');
@@ -396,16 +422,17 @@ impl Session {
         let (owner_seed, signed) = api::create_session(&serde_json::to_string(&params)?, None)?;
         client::create_session(http, relay, signed).await?;
         let url = api::owner_invite(relay, &owner_seed)?;
-        Session::join(http, &url, display_name, cache_root).await
+        Session::join(http, &url, me, cache_root).await
     }
 
     /// Join with an invite link, as the participant this cache already holds
-    /// for the session and role if there is one. If the relay no longer has
-    /// the session but the cache does, it opens read-only with `closed` set.
+    /// for the session and role if there is one (its name and description
+    /// were fixed when it first joined). If the relay no longer has the
+    /// session but the cache does, it opens read-only with `closed` set.
     pub async fn join(
         http: &reqwest::Client,
         invite: &str,
-        display_name: &str,
+        me: &Profile,
         cache_root: &Path,
     ) -> Result<Session> {
         let (info, key, role_seed) = api::parse_invite(invite).context("not a valid invite link")?;
@@ -437,6 +464,7 @@ impl Session {
         if !offline {
             cache.save_manifest(&signed)?;
         }
+        let joined_now = identity.is_none();
         let identity = match identity {
             Some(i) => i,
             None => {
@@ -447,7 +475,8 @@ impl Session {
                     "v": 1,
                     "session_id": sid,
                     "cert": serde_json::from_str::<Value>(&cert)?,
-                    "display_name": display_name,
+                    "display_name": me.display_name,
+                    "description": me.description,
                     "kind": "cli",
                     "runner": null,
                     "created_at_ms": now_ms(),
@@ -495,6 +524,7 @@ impl Session {
             unacked: HashSet::new(),
             last_seq: None,
             closed: None,
+            joined_now,
         };
         let cached = s.cache.events();
         s.evicted = cached
@@ -533,6 +563,14 @@ impl Session {
         self.relay.post_raw("/close", vec![], &[]).await?;
         self.closed = Some("closed by owner".into());
         Ok(())
+    }
+
+    /// The description this participant joined with (fixed at its first
+    /// join), as the others see it.
+    /// `None` until this participant's own join has been seen (before the
+    /// first sync).
+    pub fn my_description(&self) -> Option<Option<&str>> {
+        self.participants.get(&self.me).map(|p| p.description.as_deref())
     }
 
     pub fn participants(&self) -> Vec<Participant> {
@@ -659,6 +697,7 @@ impl Session {
             out.push(Runner {
                 name: info["name"].as_str().unwrap_or_default().into(),
                 labels: serde_json::from_value(info["labels"].clone()).unwrap_or_default(),
+                description: join["description"].as_str().map(String::from),
                 host: info["host"].as_str().unwrap_or_default().into(),
                 sandbox: info["sandbox"].as_str().unwrap_or_default().into(),
                 network_unblocked: info["network_unblocked"].as_bool().unwrap_or(false),
@@ -1060,6 +1099,7 @@ impl Session {
                                     participant_pub: public,
                                     role: j["cert"]["cert"]["role"].as_str().unwrap_or_default().into(),
                                     display_name: j["display_name"].as_str().unwrap_or_default().into(),
+                                    description: j["description"].as_str().map(String::from),
                                     kind: j["kind"].as_str().unwrap_or_default().into(),
                                     cert,
                                     left: false,

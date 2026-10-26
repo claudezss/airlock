@@ -114,6 +114,7 @@ async fn auth_and_policy_are_enforced() {
             session_id: s.id.clone(),
             cert,
             display_name: "r".into(),
+            description: None,
             kind: ClientKind::Runner,
             runner: Some(airlox_core::cert::RunnerInfo {
                 name: "r".into(),

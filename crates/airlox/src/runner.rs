@@ -45,6 +45,10 @@ pub struct JoinArgs {
     /// Labels senders can target, comma-separated.
     #[arg(long, value_delimiter = ',')]
     pub labels: Vec<String>,
+    /// What this runner is, shown to senders choosing one (up to 280
+    /// characters), e.g. "A100 80 GB, CUDA 12; data team".
+    #[arg(long, env = "AIRLOX_RUNNER_DESCRIPTION")]
+    pub description: Option<String>,
     #[arg(long, value_enum, default_value = "docker")]
     pub sandbox: SandboxArg,
     /// Keep jobs off the network even if the session allows it.
@@ -134,6 +138,12 @@ async fn join(
             session_id: sid.clone(),
             cert,
             display_name: args.name.clone(),
+            description: args
+                .description
+                .as_deref()
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .map(String::from),
             kind: ClientKind::Runner,
             runner: Some(RunnerInfo {
                 name: args.name.clone(),

@@ -107,6 +107,7 @@ pub fn generate() -> Result<Value> {
             session_id: sid.clone(),
             cert: runner_cert,
             display_name: "runner-01".into(),
+            description: None,
             kind: ClientKind::Runner,
             runner: Some(RunnerInfo {
                 name: "runner-01".into(),

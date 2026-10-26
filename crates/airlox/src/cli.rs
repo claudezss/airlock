@@ -18,8 +18,8 @@ use serde_json::{json, Value};
 use crate::client;
 use crate::files::{clean_line, clean_text, out_file_name, received_name, save_new};
 use crate::session::{
-    default_cache_root, file_type, Item, JobSpec, NewSession, NoRunnerAvailable, Outcome, Session, Status,
-    Target, DEFAULT_TYPES, FILE_TYPES_HELP,
+    default_cache_root, file_type, Item, JobSpec, NewSession, NoRunnerAvailable, Outcome, Profile, Session,
+    Status, Target, DEFAULT_TYPES, FILE_TYPES_HELP,
 };
 
 /// How a command reaches its session.
@@ -32,6 +32,10 @@ pub struct Conn {
     /// Display name shown to other participants when joining for the first time.
     #[arg(long = "as", env = "AIRLOX_NAME", default_value = "cli")]
     pub display_name: String,
+    /// What you are or do, shown to other participants when joining for the
+    /// first time (up to 280 characters).
+    #[arg(long, env = "AIRLOX_DESCRIPTION")]
+    pub description: Option<String>,
     /// Session cache directory (default: ~/.cache/airlox).
     #[arg(long, env = "AIRLOX_CACHE_DIR")]
     pub cache_dir: Option<PathBuf>,
@@ -43,7 +47,22 @@ pub struct Conn {
 impl Conn {
     async fn join(&self) -> Result<Session> {
         let root = self.cache_dir.clone().unwrap_or_else(default_cache_root);
-        Session::join(&client::http()?, &self.invite, &self.display_name, &root).await
+        let me = Profile::new(&self.display_name, self.description.as_deref());
+        let mut s = Session::join(&client::http()?, &self.invite, &me, &root).await?;
+        if !s.joined_now && me.description.is_some() && s.my_description().is_none() {
+            // Our own join is not cached yet: fetch it to compare.
+            let _ = s.sync().await;
+        }
+        if !s.joined_now
+            && me.description.is_some()
+            && s.my_description().is_some_and(|d| d != me.description.as_deref())
+        {
+            eprintln!(
+                "note: you already joined this session with this invite; your description stays as it was \
+                 (it is fixed at the first join)"
+            );
+        }
+        Ok(s)
     }
 }
 
@@ -123,6 +142,9 @@ pub struct CreateArgs {
     /// Your display name.
     #[arg(long = "as", env = "AIRLOX_NAME", default_value = "owner")]
     pub display_name: String,
+    /// What you are or do, shown to the other participants.
+    #[arg(long, env = "AIRLOX_DESCRIPTION")]
+    pub description: Option<String>,
     #[arg(long, env = "AIRLOX_CACHE_DIR")]
     pub cache_dir: Option<PathBuf>,
     /// Write the owner invite to this new file (mode 0600) instead of
@@ -179,7 +201,8 @@ pub async fn session(cmd: SessionCmd) -> Result<()> {
                 }
             }
             let root = a.cache_dir.clone().unwrap_or_else(default_cache_root);
-            let s = Session::create(&client::http()?, &a.relay, new, &a.display_name, &root).await?;
+            let me = Profile::new(&a.display_name, a.description.as_deref());
+            let s = Session::create(&client::http()?, &a.relay, new, &me, &root).await?;
             print_invites(&s, a.json, true, a.owner_invite_file.as_deref())
         }
         SessionCmd::Invites(c) => print_invites(&c.join().await?, c.json, false, None),
@@ -225,6 +248,9 @@ pub async fn session(cmd: SessionCmd) -> Result<()> {
                 for p in s.participants() {
                     let name = clean_line(&p.display_name);
                     println!("  {name:<20} {:<9}{}", p.role, if p.left { " (left)" } else { "" });
+                    if let Some(d) = &p.description {
+                        println!("  {:<20} {}", "", clean_line(d));
+                    }
                 }
                 if let Some(c) = &s.closed {
                     println!("closed: {}", clean_line(c));
@@ -827,6 +853,9 @@ pub async fn runner_list(conn: Conn) -> Result<()> {
             clean_line(&r.host),
             clean_line(&r.labels.join(","))
         );
+        if let Some(d) = &r.description {
+            println!("{:<20} {}", "", clean_line(d));
+        }
     }
     Ok(())
 }

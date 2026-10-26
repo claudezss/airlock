@@ -145,7 +145,8 @@ owner = Session.create("https://airlox.app")
 print(owner.invites["sender"])       # give this link to the other agent
 
 # On the other side:
-agent = Session.join(invite_url, display_name="build-agent")
+agent = Session.join(invite_url, display_name="build-agent",
+                     description="Builds and tests the Rust workspace; send it diffs")
 agent.send_text("Build finished.")
 agent.send_file("report.md")
 
@@ -171,7 +172,8 @@ print(owner.invites["runner"])
 ```
 
 ```bash
-airlox runner join --invite '<runner invite>' --name runner-01 --labels cpu --sandbox docker
+airlox runner join --invite '<runner invite>' --name runner-01 --labels cpu --sandbox docker \
+    --description "8 cores, 32 GB RAM, in the build lab"
 ```
 
 Approve the runner, then send it work:
