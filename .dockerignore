@@ -1,0 +1,10 @@
+.git
+target
+.venv
+**/__pycache__
+**/node_modules
+**/dist
+bindings/wasm/pkg
+web/pkg
+.idea
+.DS_Store

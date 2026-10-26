@@ -1,0 +1,79 @@
+#!/bin/sh
+# Deploy one commit of the relay. Installed as /usr/local/bin/airlox-deploy and
+# run as the forced command of the deploy user's SSH key, so that key can do
+# nothing else:
+#
+#   printf '%s' "$GHCR_TOKEN" | ssh deploy@host <commit-sha>
+#
+# It fetches deploy/docker-compose.yml and deploy/Caddyfile at that commit,
+# pulls ghcr.io/claudezss/airlox-server:sha-<commit> (the token on stdin is
+# used for this pull only), restarts, and checks https://$AIRLOX_DOMAIN. If the
+# new version is not healthy it puts the previous image back.
+set -eu
+
+REPO=claudezss/airlox
+DIR=/opt/airlox
+cd "$DIR"
+
+sha=${SSH_ORIGINAL_COMMAND:-${1:-}}
+case "$sha" in
+  *[!0-9a-f]* | "") echo "usage: airlox-deploy <40-hex commit sha>" >&2; exit 2 ;;
+esac
+[ "${#sha}" -eq 40 ] || { echo "need a full 40-character commit sha" >&2; exit 2; }
+
+# shellcheck disable=SC1091  # written by setup-droplet.sh and this script
+. ./.env
+image="ghcr.io/$REPO-server:sha-$sha"
+previous=${AIRLOX_IMAGE:-}
+
+set_image() {
+  grep -v '^AIRLOX_IMAGE=' .env > .env.new || true
+  echo "AIRLOX_IMAGE=$1" >> .env.new
+  mv .env.new .env
+}
+
+healthy() {
+  i=0
+  while [ "$i" -lt 30 ]; do
+    if curl -fsS --max-time 5 "https://$AIRLOX_DOMAIN/v1/health" | grep -q '"ok":true'; then
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 2
+  done
+  return 1
+}
+
+echo "deploying $sha"
+for f in docker-compose.yml Caddyfile; do
+  curl -fsSL --max-time 30 "https://raw.githubusercontent.com/$REPO/$sha/deploy/$f" -o "$f.new"
+done
+mv docker-compose.yml.new docker-compose.yml
+mv Caddyfile.new Caddyfile
+
+# The registry token arrives on stdin and is dropped right after the pull.
+docker login ghcr.io -u airlox-deploy --password-stdin >/dev/null
+trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+docker pull -q "$image"
+docker logout ghcr.io >/dev/null
+
+set_image "$image"
+docker compose up -d --remove-orphans
+# Caddy reads its config at start; reload picks up a changed Caddyfile.
+docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1 || true
+
+if healthy; then
+  echo "healthy: https://$AIRLOX_DOMAIN ($image)"
+  docker image prune -af --filter "until=168h" >/dev/null 2>&1 || true
+  exit 0
+fi
+
+echo "not healthy after the deploy" >&2
+docker compose logs --tail 50 airlox >&2 || true
+if [ -n "$previous" ] && [ "$previous" != "$image" ]; then
+  echo "rolling back to $previous" >&2
+  set_image "$previous"
+  docker compose up -d
+  healthy && echo "rolled back to $previous" >&2
+fi
+exit 1

@@ -1,0 +1,37 @@
+# The relay behind Caddy (automatic HTTPS). Lives in /opt/airlox on the host,
+# next to a .env with AIRLOX_DOMAIN and AIRLOX_IMAGE; deploy.sh keeps both
+# this file and the image current. See docs/deploy.md.
+services:
+  airlox:
+    image: ${AIRLOX_IMAGE:?set AIRLOX_IMAGE in .env}
+    restart: unless-stopped
+    environment:
+      # Caddy appends the client address to X-Forwarded-For.
+      AIRLOX_TRUST_PROXY: "true"
+      NO_COLOR: "1"
+    volumes:
+      - airlox-data:/data
+    logging:
+      driver: local
+
+  caddy:
+    image: caddy:2.11.7-alpine@sha256:eb4d35b7452d1ab6171fbdbe8d9275b2301dad6dad92115d91e19fb9b24d510f
+    restart: unless-stopped
+    depends_on: [airlox]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      AIRLOX_DOMAIN: ${AIRLOX_DOMAIN:?set AIRLOX_DOMAIN in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    logging:
+      driver: local
+
+volumes:
+  airlox-data:
+  caddy-data:
+  caddy-config:
