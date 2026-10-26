@@ -358,7 +358,7 @@ impl Profile {
     /// An empty or blank description (an empty `AIRLOX_DESCRIPTION=`) means none.
     pub fn new(display_name: &str, description: Option<&str>) -> Profile {
         Profile {
-            display_name: display_name.to_string(),
+            display_name: display_name.trim().to_string(),
             description: description.map(str::trim).filter(|d| !d.is_empty()).map(String::from),
         }
     }
@@ -567,8 +567,10 @@ impl Session {
 
     /// The description this participant joined with (fixed at its first
     /// join), as the others see it.
-    pub fn my_description(&self) -> Option<&str> {
-        self.participants.get(&self.me).and_then(|p| p.description.as_deref())
+    /// `None` until this participant's own join has been seen (before the
+    /// first sync).
+    pub fn my_description(&self) -> Option<Option<&str>> {
+        self.participants.get(&self.me).map(|p| p.description.as_deref())
     }
 
     pub fn participants(&self) -> Vec<Participant> {

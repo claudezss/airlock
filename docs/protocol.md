@@ -138,14 +138,21 @@ The join request is signed by the participant key the certificate names:
 
 `kind == runner`, `runner != null` and `cert.role == runner` must all hold or
 all fail. Runner names and labels match `[a-z0-9][a-z0-9._-]{0,62}`; at most
-16 labels. `display_name` is 1–64 characters, not all whitespace, with no
-control characters and no invisible or reordering ones (format characters
-such as bidi controls and zero-width characters, the tag block, line and
-paragraph separators, filler characters, variation selectors other than
-U+FE0F); `description` follows the same rule. Lengths count Unicode scalar
-values, not bytes or UTF-16 units.
+16 labels. `display_name` is 1–64 characters and `description` 1–280, counted in
+Unicode scalar values (not bytes or UTF-16 units), with no leading or
+trailing whitespace and not only whitespace. Neither may contain control
+characters or characters that are invisible, blank or reorder text: bidi
+embeddings, overrides and isolates, zero-width space, word joiner and
+invisible operators, the tag block (U+E0000–E007F), ideographic variation
+selectors (U+E0100–E01EF), line and paragraph separators, soft hyphen,
+Hangul and Khmer fillers, Braille blank (U+2800), U+FFF9–FFFC, BOM and
+private-use code points. Zero-width joiner and non-joiner are allowed only
+between visible characters (emoji sequences, Persian, Indic scripts);
+variation selectors (U+FE00–FE0F, Mongolian U+180B–180D) and the combining
+grapheme joiner only directly after a visible character, never in a run.
+Direction marks (LRM, RLM, ALM) are allowed.
 
-`description` is optional: 1–280 non-control characters in which the
+`description` is optional (the rules above apply): text in which the
 participant says what it is or does (a receiving agent's purpose, a runner's
 hardware or owner), so others can tell participants and runners apart. When
 absent the key is omitted, not `null`, so the canonical form of joins without
@@ -157,7 +164,10 @@ a runner's description is its claim, never a reason to approve it.
 Joins are parsed strictly (unknown fields are refused), so a relay or client
 older than this field rejects a join that carries one: deploy the relay and
 upgrade clients before participants start setting descriptions. Joins
-without one work everywhere.
+without one work everywhere. The character rules above are stricter than the
+first release's (which only refused control characters), so a name an older
+client accepted, with an invisible or reordering character, now fails
+verification and its author shows as unverified.
 
 ## 6. Items
 

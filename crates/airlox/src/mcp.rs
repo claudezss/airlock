@@ -426,9 +426,13 @@ should have that role. The owner link is never returned.")]
 observer) decides what you can do.")]
     async fn join_session(&self, Parameters(p): Parameters<JoinParams>) -> Result<CallToolResult, ErrorData> {
         let me = self.profile(p.description);
-        let s = tool_try!(Session::join(&self.http, &p.invite, &me, &self.cache_root).await);
-        let kept =
-            !s.joined_now && me.description.is_some() && s.my_description() != me.description.as_deref();
+        let mut s = tool_try!(Session::join(&self.http, &p.invite, &me, &self.cache_root).await);
+        if !s.joined_now && me.description.is_some() && s.my_description().is_none() {
+            let _ = s.sync().await; // our own join, to compare descriptions
+        }
+        let kept = !s.joined_now
+            && me.description.is_some()
+            && s.my_description().is_some_and(|d| d != me.description.as_deref());
         let mut info = json!({"role": s.role.as_str(), "mode": s.manifest.mode, "closed": s.closed});
         let sid = tool_try!(self.add(s, false).await);
         info["session"] = json!(sid);

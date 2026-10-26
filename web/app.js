@@ -575,7 +575,7 @@ function buildSessionLayout(s) {
     },
     runners: () => {
       renderRunners(s, runnerList, runnerNote);
-      const n = s.runners.filter((r) => !r.approved && !r.rejected).length;
+      const n = s.runners.filter((r) => !r.approved && !r.rejected && !r.relayOnly).length;
       approvalBanner.hidden = !(inv.role === "owner" && n && !s.closed);
       approvalText.textContent = `${n} runner${n === 1 ? "" : "s"} awaiting approval`;
       jobUi?.refresh();
@@ -1117,7 +1117,7 @@ function renderRunners(s, list, note) {
   list.replaceChildren(...s.runners.map((r) => {
     const approval = r.rejected ? "rejected" : r.approved ? "approved" : r.relayOnly ? "approved by relay · no signed approval here" : "awaiting approval";
     const owner = s.inv.role === "owner";
-    const live = r.rejected ? "rejected" : !r.approved ? "awaiting approval" : r.online ? (r.job ? `busy · #${short(r.job)}` : "idle") : "offline";
+    const live = r.rejected ? "rejected" : !r.approved && !r.relayOnly ? "awaiting approval" : r.online ? (r.job ? `busy · #${short(r.job)}` : "idle") : "offline";
     const dot = r.rejected ? "" : !r.approved ? "wait" : r.online ? "on" : "";
     const err = s.runnerErrors.get(r.pub);
     return el("li", { class: `runner${r.rejected ? " is-rejected" : ""}` },

@@ -48,8 +48,15 @@ impl Conn {
     async fn join(&self) -> Result<Session> {
         let root = self.cache_dir.clone().unwrap_or_else(default_cache_root);
         let me = Profile::new(&self.display_name, self.description.as_deref());
-        let s = Session::join(&client::http()?, &self.invite, &me, &root).await?;
-        if !s.joined_now && me.description.is_some() && s.my_description() != me.description.as_deref() {
+        let mut s = Session::join(&client::http()?, &self.invite, &me, &root).await?;
+        if !s.joined_now && me.description.is_some() && s.my_description().is_none() {
+            // Our own join is not cached yet: fetch it to compare.
+            let _ = s.sync().await;
+        }
+        if !s.joined_now
+            && me.description.is_some()
+            && s.my_description().is_some_and(|d| d != me.description.as_deref())
+        {
             eprintln!(
                 "note: you already joined this session with this invite; your description stays as it was \
                  (it is fixed at the first join)"
