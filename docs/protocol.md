@@ -455,12 +455,17 @@ as received or ack it until its blob is stored.
 **Re-seeding.** A participant that never received an evicted blob (a late
 joiner, or a new device, which joins with a new key) posts `want`. The relay
 refuses it from a participant that acked the item, keeps it open for 10
-minutes, allows 16 open wants per participant and 1024 over the session, and
-emits a `want` event. Any participant holding the ciphertext answers with
+minutes, allows 16 open wants and 1024 distinct items per participant, and
+emits a `want` event. Asking again for an open want is a no-op for a minute,
+then refreshes it and emits `want` again, so holders that came online since
+can answer. A want stays open while a re-seed upload is in progress (the
+upload may fail); `409 present` means the blob is on the relay to download.
+Clients ask again, about every 5 minutes, for items still evicted. Any participant holding the ciphertext answers with
 `PUT …/blob` and the raw ciphertext. The relay takes it only while a want
 from another participant is open and the blob is absent, and only if its
 length and SHA-256 match the author-signed envelope, so a re-seed cannot
-alter content. The first accepted upload closes the item's wants and emits
+alter content. An upload whose wanters all left or lapsed meanwhile is
+`409 not_wanted`. The first accepted upload closes the item's wants and emits
 `reseeded`; the askers become the blob's recipients, and it is evicted once
 they have acked (after the grace period) or after a short hold of at most 10
 minutes. Re-seeded bytes count against the session's transfer and storage
@@ -469,8 +474,9 @@ item id of a `want` as a lookup in their own verified history, never as a
 file name.
 
 **Revocation.** The owner revokes a role: every participant holding it
-departs at once (as with `leave`, and a runner's active job fails with
-`runner_revoked`), and any later join with that role is `403 revoked`, also
+departs at once (as with `leave`: a runner's active job fails with
+`runner_revoked`, and jobs a revoked sender has queued or running fail with
+`author_revoked`), and any later join with that role is `403 revoked`, also
 after a restart. Revoking twice is a no-op. The owner role cannot be revoked.
 A revoked participant still holds the session key from its invite, so what
 it already copied stays readable to it; only closing the session ends access
@@ -556,7 +562,8 @@ or `failed` with a reason:
 | `not_available` | no candidate at submission |
 | `runner_unresponsive` | not claimed within the claim timeout (default 5 s); the runner is offline until its next heartbeat |
 | `runner_lost` | no heartbeat within the runner timeout (default 30 s), or a heartbeat reported a different job |
-| `runner_left`, `runner_rejected` | its runner left or was rejected |
+| `runner_left`, `runner_rejected`, `runner_revoked` | its runner left, was rejected, or its role was revoked |
+| `author_revoked` | the sender who submitted it had its role revoked |
 | `cancelled` | cancelled before it was claimed |
 
 Every change is a `job` event `{job, state, runner, reason}` on the session

@@ -299,22 +299,15 @@ pub async fn session(cmd: SessionCmd) -> Result<()> {
         }
         SessionCmd::Audit(a) => {
             let s = a.conn.join().await?;
-            let raw = s.audit().await?;
-            // Each line re-serialized: JSON from the relay, never raw bytes.
-            let mut out = String::new();
-            for line in raw.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
-                let v: Value =
-                    serde_json::from_slice(line).context("the relay sent an audit line that is not JSON")?;
-                out.push_str(&v.to_string());
-                out.push('\n');
-            }
+            let out = s.audit().await?;
             match &a.out {
                 Some(path) => {
-                    let mut f = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(path)
-                        .with_context(|| format!("{}: choose a new file", path.display()))?;
+                    let mut opts = std::fs::OpenOptions::new();
+                    opts.write(true).create_new(true);
+                    #[cfg(unix)]
+                    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+                    let mut f =
+                        opts.open(path).with_context(|| format!("{}: choose a new file", path.display()))?;
                     std::io::Write::write_all(&mut f, out.as_bytes())?;
                     eprintln!("wrote {} lines to {}", out.lines().count(), path.display());
                 }

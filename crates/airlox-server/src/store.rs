@@ -35,11 +35,16 @@ use crate::util::{now_ms, random_bytes, random_suffix};
 pub const MAX_PARTICIPANTS: usize = 64;
 /// Concurrent SSE streams per participant.
 pub const MAX_STREAMS_PER_PARTICIPANT: usize = 4;
-/// How long a `want` stays open for holders to answer.
+/// How long a `want` stays open for holders to answer. Clients ask again
+/// while they still lack the blob.
 pub const WANT_TTL_MS: u64 = 10 * 60 * 1000;
-/// Open wants per participant, and wants per participant over the session.
+/// Asking again for an open want refreshes it, and tells holders again,
+/// at most this often.
+pub const WANT_REFRESH_MS: u64 = 60 * 1000;
+/// Open wants per participant, and distinct items a participant may ask
+/// for over the session.
 pub const MAX_OPEN_WANTS: usize = 16;
-pub const MAX_WANTS: u32 = 1024;
+pub const MAX_WANTS: usize = 1024;
 /// The longest a re-seeded blob stays (capped by the blob hold).
 pub const RESEED_HOLD_MS: u64 = 10 * 60 * 1000;
 const EVENT_BUFFER: usize = 1024;
@@ -217,8 +222,8 @@ pub struct Inner {
     evictions: BTreeMap<u64, Vec<String>>,
     /// Open wants: item → (participant → when asked).
     pub wants: HashMap<String, HashMap<String, u64>>,
-    /// Wants each participant has made.
-    pub want_counts: HashMap<String, u32>,
+    /// The items each participant has asked for.
+    pub wanted_items: HashMap<String, HashSet<String>>,
     /// Roles the owner revoked.
     pub revoked: HashSet<Role>,
     hold_ms: u64,
@@ -412,15 +417,24 @@ impl Inner {
             }
             Rec::Want { item, by } => {
                 self.wants.entry(item.clone()).or_default().insert(by.clone(), ts);
-                *self.want_counts.entry(by.clone()).or_default() += 1;
+                self.wanted_items.entry(by.clone()).or_default().insert(item.clone());
                 self.last_activity_ms = self.last_activity_ms.max(ts);
                 Ok(self.push_event(line.seq, "want", json!({"item": item, "by": by})))
             }
             Rec::Reseed { item, by } => {
                 // The wanters become the blob's recipients: it goes once they
-                // have all acked, or when its short hold ends.
-                let wanters: HashSet<String> =
-                    self.wants.remove(item).map(|w| w.into_keys().collect()).unwrap_or_default();
+                // have all acked, or when its short hold ends. Expired wants
+                // are dropped here too, so a replay matches what happened live.
+                let wanters: HashSet<String> = self
+                    .wants
+                    .remove(item)
+                    .map(|w| {
+                        w.into_iter()
+                            .filter(|(_, t)| ts.saturating_sub(*t) < WANT_TTL_MS)
+                            .map(|(k, _)| k)
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let hold = self.hold_ms.min(RESEED_HOLD_MS);
                 if let Some(r) = self.items.get_mut(item) {
                     if !r.blob_present {
@@ -441,7 +455,7 @@ impl Inner {
                 let mut cut: Vec<String> = self
                     .participants
                     .iter()
-                    .filter(|(_, p)| p.role == *role && !p.left)
+                    .filter(|(_, p)| p.role == *role && !p.left && !p.rejected)
                     .map(|(k, _)| k.clone())
                     .collect();
                 cut.sort();
@@ -568,7 +582,7 @@ impl Session {
             presence: HashMap::new(),
             evictions: BTreeMap::new(),
             wants: HashMap::new(),
-            want_counts: HashMap::new(),
+            wanted_items: HashMap::new(),
             revoked: HashSet::new(),
             hold_ms: cfg.blob_hold_ms,
             grace_ms: cfg.blob_grace_ms,

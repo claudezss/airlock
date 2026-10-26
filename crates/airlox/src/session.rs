@@ -28,6 +28,9 @@ use crate::view::write_atomic;
 /// participant sees (gaps are only events meant for others, such as job
 /// routing). Small, so one forged event cannot hide the session's future.
 const MAX_SEQ_JUMP: u64 = 10_000;
+/// Ask again for an evicted blob nobody re-seeded after this long; the
+/// relay drops a want after ten minutes.
+const REASK: Duration = Duration::from_secs(5 * 60);
 
 /// Content types a new session allows unless told otherwise.
 pub const DEFAULT_TYPES: &[&str] = &["text", "py", "md", "zip", "image"];
@@ -411,8 +414,8 @@ pub struct Session {
     index: HashMap<String, usize>,
     envelopes: HashMap<String, String>,
     evicted: HashSet<String>,
-    /// Evicted items this client asked holders for.
-    wanted: HashSet<String>,
+    /// Evicted items this client asked holders for, and when it last asked.
+    wanted: HashMap<String, Instant>,
     /// Evicted items others asked for, which this client may hold.
     asked: HashSet<String>,
     /// Evicted items back on the relay, to fetch.
@@ -547,7 +550,7 @@ impl Session {
             index: HashMap::new(),
             envelopes: HashMap::new(),
             evicted: HashSet::new(),
-            wanted: HashSet::new(),
+            wanted: HashMap::new(),
             asked: HashSet::new(),
             reseeded: HashSet::new(),
             unacked: HashSet::new(),
@@ -609,9 +612,18 @@ impl Session {
 
     /// The session's audit trail as JSONL (owner or observer): who joined,
     /// posted, acked, approved and revoked, with the signed joins and item
-    /// envelopes to check it against. It is purged with the session.
-    pub async fn audit(&self) -> Result<Vec<u8>> {
-        self.relay.audit().await
+    /// envelopes to check it against. It is purged with the session. Each
+    /// line is parsed and re-serialized: JSON from the relay, never raw bytes.
+    pub async fn audit(&self) -> Result<String> {
+        let raw = self.relay.audit().await?;
+        let mut out = String::new();
+        for line in raw.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+            let v: Value =
+                serde_json::from_slice(line).context("the relay sent an audit line that is not JSON")?;
+            out.push_str(&v.to_string());
+            out.push('\n');
+        }
+        Ok(out)
     }
 
     /// Close and purge the session on the relay (owner only).
@@ -1101,31 +1113,36 @@ impl Session {
                 }
             }
         }
-        let evicted: Vec<String> = self
+        // Never asked first, then the longest ago; a want lapses on the
+        // relay, so one still unanswered is asked for again.
+        let mut evicted: Vec<(Option<Instant>, String)> = self
             .items
             .iter()
-            .filter(|i| i.status == Status::Evicted && i.author != self.me && !self.wanted.contains(&i.id))
-            .map(|i| i.id.clone())
+            .filter(|i| i.status == Status::Evicted && i.author != self.me)
+            .map(|i| (self.wanted.get(&i.id).copied(), i.id.clone()))
+            .filter(|(at, _)| at.is_none_or(|t| t.elapsed() >= REASK))
             .collect();
-        for id in evicted {
+        evicted.sort();
+        for (_, id) in evicted {
             match self.relay.want(&id).await {
-                Ok(true) => {
-                    self.wanted.insert(id);
-                }
+                Ok(true) => {}
                 // Already back: fetch it. It stays wanted, so a relay that
-                // says present but then serves 410 gets asked once per sync.
-                Ok(false) => {
-                    self.reappeared(&id);
-                    self.wanted.insert(id);
-                }
+                // says present but then serves 410 gets asked again later.
+                Ok(false) => self.reappeared(&id),
                 // Too many open, or a busy relay: ask again on a later sync.
                 Err(e) if is_transient(&e) => break,
-                Err(e) => {
-                    tracing::debug!(item = %id, "want refused: {e:#}");
-                    self.wanted.insert(id);
-                }
+                Err(e) => tracing::debug!(item = %id, "want refused: {e:#}"),
             }
+            self.wanted.insert(id, Instant::now());
         }
+    }
+
+    /// Whether an unanswered want is due to be asked again.
+    fn reask_due(&self) -> bool {
+        self.closed.is_none()
+            && self.wanted.iter().any(|(id, t)| {
+                t.elapsed() >= REASK && self.get(id).is_some_and(|i| i.status == Status::Evicted)
+            })
     }
 
     /// An evicted blob is on the relay again: fetch it on the next retry.
@@ -1206,7 +1223,7 @@ impl Session {
                         return Ok(());
                     }
                 }
-                if trade {
+                if trade || self.reask_due() {
                     self.trade_blobs().await;
                     for i in self.fetch_reseeded().await? {
                         if !on_item(self, &self.items[i])? {

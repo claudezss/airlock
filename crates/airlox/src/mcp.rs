@@ -721,8 +721,9 @@ material to check it. The relay purges it with the session.")]
         let dir = tool_try!(self.allowed(&p.dir, false));
         let (sid, slot) = tool_try!(self.slot(&p.session).await);
         let raw = tool_try!(slot.lock().await.s.audit().await);
-        let lines = raw.split(|&b| b == b'\n').filter(|l| !l.is_empty()).count();
-        let path = tool_try!(crate::files::save_new(&dir, &format!("airlox-audit-{sid}.jsonl"), &raw));
+        let lines = raw.lines().count();
+        let path =
+            tool_try!(crate::files::save_new(&dir, &format!("airlox-audit-{sid}.jsonl"), raw.as_bytes()));
         ok(json!({"saved": path, "lines": lines}))
     }
 

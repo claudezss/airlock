@@ -537,6 +537,9 @@ async fn evicted_blobs_are_reseeded_for_late_joiners() {
     let evs = events(&env, &s, &late).await;
     assert!(evs.iter().any(|e| e["kind"] == "reseeded" && e["data"]["item"] == id.as_str()));
     assert_eq!(blob(&env, &s, &late, &id).await.bytes().await.unwrap().to_vec(), item.blob);
+    // A restart replays the re-seed: the blob and its recipients come back.
+    env.restart(|_| {}).await;
+    assert_eq!(blob(&env, &s, &late, &id).await.status(), StatusCode::OK);
     // The first upload closed the want.
     let r = reseed(&env, &s, &sender, &id, item.blob.clone()).await;
     assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "present".into()));

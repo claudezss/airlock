@@ -2,7 +2,7 @@
 //! author's certificate; the relay never sees plaintext. Log writes fsync,
 //! so they run on the blocking pool, never on the async workers.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -30,7 +30,7 @@ use tokio::sync::{broadcast, watch};
 use crate::error::{ApiError, ApiResult};
 use crate::store::{
     sync_dir, CreateError, Event, Inner, JobState, Rec, Session, Store, MAX_OPEN_WANTS, MAX_PARTICIPANTS,
-    MAX_STREAMS_PER_PARTICIPANT, MAX_WANTS,
+    MAX_STREAMS_PER_PARTICIPANT, MAX_WANTS, WANT_REFRESH_MS,
 };
 use crate::util::{new_token, now_ms, random_suffix, sha256_hex};
 
@@ -778,7 +778,10 @@ pub async fn ack(
 
 /// `POST /v1/sessions/:id/items/:item/want` — ask the participants still
 /// holding an evicted blob to upload it again. Only for a participant that
-/// never received it; rate-limited per participant.
+/// never received it; rate-limited per participant. Asking again while the
+/// want is open refreshes it once `WANT_REFRESH_MS` has passed, and is a
+/// no-op before that. A re-seed upload in progress does not answer a want:
+/// it may fail, and the wanter must stay a recipient if it succeeds.
 pub async fn want(
     State(st): State<AppState>,
     Path((id, item)): Path<(String, String)>,
@@ -794,21 +797,28 @@ pub async fn want(
             return Err(ApiError::gone("closed", "session is closed"));
         }
         let r = g.items.get(&item).ok_or_else(|| ApiError::not_found("no such item"))?;
-        if r.blob_present || g.pending.contains(&item) {
+        if r.blob_present {
             return Err(ApiError::conflict_code("present", "the blob is on the relay; download it"));
         }
         if r.acked.contains(&who) {
             return Err(ApiError::forbidden("you have already received this item"));
         }
-        g.prune_wants(now_ms());
-        if g.wants.get(&item).is_some_and(|w| w.contains_key(&who)) {
-            return Ok((StatusCode::ACCEPTED, Json(json!({"open": true}))));
-        }
-        if g.open_wants(&who) >= MAX_OPEN_WANTS {
-            return Err(ApiError::limit("too many open wants; wait for some to be answered"));
-        }
-        if g.want_counts.get(&who).copied().unwrap_or(0) >= MAX_WANTS {
-            return Err(ApiError::limit("this participant has asked for too many blobs"));
+        let now = now_ms();
+        g.prune_wants(now);
+        match g.wants.get(&item).and_then(|w| w.get(&who)) {
+            Some(t) if now.saturating_sub(*t) < WANT_REFRESH_MS => {
+                return Ok((StatusCode::ACCEPTED, Json(json!({"open": true}))));
+            }
+            Some(_) => {}
+            None => {
+                if g.open_wants(&who) >= MAX_OPEN_WANTS {
+                    return Err(ApiError::limit("too many open wants; wait for some to be answered"));
+                }
+                let asked = g.wanted_items.get(&who);
+                if asked.is_some_and(|a| a.len() >= MAX_WANTS && !a.contains(&item)) {
+                    return Err(ApiError::limit("this participant has asked for too many blobs"));
+                }
+            }
         }
         if g.log_len() + LOG_LINE_OVERHEAD > max_log {
             return Err(ApiError::too_large("session history limit reached"));
@@ -881,6 +891,15 @@ pub async fn reseed(
             if g.closed {
                 return Err(ApiError::gone("closed", "session is closed"));
             }
+            // The wanters may have left, been revoked or stopped asking
+            // during the upload; then nobody would fetch it.
+            g.prune_wants(now_ms());
+            if !g.wants.get(&item).is_some_and(|w| w.keys().any(|k| *k != who)) {
+                return Err(ApiError::conflict_code(
+                    "not_wanted",
+                    "no one is waiting for this blob any more",
+                ));
+            }
             g.pending.remove(&item);
             g.pending_bytes -= blob_len;
             // Applying the Reseed record charges the transfer for real.
@@ -935,14 +954,29 @@ pub async fn revoke_role(
         if g.revoked.contains(&role) {
             return Ok(());
         }
-        let runners: Vec<String> = g
+        let cut: HashSet<String> = g
             .participants
             .iter()
-            .filter(|(_, p)| role == Role::Runner && p.role == Role::Runner && !p.left)
+            .filter(|(_, p)| p.role == role && !p.left && !p.rejected)
             .map(|(k, _)| k.clone())
             .collect();
-        for r in runners {
-            s.fail_runner_job(&mut g, &r, "runner_revoked")?;
+        // A cut-off runner's job fails, and so does any job a cut-off
+        // sender still has queued or running.
+        for r in cut.iter().filter(|_| role == Role::Runner) {
+            s.fail_runner_job(&mut g, r, "runner_revoked")?;
+        }
+        let mut authored: Vec<(String, Option<String>)> = g
+            .jobs
+            .iter()
+            .filter(|(_, j)| j.state.active() && cut.contains(&j.author))
+            .map(|(id, j)| (id.clone(), j.runner.clone()))
+            .collect();
+        authored.sort();
+        for (job, runner) in authored {
+            s.set_job(&mut g, &job, JobState::Failed, runner.clone(), Some("author_revoked"))?;
+            if let Some(r) = &runner {
+                s.tell_runner(r, "job_cancel", json!({"job": job}));
+            }
         }
         s.append(&mut g, Rec::Revoke { role })?;
         Ok(())
