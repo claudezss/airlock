@@ -822,6 +822,12 @@ format churn is where Rust is slowest.
    than `AIRLOCK_BLOB_HOLD`, or joins later, depends on a peer being online to
    re-seed. Proposed: accept this; the owner can raise the hold on a
    self-hosted relay.
+8. **Signed relay actions.** Acks, leave and close are authorized by bearer
+   token only, so a stolen token can evict blobs early or close the session.
+   Each join is single-use now, which closes the replay route. Signing those
+   requests with the participant key, and expiring tokens, would remove the
+   remaining reliance on the token. Proposed: add both with the M4 role
+   revoke work.
 9. **Local sandbox hardening (after M2).** The Linux local backend caps
    memory with `RLIMIT_AS`, which over-counts address space for numeric
    libraries, and has no seccomp filter. Proposed: cgroup v2 limits when the
@@ -829,9 +835,3 @@ format churn is where Rust is slowest.
    seccomp denylist (`ptrace`, `bpf`, `keyctl`, `perf_event_open`, new
    namespaces) before M4. The job also sees itself as uid 0 inside its user
    namespace, with no capabilities.
-8. **Signed relay actions.** Acks, leave and close are authorized by bearer
-   token only, so a stolen token can evict blobs early or close the session.
-   Each join is single-use now, which closes the replay route. Signing those
-   requests with the participant key, and expiring tokens, would remove the
-   remaining reliance on the token. Proposed: add both with the M4 role
-   revoke work.
