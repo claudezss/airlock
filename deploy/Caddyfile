@@ -5,3 +5,7 @@
 	}
 	header Strict-Transport-Security "max-age=31536000"
 }
+
+www.{$AIRLOX_DOMAIN} {
+	redir https://{$AIRLOX_DOMAIN}{uri} permanent
+}

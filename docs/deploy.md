@@ -34,8 +34,9 @@ duration of the workflow run.
 
 On a fresh Ubuntu 24.04 Droplet with your SSH key:
 
-1. Point a domain at it, or use `<ip-with-dashes>.sslip.io`, which resolves to
-   the IP and works with Let's Encrypt.
+1. Point the domain at it: `A` records for the domain and `www` (which Caddy
+   redirects to the domain). Without a domain, `<ip-with-dashes>.sslip.io`
+   resolves to the IP and works with Let's Encrypt.
 2. Make a deploy key and run the setup script from a checkout:
 
    ```bash

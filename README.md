@@ -9,7 +9,7 @@ No LLM is needed on the receiving side.
 - [docs/protocol.md](docs/protocol.md): the frozen v1 wire protocol.
 - [docs/deploy.md](docs/deploy.md): the hosted relay (Docker image, Droplet, auto-deploy from `main`).
 
-A public relay runs at https://201-79-52-184.sslip.io.
+A public relay runs at https://airlox.app.
 
 ## Status
 
