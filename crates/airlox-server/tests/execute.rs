@@ -28,6 +28,14 @@ async fn execute_env(f: impl FnOnce(&mut Config)) -> (Env, Sess, Member, Member)
 }
 
 async fn join_runner(env: &Env, s: &Sess, name: &str, labels: &[&str]) -> Member {
+    let (kp, body) = runner_join_body(s, name, labels);
+    let r = post_join(env, s, body).await;
+    assert_eq!(r.status(), StatusCode::CREATED, "{}", r.text().await.unwrap());
+    let v: Value = r.json().await.unwrap();
+    Member { kp, token: v["token"].as_str().unwrap().to_string() }
+}
+
+fn runner_join_body(s: &Sess, name: &str, labels: &[&str]) -> (Keypair, String) {
     let kp = Keypair::generate();
     let cert = issue_cert(&s.secrets.role_keypair(Role::Runner), &s.id, Role::Runner, kp.public(), now_ms())
         .unwrap();
@@ -51,10 +59,7 @@ async fn join_runner(env: &Env, s: &Sess, name: &str, labels: &[&str]) -> Member
         },
     )
     .unwrap();
-    let r = post_join(env, s, canon(&j)).await;
-    assert_eq!(r.status(), StatusCode::CREATED, "{}", r.text().await.unwrap());
-    let v: Value = r.json().await.unwrap();
-    Member { kp, token: v["token"].as_str().unwrap().to_string() }
+    (kp, canon(&j))
 }
 
 fn pk(m: &Member) -> String {
@@ -515,4 +520,24 @@ async fn cancels_survive_a_reconnect_and_leaving_fails_the_job() {
     assert_eq!(r.status(), StatusCode::NO_CONTENT);
     let st = job_state(&env, &s, &owner, &id).await;
     assert_eq!((st["state"].as_str(), st["reason"].as_str()), (Some("failed"), Some("runner_left")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoking_runners_fails_their_jobs_and_ends_their_streams() {
+    let (env, s, owner, sender) = execute_env(|_| {}).await;
+    let runner = join_runner(&env, &s, "runner-01", &[]).await;
+    let mut stream = RunnerStream::open(&env, &s, &runner).await;
+    approve(&env, &s, &owner, &runner).await;
+    let job = seal_job(&s, &sender, &Target::Any);
+    let id = job.envelope.header.id.clone();
+    assert_eq!(submit(&env, &s, &sender, &job).await.status(), StatusCode::CREATED);
+    stream.next("job_assigned").await;
+
+    assert_eq!(revoke(&env, &s, &owner, "runner").await.status(), StatusCode::NO_CONTENT);
+    assert_eq!(job_state(&env, &s, &owner, &id).await["reason"], "runner_revoked");
+    assert!(stream.ended().await);
+    assert_eq!(claim(&env, &s, &runner, &id).await, StatusCode::UNAUTHORIZED);
+    // No runner can join to take its place.
+    let (_, body) = runner_join_body(&s, "runner-02", &[]);
+    assert_eq!(error_code(post_join(&env, &s, body).await).await, (StatusCode::FORBIDDEN, "revoked".into()));
 }

@@ -401,7 +401,7 @@ async function sessionView() {
   }
   const me = ac.publicKey(identity.seed);
   const s = { sid, inv, manifest, signed, identity, me, participants: new Map(), items: new Map(), evicted: new Set(),
-    wanted: new Set(), asked: new Set(),
+    wanted: new Set(), asked: new Set(), revokedRoles: new Set(),
     lastSeq: -1, closed: null, jobs: new Map(), results: new Map(), runners: [], picked: new Set(), decisions: null,
     said: new Map(), announce: false, jobErrors: new Map(), runnerErrors: new Map(), runnerSeen: new Map(), open: new Set() };
   buildSessionLayout(s);
@@ -428,6 +428,7 @@ async function sessionView() {
     s.render.scroll(true);
   } catch (e) {
     if (e.status === 404 || e.status === 410) return s.render.closed("it is no longer on the relay");
+    if (e.status === 401) return s.render.closed("the relay no longer accepts this browser (it left, or its role was revoked)");
   }
   s.announce = true;
   streamLoop(s);
@@ -522,6 +523,43 @@ function buildSessionLayout(s) {
       closeErr.textContent = `Could not close: ${e.message}`;
     }
   } }, "Close & purge") : null;
+  // Revoking cuts off a role's participants and disables its invite.
+  const revokeErr = el("p", { class: "error", role: "alert" });
+  const revokeBtns = inv.role === "owner"
+    ? ["sender", "observer", ...(execute ? ["runner"] : [])].map((role) => {
+      const b = el("button", { class: "small danger", type: "button", "data-role": role, onclick: async () => {
+        if (!confirm(`Revoke the ${role} role? Everyone who joined with the ${role} invite is cut off and the invite stops working. They keep what they already copied.`)) return;
+        revokeErr.textContent = "";
+        try {
+          await api("POST", `/v1/sessions/${sid}/roles/${role}/revoke`, { token: identity.token });
+        } catch (e) {
+          revokeErr.textContent = `Could not revoke: ${e.message}`;
+        }
+      } }, `Revoke ${role}s`);
+      return b;
+    })
+    : [];
+  const access = revokeBtns.length ? el("details", {},
+    el("summary", {}, "Revoke access"),
+    el("div", { class: "stack" },
+      el("p", { class: "muted" }, "Cuts off a role and disables its invite. To end access to what was shared, close the session."),
+      el("div", { class: "chips" }, revokeBtns), revokeErr)) : null;
+  // The audit trail goes with the session when it is purged.
+  const auditErr = el("p", { class: "error", role: "alert" });
+  const auditBtn = ["owner", "observer"].includes(inv.role) ? el("button", { type: "button", onclick: async () => {
+    auditErr.textContent = "";
+    try {
+      const r = await api("GET", `/v1/sessions/${sid}/audit.jsonl`, { token: identity.token });
+      const url = URL.createObjectURL(new Blob([await r.arrayBuffer()], { type: "application/x-ndjson" }));
+      const a = el("a", { href: url, download: `${sid}-audit.jsonl`, hidden: true });
+      document.body.append(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    } catch (e) {
+      auditErr.textContent = `Could not export: ${e.message}`;
+    }
+  } }, "Export audit log") : null;
   const invites = inv.role === "owner" ? el("details", {},
     el("summary", {}, "Invites"),
     el("div", { class: "stack" },
@@ -538,7 +576,7 @@ function buildSessionLayout(s) {
       el("p", { class: "mono muted" }, sid),
       el("p", { class: "muted" }, `Expires ${new Date(manifest.expires_at_ms).toLocaleString()}`),
       el("p", { class: "muted" }, `Files up to ${fmtBytes(manifest.max_item_bytes)}`),
-      invites, closeBtn, closeErr),
+      invites, access, auditBtn, auditErr, closeBtn, closeErr),
     el("section", { class: "stack" }, el("h2", {}, "This browser"),
       el("p", { class: "muted" }, "Received items are kept here, still encrypted, so they survive the relay deleting them."),
       el("button", { type: "button", onclick: async () => {
@@ -639,10 +677,17 @@ function buildSessionLayout(s) {
       jobUi?.refresh();
     },
     scroll: () => timeline.lastElementChild?.scrollIntoView({ block: "end" }),
+    revoked: () => {
+      for (const b of revokeBtns) {
+        const gone = s.revokedRoles.has(b.dataset.role);
+        b.disabled = gone || !!s.closed;
+        b.textContent = gone ? `${b.dataset.role}s revoked` : `Revoke ${b.dataset.role}s`;
+      }
+    },
     closed: (reason) => {
       banner.hidden = false;
       banner.textContent = `This session is closed: ${reason}. Its history stays in this browser until you clear it.`;
-      for (const c of [sendBtn, text, file, closeBtn]) if (c) c.disabled = true;
+      for (const c of [sendBtn, text, file, closeBtn, ...revokeBtns]) if (c) c.disabled = true;
       attach.setAttribute("aria-disabled", "true");
       approvalBanner.hidden = true;
       if (invites) invites.hidden = true;
@@ -695,6 +740,18 @@ async function applyEvent(s, ev, { fetch, record }) {
     if (p) {
       p.left = true;
       s.render.people();
+    }
+  } else if (ev.kind === "revoked") {
+    s.revokedRoles.add(ev.data.role);
+    for (const pk of ev.data.participants || []) {
+      const p = s.participants.get(pk);
+      if (p) p.left = true;
+    }
+    s.render.people();
+    s.render.revoked();
+    if ((ev.data.participants || []).includes(s.me)) {
+      s.closed = `revoked`;
+      s.render.closed(`the owner revoked the ${ev.data.role} role`);
     }
   } else if (ev.kind === "closed") {
     s.closed = ev.data.reason;
@@ -1442,9 +1499,9 @@ async function streamLoop(s) {
       const headers = { Authorization: `Bearer ${s.identity.token}` };
       if (s.lastSeq >= 0) headers["Last-Event-ID"] = String(s.lastSeq);
       const r = await fetch(`/v1/sessions/${s.sid}/stream`, { headers });
-      if (r.status === 404 || r.status === 410) {
+      if (r.status === 404 || r.status === 410 || r.status === 401) {
         s.closed = "gone";
-        s.render.closed("it is no longer on the relay");
+        s.render.closed(r.status === 401 ? "the relay no longer accepts this browser (it left, or its role was revoked)" : "it is no longer on the relay");
         return;
       }
       if (!r.ok) throw new Error(`stream ${r.status}`);

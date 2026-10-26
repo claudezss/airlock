@@ -581,3 +581,93 @@ async fn wants_are_rate_limited() {
     let r = reseed(&env, &s, &sender, &ids[0], vec![0; 4]).await;
     assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "not_wanted".into()));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoking_a_role_cuts_off_its_participants_and_invite() {
+    let mut env = Env::new().await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let sender = join(&env, &s, Role::Sender, "sender").await;
+    let viewer = join(&env, &s, Role::Observer, "viewer").await;
+    let stream = env
+        .http
+        .get(env.url(&format!("/v1/sessions/{}/stream", s.id)))
+        .bearer_auth(&sender.token)
+        .send()
+        .await
+        .unwrap();
+
+    // Only the owner revokes, and never the owner role.
+    assert_eq!(revoke(&env, &s, &sender, "observer").await.status(), StatusCode::FORBIDDEN);
+    assert_eq!(revoke(&env, &s, &owner, "owner").await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(revoke(&env, &s, &owner, "sender").await.status(), StatusCode::NO_CONTENT);
+    assert_eq!(revoke(&env, &s, &owner, "sender").await.status(), StatusCode::NO_CONTENT);
+
+    // The sender's open stream ends with the revocation; its token is dead.
+    let text = read_sse_until(stream, "event: revoked").await;
+    assert!(text.contains(&sender.kp.public().to_b64()));
+    let r = env
+        .http
+        .get(env.url(&format!("/v1/sessions/{}/events", s.id)))
+        .bearer_auth(&sender.token)
+        .send()
+        .await;
+    assert_eq!(r.unwrap().status(), StatusCode::UNAUTHORIZED);
+    // The sender invite admits no one, now or after a restart.
+    let (_, body) = join_body(&s, Role::Sender, "again");
+    assert_eq!(error_code(post_join(&env, &s, body).await).await, (StatusCode::FORBIDDEN, "revoked".into()));
+    env.restart(|_| {}).await;
+    let (_, body) = join_body(&s, Role::Sender, "again");
+    assert_eq!(error_code(post_join(&env, &s, body).await).await, (StatusCode::FORBIDDEN, "revoked".into()));
+
+    // Other roles carry on, and see one revocation.
+    let evs = events(&env, &s, &viewer).await;
+    let revoked: Vec<&Value> = evs.iter().filter(|e| e["kind"] == "revoked").collect();
+    assert_eq!(revoked.len(), 1);
+    assert_eq!(revoked[0]["data"]["role"], "sender");
+    assert_eq!(revoked[0]["data"]["participants"][0], sender.kp.public().to_b64().as_str());
+    join(&env, &s, Role::Observer, "another viewer").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn audit_export_is_verifiable_and_holds_no_secrets() {
+    let env = Env::new().await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let sender = join(&env, &s, Role::Sender, "sender").await;
+    let viewer = join(&env, &s, Role::Observer, "viewer").await;
+    let item = seal_text(&s, &sender, "audited");
+    let id = item.envelope.header.id.clone();
+    post(&env, &s, &sender, frame(&item)).await;
+    ack(&env, &s, &owner, &id).await;
+    revoke(&env, &s, &owner, "sender").await;
+
+    assert_eq!(audit(&env, &s, &sender).await.status(), StatusCode::UNAUTHORIZED);
+    join(&env, &s, Role::Observer, "late").await;
+    let r = audit(&env, &s, &viewer).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(r.headers()["content-type"], "application/x-ndjson");
+    let text = r.text().await.unwrap();
+    // No bearer-token hashes, no address hash.
+    assert!(!text.contains("token") && !text.contains("ip_hash"), "{text}");
+    let lines: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let actions: Vec<&str> = lines.iter().map(|l| l["action"].as_str().unwrap()).collect();
+    assert_eq!(actions, ["create", "join", "join", "join", "item", "ack", "revoke", "join"]);
+    assert!(lines.windows(2).all(|w| w[0]["seq"].as_u64() < w[1]["seq"].as_u64()));
+    // The item line carries what the author signed: the envelope and the blob hash.
+    let it = &lines[4];
+    assert_eq!(
+        (it["actor"].as_str(), it["item"].as_str()),
+        (Some(sender.kp.public().to_b64().as_str()), Some(id.as_str()))
+    );
+    let env_json: airlox_core::item::ItemEnvelope =
+        serde_json::from_str(it["envelope"].as_str().unwrap()).unwrap();
+    let digest: [u8; 32] =
+        airlox_core::encoding::b64d(it["blob_sha256"].as_str().unwrap()).unwrap().try_into().unwrap();
+    env_json.verify_blob_digest(it["blob_len"].as_u64().unwrap(), &digest).unwrap();
+    assert_eq!(lines[6]["participants"][0], sender.kp.public().to_b64().as_str());
+    // Owners may export too; senders and runners may not.
+    assert_eq!(audit(&env, &s, &owner).await.status(), StatusCode::OK);
+}

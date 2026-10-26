@@ -55,7 +55,7 @@ canvas (landing, live session, new session, runner console).
 | Relay server (API, SSE, storage, purge) | **Rust** | `axum` + `tokio`, `tower` middleware; storage is plain files (append-only session logs + blob files), **no database** |
 | `airlox` binary: runner, CLI, MCP server | **Rust** | `tokio`, `reqwest` (SSE), `bollard` (Docker), `kube` (Kubernetes), `nix` + Landlock + seccomp for the local backend |
 | SDK (`pip install airlox`) | **Python 3.9+** | thin orchestration over the Rust core compiled into the same wheel (`airlox._core`); `httpx`; the wheel also bundles the `airlox` binary |
-| Web UI (static SPA served by the server) | **TypeScript** | Vite + React, `airlox-core` wasm for all crypto, markdown-it + DOMPurify, zip.js |
+| Web UI (static pages served by the server) | **JavaScript** (ES modules, no build step) | `airlox-core` wasm for all crypto and content checks; no third-party JavaScript |
 
 Rust owns everything that touches keys, signatures, sandboxes or the wire.
 Python is a thin convenience layer for agents that write code. TypeScript
@@ -227,7 +227,9 @@ drops the connection.
 ### Revocation
 
 v1: the owner revokes a role server-side (`POST …/roles/:role/revoke`), which
-stops admission and invalidates tokens for that role. Because the role private
+stops admission and invalidates tokens for that role: its participants'
+streams end with a `revoked` event, a runner's active job fails, and a join
+with that role's invite is `403 revoked`. Because the role private
 key is in the invite, true cryptographic revocation requires rotating `K` and
 reissuing invites; v1 exposes that as "Close & purge". Per-role key rotation
 without closing the session is a v2 item.
@@ -654,14 +656,15 @@ own key.
 
 ## 8. Web UI
 
-Static SPA (Vite + React + TypeScript) served by the server at `/`, mirroring
-the four design screens: landing, new session, live session, runner console.
-
-M1 ships a deliberately small timeline instead: plain JavaScript modules in
-`web/` with no build step, embedded into the server binary. It creates
+Plain JavaScript in `web/` with no build step and no third-party code,
+embedded into the server binary and served at `/`, covering the four design
+screens: landing, new session, live session, runner console. It creates
 sessions, joins from an invite, renders all content types, sends text and
-files, keeps IndexedDB history and acks after storing. The React SPA replaces
-it at design parity in M4.
+files, keeps IndexedDB history and acks after storing, asks for and answers
+re-seeds, approves runners, revokes roles and exports the audit trail. A
+framework rewrite was considered and declined: the page holds session keys,
+so a large build-time dependency tree is attack surface, and a no-build page
+keeps the v2 pinned-origin UI (fixed hashes, reproducible build) simple.
 
 - All crypto in the browser goes through the `airlox-core` wasm package
   (session creation, certificates, item encrypt/decrypt/sign/verify). No
@@ -680,9 +683,10 @@ it at design parity in M4.
   cache), and offers "Clear local history" per session, which also leaves the
   session on the relay. Browser storage quotas apply; when
   one is hit, the oldest sessions' blobs are dropped first.
-- Viewers: Markdown (markdown-it + DOMPurify), image preview (re-encoded on
-  send), ZIP manifest (zip.js, listing only), Python (Shiki/Prism highlighting),
-  job detail (status, signature, hashes, result bundle).
+- Viewers: Markdown and Python as plain text (never rendered as HTML, so
+  nothing a participant writes can run in the page), image preview
+  (re-encoded on send), ZIP listing (checked by the wasm core's zip
+  validator), job detail (status, signature, hashes, result bundle).
 - Composer: message, or "Send as job" with a runner/label/any picker. The
   owner can submit jobs only if they also hold the sender role (they do by
   construction: the owner mints all role keys).
@@ -710,7 +714,7 @@ for item in s.stream(): ...                       # decrypted items as they arri
 ```
 
 CLI (`airlox …`, Rust, same binary as the runner): `session
-create|invites|info|close`, `send text|file`, `run <file.py>
+create|invites|info|revoke|audit|close`, `send text|file`, `run <file.py>
 [--runner|--label] [--input …] [--out-dir]`, `result`, `cancel`, `items`,
 `watch`, `runner join|list|approve|reject`, and `mcp`. Every command takes the
 invite as `--invite` or `AIRLOX_INVITE` (preferred: arguments are visible to
@@ -751,7 +755,7 @@ Chat apps and IDEs without a shell use the MCP server, `airlox mcp` (stdio,
 the official Rust SDK `rmcp`): tools `create_session`, `join_session`,
 `session_info`, `get_invites`, `send_text`, `send_file`, `list_items`,
 `save_file`, `list_runners`, `approve_runner`, `reject_runner`, `run_python`,
-`get_result`, `close_session`. Because other participants' messages reach the
+`get_result`, `revoke_role`, `export_audit`, `close_session`. Because other participants' messages reach the
 model, it reads and writes files only inside `--allow-dir` directories
 (default: its working directory, unless that is `/` or the home directory),
 never in hidden directories, the session cache or the owner-invite
@@ -828,7 +832,7 @@ airlox/
     airlox/          SDK (airlox/); the maturin project for the `airlox` wheel, bundles the binary
   skills/airlox/            agent skill teaching the CLI
   packaging/                npm wrapper, MCPB manifest, MCP registry entry and the script that stages them
-  web/                      browser UI embedded into airlox-server (M1: plain JS timeline; M4: Vite + React + TS SPA)
+  web/                      browser UI embedded into airlox-server (plain JavaScript, no build step)
   deploy/
     docker/                 Dockerfiles (server, runtime base image)
     k8s/                    runner Deployment + RBAC + NetworkPolicy examples; server manifests
@@ -840,7 +844,7 @@ airlox/
 Tooling: `cargo` workspace with `clippy -D warnings`, `cargo-deny`,
 `cargo-nextest`; `maturin` for the Python wheel and `wasm-pack` for the browser
 package; `cargo-zigbuild` for static musl runner builds; `uv` + `ruff` +
-`mypy --strict` for the Python SDK; `pnpm` + `vitest` for web. CI runs the
+`mypy --strict` for the Python SDK. CI runs the
 docker backend tests against a Docker daemon and the k8s backend against
 `kind`.
 

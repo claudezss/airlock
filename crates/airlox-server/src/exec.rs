@@ -445,6 +445,11 @@ pub async fn runner_stream(
                 },
                 r = st.closed_rx.recv() => match r {
                     Ok(e) if e.kind == "closed" => return None,
+                    Ok(e) if e.kind == "revoked"
+                        && e.data["participants"].as_array().is_some_and(|a| a.iter().any(|p| p == st.who.as_str())) =>
+                    {
+                        return None
+                    }
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(_) => return None,
                 },

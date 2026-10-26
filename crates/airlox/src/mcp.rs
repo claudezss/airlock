@@ -234,6 +234,20 @@ pub struct SaveParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+pub struct RevokeParams {
+    /// The role to revoke: sender, observer or runner.
+    pub role: String,
+    pub session: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct AuditParams {
+    /// Directory to save the audit trail into, inside an allowed directory.
+    pub dir: String,
+    pub session: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct RunnerParams {
     /// Runner name or key.
     pub runner: String,
@@ -681,6 +695,35 @@ job writes to $AIRLOX_OUT come back as out files; use get_result with save_dir t
             None => vec![],
         };
         ok(json!({"note": UNTRUSTED, "result": r, "saved": saved}))
+    }
+
+    #[tool(
+        description = "Revoke a role (owner only): everyone who joined with that role's invite is cut off, and \
+the invite admits no one again. They keep what they already copied. Only do this when the user asks.",
+        annotations(destructive_hint = true)
+    )]
+    async fn revoke_role(
+        &self,
+        Parameters(p): Parameters<RevokeParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let (sid, slot) = tool_try!(self.slot(&p.session).await);
+        tool_try!(slot.lock().await.s.revoke(&p.role).await);
+        ok(json!({"session": sid, "revoked": p.role}))
+    }
+
+    #[tool(description = "Save the session's audit trail (owner or observer) as a JSON-lines file in a \
+directory inside an allowed directory: who joined, posted, acked, approved and revoked, with the signed \
+material to check it. The relay purges it with the session.")]
+    async fn export_audit(
+        &self,
+        Parameters(p): Parameters<AuditParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let dir = tool_try!(self.allowed(&p.dir, false));
+        let (sid, slot) = tool_try!(self.slot(&p.session).await);
+        let raw = tool_try!(slot.lock().await.s.audit().await);
+        let lines = raw.split(|&b| b == b'\n').filter(|l| !l.is_empty()).count();
+        let path = tool_try!(crate::files::save_new(&dir, &format!("airlox-audit-{sid}.jsonl"), &raw));
+        ok(json!({"saved": path, "lines": lines}))
     }
 
     #[tool(

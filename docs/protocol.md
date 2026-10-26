@@ -380,6 +380,8 @@ sends nothing for 30 seconds is answered with `408`.
 | `POST /v1/sessions/{id}/items/{item}/ack` | bearer, recipient | none | `204` |
 | `POST /v1/sessions/{id}/items/{item}/want` | bearer, never received it | none | `202 {"open": true}`; `409 present` if the blob is on the relay |
 | `PUT /v1/sessions/{id}/items/{item}/blob` | bearer, while wanted | ciphertext | `204`; `409 present` or `409 not_wanted` |
+| `POST /v1/sessions/{id}/roles/{role}/revoke` | bearer, owner | none | `204`; `role` is `sender`, `observer` or `runner` |
+| `GET /v1/sessions/{id}/audit.jsonl` | bearer, owner or observer | none | `200` JSON lines, see below |
 | `POST /v1/sessions/{id}/close` | bearer, owner | none | `204`; the session is purged |
 
 **Create.** The relay verifies the manifest signature, requires
@@ -424,6 +426,7 @@ public event carries that line's `seq`. Events are `{"seq", "kind", "data"}`:
 | `evicted` | `{item}`: the blob left the relay; the envelope stays |
 | `want` | `{item, by}`: participant `by` asks holders to upload the evicted blob again |
 | `reseeded` | `{item, by}`: participant `by` uploaded it; it is on the relay again |
+| `revoked` | `{role, participants}`: the owner revoked `role`; those participants' tokens are revoked |
 | `closed` | `{reason}`: the last event of a session |
 
 Clients must verify each `signed_join` themselves (§5) and take a
@@ -434,7 +437,8 @@ durable before it is sent, so a sequence number is never reused.
 **Stream.** `GET /stream` is Server-Sent Events with `id: <seq>`,
 `event: <kind>` and `data: <event data JSON>`. It first replays every event
 after `Last-Event-ID` (or all events when the header is absent), then streams
-live ones. It ends after `closed`, on server shutdown, or when the client
+live ones. It ends after `closed`, after a `left` or `revoked` event that
+names the stream's own participant, on server shutdown, or when the client
 falls too far behind; clients reconnect with `Last-Event-ID`. A participant
 may hold 4 streams at once; a fifth is `429`. Browsers use
 `fetch` rather than `EventSource` so the token stays in a header.
@@ -464,13 +468,34 @@ limits. Clients answer only for items they have verified, and must take the
 item id of a `want` as a lookup in their own verified history, never as a
 file name.
 
+**Revocation.** The owner revokes a role: every participant holding it
+departs at once (as with `leave`, and a runner's active job fails with
+`runner_revoked`), and any later join with that role is `403 revoked`, also
+after a restart. Revoking twice is a no-op. The owner role cannot be revoked.
+A revoked participant still holds the session key from its invite, so what
+it already copied stays readable to it; only closing the session ends access
+to the rest. Clients treat `401` from `events` or `stream` as the session
+having ended for them.
+
+**Audit export.** `GET …/audit.jsonl` returns one JSON object per log
+record, oldest first: `{"seq", "ts_ms", "action", "actor"?, …}`, where
+`action` is `create` (with `signed_manifest`), `join` (with `role` and
+`signed_join`), `item` (with `item`, `kind`, `blob_len`, `blob_sha256` and the
+signed `envelope`), `ack`, `leave`, `evict`, `want`, `reseed`,
+`runner_approve`, `runner_reject`, `job` (with `state`, `runner`, `reason`),
+`revoke` (with `role` and the `participants` cut off) or `close`. `actor` is a
+participant key. With the signed joins and envelopes, and `blob_sha256` (the
+digest each author signed), anyone can check every item line against its
+author without the relay. The export never contains ciphertext, bearer-token
+hashes or the creator's address hash. It is purged with the session.
+
 **Error codes.**
 
 | Status | `error` | Meaning |
 |---|---|---|
 | 400 | `invalid`, `signature`, `body`, `clock`, `ttl`, `item_size` | malformed or unverifiable input |
 | 401 | `unauthorized` | missing or unknown bearer token |
-| 403 | `forbidden` | role, author or content policy not allowed |
+| 403 | `forbidden`, `revoked` | role, author or content policy not allowed; a join with a revoked role's invite |
 | 404 | `not_found` | no such session or item |
 | 408 | `timeout` | request body stalled or upload too slow |
 | 409 | `conflict`, `present`, `not_wanted` | duplicate session, item id, or participant key; a want for a blob the relay has; a re-seed nobody asked for |

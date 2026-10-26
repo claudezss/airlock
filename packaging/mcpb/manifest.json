@@ -76,6 +76,8 @@
     { "name": "reject_runner", "description": "Turn a runner away" },
     { "name": "run_python", "description": "Run Python on a runner" },
     { "name": "get_result", "description": "Get a job's signed result" },
+    { "name": "revoke_role", "description": "Cut off everyone with a role and disable its invite" },
+    { "name": "export_audit", "description": "Save the session's audit trail to the working folder" },
     { "name": "close_session", "description": "Close and purge a session" }
   ],
   "compatibility": {

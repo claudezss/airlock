@@ -245,6 +245,13 @@ pub async fn join(
         if g.closed {
             return Err(ApiError::gone("closed", "session is closed"));
         }
+        if g.revoked.contains(&role) {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "revoked",
+                "the owner revoked this invite's role",
+            ));
+        }
         if g.participants.contains_key(&pk2) {
             return Err(ApiError::conflict(
                 "this key has already joined; a client that lost its token joins again with a new key",
@@ -389,9 +396,17 @@ pub async fn stream(
                 _ = st.shutdown.changed() => return None,
             }
         };
-        if ev.kind == "closed" {
-            st.done = true;
-        }
+        // The last event a participant gets: the session closed, or it left
+        // or was revoked (its token no longer works).
+        let me = &st._slot.who;
+        st.done = match ev.kind {
+            "closed" => true,
+            "left" => ev.data["participant_pub"] == me.as_str(),
+            "revoked" => {
+                ev.data["participants"].as_array().is_some_and(|a| a.iter().any(|p| p == me.as_str()))
+            }
+            _ => false,
+        };
         Some((Ok(sse_event(&ev)), st))
     });
     Ok(Sse::new(out).keep_alive(KeepAlive::default()))
@@ -431,6 +446,7 @@ pub(crate) struct Upload {
     env_json: String,
     pub(crate) env: ItemEnvelope,
     blob_len: u64,
+    blob_sha256: String,
     tmp_path: std::path::PathBuf,
     reservation: Reservation,
 }
@@ -520,13 +536,14 @@ pub(crate) async fn receive_upload(
     };
 
     let first = Bytes::copy_from_slice(&buf[4 + n..]);
-    let tmp_path = receive_blob(s, &env, blob_len, first, chunks, &mut reservation).await?;
-    Ok(Upload { env_json, env, blob_len, tmp_path, reservation })
+    let (tmp_path, digest) = receive_blob(s, &env, blob_len, first, chunks, &mut reservation).await?;
+    let blob_sha256 = airlox_core::encoding::b64e(&digest);
+    Ok(Upload { env_json, env, blob_len, blob_sha256, tmp_path, reservation })
 }
 
 /// Stream a blob (`first`, then the rest of the body) to a temp file in the
 /// session's blob directory, checking its length and its SHA-256 against
-/// the signed envelope. Returns the temp file's path.
+/// the signed envelope. Returns the temp file's path and the SHA-256.
 async fn receive_blob(
     s: &Session,
     env: &ItemEnvelope,
@@ -534,7 +551,7 @@ async fn receive_blob(
     first: Bytes,
     mut chunks: BodyDataStream,
     reservation: &mut Reservation,
-) -> ApiResult<std::path::PathBuf> {
+) -> ApiResult<(std::path::PathBuf, [u8; 32])> {
     let tmp_path = s.dir.join("blobs").join(format!(".{}.{}.tmp", env.header.id, random_suffix()));
     // A steady trickle still has to finish: allow two minutes plus 16 KiB/s.
     let deadline = Duration::from_secs(120 + blob_len / (16 * 1024));
@@ -571,11 +588,13 @@ async fn receive_blob(
         Err(_) => Err(ApiError::timeout()),
     };
     reservation.received = written;
-    if let Err(e) = result.and_then(|d| env.verify_blob_digest(blob_len, &d).map_err(ApiError::from)) {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(e);
+    match result.and_then(|d| env.verify_blob_digest(blob_len, &d).map(|()| d).map_err(ApiError::from)) {
+        Ok(d) => Ok((tmp_path, d)),
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            Err(e)
+        }
     }
-    Ok(tmp_path)
 }
 
 /// Move the blob into place and append the item to the log. `then` runs
@@ -587,7 +606,7 @@ pub(crate) fn commit_upload<T>(
     up: Upload,
     then: impl FnOnce(&Session, &mut Inner, u64) -> ApiResult<T>,
 ) -> ApiResult<(u64, T)> {
-    let Upload { env_json, env, blob_len, tmp_path, mut reservation } = up;
+    let Upload { env_json, env, blob_len, blob_sha256, tmp_path, mut reservation } = up;
     let final_path = s.blob_path(&env.header.id);
     let commit = || -> ApiResult<(u64, T)> {
         std::fs::rename(&tmp_path, &final_path).map_err(closed_if_missing)?;
@@ -602,7 +621,8 @@ pub(crate) fn commit_upload<T>(
         // Applying the Item record charges the transfer for real.
         g.transfer_bytes -= blob_len;
         reservation.committed = true;
-        let seq = match s.append(&mut g, Rec::Item { envelope: env_json, recipients, blob_len }) {
+        let rec = Rec::Item { envelope: env_json, recipients, blob_len, blob_sha256: Some(blob_sha256) };
+        let seq = match s.append(&mut g, rec) {
             Ok(ev) => ev.map(|e| e.seq).unwrap_or_default(),
             Err(e) => {
                 g.transfer_bytes += blob_len;
@@ -850,7 +870,7 @@ pub async fn reseed(
         (env, res)
     };
     let blob_len = reservation.bytes;
-    let tmp_path =
+    let (tmp_path, _) =
         receive_blob(&s, &env, blob_len, Bytes::new(), body.into_data_stream(), &mut reservation).await?;
     blocking(move || {
         let final_path = s.blob_path(&item);
@@ -886,4 +906,69 @@ pub async fn reseed(
     })
     .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /v1/sessions/:id/roles/:role/revoke` — owner only. The role's
+/// participants are cut off (their tokens stop working, a runner's active
+/// job fails) and its invite admits no one from then on. Anyone who kept the
+/// invite still holds the session key and can decrypt what they copied;
+/// only closing the session ends access to the rest.
+pub async fn revoke_role(
+    State(st): State<AppState>,
+    Path((id, role)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    let s = session(&st, &id)?;
+    let (_, by) = auth(&s, &headers)?;
+    if by != Role::Owner {
+        return Err(ApiError::forbidden("only the owner may revoke a role"));
+    }
+    let role = Role::parse(&role)
+        .ok()
+        .filter(|r| *r != Role::Owner)
+        .ok_or_else(|| ApiError::not_found("no such role; revoke sender, observer or runner"))?;
+    blocking(move || {
+        let mut g = s.lock();
+        if g.closed {
+            return Err(ApiError::gone("closed", "session is closed"));
+        }
+        if g.revoked.contains(&role) {
+            return Ok(());
+        }
+        let runners: Vec<String> = g
+            .participants
+            .iter()
+            .filter(|(_, p)| role == Role::Runner && p.role == Role::Runner && !p.left)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for r in runners {
+            s.fail_runner_job(&mut g, &r, "runner_revoked")?;
+        }
+        s.append(&mut g, Rec::Revoke { role })?;
+        Ok(())
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /v1/sessions/:id/audit.jsonl` — owner or observer. The session's
+/// history as JSONL, derived from its log (envelopes, hashes and events,
+/// never ciphertext). It is purged with the session, so export it first.
+pub async fn audit(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let s = session(&st, &id)?;
+    let (_, role) = auth(&s, &headers)?;
+    if !matches!(role, Role::Owner | Role::Observer) {
+        return Err(ApiError::forbidden("only the owner and observers may export the audit trail"));
+    }
+    let name = format!("attachment; filename=\"{}-audit.jsonl\"", s.id);
+    let body = blocking(move || Ok(s.audit()?)).await?;
+    Ok((
+        [(header::CONTENT_TYPE, "application/x-ndjson".to_string()), (header::CONTENT_DISPOSITION, name)],
+        body,
+    )
+        .into_response())
 }

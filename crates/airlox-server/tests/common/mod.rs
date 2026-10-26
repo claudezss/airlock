@@ -240,3 +240,21 @@ pub async fn reseed(env: &Env, s: &Sess, m: &Member, item: &str, blob: Vec<u8>) 
         .await
         .unwrap()
 }
+
+pub async fn revoke(env: &Env, s: &Sess, m: &Member, role: &str) -> reqwest::Response {
+    env.http
+        .post(env.url(&format!("/v1/sessions/{}/roles/{role}/revoke", s.id)))
+        .bearer_auth(&m.token)
+        .send()
+        .await
+        .unwrap()
+}
+
+pub async fn audit(env: &Env, s: &Sess, m: &Member) -> reqwest::Response {
+    env.http
+        .get(env.url(&format!("/v1/sessions/{}/audit.jsonl", s.id)))
+        .bearer_auth(&m.token)
+        .send()
+        .await
+        .unwrap()
+}

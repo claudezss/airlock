@@ -299,6 +299,23 @@ class Session:
         self._req("POST", "/close")
         self.closed = "closed by owner"
 
+    def revoke(self, role: str) -> None:
+        """Revoke a role (owner only): its participants are cut off and its
+        invite admits no one. Whoever kept that invite still holds the session
+        key, so what they already copied stays readable to them."""
+        if self.role != "owner":
+            raise PermissionError("only the owner can revoke a role")
+        if role not in ("sender", "observer", "runner"):
+            raise ValueError("revoke one of sender, observer or runner")
+        self._req("POST", f"/roles/{role}/revoke")
+
+    def audit(self) -> List[dict]:
+        """The session's audit trail (owner or observer): one dict per
+        record, oldest first, with the signed joins and item envelopes to
+        check it against. It is purged with the session."""
+        text = self._req("GET", "/audit.jsonl").text
+        return [json.loads(line) for line in text.splitlines() if line]
+
     def leave(self, *, delete_cache: bool = False) -> None:
         """Stop receiving: the relay no longer waits for this participant
         before deleting blobs, and its token stops working."""
@@ -516,8 +533,8 @@ class Session:
         try:
             evs = self._req("GET", f"/events{query}").json()["events"]
         except RelayError as e:
-            if e.status in (404, 410):
-                self.closed = self.closed or "no longer on the relay"
+            if e.status in (401, 404, 410):
+                self.closed = self.closed or _gone_reason(e.status)
                 return out
             raise
         out += [i for i in (self._apply(e) for e in evs) if i is not None and i.status != "pending"]
@@ -555,8 +572,8 @@ class Session:
                     headers=headers,
                     timeout=httpx.Timeout(read, connect=10.0),
                 ) as r:
-                    if r.status_code in (404, 410):
-                        self.closed = self.closed or "no longer on the relay"
+                    if r.status_code in (401, 404, 410):
+                        self.closed = self.closed or _gone_reason(r.status_code)
                         return
                     if r.status_code != 200:
                         r.read()
@@ -633,6 +650,14 @@ class Session:
             p = self._participants.get(data.get("participant_pub"))
             if p is not None:
                 p["left"] = True
+        elif kind == "revoked":
+            cut = data.get("participants") or []
+            for pk in cut:
+                p = self._participants.get(pk)
+                if p is not None:
+                    p["left"] = True
+            if self.participant_pub in cut:
+                self.closed = f"the owner revoked the {data.get('role', 'this')} role"
         elif kind == "closed":
             self.closed = data.get("reason", "closed")
         if record:
@@ -774,6 +799,14 @@ class Session:
             if header["author"] != self.participant_pub:
                 self._ack(item_id)
         return item
+
+
+def _gone_reason(status: int) -> str:
+    """Why the relay stopped answering: the session is gone, or (401) this
+    participant left or its role was revoked."""
+    if status == 401:
+        return "the relay no longer accepts this participant (it left, or its role was revoked)"
+    return "no longer on the relay"
 
 
 def _check(r: httpx.Response) -> httpx.Response:

@@ -188,6 +188,16 @@ impl Cache {
     }
 }
 
+/// Why the relay stopped answering: the session is gone, or (401) this
+/// participant left or its role was revoked.
+fn gone_reason(e: &anyhow::Error) -> String {
+    if status_of(e) == Some(401) {
+        "the relay no longer accepts this participant (it left, or its role was revoked)".into()
+    } else {
+        "no longer on the relay".into()
+    }
+}
+
 // ---------------------------------------------------------------- items --
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -580,6 +590,28 @@ impl Session {
         }
         out.insert("owner".into(), api::owner_invite(&self.base_url, seed)?);
         Ok(out)
+    }
+
+    /// Revoke a role (owner only): its participants are cut off and its
+    /// invite admits no one. Whoever kept that invite still holds the session
+    /// key, so what they already copied stays readable to them.
+    pub async fn revoke(&mut self, role: &str) -> Result<()> {
+        if self.role != Role::Owner {
+            bail!("only the owner can revoke a role");
+        }
+        let role = Role::parse(role)
+            .ok()
+            .filter(|r| *r != Role::Owner)
+            .context("revoke one of sender, observer or runner")?;
+        self.relay.post_raw(&format!("/roles/{}/revoke", role.as_str()), vec![], &[]).await?;
+        Ok(())
+    }
+
+    /// The session's audit trail as JSONL (owner or observer): who joined,
+    /// posted, acked, approved and revoked, with the signed joins and item
+    /// envelopes to check it against. It is purged with the session.
+    pub async fn audit(&self) -> Result<Vec<u8>> {
+        self.relay.audit().await
     }
 
     /// Close and purge the session on the relay (owner only).
@@ -1009,8 +1041,8 @@ impl Session {
         let mut out = self.retry().await?;
         let evs = match self.relay.events(self.last_seq).await {
             Ok(e) => e,
-            Err(e) if matches!(status_of(&e), Some(404 | 410)) => {
-                self.closed.get_or_insert_with(|| "no longer on the relay".into());
+            Err(e) if matches!(status_of(&e), Some(401 | 404 | 410)) => {
+                self.closed.get_or_insert_with(|| gone_reason(&e));
                 return Ok(out);
             }
             Err(e) => return Err(e),
@@ -1131,8 +1163,8 @@ impl Session {
             }
             let resp = match self.relay.session_stream(self.last_seq).await {
                 Ok(r) => r,
-                Err(e) if matches!(status_of(&e), Some(404 | 410)) => {
-                    self.closed.get_or_insert_with(|| "no longer on the relay".into());
+                Err(e) if matches!(status_of(&e), Some(401 | 404 | 410)) => {
+                    self.closed.get_or_insert_with(|| gone_reason(&e));
                     return Ok(());
                 }
                 Err(e) if is_transient(&e) => {
@@ -1260,6 +1292,19 @@ impl Session {
             "left" => {
                 if let Some(p) = data["participant_pub"].as_str().and_then(|k| self.participants.get_mut(k)) {
                     p.left = true;
+                }
+            }
+            "revoked" => {
+                let cut: Vec<&str> =
+                    data["participants"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                for k in &cut {
+                    if let Some(p) = self.participants.get_mut(*k) {
+                        p.left = true;
+                    }
+                }
+                if cut.contains(&self.me.as_str()) {
+                    let role = data["role"].as_str().unwrap_or("this");
+                    self.closed = Some(format!("the owner revoked the {role} role"));
                 }
             }
             "closed" => {
