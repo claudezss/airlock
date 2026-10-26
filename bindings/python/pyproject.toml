@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "airlock-core"
+description = "Airlock protocol core: crypto, wire formats and validators (Rust, via PyO3)"
+requires-python = ">=3.9"
+dynamic = ["version"]
+classifiers = ["Programming Language :: Rust", "Programming Language :: Python :: 3"]
+
+[tool.maturin]
+module-name = "airlock_core"
+features = ["pyo3/extension-module"]
