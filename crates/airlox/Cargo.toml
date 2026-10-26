@@ -23,6 +23,8 @@ bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+rmcp = { version = "3.7", default-features = false, features = ["server", "macros", "transport-io"] }
+schemars = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "fs", "io-util", "signal"] }
 tracing = "0.1"

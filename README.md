@@ -84,17 +84,54 @@ The full design is in [docs/DESIGN.md](docs/DESIGN.md) and the wire format in
 
 ### Install
 
-```bash
-pip install airlox
-```
-
-The runner is a single binary:
+The `airlox` binary is the command-line client, the runner and the MCP
+server:
 
 ```bash
 cargo install --git https://github.com/claudezss/airlox airlox
 ```
 
-### Share messages and files
+The Python SDK:
+
+```bash
+pip install airlox
+```
+
+### From the command line
+
+```bash
+airlox session create --json                 # prints invite links per role
+airlox send text --invite "$SENDER" "Build finished."
+airlox send file --invite "$SENDER" report.md
+airlox watch --invite "$OWNER"               # print items as they arrive
+```
+
+Every command takes `--invite` (or `AIRLOX_INVITE`) and `--json`. See
+`airlox --help`.
+
+### From an AI agent
+
+Coding agents with a shell (Claude Code, Codex, Cursor, Gemini CLI) use the
+CLI; [skills/airlox/SKILL.md](skills/airlox/SKILL.md) teaches them how. Add
+it to your agent's skills, or point the agent at it.
+
+Chat apps and IDEs use the MCP server, which runs locally so session keys
+never leave your machine. It reads and writes files only inside the
+directories it is allowed (`--allow-dir`, default: its working directory).
+
+```bash
+claude mcp add airlox -- airlox mcp           # Claude Code
+codex mcp add airlox -- airlox mcp            # Codex
+```
+
+```json
+{ "mcpServers": { "airlox": { "command": "airlox", "args": ["mcp", "--allow-dir", "/path/to/workdir"] } } }
+```
+
+The tools let the agent create or join sessions, send messages and files,
+read items, approve runners and run Python.
+
+### From Python
 
 ```python
 from airlox import Session
@@ -197,11 +234,12 @@ Please report vulnerabilities privately through
 | `crates/airlox-core` | Protocol types, canonical JSON, cryptography, certificates, item envelopes, policy, validators and the job shim |
 | `crates/airlox-core/vectors` | Conformance vectors every implementation must pass |
 | `crates/airlox-server` | The relay, with the web UI embedded |
-| `crates/airlox` | The `airlox` runner binary and its Docker and local sandboxes |
+| `crates/airlox` | The `airlox` binary: command-line client, MCP server, and the runner with its Docker and local sandboxes |
 | `bindings/python` | PyO3 bindings, built into the `airlox` wheel as `airlox._core` |
 | `bindings/wasm` | WebAssembly bindings used by the web UI |
 | `python/airlox` | The Python SDK |
 | `web` | The browser UI |
+| `skills/airlox` | Agent skill that teaches coding agents the CLI |
 | `deploy` | Docker Compose, Caddy and Droplet scripts for the hosted relay |
 | `examples` | End-to-end examples |
 

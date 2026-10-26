@@ -62,6 +62,12 @@ pub async fn get_manifest(http: &reqwest::Client, base: &str, sid: &str) -> Resu
     v["signed_manifest"].as_str().map(str::to_string).context("relay sent no manifest")
 }
 
+/// `POST /v1/sessions`: register a session from its signed manifest.
+pub async fn create_session(http: &reqwest::Client, base: &str, signed_manifest: String) -> Result<()> {
+    check(http.post(format!("{base}/v1/sessions")).body(signed_manifest).send().await?).await?;
+    Ok(())
+}
+
 /// `POST /v1/sessions/{id}/participants`: returns the bearer token.
 pub async fn join(http: &reqwest::Client, base: &str, sid: &str, signed_join: String) -> Result<String> {
     let r =
@@ -150,5 +156,33 @@ impl Relay {
     pub async fn runner_stream(&self) -> Result<reqwest::Response> {
         let r = self.http.get(self.url("/runners/me/stream")).bearer_auth(&self.token).send().await?;
         check(r).await
+    }
+
+    /// An authenticated `GET` of a session path, as JSON.
+    pub async fn get_json(&self, path: &str) -> Result<Value> {
+        Ok(check(self.get(path).send().await?).await?.json().await?)
+    }
+
+    /// An authenticated `POST` with an optional body and extra headers.
+    pub async fn post_raw(
+        &self,
+        path: &str,
+        body: Vec<u8>,
+        headers: &[(&str, String)],
+    ) -> Result<reqwest::Response> {
+        let mut req = self.post(path).body(body);
+        for (k, v) in headers {
+            req = req.header(*k, v);
+        }
+        check(req.send().await?).await
+    }
+
+    /// Open the session's event stream (SSE), resuming after `last_seq`.
+    pub async fn session_stream(&self, last_seq: Option<u64>) -> Result<reqwest::Response> {
+        let mut req = self.http.get(self.url("/stream")).bearer_auth(&self.token);
+        if let Some(s) = last_seq {
+            req = req.header("Last-Event-ID", s.to_string());
+        }
+        check(req.send().await?).await
     }
 }
