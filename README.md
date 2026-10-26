@@ -117,17 +117,15 @@ Docker daemon is available), and the wasm tests in Node.
 
 ## Releasing
 
-Releases come from CI (`.github/workflows/release.yml`), never from a laptop.
-Set the same version in `Cargo.toml` (`workspace.package.version`),
-`python/airlox/pyproject.toml` (`version` and the `airlox-core==` pin) and
-`bindings/wasm/package.json`, then push a matching tag:
+PyPI releases come from CI (`.github/workflows/release.yml`), never from a
+laptop. Set the same version in `Cargo.toml` (`workspace.package.version`),
+`python/airlox/pyproject.toml` (`version` and the `airlox-core==` pin), then
+push a matching tag:
 
 ```bash
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-The workflow checks that the versions agree and builds everything first:
-`airlox-core` wheels for Linux (x86_64, aarch64), macOS (x86_64, arm64) and
-Windows plus its sdist, the `airlox` SDK, and the `airlox-core` npm package
-(wasm, for Node and browsers). Only then does it upload to PyPI (`PYPI_TOKEN`
-secret) and npm (`NPM_TOKEN` secret, with provenance).
+The workflow checks that the versions agree, builds `airlox-core` wheels for
+Linux (x86_64, aarch64), macOS (x86_64, arm64) and Windows plus its sdist,
+builds the `airlox` SDK, and uploads them all with the `PYPI_TOKEN` secret.
