@@ -430,7 +430,12 @@ class Session:
         if runner is not None and labels is not None:
             raise ValueError("pass runner or labels, not both")
         if runner is not None:
-            r = self._runner(runner)
+            # Re-resolved (not a caller's possibly stale Runner) so approval is current.
+            r = self._runner(runner.participant_pub if isinstance(runner, Runner) else runner)
+            if not r.approved:
+                # The relay may still route to it (if posting the owner's
+                # signed approval failed); it would get the code only to refuse.
+                raise ac.PolicyError(f"runner {r.name} has no signed approval from the owner yet")
             target = {"type": "runner", "participant_pub": r.participant_pub, "name": r.name}
         elif labels is not None:
             target = {"type": "labels", "labels": list(labels)}

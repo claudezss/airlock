@@ -107,7 +107,8 @@ async fn verify(ctx: &Ctx, view: &mut View, job_id: &str) -> Result<(ItemRef, Ve
         let until = tokio::time::Instant::now() + APPROVAL_WAIT;
         while !view.approved && !view.rejected && tokio::time::Instant::now() < until {
             tokio::time::sleep(Duration::from_millis(250)).await;
-            if let Err(e) = view.sync().await {
+            // Bounded by the same deadline, so a slow relay cannot stretch it.
+            if let Ok(Err(e)) = tokio::time::timeout_at(until, view.sync()).await {
                 tracing::debug!("sync while waiting for approval: {e:#}");
             }
         }

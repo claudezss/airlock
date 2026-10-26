@@ -82,10 +82,13 @@ impl Running {
     /// Wait until the server exits (after a shutdown signal) and has
     /// released the data directory.
     pub async fn wait(self) -> std::io::Result<()> {
-        let r = self.server.await.map_err(std::io::Error::other)?;
+        let r = self.server.await.map_err(std::io::Error::other);
+        // The server may also end on its own (an I/O error): stop the
+        // sweeper either way.
+        let _ = self.shutdown.send(true);
         let _ = self.sweeper.await;
         release(self.store).await;
-        r
+        r?
     }
 }
 
