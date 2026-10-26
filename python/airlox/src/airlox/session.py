@@ -383,7 +383,10 @@ class Session:
     def _runner(self, which: Union[Runner, str]) -> Runner:
         if isinstance(which, Runner):
             return which
-        matches = [r for r in self.runners() if which in (r.name, r.participant_pub)]
+        runners = self.runners()
+        # A key names exactly one runner; only then try names (a runner may
+        # pick another runner's key as its name to make the lookup ambiguous).
+        matches = [r for r in runners if r.participant_pub == which] or [r for r in runners if r.name == which]
         if len(matches) != 1:
             raise LookupError(f"{'no' if not matches else 'more than one'} runner matches {which!r}")
         return matches[0]

@@ -1111,7 +1111,9 @@ function renderRunners(s, list, note) {
         el("span", { class: `chip approval ${r.rejected ? "bad" : r.approved ? "good" : "wait"}` }, approval),
         r.networkUnblocked && !r.rejected ? el("span", { class: "chip warn", title: "This runner's sandbox cannot block network access" }, "⚠ network not blocked") : null),
       owner && !r.rejected ? el("div", { class: "row" },
-        r.approved ? null : el("button", { type: "button", class: "small primary", onclick: (ev) => decideRunner(s, r, true, ev.currentTarget) }, "Approve"),
+        // Kept after a failed approval: the relay may say approved while the
+        // signed approval never got posted, and the owner must be able to retry.
+        r.approved && !err ? null : el("button", { type: "button", class: "small primary", onclick: (ev) => decideRunner(s, r, true, ev.currentTarget) }, "Approve"),
         el("button", { type: "button", class: "small danger", onclick: (ev) => decideRunner(s, r, false, ev.currentTarget) }, "Reject")) : null,
       err ? el("p", { class: "error", role: "alert" }, err) : null);
   }));

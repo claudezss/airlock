@@ -103,6 +103,21 @@ def test_idle_runner_still_sees_its_approval(execute):
     assert res.ok and res.stdout.strip() == "ok", (res, runner.output())
 
 
+def test_job_arriving_just_before_the_signed_approval_runs(execute):
+    # approve_runner approves on the relay, then posts the signed event: a
+    # job routed in between waits briefly for that event instead of being
+    # refused.
+    owner, agent, runner = execute
+    [r] = owner.runners()
+    owner._req("POST", f"/runners/{r.participant_pub}/approve")
+    job = agent.run_python("print('ok')", labels=["cpu"])
+    time.sleep(1.0)
+    owner._send("event", None, {"type": "event", "event": "runner_approve", "participant_pub": r.participant_pub},
+                b"", [])
+    res = job.wait(timeout=60)
+    assert res.ok and res.stdout.strip() == "ok", (res, runner.output())
+
+
 def test_refusals_timeouts_and_cancels(execute):
     owner, agent, runner = execute
     owner.approve_runner("runner-01")

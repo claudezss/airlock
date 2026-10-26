@@ -66,12 +66,7 @@ impl Running {
     /// when this returns, another server can open it.
     pub async fn stop(self) -> std::io::Result<()> {
         let _ = self.shutdown.send(true);
-        let r = self.server.await.map_err(std::io::Error::other)?;
-        // The sweeper sees the same signal and finishes any sweep in
-        // progress, which holds the store, before it exits.
-        let _ = self.sweeper.await;
-        release(self.store).await;
-        r
+        self.wait().await
     }
 
     /// A handle that triggers the same shutdown as [`Running::stop`].
@@ -99,6 +94,11 @@ async fn release(store: Arc<Store>) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while Arc::strong_count(&store) > 1 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if Arc::strong_count(&store) > 1 {
+        tracing::warn!(
+            "the data directory is still in use after shutdown; its lock is released when that ends"
+        );
     }
     drop(store);
 }
