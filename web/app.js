@@ -298,7 +298,7 @@ function newSession() {
         inviteRow("Owner", owner, "you · keep it private"),
         inviteRow("Sender", ac.memberInvite(base, s.ownerSeed, "sender"), "your code agent"),
         inviteRow("Observer", ac.memberInvite(base, s.ownerSeed, "observer"), "read-only, optional"),
-        execute ? runnerInviteRow(ac.memberInvite(base, s.ownerSeed, "runner")) : null,
+        ...(execute ? [runnerInviteRow(ac.memberInvite(base, s.ownerSeed, "runner"))] : []),
         el("div", { class: "row" },
           // A button, not a link: the owner key must not show in the status bar on hover.
           el("button", { class: "primary cta", type: "button", onclick: () => { invitesShown = false; location.assign(owner); } }, "Open session"),
