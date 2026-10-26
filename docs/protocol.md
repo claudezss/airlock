@@ -285,6 +285,9 @@ PEP 503-normalized, is in `packages`; the target is well-formed. Runners also
 verify the author's certificate chains to the sender (or owner) role, that a
 `runner_approve` event for themselves is signed by an owner-role participant,
 and keep a per-session set of job ids so a relayed duplicate never runs twice.
+Runners install the manifest's `packages` from wheels only (`--only-binary
+:all:`) when they join, before approval: a source distribution's build script
+would otherwise run outside the sandbox.
 
 ## 9. ZIP handling
 
@@ -492,8 +495,13 @@ signed `envelope`), `ack`, `leave`, `evict`, `want`, `reseed`,
 `revoke` (with `role` and the `participants` cut off) or `close`. `actor` is a
 participant key. With the signed joins and envelopes, and `blob_sha256` (the
 digest each author signed), anyone can check every item line against its
-author without the relay. The export never contains ciphertext, bearer-token
-hashes or the creator's address hash. It is purged with the session.
+author without the relay. Only those lines are signed: the rest (acks,
+evictions, approvals as the relay recorded them, revocations, job states) are
+the relay's word, and the relay could leave lines out, so the export is a
+record to check items against, not a tamper-evident log. The export never
+contains ciphertext, bearer-token hashes or the creator's address hash. It is
+purged with the session. The relay builds two exports at a time; more are
+`429`.
 
 **Error codes.**
 

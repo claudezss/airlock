@@ -16,7 +16,7 @@ const MAX_JSON: usize = 32 << 20;
 /// Read a response body, refusing one larger than `limit` bytes: a relay
 /// cannot make a client buffer without bound.
 /// The largest audit trail read: a session log is capped well below this.
-pub const MAX_AUDIT: usize = 256 << 20;
+pub const MAX_AUDIT: usize = 32 << 20;
 
 pub async fn read_capped(r: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
     if r.content_length().is_some_and(|n| n > limit as u64) {

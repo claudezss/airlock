@@ -108,7 +108,9 @@ impl Local {
             if !spec.packages.is_empty() {
                 run_ok(
                     Command::new(&uv)
-                        .args(["pip", "install", "--quiet", "--python"])
+                        // Wheels only: an sdist's build script would run
+                        // here, on the host, outside the sandbox.
+                        .args(["pip", "install", "--quiet", "--only-binary", ":all:", "--python"])
                         .arg(&python)
                         .args(&spec.packages),
                     "uv pip install",

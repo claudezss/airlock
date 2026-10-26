@@ -70,7 +70,8 @@ impl Docker {
         let mut f = format!("FROM python:{}-slim\n", spec.python_version());
         if !spec.packages.is_empty() {
             f += &format!(
-                "RUN pip install --no-cache-dir --disable-pip-version-check {}\n",
+                // Wheels only: no build scripts from the session's packages.
+                "RUN pip install --no-cache-dir --disable-pip-version-check --only-binary :all: {}\n",
                 spec.packages.join(" ")
             );
         }

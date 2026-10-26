@@ -106,6 +106,12 @@ struct Identity {
 impl Cache {
     fn open(root: &Path, sid: &str) -> Result<Cache> {
         let dir = root.join(sid);
+        // A new cache root is private too: its entries name the sessions.
+        #[cfg(unix)]
+        if !root.exists() {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new().recursive(true).mode(0o700).create(root)?;
+        }
         fs::create_dir_all(dir.join("blobs"))?;
         #[cfg(unix)]
         {

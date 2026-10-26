@@ -44,6 +44,11 @@ pub const MAX_CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
 pub const BODY_IDLE: Duration = Duration::from_secs(30);
 /// Log space reserved per line beyond its payload (seq, timestamps, token hash).
 const LOG_LINE_OVERHEAD: u64 = 512;
+/// Re-seed uploads one participant may have in flight.
+const MAX_RESEEDS_IN_FLIGHT: usize = 4;
+/// Audit exports built at once, relay-wide: each holds about twice its log
+/// in memory.
+static AUDITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -615,6 +620,10 @@ pub(crate) fn commit_upload<T>(
         if g.closed {
             return Err(ApiError::gone("closed", "session is closed"));
         }
+        // The author may have left, been rejected or revoked while uploading.
+        if !g.is_live(who) {
+            return Err(ApiError::unauthorized());
+        }
         let recipients: Vec<String> = g.active_participants().filter(|k| *k != who).cloned().collect();
         g.pending.remove(&reservation.id);
         g.pending_bytes -= blob_len;
@@ -832,6 +841,8 @@ pub async fn want(
 /// `PUT /v1/sessions/:id/items/:item/blob` — re-seed an evicted blob: the
 /// raw ciphertext, accepted only while a want for it is open and it is
 /// absent, and only if its SHA-256 matches the author-signed envelope.
+/// Holders may upload at once and the first to finish wins, so one slow or
+/// stalled uploader cannot hold the others off.
 pub async fn reseed(
     State(st): State<AppState>,
     Path((id, item)): Path<(String, String)>,
@@ -845,11 +856,21 @@ pub async fn reseed(
         return Err(ApiError::storage_full());
     }
     let cfg = st.store.cfg.clone();
+    // Pending under its own key, apart from the item id and from other
+    // holders' uploads of the same blob.
+    let key = format!("{item}/reseed/{who}");
     let (env, mut reservation) = {
         let mut g = s.lock();
         let r = g.items.get(&item).ok_or_else(|| ApiError::not_found("no such item"))?;
-        if r.blob_present || g.pending.contains(&item) {
-            return Err(ApiError::conflict_code("present", "the blob is on the relay or being uploaded"));
+        if r.blob_present {
+            return Err(ApiError::conflict_code("present", "the blob is on the relay"));
+        }
+        if g.pending.contains(&key) {
+            return Err(ApiError::conflict_code("uploading", "you are already uploading this blob"));
+        }
+        let suffix = format!("/reseed/{who}");
+        if g.pending.iter().filter(|k| k.ends_with(&suffix)).count() >= MAX_RESEEDS_IN_FLIGHT {
+            return Err(ApiError::limit("too many re-seed uploads at once"));
         }
         let blob_len = r.blob_len;
         g.prune_wants(now_ms());
@@ -867,12 +888,12 @@ pub async fn reseed(
         if g.transfer_bytes + blob_len > cfg.max_session_transfer {
             return Err(ApiError::limit("session transfer limit reached"));
         }
-        g.pending.insert(item.clone());
+        g.pending.insert(key.clone());
         g.pending_bytes += blob_len;
         g.transfer_bytes += blob_len;
         let res = Reservation {
             session: s.clone(),
-            id: item.clone(),
+            id: key.clone(),
             bytes: blob_len,
             received: 0,
             committed: false,
@@ -884,12 +905,19 @@ pub async fn reseed(
         receive_blob(&s, &env, blob_len, Bytes::new(), body.into_data_stream(), &mut reservation).await?;
     blocking(move || {
         let final_path = s.blob_path(&item);
-        let commit = || -> ApiResult<()> {
-            std::fs::rename(&tmp_path, &final_path).map_err(closed_if_missing)?;
-            sync_dir(final_path.parent().expect("blob has a parent")).map_err(closed_if_missing)?;
+        // Checked and moved into place under the lock: another holder's
+        // upload may have won meanwhile, and its file must not be touched.
+        let mut placed = false;
+        let mut commit = || -> ApiResult<()> {
             let mut g = s.lock();
             if g.closed {
                 return Err(ApiError::gone("closed", "session is closed"));
+            }
+            if !g.is_live(&who) {
+                return Err(ApiError::unauthorized());
+            }
+            if g.items.get(&item).is_some_and(|r| r.blob_present) {
+                return Err(ApiError::conflict_code("present", "another holder re-seeded it first"));
             }
             // The wanters may have left, been revoked or stopped asking
             // during the upload; then nobody would fetch it.
@@ -900,14 +928,17 @@ pub async fn reseed(
                     "no one is waiting for this blob any more",
                 ));
             }
-            g.pending.remove(&item);
+            std::fs::rename(&tmp_path, &final_path).map_err(closed_if_missing)?;
+            placed = true;
+            sync_dir(final_path.parent().expect("blob has a parent")).map_err(closed_if_missing)?;
+            g.pending.remove(&key);
             g.pending_bytes -= blob_len;
             // Applying the Reseed record charges the transfer for real.
             g.transfer_bytes -= blob_len;
             reservation.committed = true;
-            if let Err(e) = s.append(&mut g, Rec::Reseed { item: item.clone(), by: who }) {
+            if let Err(e) = s.append(&mut g, Rec::Reseed { item: item.clone(), by: who.clone() }) {
                 g.transfer_bytes += blob_len;
-                g.pending.insert(item.clone());
+                g.pending.insert(key.clone());
                 g.pending_bytes += blob_len;
                 reservation.committed = false;
                 reservation.received = blob_len;
@@ -918,7 +949,9 @@ pub async fn reseed(
         let r = commit();
         if r.is_err() && !reservation.committed {
             let _ = std::fs::remove_file(&tmp_path);
-            let _ = std::fs::remove_file(&final_path);
+            if placed {
+                let _ = std::fs::remove_file(&final_path);
+            }
         }
         drop(reservation);
         r
@@ -999,6 +1032,8 @@ pub async fn audit(
         return Err(ApiError::forbidden("only the owner and observers may export the audit trail"));
     }
     let name = format!("attachment; filename=\"{}-audit.jsonl\"", s.id);
+    let _permit =
+        AUDITS.try_acquire().map_err(|_| ApiError::limit("the relay is busy exporting; try again"))?;
     let body = blocking(move || Ok(s.audit()?)).await?;
     Ok((
         [(header::CONTENT_TYPE, "application/x-ndjson".to_string()), (header::CONTENT_DISPOSITION, name)],

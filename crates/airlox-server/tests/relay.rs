@@ -674,3 +674,73 @@ async fn audit_export_is_verifiable_and_holds_no_secrets() {
     // Owners may export too; senders and runners may not.
     assert_eq!(audit(&env, &s, &owner).await.status(), StatusCode::OK);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_in_flight_when_its_author_is_revoked_is_refused() {
+    let env = Env::new().await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let sender = join(&env, &s, Role::Sender, "sender").await;
+    let item = seal_text(&s, &sender, "sent after the revoke");
+    let body = frame(&item);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(1);
+    let stream = futures_util::stream::unfold(rx, |mut rx| async { rx.recv().await.map(|c| (c, rx)) });
+    let upload = tokio::spawn(
+        env.http
+            .post(env.url(&format!("/v1/sessions/{}/items", s.id)))
+            .bearer_auth(&sender.token)
+            .body(reqwest::Body::wrap_stream(stream))
+            .send(),
+    );
+    // Half the frame, so the relay has checked the token and is reading the blob.
+    let half = body.len() / 2;
+    tx.send(Ok(body[..half].to_vec())).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(revoke(&env, &s, &owner, "sender").await.status(), StatusCode::NO_CONTENT);
+    tx.send(Ok(body[half..].to_vec())).await.unwrap();
+    drop(tx);
+    let r = upload.await.unwrap().unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    let evs = events(&env, &s, &owner).await;
+    assert!(!evs.iter().any(|e| e["kind"] == "item"), "the item must not land");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_reseed_does_not_hold_off_other_holders() {
+    let env = Env::new().await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let sender = join(&env, &s, Role::Sender, "sender").await;
+    let item = seal_text(&s, &sender, &"x".repeat(4096));
+    let id = item.envelope.header.id.clone();
+    post(&env, &s, &sender, frame(&item)).await;
+    ack(&env, &s, &owner, &id).await;
+    assert!(eventually(|| async { blob(&env, &s, &owner, &id).await.status() == StatusCode::GONE }).await);
+    let late = join(&env, &s, Role::Observer, "late").await;
+    assert_eq!(want(&env, &s, &late, &id).await.status(), StatusCode::ACCEPTED);
+
+    // The sender starts an upload and stalls halfway.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(1);
+    let stream = futures_util::stream::unfold(rx, |mut rx| async { rx.recv().await.map(|c| (c, rx)) });
+    let stalled = tokio::spawn(
+        env.http
+            .put(env.url(&format!("/v1/sessions/{}/items/{id}/blob", s.id)))
+            .bearer_auth(&sender.token)
+            .body(reqwest::Body::wrap_stream(stream))
+            .send(),
+    );
+    let half = item.blob.len() / 2;
+    tx.send(Ok(item.blob[..half].to_vec())).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // While the want stays open, and the owner's upload wins.
+    assert_eq!(want(&env, &s, &late, &id).await.status(), StatusCode::ACCEPTED);
+    let r = reseed(&env, &s, &owner, &id, item.blob.clone()).await;
+    assert_eq!(r.status(), StatusCode::NO_CONTENT, "{}", r.text().await.unwrap());
+    tx.send(Ok(item.blob[half..].to_vec())).await.unwrap();
+    drop(tx);
+    let r = stalled.await.unwrap().unwrap();
+    assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "present".into()));
+    assert_eq!(blob(&env, &s, &late, &id).await.bytes().await.unwrap().to_vec(), item.blob);
+}

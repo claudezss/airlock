@@ -475,6 +475,11 @@ impl Inner {
         }
     }
 
+    /// Whether `who` is still in the session: not left, rejected or revoked.
+    pub fn is_live(&self, who: &str) -> bool {
+        self.participants.get(who).is_some_and(|p| !p.left && !p.rejected)
+    }
+
     /// `(participant_pub, role)` for a live token.
     pub fn participant_by_token(&self, token_sha256: &str) -> Option<(String, Role)> {
         let pk = self.tokens.get(token_sha256)?;
