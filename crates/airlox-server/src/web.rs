@@ -36,6 +36,10 @@ pub async fn index() -> Response {
     serve("index.html")
 }
 
+pub async fn new_page() -> Response {
+    serve("index.html")
+}
+
 pub async fn session_page(Path(_id): Path<String>) -> Response {
     serve("index.html")
 }
