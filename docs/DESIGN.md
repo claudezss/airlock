@@ -149,9 +149,9 @@ implementation exists.
 
 ### Session creation (owner, client-side)
 
-1. Generate session key `K` (32 random bytes).
-2. Generate owner keypair `O` and one **role keypair** per role: `R_send`,
-   `R_run`, `R_view`.
+1. Generate a 32-byte owner seed; the owner keypair `O` uses it directly.
+2. Derive session key `K` and one **role keypair** per role (`R_send`,
+   `R_run`, `R_view`) from the owner seed with HKDF.
 3. `session_id = "ak_" + base32(sha256(O.pub))[:12]`.
 4. Build the **manifest** (plaintext, signed by `O`):
 
@@ -175,11 +175,15 @@ implementation exists.
 
 ```
 https://<host>/s/<session_id>#v=1&r=<send|run|view>&k=<K>&rk=<role private seed>
+https://<host>/s/<session_id>#v=1&r=owner&ok=<owner seed>
 ```
 
 The fragment never reaches the server. Holding an invite = holding `K` (read
 everything) + the role's private key (mint a certificate for that role). This
 matches the design copy: "each link carries its role and the session key".
+`K` and the role seeds are derived from the owner seed with HKDF, so the owner
+link carries only the owner seed. The normative format is in
+[protocol.md](protocol.md).
 
 ### Joining (any participant)
 
@@ -222,13 +226,13 @@ plaintext **header**, the **ciphertext**, and the **signature**.
 ```
 header (canonical JSON, plaintext):
   { "v":1, "id": ulid, "session_id", "author": P.pub fingerprint,
-    "kind": "text|file|job|result|event", "subkind": "md|py|zip|image|…",
-    "size": plaintext bytes, "ct_sha256", "created_at", "refs": [item ids] }
+    "kind": "text|file|job|result|event", "subkind": "md|py|zip|image|null",
+    "size": plaintext bytes, "created_at_ms", "refs": [item ids] }
 
-ciphertext: AES-256-GCM( key = HKDF(K, salt=session_id, info="item:"+id),
-                         nonce = 12 random bytes, aad = header bytes )
+blob: nonce(12) || AES-256-GCM( key = HKDF(K, salt=session_id, info="airlock/v1/item-key\0"+id),
+                                 aad = canonical(header) )
 
-sig: Ed25519( P.priv, sha256(header || ct_sha256) )
+sig: Ed25519( P.priv, ctx "item", canonical(header) || sha256(blob) )
 ```
 
 - **Per-item keys** derived from `K` mean a leaked item key exposes one item.
@@ -239,13 +243,15 @@ sig: Ed25519( P.priv, sha256(header || ct_sha256) )
 - Payloads by kind:
   - `text`: UTF-8 string.
   - `file`: `{name, mime, bytes}`; `subkind` fixes which viewer applies.
-  - `job`: `{code, filename, runtime, timeout_s, files: [item ids],
-    requirements: [...], target: {"runner": name} | {"labels": [...]} | "any"}`.
-  - `result`: `{job_id, exit_code, wall_ms, peak_mem_mb, stdout, stderr,
-    truncated: {stdout: bool, stderr: bool}, out_files: [{name, size,
-    item_id}], code_sha256, input_sha256}`. Files from `/out` are uploaded as
-    separate `file` items first (images as `image`, everything else bundled
-    into one `zip`), then referenced.
+  - `job`: `{code, filename, runtime, timeout_s, files: [item refs],
+    requirements: [...], target: {runner: participant_pub} | {labels: [...]} | any}`.
+  - `result`: `{job: item ref, exit_code, status, wall_ms, peak_mem_mb, stdout,
+    stderr, out_files: [{name, size, item: item ref}], code_sha256,
+    input_sha256}`. Files from `/out` are uploaded as separate `file` items
+    first (images as `image`, everything else bundled into one `zip`), then
+    referenced.
+  - An item ref is `{id, blob_sha256}`, so a reference cannot be redirected
+    to a different item with the same id. Exact formats: [protocol.md](protocol.md).
   - `event`: `runner.approve`, `runner.reject`, `session.close`, `job.cancel`.
 
 ### Content handling rules (client/runner side, since the server is blind)
@@ -306,7 +312,7 @@ wall_ms, peak_mem_mb, out_dir}`.
 
 All backends execute the same tiny **job shim**, a dependency-free Python
 script embedded in `airlock-core` and copied into the sandbox: it sets
-`cwd=/work`, scrubs the environment, runs `python -I entry.py`, enforces the
+`cwd=/work`, scrubs the environment, runs `python -E -s entry.py`, enforces the
 wall clock, measures peak RSS and writes a `result.json`. The shim stays in
 Python because it must run inside an image that has only Python; it is ~150
 lines and is covered by the core test suite. One shim → identical behaviour
@@ -341,8 +347,10 @@ in the design possible.
 
 The local backend on Linux is a real sandbox and acceptable for untrusted
 code from another agent. On macOS and Windows it is for development and
-trusted pairs only; the CLI prints a one-line warning when it is selected in a
-session whose manifest says `network: false`.
+trusted pairs only: the shim kills the job's process group, but a job that
+calls `setsid()` can outlive it there, and network cannot be blocked. The CLI
+prints a one-line warning when it is selected in a session whose manifest says
+`network: false`.
 
 ### Job routing ("no queue")
 

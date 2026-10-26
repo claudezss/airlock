@@ -1,0 +1,22 @@
+[package]
+name = "airlock-core-py"
+description = "Python bindings for airlock-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "airlock_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+airlock-core = { workspace = true, features = ["image", "fs"] }
+serde.workspace = true
+pyo3 = { version = "0.25", features = ["extension-module", "abi3-py39"] }
+
+[lints]
+workspace = true
+
+[build-dependencies]
+pyo3-build-config = "0.25"

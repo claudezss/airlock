@@ -1,0 +1,10 @@
+/target
+.idea/
+.venv/
+__pycache__/
+*.pyc
+*.so
+/bindings/wasm/pkg/
+/bindings/python/dist/
+node_modules/
+.DS_Store
