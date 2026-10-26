@@ -23,10 +23,24 @@ pub fn safe_name(name: &str) -> Option<&str> {
 /// never be `conftest.py`, `CLAUDE.md` or `test_*.py`, and the extension
 /// keeps test runners and importers from picking up received code under any
 /// name (`*_test.py`).
-pub fn received_name(name: &str) -> Option<String> {
+///
+/// The extension follows the item's verified type, not the sender's name
+/// (the core does not tie one to the other): a file sent as Markdown named
+/// `run.sh` or `page.html` is saved as `…-run.sh.md`.
+pub fn received_name(name: &str, subkind: &str, mime: &str) -> Option<String> {
     let name = safe_name(name)?;
     let tag: String = airlox_core::api::generate_seed()[..4].iter().map(|b| format!("{b:02x}")).collect();
-    let tail = if name.to_ascii_lowercase().ends_with(".py") { ".txt" } else { "" };
+    let lower = name.to_ascii_lowercase();
+    let (keep, add): (&[&str], &str) = match (subkind, mime) {
+        ("py", _) => (&[], if lower.ends_with(".py") { ".txt" } else { ".py.txt" }),
+        ("md", _) => (&[".md", ".markdown"], ".md"),
+        ("zip", _) => (&[".zip"], ".zip"),
+        ("image", "image/png") => (&[".png"], ".png"),
+        ("image", "image/jpeg") => (&[".jpg", ".jpeg"], ".jpg"),
+        ("image", "image/webp") => (&[".webp"], ".webp"),
+        _ => (&[], ".bin"),
+    };
+    let tail = if keep.iter().any(|e| lower.ends_with(e)) { "" } else { add };
     Some(format!("airlox-{tag}-{name}{tail}"))
 }
 
@@ -119,19 +133,26 @@ mod tests {
 
     #[test]
     fn received_names_are_not_the_senders_choice() {
-        for (sent, ext) in [
-            ("conftest.py", "-conftest.py.txt"),
-            ("x_test.py", "-x_test.py.txt"),
-            ("CLAUDE.md", "-CLAUDE.md"),
+        for (sent, kind, mime, ext) in [
+            ("conftest.py", "py", "text/x-python", "-conftest.py.txt"),
+            ("x_test.py", "py", "text/x-python", "-x_test.py.txt"),
+            ("CLAUDE.md", "md", "text/markdown", "-CLAUDE.md"),
+            ("run.sh", "md", "text/markdown", "-run.sh.md"),
+            ("page.html", "zip", "application/zip", "-page.html.zip"),
+            ("evil.py", "md", "text/markdown", "-evil.py.md"),
+            ("x.js", "py", "text/x-python", "-x.js.py.txt"),
+            ("pic.JPEG", "image", "image/jpeg", "-pic.JPEG"),
+            ("pic.png", "image", "image/webp", "-pic.png.webp"),
         ] {
-            let n = received_name(sent).unwrap();
+            let n = received_name(sent, kind, mime).unwrap();
             assert!(
                 n.starts_with("airlox-") && n.ends_with(ext) && n.len() == "airlox-".len() + 8 + ext.len(),
                 "{n}"
             );
         }
-        assert_ne!(received_name("a.md"), received_name("a.md"));
-        assert_eq!(received_name("../a.md"), None);
+        let md = |n| received_name(n, "md", "text/markdown");
+        assert_ne!(md("a.md"), md("a.md"));
+        assert_eq!(md("../a.md"), None);
     }
 
     #[test]
