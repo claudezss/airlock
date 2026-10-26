@@ -223,6 +223,25 @@ pub fn open_checked(
     Ok((role.as_str().to_string(), json(&p.meta)?, p.body))
 }
 
+/// Bind a decrypted result to the job it answers: the result must reference
+/// exactly this job item, and a job aimed at one runner only accepts that
+/// runner's result. `job_ref_json` comes from [`item_ref`] on the fetched job;
+/// both metas come from [`open_checked`].
+pub fn check_result_for_job(
+    job_ref_json: &str,
+    job_meta_json: &str,
+    result_author_b64: &str,
+    result_meta_json: &str,
+) -> Result<()> {
+    let job_ref: ItemRef = serde_json::from_str(job_ref_json)?;
+    let (Meta::Job(job), Meta::Result(r)) =
+        (serde_json::from_str(job_meta_json)?, serde_json::from_str(result_meta_json)?)
+    else {
+        return Err(Error::invalid("result", "expected a job meta and a result meta"));
+    };
+    crate::policy::check_result_matches_job(&job_ref, &job, PublicKey::from_b64(result_author_b64)?, &r)
+}
+
 /// Returns a JSON array of entries.
 pub fn inspect_zip(bytes: &[u8]) -> Result<String> {
     Ok(serde_json::to_string(&inspect(bytes, &ZipLimits::default())?)?)

@@ -202,6 +202,18 @@ pub fn item_ref(envelope_json: &str, blob: &[u8]) -> R<String> {
     api::item_ref(envelope_json, blob).map_err(err)
 }
 
+/// Bind a result to its job: same job reference, and for a job aimed at one
+/// runner, a result from that runner.
+#[wasm_bindgen(js_name = checkResultForJob)]
+pub fn check_result_for_job(
+    job_ref_json: &str,
+    job_meta_json: &str,
+    result_author: &str,
+    result_meta_json: &str,
+) -> R<()> {
+    api::check_result_for_job(job_ref_json, job_meta_json, result_author, result_meta_json).map_err(err)
+}
+
 #[wasm_bindgen(js_name = inspectZip)]
 pub fn inspect_zip(data: &[u8]) -> R<String> {
     api::inspect_zip(data).map_err(err)

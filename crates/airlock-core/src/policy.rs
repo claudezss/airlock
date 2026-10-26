@@ -299,6 +299,16 @@ pub fn check_result(r: &JobResult) -> Result<()> {
     Ok(())
 }
 
+/// Whether a runner with this key and these labels may take a job aimed at
+/// `target`. The relay routes with it; the runner re-checks the signed target.
+pub fn target_matches(target: &Target, runner: PublicKey, labels: &[String]) -> bool {
+    match target {
+        Target::Runner { participant_pub, .. } => *participant_pub == runner,
+        Target::Labels { labels: want } => want.iter().all(|l| labels.contains(l)),
+        Target::Any => true,
+    }
+}
+
 /// Bind a result to the job it claims to answer. `job_ref` must already have
 /// been matched against the fetched job item ([`ItemRef::matches`]). A job
 /// aimed at one runner only accepts a result from that runner's key.
@@ -483,6 +493,18 @@ mod tests {
         check_result_matches_job(&iref(3), &j, runner, &r).unwrap();
         assert!(check_result_matches_job(&iref(3), &j, intruder, &r).is_err());
         assert!(check_result_matches_job(&iref(7), &j, runner, &r).is_err());
+    }
+
+    #[test]
+    fn targets() {
+        let me = Keypair::from_seed(&[5u8; 32]).public();
+        let other = Keypair::from_seed(&[6u8; 32]).public();
+        let labels = vec!["cpu".to_string(), "py3.12".to_string()];
+        assert!(target_matches(&Target::Any, me, &[]));
+        assert!(target_matches(&Target::Labels { labels: vec!["cpu".into()] }, me, &labels));
+        assert!(!target_matches(&Target::Labels { labels: vec!["gpu".into()] }, me, &labels));
+        assert!(target_matches(&Target::Runner { participant_pub: me, name: "r".into() }, me, &[]));
+        assert!(!target_matches(&Target::Runner { participant_pub: other, name: "r".into() }, me, &[]));
     }
 
     #[test]

@@ -219,6 +219,18 @@ fn item_ref(py: Python<'_>, envelope_json: &str, blob: &[u8]) -> PyResult<String
     py.allow_threads(|| api::item_ref(envelope_json, blob)).map_err(err)
 }
 
+/// Bind a result to its job: same job reference, and for a job aimed at one
+/// runner, a result from that runner.
+#[pyfunction]
+fn check_result_for_job(
+    job_ref_json: &str,
+    job_meta_json: &str,
+    result_author: &str,
+    result_meta_json: &str,
+) -> PyResult<()> {
+    api::check_result_for_job(job_ref_json, job_meta_json, result_author, result_meta_json).map_err(err)
+}
+
 /// Returns a JSON array of {path, size, compressed_size, is_dir}.
 #[pyfunction]
 fn inspect_zip(py: Python<'_>, data: &[u8]) -> PyResult<String> {
@@ -274,6 +286,7 @@ fn airlock_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(check_header, m)?)?;
     m.add_function(wrap_pyfunction!(open_checked, m)?)?;
     m.add_function(wrap_pyfunction!(item_ref, m)?)?;
+    m.add_function(wrap_pyfunction!(check_result_for_job, m)?)?;
     m.add_function(wrap_pyfunction!(inspect_zip, m)?)?;
     m.add_function(wrap_pyfunction!(extract_zip, m)?)?;
     m.add_function(wrap_pyfunction!(sanitize_image, m)?)?;

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use airlock_core::cert::SignedJoinRequest;
 use airlock_core::encoding::parse_canonical;
-use airlock_core::item::{is_item_id, ItemEnvelope};
+use airlock_core::item::{is_item_id, ItemEnvelope, ItemKind};
 use airlock_core::policy;
 use airlock_core::session::{is_session_id, Mode, Role, SignedManifest};
 use axum::body::{Body, BodyDataStream};
@@ -29,7 +29,8 @@ use tokio::sync::{broadcast, watch};
 
 use crate::error::{ApiError, ApiResult};
 use crate::store::{
-    sync_dir, CreateError, Event, Rec, Session, Store, MAX_PARTICIPANTS, MAX_STREAMS_PER_PARTICIPANT,
+    sync_dir, CreateError, Event, Inner, JobState, Rec, Session, Store, MAX_PARTICIPANTS,
+    MAX_STREAMS_PER_PARTICIPANT,
 };
 use crate::util::{new_token, now_ms, random_suffix, sha256_hex};
 
@@ -51,23 +52,25 @@ pub struct AppState {
 }
 
 /// Run disk-bound work on the blocking pool.
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> ApiResult<T> + Send + 'static) -> ApiResult<T> {
+pub(crate) async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> ApiResult<T> + Send + 'static,
+) -> ApiResult<T> {
     tokio::task::spawn_blocking(f).await.map_err(ApiError::internal)?
 }
 
-fn session(st: &AppState, id: &str) -> ApiResult<Arc<Session>> {
+pub(crate) fn session(st: &AppState, id: &str) -> ApiResult<Arc<Session>> {
     if !is_session_id(id) {
         return Err(ApiError::not_found("no such session"));
     }
     st.store.get(id).ok_or_else(|| ApiError::not_found("no such session"))
 }
 
-fn bearer(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")
 }
 
 /// Resolve the bearer token to `(participant_pub, role)`.
-fn auth(s: &Session, headers: &HeaderMap) -> ApiResult<(String, Role)> {
+pub(crate) fn auth(s: &Session, headers: &HeaderMap) -> ApiResult<(String, Role)> {
     let token = bearer(headers).ok_or_else(ApiError::unauthorized)?;
     let g = s.lock();
     if g.closed {
@@ -116,7 +119,7 @@ async fn next_chunk(chunks: &mut BodyDataStream) -> ApiResult<Option<Bytes>> {
 }
 
 /// Read a small UTF-8 body with a size cap and an idle timeout.
-async fn read_json_body(body: Body) -> ApiResult<String> {
+pub(crate) async fn read_json_body(body: Body) -> ApiResult<String> {
     let mut chunks = body.into_data_stream();
     let mut buf = Vec::new();
     while let Some(c) = next_chunk(&mut chunks).await? {
@@ -274,6 +277,7 @@ pub async fn leave(
     blocking(move || {
         let mut g = s.lock();
         if !g.closed {
+            s.fail_runner_job(&mut g, &who, "runner_left")?;
             s.append(&mut g, Rec::Leave { who })?;
         }
         Ok(())
@@ -316,7 +320,7 @@ pub async fn events(
     Ok(Json(json!({"events": evs})))
 }
 
-fn sse_event(e: &Event) -> SseEvent {
+pub(crate) fn sse_event(e: &Event) -> SseEvent {
     SseEvent::default().id(e.seq.to_string()).event(e.kind).data(e.data.to_string())
 }
 
@@ -422,15 +426,27 @@ fn closed_if_missing(e: std::io::Error) -> ApiError {
     }
 }
 
-/// `POST /v1/sessions/:id/items` — body: `u32_be(len) || envelope || blob`.
-pub async fn post_item(
-    State(st): State<AppState>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
+/// A verified upload whose blob sits in a temp file, not yet in the log.
+pub(crate) struct Upload {
+    env_json: String,
+    pub(crate) env: ItemEnvelope,
+    blob_len: u64,
+    tmp_path: std::path::PathBuf,
+    reservation: Reservation,
+}
+
+/// Read an upload frame (`u32_be(len) || envelope || blob`), check the
+/// envelope against the author and header policy, and stream the blob to a
+/// temp file while hashing it. `kind_ok` decides which item kinds this
+/// endpoint takes.
+pub(crate) async fn receive_upload(
+    st: &AppState,
+    s: &Arc<Session>,
+    who: &str,
+    role: Role,
     body: Body,
-) -> ApiResult<(StatusCode, Json<Value>)> {
-    let s = session(&st, &id)?;
-    let (who, role) = auth(&s, &headers)?;
+    kind_ok: impl FnOnce(ItemKind) -> ApiResult<()>,
+) -> ApiResult<Upload> {
     let cfg = st.store.cfg.clone();
     let mut chunks = body.into_data_stream();
     let mut buf: Vec<u8> = Vec::new();
@@ -466,6 +482,7 @@ pub async fn post_item(
         )));
     }
     policy::check_header(&s.signed.manifest, role, h)?;
+    kind_ok(h.kind)?;
     let item_id = h.id.clone();
     let blob_len = h.blob_len()?;
 
@@ -502,7 +519,6 @@ pub async fn post_item(
         }
     };
 
-    let final_path = s.blob_path(&item_id);
     let tmp_path = s.dir.join("blobs").join(format!(".{item_id}.{}.tmp", random_suffix()));
     // A steady trickle still has to finish: allow two minutes plus 16 KiB/s.
     let deadline = Duration::from_secs(120 + blob_len / (16 * 1024));
@@ -543,48 +559,98 @@ pub async fn post_item(
         let _ = tokio::fs::remove_file(&tmp_path).await;
         return Err(e);
     }
+    Ok(Upload { env_json, env, blob_len, tmp_path, reservation })
+}
 
-    let s2 = s.clone();
-    let seq = blocking(move || {
-        let commit = || -> ApiResult<u64> {
-            std::fs::rename(&tmp_path, &final_path).map_err(closed_if_missing)?;
-            sync_dir(final_path.parent().expect("blob has a parent")).map_err(closed_if_missing)?;
-            let mut g = s2.lock();
-            if g.closed {
-                return Err(ApiError::gone("closed", "session is closed"));
-            }
-            let recipients: Vec<String> = g.active_participants().filter(|k| **k != who).cloned().collect();
-            g.pending.remove(&reservation.id);
-            g.pending_bytes -= blob_len;
-            // Applying the Item record charges the transfer for real.
-            g.transfer_bytes -= blob_len;
-            reservation.committed = true;
-            match s2.append(&mut g, Rec::Item { envelope: env_json, recipients, blob_len }) {
-                Ok(ev) => Ok(ev.map(|e| e.seq).unwrap_or_default()),
-                Err(e) => {
-                    g.transfer_bytes += blob_len;
-                    reservation.committed = false;
-                    // Reservation::drop releases pending; it re-locks, so drop the guard first.
-                    g.pending.insert(reservation.id.clone());
-                    g.pending_bytes += blob_len;
-                    reservation.received = blob_len;
-                    Err(e.into())
-                }
+/// Move the blob into place and append the item to the log. `then` runs
+/// under the same session lock right after the item is recorded, so routing
+/// decisions and job state changes are atomic with it. Blocks on disk.
+pub(crate) fn commit_upload<T>(
+    s: &Arc<Session>,
+    who: &str,
+    up: Upload,
+    then: impl FnOnce(&Session, &mut Inner, u64) -> ApiResult<T>,
+) -> ApiResult<(u64, T)> {
+    let Upload { env_json, env, blob_len, tmp_path, mut reservation } = up;
+    let final_path = s.blob_path(&env.header.id);
+    let commit = || -> ApiResult<(u64, T)> {
+        std::fs::rename(&tmp_path, &final_path).map_err(closed_if_missing)?;
+        sync_dir(final_path.parent().expect("blob has a parent")).map_err(closed_if_missing)?;
+        let mut g = s.lock();
+        if g.closed {
+            return Err(ApiError::gone("closed", "session is closed"));
+        }
+        let recipients: Vec<String> = g.active_participants().filter(|k| *k != who).cloned().collect();
+        g.pending.remove(&reservation.id);
+        g.pending_bytes -= blob_len;
+        // Applying the Item record charges the transfer for real.
+        g.transfer_bytes -= blob_len;
+        reservation.committed = true;
+        let seq = match s.append(&mut g, Rec::Item { envelope: env_json, recipients, blob_len }) {
+            Ok(ev) => ev.map(|e| e.seq).unwrap_or_default(),
+            Err(e) => {
+                g.transfer_bytes += blob_len;
+                reservation.committed = false;
+                // Reservation::drop releases pending; it re-locks, so drop the guard first.
+                g.pending.insert(reservation.id.clone());
+                g.pending_bytes += blob_len;
+                reservation.received = blob_len;
+                return Err(e.into());
             }
         };
-        let r = commit();
-        if r.is_err() {
-            let _ = std::fs::remove_file(&tmp_path);
-            let _ = std::fs::remove_file(&final_path);
-        }
-        drop(reservation);
-        r
+        let out = then(s, &mut g, seq)?;
+        Ok((seq, out))
+    };
+    let r = commit();
+    if r.is_err() && !reservation.committed {
+        let _ = std::fs::remove_file(&tmp_path);
+        let _ = std::fs::remove_file(&final_path);
+    }
+    drop(reservation);
+    r
+}
+
+/// `POST /v1/sessions/:id/items` — body: `u32_be(len) || envelope || blob`.
+/// Jobs go through `POST /jobs` instead, so every job gets routed.
+pub async fn post_item(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let s = session(&st, &id)?;
+    let (who, role) = auth(&s, &headers)?;
+    let up = receive_upload(&st, &s, &who, role, body, |kind| match kind {
+        ItemKind::Job => Err(ApiError::forbidden("submit jobs with POST /jobs")),
+        _ => Ok(()),
+    })
+    .await?;
+    let item_id = up.env.header.id.clone();
+    let is_result = up.env.header.kind == ItemKind::Result;
+    let refs: Vec<String> = up.env.header.refs.iter().map(|r| r.id.clone()).collect();
+    let (seq, ()) = blocking(move || {
+        commit_upload(&s, &who.clone(), up, |s, g, _| {
+            // A result from the runner a job is assigned to finishes that job.
+            if is_result {
+                let done: Vec<String> = refs
+                    .iter()
+                    .filter(|j| {
+                        g.jobs.get(*j).is_some_and(|r| r.state.active() && r.runner.as_deref() == Some(&who))
+                    })
+                    .cloned()
+                    .collect();
+                for j in done {
+                    s.set_job(g, &j, JobState::Done, Some(who.clone()), None)?;
+                }
+            }
+            Ok(())
+        })
     })
     .await?;
     Ok((StatusCode::CREATED, Json(json!({"id": item_id, "seq": seq}))))
 }
 
-fn item_path_ok(item: &str) -> ApiResult<()> {
+pub(crate) fn item_path_ok(item: &str) -> ApiResult<()> {
     if is_item_id(item) {
         Ok(())
     } else {

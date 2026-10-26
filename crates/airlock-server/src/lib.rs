@@ -7,6 +7,7 @@
 pub mod api;
 pub mod config;
 pub mod error;
+pub mod exec;
 pub mod store;
 mod util;
 mod web;
@@ -36,6 +37,15 @@ pub fn router(state: api::AppState) -> Router {
         .route("/v1/sessions/{id}/items", post(api::post_item))
         .route("/v1/sessions/{id}/items/{item}/blob", get(api::get_blob))
         .route("/v1/sessions/{id}/items/{item}/ack", post(api::ack))
+        .route("/v1/sessions/{id}/jobs", post(exec::post_job))
+        .route("/v1/sessions/{id}/jobs/{job}", get(exec::get_job))
+        .route("/v1/sessions/{id}/jobs/{job}/claim", post(exec::claim_job))
+        .route("/v1/sessions/{id}/jobs/{job}/cancel", post(exec::cancel_job))
+        .route("/v1/sessions/{id}/runners", get(exec::runners))
+        .route("/v1/sessions/{id}/runners/me/stream", get(exec::runner_stream))
+        .route("/v1/sessions/{id}/runners/me/heartbeat", post(exec::heartbeat))
+        .route("/v1/sessions/{id}/runners/{participant}/approve", post(exec::approve_runner))
+        .route("/v1/sessions/{id}/runners/{participant}/reject", post(exec::reject_runner))
         .route("/", get(web::index))
         .route("/s/{id}", get(web::session_page))
         .route("/assets/{*path}", get(web::asset))
