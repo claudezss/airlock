@@ -230,6 +230,13 @@ memory, items as large as the relay allows (up to 100 MB) and runner approval
 on. Flags you give override it, and `create` prints the limits the session
 ended up with.
 
+Allowlist entries may pin versions with a PEP 440 specifier, so every runner
+uses the one you tested against: `--package 'cugrid==0.1.0'` or
+`"packages": ["numpy>=1.26,<3"]` (quote it in a shell). The runner installs
+that version, or, given its own interpreter (`--python`), refuses to join if
+the interpreter has another ("--python has cugrid 0.2.1, but the session pins
+cugrid==0.1.0"). Jobs still name the package alone in `requirements`.
+
 Approve the runner, then send it work:
 
 ```python
@@ -243,6 +250,23 @@ print(res.status, res.exit_code, res.stdout)
 chart = res.read("chart.png")            # files the job wrote to $AIRLOX_OUT
 summary = res.read("summary.json")       # by path, whether or not it came zipped
 ```
+
+Every result carries `env`, signed by the runner and not written by the job:
+the Python version, the installed version of each allowlisted package, the
+sandbox, the airlox version and where the interpreter came from (`uv-runtime`,
+`--python` or `docker:<image>`), without any file system path. `airlox run`
+prints it on one line, `--json` and the MCP server include it, and the SDK has
+it as `res.env`.
+
+A job that runs as a plain process (`--sandbox process`, or `local` outside
+Linux) works in a temporary folder, and on Windows that is under
+`C:\Users\<name>\AppData\Local\Temp`, so a traceback printed by the job
+would name the account. `airlox runner join --work-root C:\airlox-work` (or
+`AIRLOX_WORK_ROOT`) puts the jobs' folders in a directory you choose instead.
+Whichever you use, the runner replaces the job's work folder in its stdout and
+stderr with `$WORK`, its output folder with `$AIRLOX_OUT` and the job's own
+folder with `$JOB` before it signs the result; files the job writes are
+returned as written.
 
 The runner builds its job image once (`python:3.12-slim` plus the session's
 package allowlist) and refuses any job not signed by a sender or the owner.

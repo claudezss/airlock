@@ -28,6 +28,30 @@ runner first: `s.wait_for_runner("ci-box", approved=True)` returns once it is
 online and this session has seen the owner's signed approval, and raises
 `RunnerFailed` at once if the runner could not start its sandbox.
 
+Creating a session returns its owner. **Save the owner invite
+(`session.invites["owner"]`) somewhere private right away**, such as a file
+only you can read (mode 0600, outside any repository): it is the only way to
+approve runners, revoke a role or close the session later, and `Session.join`
+with it reopens the session as owner. Anyone who has it controls the session,
+so don't print it or pass it to agents; hand out the `sender`, `observer` and
+`runner` invites instead. The CLI does the same with
+`airlox session create --owner-invite-file FILE`.
+
+```python
+import os
+
+owner = Session.create("https://airlox.app", mode="execute", job_limits={...})
+fd = os.open("owner.link", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w") as f:
+    f.write(owner.invites["owner"])
+```
+
+Package allowlist entries in `job_limits` may pin versions with a PEP 440
+specifier, such as `"cugrid==0.1.0"` or `"numpy>=1.26,<3"`. Every result says
+where the job ran, signed by the runner: `res.env` holds the Python version,
+the installed version of each allowlisted package, the sandbox and where the
+interpreter came from.
+
 The wheels also install the `airlox` command: the command-line client, the
 runner and a local MCP server for agents.
 

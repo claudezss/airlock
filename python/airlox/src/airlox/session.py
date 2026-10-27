@@ -202,7 +202,19 @@ class Session:
 
         ``max_item_bytes`` defaults to the largest item the relay allows, up
         to 100 MB (25 MB if the relay does not say). Package names in ``job_limits`` are PEP 503
-        normalized (``"pyPowerGEM"`` becomes ``"pypowergem"``).
+        normalized (``"pyPowerGEM"`` becomes ``"pypowergem"``). An entry may also pin
+        versions with a PEP 440 specifier (``"cugrid==0.1.0"``, ``"numpy>=1.26,<3"``): runners
+        install that version, or, with ``--python``, refuse to join an interpreter that has
+        another. Jobs still name the package alone in ``requirements``, and each result's
+        ``env`` says which versions it ran with.
+
+        **Save the owner invite.** ``session.invites["owner"]`` is the only way to approve
+        runners, mint more invites, revoke a role or close the session later: it holds the
+        owner key, and nothing else in the cache or on the relay can stand in for it. Write
+        it to a private file (mode 0600, outside any repository) as soon as the session
+        exists, like the CLI's ``--owner-invite-file``, and treat it as a secret: anyone
+        with it controls the session. ``Session.join(invite)`` with it reopens the session
+        as owner.
 
         ``insecure_http_host`` lets participants reach the relay over plain
         ``http://`` at that host, such as ``"airlox-relay.ns.svc"`` inside a
