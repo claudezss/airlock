@@ -11,6 +11,7 @@ from __future__ import annotations
 import io
 import json
 import time
+import unicodedata
 import zipfile
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
@@ -40,8 +41,18 @@ class RunnerFailed(Exception):
     once instead of waiting for it to time out."""
 
     def __init__(self, runner: "Runner") -> None:
-        super().__init__(f"runner {runner.name} could not start: {runner.detail or 'no reason given'}")
+        # The runner's own words, unsigned: shown without letting them drive a terminal.
+        detail = _printable(runner.detail or "no reason given")
+        super().__init__(f"runner {_printable(runner.name)} could not start: {detail}")
         self.runner = runner
+
+
+def _printable(s: str) -> str:
+    """``s`` on one line with control and invisible formatting characters
+    (escapes, bidi overrides, zero-width marks) shown as ``\\u{…}``."""
+    return "".join(
+        f"\\u{{{ord(c):x}}}" if unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") else c for c in s
+    )
 
 
 @dataclass

@@ -51,6 +51,132 @@ pub fn out_file_name(name: &str) -> Option<&str> {
     matches!(file_type(n), Some(("image" | "zip", _))).then_some(n)
 }
 
+/// Extensions something may run or import, and names tools load from the
+/// directory they work in (test runners, build tools, coding agents).
+const RUNNABLE: &[&str] = &[
+    "py",
+    "pyw",
+    "pyc",
+    "pth",
+    "ipynb",
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "command",
+    "js",
+    "mjs",
+    "cjs",
+    "ts",
+    "mts",
+    "cts",
+    "jsx",
+    "tsx",
+    "rb",
+    "pl",
+    "php",
+    "lua",
+    "ps1",
+    "psm1",
+    "bat",
+    "cmd",
+    "vbs",
+    "wsf",
+    "exe",
+    "com",
+    "msi",
+    "so",
+    "dylib",
+    "dll",
+    "jar",
+    "app",
+    "scpt",
+    "applescript",
+    "desktop",
+    "lnk",
+    "html",
+    "htm",
+    "svg",
+];
+const LOADED_BY_NAME: &[&str] = &[
+    "claude.md",
+    "agents.md",
+    "gemini.md",
+    "copilot-instructions.md",
+    "makefile",
+    "gnumakefile",
+    "justfile",
+    "dockerfile",
+    "procfile",
+    "package.json",
+    "pyproject.toml",
+    "setup.cfg",
+    "tox.ini",
+    "pytest.ini",
+    "cargo.toml",
+    "go.mod",
+    "gemfile",
+    "rakefile",
+    "vagrantfile",
+    "requirements.txt",
+];
+
+/// The name an unpacked out file is saved under: its own, with `.txt` added
+/// if something could run it or load it by name, so a job's output never
+/// becomes `conftest.py`, `test_x.py`, `CLAUDE.md` or a `Makefile`.
+pub fn unpacked_name(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    let ext = lower.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    if RUNNABLE.contains(&ext) || LOADED_BY_NAME.contains(&lower.as_str()) {
+        format!("{name}.txt")
+    } else {
+        name.to_string()
+    }
+}
+
+/// Unpack a job's `out.zip` into a new directory `out` (or `out (1)` …) in
+/// `dir`, after the checks the runner applies to inputs (no traversal,
+/// links, duplicates or bombs). Hidden entries (`.git/`, `.envrc`) are
+/// skipped and names pass through [`unpacked_name`], so nothing unpacked is
+/// picked up by the tools working in `dir`. Returns the directory, the files
+/// written and notes on what was skipped. On an error the files written so
+/// far stay.
+pub fn unpack_out_zip(data: &[u8], dir: &Path) -> Result<(PathBuf, Vec<PathBuf>, Vec<String>)> {
+    use airlox_core::validate::zip::{inspect_zip, ZipLimits};
+    use std::io::Read;
+    let entries = inspect_zip(data, &ZipLimits::default())?;
+    let dest = new_dir(dir, "out")?;
+    let mut ar = zip::ZipArchive::new(std::io::Cursor::new(data))?;
+    let (mut written, mut notes) = (Vec::new(), Vec::new());
+    for e in entries.iter().filter(|e| !e.is_dir) {
+        let parts: Vec<&str> = e.path.split('/').collect();
+        if parts.iter().any(|p| p.starts_with('.')) {
+            notes.push(format!("skipped out/{}: hidden", clean_line(&e.path)));
+            continue;
+        }
+        let (file, dirs) = parts.split_last().expect("split yields one part");
+        // Every directory under `dest` is made here, from checked names.
+        let mut target = dest.clone();
+        target.extend(dirs);
+        fs::create_dir_all(&target)?;
+        target.push(unpacked_name(file));
+        let mut out = match fs::OpenOptions::new().write(true).create_new(true).open(&target) {
+            Ok(f) => f,
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                notes.push(format!("skipped out/{}: {} exists", clean_line(&e.path), target.display()));
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let n = std::io::copy(&mut ar.by_name(&e.path)?.take(e.size + 1), &mut out)?;
+        if n > e.size {
+            bail!("out/{} inflates beyond its declared size", clean_line(&e.path));
+        }
+        written.push(target);
+    }
+    Ok((dest, written, notes))
+}
+
 /// Write `data` to a new file `name` in `dir`, never replacing or writing
 /// through an existing file or link: a taken name becomes `name (1).ext`,
 /// and so on. Returns the path written.

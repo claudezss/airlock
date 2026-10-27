@@ -84,7 +84,9 @@ such as `no_runner_available` (no approved, online, idle runner matched: jobs
 are not queued) or `runner_lost`. Files the
 job writes to `$AIRLOX_OUT` come back: top-level images as they are,
 everything else in `out.zip`. `--out-dir` saves them and unpacks `out.zip`
-into a new `out/` directory beside it; with `--json`, small text files from
+into a new `out/` directory beside it, skipping hidden files and adding
+`.txt` to code and to files tools load by name (`conftest.py.txt`,
+`CLAUDE.md.txt`): read them, don't run them. With `--json`, small text files from
 `out.zip` are also inline in `out_text` (`[{"name", "text"}]`), so a report
 needs no saving. `runner_name` says which runner ran the job.
 

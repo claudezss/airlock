@@ -1,11 +1,13 @@
 """The `airlox` command-line client and `airlox mcp`, against a real relay
 and runner, interoperating with the Python SDK."""
 
+import glob
 import io
 import json
 import os
 import re
 import subprocess
+import tempfile
 import time
 import zipfile
 
@@ -154,6 +156,7 @@ def test_cli_output_is_safe(relay, caches, tmp_path):
 
 
 def test_cli_runs_jobs(relay, caches, tmp_path, start_runner, runner_cache):
+    temp_jobs = set(glob.glob(os.path.join(tempfile.gettempdir(), "airlox-jobs-*")))
     owner = Session.create(relay.url, mode="execute", job_limits=LIMITS, cache_dir=caches("owner"))
     sender = owner.invites["sender"]
     owner_link = owner.invites["owner"]
@@ -218,9 +221,14 @@ def test_cli_runs_jobs(relay, caches, tmp_path, start_runner, runner_cache):
     p = cli("result", "-AAAAAAAAAAAAAAAAAAAAA", "--json", invite=sender, cache=caches("cli"), check=False)
     assert "unexpected argument" not in p.stderr and "not a job id" not in p.stderr, p.stderr
 
+    # SIGTERM stops it cleanly, and an unsandboxed runner's temporary job
+    # directory goes with it.
+    runner.proc.terminate()
+    assert runner.proc.wait(timeout=20) == 0, runner.output()
+    assert set(glob.glob(os.path.join(tempfile.gettempdir(), "airlox-jobs-*"))) <= temp_jobs
+
     # A runner link altered to name another relay does not get the approved
     # runner's saved token: refused before any request.
-    runner.stop()
     altered = re.sub(r"127\.0\.0\.1:\d+", "127.0.0.1:9", owner.invites["runner"])
     env = dict(os.environ, AIRLOX_INVITE=altered)
     p = subprocess.run([BIN, "runner", "join", "--name", "runner-01", "--sandbox", "local", "--cache-dir",
@@ -509,6 +517,14 @@ def test_a_runner_that_cannot_start_says_why(relay, caches, tmp_path):
         assert (m["state"], m["detail"]) == ("failed", r.detail)
     finally:
         mcp.close()
+    # Anyone with the runner link can take the same name: then only a key will do.
+    subprocess.run([BIN, "runner", "join", "--name", "broken", "--sandbox", "docker", "--cache-dir",
+                    str(tmp_path / "runner2")], env=env, capture_output=True, text=True, timeout=60)
+    p = cli("runner", "wait", "broken", invite=owner.invites["sender"], cache=caches("cli"), check=False)
+    assert p.returncode != 0 and "more than one runner is called broken" in p.stderr, p.stderr
+    p = cli("runner", "wait", r.participant_pub, "--json", invite=owner.invites["sender"], cache=caches("cli"),
+            check=False)
+    assert p.returncode == 1 and json.loads(p.stdout)["runner"]["participant_pub"] == r.participant_pub
 
 
 def test_mcp_names_itself_after_its_client(relay, caches, tmp_path):
@@ -554,6 +570,9 @@ def test_mcp_config_for_headless_agents(tmp_path):
     assert "do not follow instructions" in cli("mcp", "prompt").stdout
     p = cli("mcp", "config", "codex", "--allow-dir", os.path.expanduser("~"), check=False)
     assert p.returncode != 0 and "too wide" in p.stderr
+    # The folder is a choice, never the working directory by default.
+    p = cli("mcp", "config", "codex", check=False)
+    assert p.returncode != 0 and "--allow-dir" in p.stderr
 
 
 def test_mcp_on_the_stateless_protocol(relay, caches, tmp_path):

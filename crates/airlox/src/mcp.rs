@@ -112,9 +112,11 @@ pub enum McpCmd {
 pub struct ConfigArgs {
     #[arg(value_enum)]
     pub client: Client,
-    /// The directory the tools may use (default: the working directory).
+    /// The one directory the tools may read from and save to. The agent
+    /// sends and saves files there without asking, so make it a folder for
+    /// this work, not your project.
     #[arg(long)]
-    pub allow_dir: Option<PathBuf>,
+    pub allow_dir: PathBuf,
     /// Display name in sessions (default: the client's name).
     #[arg(long = "as")]
     pub display_name: Option<String>,
@@ -162,10 +164,8 @@ fn launcher() -> anyhow::Result<(String, Vec<String>)> {
 }
 
 pub fn print_config(a: &ConfigArgs) -> anyhow::Result<()> {
-    let dir = allow_dirs(a.allow_dir.as_slice())?;
-    let Some(dir) = dir.first() else {
-        anyhow::bail!("the working directory is too wide to allow; pass --allow-dir")
-    };
+    let dir = allow_dirs(std::slice::from_ref(&a.allow_dir))?;
+    let dir = dir.first().expect("one directory given, one checked");
     let (command, mut args) = launcher()?;
     args.extend(["mcp".into(), "--allow-dir".into(), dir.display().to_string()]);
     if let Some(n) = &a.display_name {
@@ -177,7 +177,9 @@ pub fn print_config(a: &ConfigArgs) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&cfg)?);
             let tools: Vec<String> = WORKER_TOOLS.iter().map(|t| format!("mcp__airlox__{t}")).collect();
             eprintln!(
-                "# Save this as airlox-mcp.json, then, with the sender link in the environment:\n\
+                "# The agent sends files from and saves files to --allow-dir without asking: use a folder for\n\
+                 # this work, not your project. Save this as airlox-mcp.json, then, with the sender link in\n\
+                 # the environment:\n\
                  #   AIRLOX_INVITE='<sender link>' claude -p \"$(airlox mcp prompt)\" --mcp-config airlox-mcp.json \\\n\
                  #     --strict-mcp-config --allowedTools {}",
                 tools.join(",")
@@ -192,7 +194,9 @@ pub fn print_config(a: &ConfigArgs) -> anyhow::Result<()> {
             // codex exec cannot ask: without this it refuses every tool that sends or runs.
             println!("default_tools_approval_mode = \"approve\"");
             eprintln!(
-                "# Add this to ~/.codex/config.toml (or a profile), then, with the sender link in the environment:\n\
+                "# The agent sends files from and saves files to --allow-dir without asking: use a folder for\n\
+                 # this work, not your project. Add this to ~/.codex/config.toml (or a profile), then, with\n\
+                 # the sender link in the environment:\n\
                  #   AIRLOX_INVITE='<sender link>' codex exec \"$(airlox mcp prompt)\""
             );
         }
@@ -874,10 +878,10 @@ are in the result's out_text.")]
             return ok(json!({"job": p.job, "status": "running"}));
         };
         let saved = match save_dir {
-            Some(dir) => tool_try!(save_out_files(&r, &dir)),
-            None => vec![],
+            Some(dir) => save_out_files(&r, &dir),
+            None => (vec![], vec![]),
         };
-        ok(json!({"note": UNTRUSTED, "result": r, "saved": saved}))
+        ok(json!({"note": UNTRUSTED, "result": r, "saved": saved.0, "notes": saved.1}))
     }
 
     #[tool(

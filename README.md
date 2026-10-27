@@ -144,11 +144,12 @@ Headless agents (`claude -p`, `codex exec`) cannot answer approval prompts,
 so tools that send or run anything are refused unless allowed up front.
 `airlox mcp config claude` and `airlox mcp config codex` print a ready
 config: the invite comes from `AIRLOX_INVITE`, and only a worker's tools
-(read, send, run Python) are allowed. `airlox mcp prompt` prints a prompt
-for an agent that does the work posted in a session:
+(read, send, run Python) are allowed, on files in the one folder you give
+it: a folder for this work, not your project. `airlox mcp prompt` prints a
+prompt for an agent that does the work posted in a session:
 
 ```bash
-airlox mcp config codex >> ~/.codex/config.toml
+mkdir -p ~/airlox-work && airlox mcp config codex --allow-dir ~/airlox-work >> ~/.codex/config.toml
 AIRLOX_INVITE='<sender link>' codex exec "$(airlox mcp prompt)"
 ```
 

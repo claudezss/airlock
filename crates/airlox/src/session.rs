@@ -347,9 +347,14 @@ pub struct OutText {
     pub text: String,
 }
 
-/// Inline only files this small, at most this many bytes in all.
+/// The longest runner `detail` (its setup failure) kept, as the relay allows.
+const MAX_DETAIL_CHARS: usize = 300;
+
+/// Inline only files this small, at most this many bytes and files in all:
+/// the runner chooses what is in out.zip, and this goes to a model.
 const OUT_TEXT_MAX: u64 = 16 * 1024;
 const OUT_TEXT_TOTAL: u64 = 64 * 1024;
+const OUT_TEXT_FILES: usize = 20;
 
 /// The small UTF-8 text files in `out.zip`, by path. Anything else in the
 /// archive (binary, larger, or past the total) is left to `--out-dir`.
@@ -364,7 +369,10 @@ pub fn out_text(outs: &[OutFile]) -> Vec<OutText> {
     let mut out = Vec::new();
     let mut budget = OUT_TEXT_TOTAL;
     for e in &entries {
-        if e.is_dir || e.size > OUT_TEXT_MAX.min(budget) {
+        if out.len() == OUT_TEXT_FILES {
+            break;
+        }
+        if e.is_dir || e.size == 0 || e.size > OUT_TEXT_MAX.min(budget) {
             continue;
         }
         let Ok(f) = ar.by_name(&e.path) else { continue };
@@ -846,7 +854,11 @@ impl Session {
                 online: r["online"].as_bool().unwrap_or(false),
                 job: r["job"].as_str().map(String::from),
                 state: r["state"].as_str().map(String::from),
-                detail: r["detail"].as_str().map(String::from),
+                // The relay caps it, but the relay is not trusted either.
+                detail: r["detail"].as_str().map(|d| match d.char_indices().nth(MAX_DETAIL_CHARS) {
+                    Some((cut, _)) => format!("{}…", &d[..cut]),
+                    None => d.to_string(),
+                }),
                 participant_pub: public,
             });
         }
@@ -1614,5 +1626,15 @@ mod tests {
         let names: Vec<String> = (0..6).map(|i| format!("f{i}.txt")).collect();
         let files: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), chunk.as_slice())).collect();
         assert_eq!(out_text(&out_zip(&files)).len(), (OUT_TEXT_TOTAL / OUT_TEXT_MAX) as usize);
+    }
+
+    #[test]
+    fn out_text_skips_empty_files_and_stops_at_a_count() {
+        let names: Vec<String> = (0..40).map(|i| format!("f{i}.txt")).collect();
+        let mut files: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), b"x".as_slice())).collect();
+        files.insert(0, ("empty.txt", b""));
+        let got = out_text(&out_zip(&files));
+        assert_eq!(got.len(), OUT_TEXT_FILES);
+        assert_eq!(got[0].name, "f0.txt");
     }
 }

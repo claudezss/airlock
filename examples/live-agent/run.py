@@ -23,8 +23,10 @@ import json
 import os
 import pathlib
 import re
+import signal
 import subprocess
 import sys
+import threading
 import zipfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -56,6 +58,7 @@ def sales_zip() -> bytes:
     return out.getvalue()
 
 
+AGENT_TIMEOUT_S = 600
 TOOLS = ["list_items", "session_info", "list_runners", "run_python", "get_result", "send_text"]
 
 
@@ -119,17 +122,32 @@ def run_agent(agent: str, invite: str, workdir: pathlib.Path, step=quiet):
         args += ["--model", model] if model else []
     stderr = workdir.parent / f"{agent}.stderr"
     with stderr.open("w") as err:
+        # Its own process group, so a hung agent is stopped with everything it
+        # started: a child left holding its output open would block the read.
         proc = subprocess.Popen(args, cwd=workdir, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=err, text=True)
+                                stderr=err, text=True, start_new_session=True)
+        timed_out = threading.Event()
+
+        def stop():
+            timed_out.set()
+            os.killpg(proc.pid, signal.SIGKILL)
+
+        watchdog = threading.Timer(AGENT_TIMEOUT_S, stop)
+        watchdog.start()
         tail = []
-        for line in proc.stdout:
-            tail = (tail + [line])[-20:]
-            for tool, detail in events(agent, line):
-                if tool:
-                    step(agent, f"calls {tool}", describe(tool, detail))
-                else:
-                    step(agent, "says", out=detail)
-        code = proc.wait(timeout=600)
+        try:
+            for line in proc.stdout:
+                tail = (tail + [line])[-20:]
+                for tool, detail in events(agent, line):
+                    if tool:
+                        step(agent, f"calls {tool}", describe(tool, detail))
+                    else:
+                        step(agent, "says", out=detail)
+            code = proc.wait()
+        finally:
+            watchdog.cancel()
+        if timed_out.is_set():
+            tail.append(f"\n{agent} was stopped after {AGENT_TIMEOUT_S} s\n")
     return code, "".join(tail)[-2000:] + stderr.read_text()[-2000:]
 
 

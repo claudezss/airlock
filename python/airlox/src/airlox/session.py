@@ -438,7 +438,8 @@ class Session:
                     job=r["job"],
                     description=join.get("description"),
                     state=r.get("state"),
-                    detail=r.get("detail"),
+                    # The relay caps it, but the relay is not trusted either.
+                    detail=r["detail"][:300] if isinstance(r.get("detail"), str) else None,
                 )
             )
         return out

@@ -11,13 +11,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use airlox_core::session::{JobLimits, Mode};
-use airlox_core::validate::zip::{extract_zip, ZipLimits};
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 
 use crate::client;
-use crate::files::{clean_line, clean_text, new_dir, out_file_name, received_name, save_new};
+use crate::files::{clean_line, clean_text, out_file_name, received_name, save_new, unpack_out_zip};
 use crate::session::{
     default_cache_root, file_type, Item, JobSpec, NewSession, NoRunnerAvailable, Outcome, Profile, Session,
     Status, Target, DEFAULT_TYPES, FILE_TYPES_HELP,
@@ -595,16 +594,20 @@ async fn finish(
         }
         return Ok(75); // EX_TEMPFAIL
     };
-    let saved = match out_dir {
-        Some(d) => save_out_files(&r, d)?,
-        None => vec![],
+    let (saved, notes) = match out_dir {
+        Some(d) => save_out_files(&r, d),
+        None => (vec![], vec![]),
     };
     if json_out {
         let mut v = serde_json::to_value(&r)?;
         v["saved"] = json!(saved);
+        v["notes"] = json!(notes);
         print_json(&v);
     } else {
         print_outcome(&r, &saved, out_dir.is_none());
+        for n in &notes {
+            eprintln!("   {}", clean_line(n));
+        }
     }
     Ok(exit_status(&r))
 }
@@ -619,29 +622,43 @@ fn exit_status(r: &Outcome) -> i32 {
     }
 }
 
-/// Save a job's out files into `dir`, never over an existing file. Only
-/// the names runners produce (top-level images, `out.zip`) are saved, and
-/// `out.zip` is also unpacked into a new directory beside it (`out`, or
-/// `out (1)` …) with the checks the runner applies to inputs.
-pub fn save_out_files(r: &Outcome, dir: &Path) -> Result<Vec<String>> {
-    let mut saved = Vec::new();
+/// Unpacked files listed by name in `saved`; past this, a note counts them.
+const MAX_LISTED: usize = 20;
+
+/// Save a job's out files into `dir`, never over an existing file: the
+/// names runners produce (top-level images, `out.zip`), and `out.zip`
+/// unpacked into a new `out/` beside it ([`unpack_out_zip`]). Returns what
+/// was saved and notes on what was not. Saving never fails the result: a
+/// file that cannot be saved is a note.
+pub fn save_out_files(r: &Outcome, dir: &Path) -> (Vec<String>, Vec<String>) {
+    let (mut saved, mut notes) = (Vec::new(), Vec::new());
     for f in &r.out_files {
         let Some(data) = &f.data else { continue };
         let Some(name) = out_file_name(&f.name) else {
-            eprintln!("   not saving out file {:?}: not an image or out.zip", clean_line(&f.name));
+            notes.push(format!("not saving out file {:?}: not an image or out.zip", clean_line(&f.name)));
             continue;
         };
-        saved.push(save_new(dir, name, data)?.display().to_string());
+        match save_new(dir, name, data) {
+            Ok(p) => saved.push(p.display().to_string()),
+            Err(e) => {
+                notes.push(format!("could not save {name}: {e:#}"));
+                continue;
+            }
+        }
         if name == "out.zip" {
-            let dest = new_dir(dir, "out")?;
-            let entries = extract_zip(data, &dest, &ZipLimits::default())
-                .with_context(|| format!("unpacking out.zip into {}", dest.display()))?;
-            saved.extend(
-                entries.iter().filter(|e| !e.is_dir).map(|e| dest.join(&e.path).display().to_string()),
-            );
+            match unpack_out_zip(data, dir) {
+                Ok((dest, files, skipped)) => {
+                    saved.extend(files.iter().take(MAX_LISTED).map(|p| p.display().to_string()));
+                    if files.len() > MAX_LISTED {
+                        notes.push(format!("{} more files in {}", files.len() - MAX_LISTED, dest.display()));
+                    }
+                    notes.extend(skipped);
+                }
+                Err(e) => notes.push(format!("could not unpack out.zip (it is saved as is): {e:#}")),
+            }
         }
     }
-    Ok(saved)
+    (saved, notes)
 }
 
 fn print_outcome(r: &Outcome, saved: &[String], hint: bool) {
@@ -980,8 +997,18 @@ pub async fn runner_wait(a: WaitArgs) -> Result<i32> {
     let deadline = std::time::Instant::now() + a.timeout;
     loop {
         let rs = s.runners().await?;
-        let mut found = rs.iter().filter(|r| r.name == a.runner || r.participant_pub == a.runner);
-        if let Some(r) = found.next() {
+        // A key names one runner; only then names, of which a runner can
+        // pick any (another's included), so a name two runners use is refused.
+        let by_key: Vec<_> = rs.iter().filter(|r| r.participant_pub == a.runner).collect();
+        let found =
+            if by_key.is_empty() { rs.iter().filter(|r| r.name == a.runner).collect() } else { by_key };
+        if found.len() > 1 {
+            bail!(
+                "more than one runner is called {}; use its key (airlox runner list)",
+                clean_line(&a.runner)
+            );
+        }
+        if let Some(r) = found.first() {
             let (code, what) = if r.state.as_deref() == Some("failed") {
                 (
                     1,
@@ -1009,6 +1036,9 @@ pub async fn runner_wait(a: WaitArgs) -> Result<i32> {
             }
         }
         if std::time::Instant::now() >= deadline {
+            if a.conn.json {
+                print_json(&json!({"runner": found.first(), "status": "timeout"}));
+            }
             eprintln!("runner {} is not ready after {}s", clean_line(&a.runner), a.timeout.as_secs());
             return Ok(75); // EX_TEMPFAIL
         }
@@ -1085,23 +1115,70 @@ mod tests {
         std::fs::create_dir(d.path().join("out")).unwrap();
         std::fs::write(d.path().join("out/report.json"), "mine").unwrap();
         let r = outcome(zip_of(&[("report.json", b"{}"), ("logs/run.txt", b"ok")]));
-        let saved = save_out_files(&r, d.path()).unwrap();
+        let (saved, notes) = save_out_files(&r, d.path());
         let names: Vec<_> =
             saved.iter().map(|p| Path::new(p).strip_prefix(d.path()).unwrap().to_owned()).collect();
         assert_eq!(
             names,
             [Path::new("out.zip"), Path::new("out (1)/report.json"), Path::new("out (1)/logs/run.txt")]
         );
+        assert!(notes.is_empty(), "{notes:?}");
         assert_eq!(std::fs::read_to_string(d.path().join("out/report.json")).unwrap(), "mine");
     }
 
     #[test]
-    fn a_hostile_out_zip_writes_nothing_outside() {
+    fn unpacked_files_are_never_ones_tools_load() {
+        let d = tempfile::tempdir().unwrap();
+        let r = outcome(zip_of(&[
+            ("conftest.py", b"x"),
+            ("tests/test_x.py", b"x"),
+            ("CLAUDE.md", b"x"),
+            ("Makefile", b"x"),
+            ("package.json", b"x"),
+            ("report.md", b"x"),
+            (".envrc", b"x"),
+            (".claude/settings.json", b"x"),
+            (".git/config", b"x"),
+        ]));
+        let (saved, notes) = save_out_files(&r, d.path());
+        let mut names: Vec<_> =
+            saved.iter().map(|p| p.strip_prefix(&*d.path().to_string_lossy()).unwrap()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "/out.zip",
+                "/out/CLAUDE.md.txt",
+                "/out/Makefile.txt",
+                "/out/conftest.py.txt",
+                "/out/package.json.txt",
+                "/out/report.md",
+                "/out/tests/test_x.py.txt"
+            ]
+        );
+        assert_eq!(notes.iter().filter(|n| n.contains("hidden")).count(), 3, "{notes:?}");
+        assert!(!d.path().join("out/.git").exists() && !d.path().join("out/.claude").exists());
+    }
+
+    #[test]
+    fn a_hostile_out_zip_writes_nothing_outside_and_keeps_the_result() {
         let d = tempfile::tempdir().unwrap();
         let inner = d.path().join("save");
         let r = outcome(zip_of(&[("ok.txt", b"x"), ("../escaped.txt", b"x")]));
-        assert!(save_out_files(&r, &inner).is_err());
+        let (saved, notes) = save_out_files(&r, &inner);
+        assert_eq!(saved.len(), 1, "out.zip itself is kept: {saved:?}");
+        assert!(notes.iter().any(|n| n.contains("could not unpack out.zip")), "{notes:?}");
         assert!(!d.path().join("escaped.txt").exists());
         assert!(crate::session::out_text(&r.out_files).is_empty());
+    }
+
+    #[test]
+    fn many_unpacked_files_are_counted_not_listed() {
+        let d = tempfile::tempdir().unwrap();
+        let names: Vec<String> = (0..50).map(|i| format!("f{i}.txt")).collect();
+        let files: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), b"x".as_slice())).collect();
+        let (saved, notes) = save_out_files(&outcome(zip_of(&files)), d.path());
+        assert_eq!(saved.len(), 1 + MAX_LISTED);
+        assert!(notes.iter().any(|n| n.starts_with("30 more files in")), "{notes:?}");
     }
 }

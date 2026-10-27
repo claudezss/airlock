@@ -426,8 +426,26 @@ async fn serve(
     let mut handled = 0usize;
     let mut tick = tokio::time::interval(HEARTBEAT);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
+    // Ctrl-C, or SIGTERM from `kill` or a service manager: stop cleanly, so
+    // the running job is cancelled and its files are removed.
+    let stop = async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            match signal(SignalKind::terminate()) {
+                Ok(mut term) => tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                },
+                Err(_) => {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    tokio::pin!(stop);
 
     let start = async |job: String| -> Option<Running> {
         match relay.claim(&job).await {
@@ -526,7 +544,7 @@ async fn serve(
             _ = lost.changed() => {
                 break Err(anyhow::anyhow!("the relay no longer accepts this runner"));
             }
-            _ = &mut ctrl_c => {
+            _ = &mut stop => {
                 tracing::info!("interrupted");
                 break Ok(());
             }

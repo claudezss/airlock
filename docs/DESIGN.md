@@ -733,7 +733,14 @@ drive the terminal; so does error text from the relay. Received files are
 saved as `airlox-<random>-<name>`, with a prefix chosen locally (an item id
 is the sender's choice) and Python saved as `.py.txt`, so no received file
 can be `conftest.py`, `CLAUDE.md` or anything a test runner collects; job out
-files keep their names, but only images and `out.zip`. Nothing is ever
+files keep their names, but only images and `out.zip`. `--out-dir` (and the
+MCP `save_dir`) also unpacks `out.zip`, after the checks runners apply to
+inputs, into a new `out/` directory: hidden entries (`.git/`, `.envrc`,
+`.claude/`) are skipped, and `.txt` is added to anything runnable or loaded
+by name (`conftest.py.txt`, `test_x.py.txt`, `CLAUDE.md.txt`,
+`Makefile.txt`), so a job's output never steers the tools working there.
+A file that cannot be saved or unpacked is reported next to the result, never
+instead of it. Nothing is ever
 written over an existing file or through a link. `session create
 --owner-invite-file` writes the owner link to a new 0600 file instead of
 printing it, for agents that should hold it without seeing it. A cached
