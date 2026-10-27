@@ -83,6 +83,8 @@ main.wide { max-width: none; padding: 0; }
 .mode .option span:last-child { font-size: 13px; color: var(--muted); }
 .size { display: flex; align-items: center; gap: 8px; max-width: 200px; }
 .eyebrow { font-family: var(--mono); font-size: 12px; color: var(--ok); letter-spacing: 0.04em; }
+.callout { display: flex; flex-direction: column; gap: 4px; border: 1px solid var(--accent-line); background: var(--accent-bg); border-radius: 8px; padding: 12px 14px; font-size: 14px; }
+.callout span { color: var(--soft); }
 .invite-row { display: flex; flex-direction: column; gap: 6px; }
 .invite-row .head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
 .invite { display: flex; gap: 8px; align-items: center; }
@@ -117,7 +119,8 @@ main.wide { max-width: none; padding: 0; }
 
 /* live session */
 .session { display: grid; grid-template-columns: 280px minmax(0, 1fr); min-height: calc(100vh - 65px); }
-.rail { border-right: 1px solid var(--line); padding: 24px; display: flex; flex-direction: column; gap: 28px; }
+/* The timeline comes first in the DOM (reading order); wide screens show the rail on its left. */
+.rail { grid-column: 1; grid-row: 1; border-right: 1px solid var(--line); padding: 24px; display: flex; flex-direction: column; gap: 28px; }
 .rail h2 { font-family: var(--mono); font-size: 12px; font-weight: 500; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); margin-bottom: 12px; }
 .rail .stack { gap: 10px; }
 .rail p { margin: 0; font-size: 13px; }
@@ -130,7 +133,7 @@ details[open] > summary::before { transform: rotate(45deg); margin-bottom: 4px; 
 @media (prefers-reduced-motion: reduce) { summary::before { transition: none !important; } }
 .skip { position: absolute; left: 8px; top: -100px; z-index: 20; padding: 10px 14px; border-radius: 8px; background: var(--accent); color: var(--accent-ink); font-weight: 600; text-decoration: none; }
 .skip:focus { top: 8px; }
-.main-col { display: flex; flex-direction: column; min-width: 0; }
+.main-col { grid-column: 2; grid-row: 1; display: flex; flex-direction: column; min-width: 0; }
 .timeline { flex: 1; display: flex; flex-direction: column; gap: 20px; padding: 24px 32px 32px; }
 .pill { align-self: center; font-family: var(--mono); font-size: 12px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px; text-align: center; }
 .empty { align-self: center; color: var(--muted); margin: 24px 0; text-align: center; }
@@ -205,11 +208,24 @@ select:focus { border-color: var(--accent); outline: none; }
 
 .jobpanel { padding: 12px 16px 4px; border-bottom: 1px solid var(--line); display: flex; flex-direction: column; gap: 10px; }
 .jobrow { display: flex; flex-wrap: wrap; gap: 10px; }
+.jobpanel > .field { gap: 4px; }
 .jobrow { flex-wrap: wrap; align-items: flex-end; }
 .jobrow .field { flex: 1 1 140px; min-width: 0; gap: 4px; }
 .jobrow .field.narrow { flex: 0 0 110px; }
 .inputfiles summary { cursor: pointer; min-height: 36px; display: flex; align-items: center; font-size: 13px; color: var(--muted); }
 .pickfiles { padding-bottom: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+.field-label { font-size: 13px; color: var(--muted); }
+.runchips { display: flex; flex-wrap: wrap; gap: 6px; }
+.runchip { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; }
+.runchip[aria-pressed=true] { border-color: var(--accent); color: var(--accent); background: var(--accent-bg); }
+.runchip .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--line-3); flex: none; }
+.runchip .dot.on { background: var(--ok); }
+.runchip .dot.wait { background: var(--accent); }
+.runchip .dot.busy { background: var(--link); }
+.runchip .state { color: var(--muted); font-size: 12px; }
+.job-ready { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; border: 1px solid var(--accent-line); background: var(--accent-bg); border-radius: 8px; padding: 8px 12px; font-size: 13px; }
+.job-ready .ready-icon { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--accent); color: var(--accent); font-size: 11px; font-weight: 700; flex: none; }
+.job-ready #job-ready { flex: 1 1 200px; }
 .jobpanel legend { font-size: 13px; margin-bottom: 6px; color: var(--muted); font-weight: 500; }
 .toolbar button[aria-pressed=true], .agent-pick button[aria-pressed=true] { border-color: var(--accent); color: var(--accent); background: var(--accent-bg); }
 
@@ -259,7 +275,8 @@ select:focus { border-color: var(--accent); outline: none; }
 
 @media (max-width: 820px) {
   .session { grid-template-columns: minmax(0, 1fr); }
-  .rail { order: 2; border-right: 0; border-top: 1px solid var(--line); }
+  .rail, .main-col { grid-column: 1; grid-row: auto; }
+  .rail { border-right: 0; border-top: 1px solid var(--line); }
   .timeline { padding: 20px 16px; }
   .composer-wrap { padding: 10px 16px 16px; }
   .banner { margin: 12px 16px 0; }
@@ -268,7 +285,20 @@ select:focus { border-color: var(--accent); outline: none; }
   .readonly { margin: 0 16px 16px; }
   .composer-wrap { max-height: 60vh; max-height: 60dvh; }
   .composer textarea.code { min-height: 96px; max-height: 24vh; max-height: 24dvh; }
-  .title { display: none !important; }
+}
+/* Session pages keep who/what/when in one header row at every width. */
+@media (max-width: 820px) {
+  .top:has(#title:not([hidden])) { flex-wrap: nowrap; gap: 12px; }
+  .top:has(#title:not([hidden])) .brand { min-width: 44px; justify-content: center; }
+  .top:has(#title:not([hidden])) .brand span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .title { flex: 1 1 auto; padding-left: 12px; }
+  .title span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .top-right { flex: none; gap: 8px; }
+}
+@media (max-width: 600px) {
+  .badge:not(.off) #badge-text, .exp-word { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .badge:not(.off) { padding: 6px; }
+  .expiry { border: 1px solid var(--line-2); border-radius: 999px; padding: 4px 10px; font-size: 12px; }
 }
 @media (max-width: 480px) {
   main { padding: 24px 16px; }

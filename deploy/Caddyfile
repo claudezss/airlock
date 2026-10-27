@@ -9,12 +9,14 @@
 }
 
 {$AIRLOX_DOMAIN} {
-	# No response compression: event streams must reach clients unbuffered.
+	# No response compression here: event streams must reach clients
+	# unbuffered. The relay gzips its static files itself.
 	reverse_proxy airlox:8080 {
 		flush_interval -1
 	}
 	header Strict-Transport-Security "max-age=31536000"
-	header X-Content-Type-Options nosniff
+	# The relay sets this on pages and assets; add it only where missing.
+	header ?X-Content-Type-Options nosniff
 }
 
 www.{$AIRLOX_DOMAIN} {

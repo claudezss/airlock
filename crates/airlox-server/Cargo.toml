@@ -28,6 +28,7 @@ clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rust-embed = "8"
+flate2 = "1"
 mime_guess = "2"
 
 [target.'cfg(unix)'.dependencies]

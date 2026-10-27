@@ -84,6 +84,8 @@ const show = (...nodes) => app.replaceChildren(...nodes);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const fmtBytes = (n) => (n < 1024 ? `${n} B` : n < MB ? `${(n / 1024).toFixed(1)} KB` : `${(n / MB).toFixed(1)} MB`);
 const hhmm = (ms) => new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+// Status symbols are decoration next to words: screen readers skip them.
+const sym = (c) => el("span", { "aria-hidden": "true" }, c);
 const initials = (name) => (name.split(/[^\p{L}\p{N}]+/u).filter(Boolean).slice(0, 2).map((w) => w[0]).join("") || "?").toUpperCase();
 
 // One polite live region for job and runner transitions.
@@ -196,11 +198,13 @@ async function copyText(btn, text, label) {
 const touchOnly = () => matchMedia("(hover: none) and (pointer: coarse)").matches;
 const pressCopy = () => (touchOnly() ? "Long-press to copy" : navigator.platform.startsWith("Mac") ? "Press ⌘C" : "Press Ctrl+C");
 
-function inviteRow(name, url, hint, label = "Copy") {
+// `onSaved` runs once the link has really left this page: copied, or its
+// transfer code picked up.
+function inviteRow(name, url, hint, label = "Copy", onSaved = () => {}) {
   const shown = el("code", {}, maskInvite(url));
   const box = el("div", { class: "invite" }, shown);
   const btn = el("button", { class: "small", type: "button", onclick: async () => {
-    if (await copyText(btn, url, label)) return;
+    if (await copyText(btn, url, label)) return onSaved();
     // Clipboard denied: reveal the link in a selected field for manual copy.
     const input = el("input", { type: "text", readonly: true, value: url, "aria-label": `${name} invite link` });
     shown.replaceWith(input);
@@ -210,7 +214,7 @@ function inviteRow(name, url, hint, label = "Copy") {
   box.append(btn);
   return el("div", { class: "invite-row", "data-role": name.toLowerCase() },
     el("div", { class: "head" }, el("strong", {}, name), hint ? el("span", { class: "muted" }, hint) : null), box,
-    sendCode(name, url));
+    sendCode(name, url, onSaved));
 }
 
 // ---------- one-time transfer codes ----------
@@ -226,7 +230,7 @@ addEventListener("pagehide", () => {
 const relayFlag = () => (location.origin === PUBLIC_RELAY ? "" : ` --relay ${location.origin}`);
 const mmss = (ms) => { const s = Math.max(0, Math.ceil(ms / 1000)); return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`; };
 
-function sendCode(name, url) {
+function sendCode(name, url, onSaved = () => {}) {
   const wrap = el("div", { class: "send-code" });
   const start = el("button", { class: "small", type: "button", onclick: () => open() }, "Send to another machine");
   const idle = ({ focus = false } = {}) => {
@@ -300,6 +304,7 @@ function sendCode(name, url) {
         const st = await (await api("GET", `/v1/drops/${n}`, { token })).json();
         if (drop !== mine) return;
         if (st.state === "picked_up") {
+          onSaved();
           ended("good", `Picked up ${hhmm(st.picked_up_at_ms)} · the code is gone.${name === "Owner" ? "" : ` If that wasn't you, revoke ${name}.`}`, { again: false });
         } else if (st.state === "burned") {
           ended("bad", "Someone typed wrong words too many times, so the code was cancelled. Make a new one.");
@@ -580,19 +585,57 @@ function newSession() {
       const base = location.origin;
       const owner = ac.ownerInvite(base, s.ownerSeed);
       const heading = el("h2", { tabindex: -1 }, "Hand out invites");
+      const ownerRow = inviteRow("Owner", owner, "you · keep it private", "Copy", () => markSaved());
+      // Without the owner link nobody can approve runners, revoke or close:
+      // opening the session waits until it has been saved one way or another.
+      // A button, not a link: the owner key must not show in the status bar on hover.
+      const openBtn = el("button", { class: "primary cta", type: "button", disabled: true, "aria-describedby": "owner-gate",
+        onclick: () => openOwnerSession(owner) }, "Open session");
+      const gate = el("p", { class: "muted hint-text", id: "owner-gate" }, "Save the owner link first: copy it, download it, or send it to another machine and enter the code there.");
+      const saved = el("input", { type: "checkbox", id: "owner-saved" });
+      const markSaved = () => {
+        openBtn.disabled = false;
+        openBtn.removeAttribute("aria-describedby");
+        gate.hidden = true;
+        saved.checked = true;
+      };
+      saved.addEventListener("change", () => {
+        if (saved.checked) return markSaved();
+        openBtn.disabled = true;
+        openBtn.setAttribute("aria-describedby", "owner-gate");
+        gate.hidden = false;
+      });
+      const download = el("button", { class: "small", type: "button", onclick: () => {
+        const name = `airlox-owner-${session_id.slice(0, 7)}.txt`;
+        const body = `Airlox owner link for session ${session_id}\n\n${owner}\n\n` +
+          "Anyone with this link controls the session: keep it private. It cannot be shown again.\n";
+        const url = URL.createObjectURL(new Blob([body], { type: "text/plain" }));
+        const a = el("a", { href: url, download: name, hidden: true });
+        document.body.append(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+        announce(`Downloaded ${name}`);
+        markSaved();
+      } }, "Download as .txt");
+      ownerRow.querySelector(".send-code").before(el("div", { class: "row" }, download));
       aside.replaceChildren(
         el("div", { class: "eyebrow" }, `Created · ${session_id.slice(0, 7)}`),
         heading,
-        el("p", { class: "muted" }, "Copy the owner link now: it cannot be shown again. Sender, observer and runner links stay available under Invites in the session."),
+        el("div", { class: "callout", role: "note" },
+          el("strong", {}, "Save your owner link now: it is shown only once."),
+          el("span", {}, "Without it you cannot approve runners, revoke access or close the session. Sender, observer and runner links stay available under Invites in the session.")),
         el("p", { class: "muted hint-text" }, MASKED_NOTE),
-        inviteRow("Owner", owner, "you · keep it private"),
+        ownerRow,
+        el("label", { class: "option check" }, saved, "I've saved it somewhere safe"),
         senderInviteRow(ac.memberInvite(base, s.ownerSeed, "sender")),
         inviteRow("Observer", ac.memberInvite(base, s.ownerSeed, "observer"), "can read everything and export the audit log"),
         ...(execute ? [runnerInviteRow(ac.memberInvite(base, s.ownerSeed, "runner"))] : []),
         el("div", { class: "row" },
           // A button, not a link: the owner key must not show in the status bar on hover.
-          el("button", { class: "primary cta", type: "button", onclick: () => openOwnerSession(owner) }, "Open session"),
-          el("button", { type: "button", onclick: () => { invitesShown = false; location.reload(); } }, "Create another")));
+          openBtn,
+          el("button", { type: "button", onclick: () => { invitesShown = false; location.reload(); } }, "Create another")),
+        gate);
       heading.focus();
       invitesShown = true;
       invitesCreated = true;
@@ -746,6 +789,7 @@ function buildSessionLayout(s) {
   const submit = async () => {
     if (sendBtn.disabled) return;
     sendBtn.disabled = true;
+    sendBtn.dataset.busy = "1";
     status.textContent = "";
     try {
       if (jobUi?.active()) {
@@ -779,7 +823,9 @@ function buildSessionLayout(s) {
       }
       status.replaceChildren(...[e.final ? e.message : `Not sent: ${e.message || e}`, e.detail && el("span", { class: "detail" }, e.detail)].filter(Boolean));
     } finally {
-      sendBtn.disabled = !!s.closed;
+      delete sendBtn.dataset.busy;
+      sendBtn.disabled = !!s.closed || !!jobUi?.blocked();
+      jobUi?.refresh(); // also links the reason to a blocked Send job
     }
   };
   text.addEventListener("keydown", (ev) => {
@@ -908,7 +954,7 @@ function buildSessionLayout(s) {
       (sec?.querySelector("button.primary") || sec)?.focus({ preventScroll: true });
     } }, "Review runners"));
   show(el("div", { class: "session" }, el("h1", { class: "sr-only" }, `Session ${sid.slice(0, 7)}, ${manifest.mode} mode, ${inv.role}`),
-    rail, el("div", { class: "main-col" }, approvalBanner, banner, timeline, composer)));
+    el("div", { class: "main-col" }, approvalBanner, banner, timeline, composer), rail));
   // A #fragment would replace the stored invite on reload: move focus instead.
   const skip = (label, to) => el("a", { class: "skip", href: "#", onclick: (ev) => {
     ev.preventDefault();
@@ -948,7 +994,8 @@ function buildSessionLayout(s) {
     const h = Math.floor(t / 3600);
     const mm = String(Math.floor((t % 3600) / 60)).padStart(2, "0");
     const ss = String(t % 60).padStart(2, "0");
-    expiry.textContent = `expires in ${h ? `${h}:` : ""}${mm}:${ss}`;
+    // On phones only the time shows; "expires in" stays for screen readers.
+    expiry.replaceChildren(el("span", { class: "exp-word" }, "expires in "), `${h ? `${h}:` : ""}${mm}:${ss}`);
     expiry.classList.toggle("soon", left < 5 * 60 * 1000);
   };
   const timer = setInterval(tick, 1000);
@@ -1363,7 +1410,7 @@ function renderItem(s, it) {
     el("strong", {}, it.authorName),
     it.role ? el("span", { class: "muted" }, it.role) : null,
     el("span", { class: "when" }, hhmm(it.created),
-      it.status === "ok" ? el("span", { class: "verified" }, " · ✓ verified") : null));
+      it.status === "ok" ? el("span", { class: "verified" }, " · ", sym("✓"), " verified") : null));
   const card = el("div", { class: "card" });
   const node = el("article", { class: cls, id: `item-${it.id}`, tabindex: -1 },
     el("div", { class: `avatar ${av}`, "aria-hidden": "true" }, initials(it.authorName)),
@@ -1393,7 +1440,7 @@ function renderItem(s, it) {
     return node;
   }
   if (it.status === "rejected") {
-    card.append(el("p", {}, `✕ Not shown: ${it.error}`));
+    card.append(el("p", {}, sym("✕ "), `Not shown: ${it.error}`));
     if (it.detail) card.append(el("div", { class: "detail" }, it.detail));
     return node;
   }
@@ -1568,7 +1615,7 @@ function settle(s, it) {
 
 // `pending`: a neutral note, since the owner's approval may still arrive.
 function rejectedResult(reason, pending) {
-  return el("div", {}, pending ? el("p", { class: "note" }, reason) : el("p", { class: "note error" }, `✕ Result not accepted: ${reason}`));
+  return el("div", {}, pending ? el("p", { class: "note" }, reason) : el("p", { class: "note error" }, sym("✕ "), `Result not accepted: ${reason}`));
 }
 
 function logBlock(label, text, truncated) {
@@ -1604,7 +1651,7 @@ function renderOutFile(s, f) {
     return box;
   }
   if (!fi.ref || fi.ref.blob_sha256 !== f.item.blob_sha256) {
-    box.append(el("p", { class: "note error" }, `✕ ${f.name}: the file does not match the runner's result`));
+    box.append(el("p", { class: "note error" }, sym("✕ "), `${f.name}: the file does not match the runner's result`));
     return box;
   }
   appendFileView(box, fi);
@@ -1722,7 +1769,7 @@ function renderEvent(s, it, meta) {
   const ownerOnly = m.event !== "job_cancel";
   const suspect = ownerOnly && it.role !== "owner";
   return el("article", { class: `item evline${suspect ? " rejected" : ""}`, id: `item-${it.id}` },
-    el("div", { class: "pill" }, suspect ? `✕ ignored: ${text} (not from the owner)` : text, " · ", hhmm(it.created)));
+    el("div", { class: "pill" }, suspect ? [sym("✕ "), `ignored: ${text} (not from the owner)`] : text, " · ", hhmm(it.created)));
 }
 
 // ---------- runner console ----------
@@ -1836,7 +1883,7 @@ function renderRunners(s, list, note) {
     const failed = r.setup === "failed" && !r.rejected;
     const canApprove = owner && !r.rejected && !failed && (!r.approved || !!err);
     const warn = r.networkUnblocked && !r.rejected
-      ? el("span", { class: "chip warn", title: "This runner's sandbox cannot block network access" }, "⚠ network not blocked") : null;
+      ? el("span", { class: "chip warn", title: "This runner's sandbox cannot block network access" }, sym("⚠ "), "network not blocked") : null;
     const act = (name, label, cls, approve) => el("button", { type: "button", class: `small ${cls}`, "data-pub": r.pub, "data-act": name,
       disabled: !!s.closed, onclick: (ev) => decideRunner(s, r, approve, ev.currentTarget) }, label);
     return el("li", { class: `runner${r.rejected ? " is-rejected" : ""}` },
@@ -1900,24 +1947,29 @@ function buildJobPanel(s, text, file) {
   const lim = s.manifest.job_limits;
   let on = false;
   let sendBtn;
-  let optsSig = null; // null: the options are not drawn yet (an empty list has an empty signature too)
+  let chipsSig = null; // null: the chips are not drawn yet
   let filesSig = null;
   let locked = false;
-  const target = el("select", { id: "job-target" });
+  // "any", "labels" or "runner:<pub>"; the relay picks the runner, this only says which.
+  let target = "any";
+  const chips = el("div", { class: "runchips", role: "group", "aria-labelledby": "job-target-label" });
   const labels = el("input", { type: "text", id: "job-labels", placeholder: "gpu, cpu", autocomplete: "off", "aria-label": "Runner labels" });
   const labelField = el("div", { class: "stack field", hidden: true }, el("label", { for: "job-labels" }, "Labels"), labels);
   const timeout = el("input", { type: "number", id: "job-timeout", min: 1, max: lim.timeout_s, step: 1, value: lim.timeout_s,
     title: `1 to ${lim.timeout_s} seconds` });
   const files = el("div", { class: "pickfiles" });
   const filesSummary = el("summary", {}, "Input files · none selected");
-  const status = el("p", { class: "muted hint-text" });
+  // Why a job sent now would fail, with what would fix it.
+  const readyText = el("span", { id: "job-ready" });
+  const readyAct = el("span", { class: "ready-act" });
+  const ready = el("div", { class: "job-ready", hidden: true }, el("span", { class: "ready-icon", "aria-hidden": "true" }, "!"), readyText, readyAct);
   const panel = el("div", { class: "jobpanel", hidden: true },
+    el("div", { class: "stack field" }, el("span", { class: "field-label", id: "job-target-label" }, "Run on"), chips),
     el("div", { class: "jobrow" },
-      el("div", { class: "stack field" }, el("label", { for: "job-target" }, "Target"), target),
-      el("div", { class: "stack field narrow" }, el("label", { for: "job-timeout" }, "Timeout (s)"), timeout),
-      labelField),
-    el("details", { class: "inputfiles" }, filesSummary, files),
-    status);
+      labelField,
+      el("div", { class: "stack field narrow" }, el("label", { for: "job-timeout" }, "Timeout (s)"), timeout)),
+    ready,
+    el("details", { class: "inputfiles" }, filesSummary, files));
   const countPicked = () => {
     const n = s.picked.size;
     filesSummary.textContent = `Input files · ${n ? `${n} selected` : "none selected"}`;
@@ -1927,33 +1979,120 @@ function buildJobPanel(s, text, file) {
     toggle.setAttribute("aria-pressed", String(on));
     toggle.classList.toggle("on", on);
     panel.hidden = !on;
-    optsSig = null;
+    chipsSig = null;
     filesSig = null;
     text.placeholder = on ? "Python code to run (or attach a .py file)…" : "Message the session…";
     text.classList.toggle("code", on);
     text.spellcheck = !on;
     text.rows = on ? 7 : 2;
     if (sendBtn) sendBtn.textContent = on ? "Send job" : "Send";
+    if (!on && sendBtn && !sendBtn.dataset.busy) {
+      sendBtn.disabled = !!s.closed;
+      sendBtn.removeAttribute("aria-describedby");
+    }
     refresh();
   };
   const toggle = el("button", { type: "button", class: "small", "aria-pressed": "false", onclick: () => setOn(!on) }, "Send as job");
-  target.addEventListener("change", () => (labelField.hidden = target.value !== "labels"));
+  labels.addEventListener("input", () => syncReady());
+
+  // The relay's rule: approved (signed by the owner here), online, idle, and
+  // matching the target. Anything else fails at once: there is no queue.
+  // A runner the relay approved counts even before the owner's signed
+  // approval reaches this browser (relayOnly): the relay would route the job
+  // there; only its results wait for the approval.
+  const cleared = (r) => r.approved || r.relayOnly;
+  const usable = (r) => !r.rejected && cleared(r) && r.setup !== "failed" && r.online;
+  const runnerState = (r) => r.setup === "failed" ? "setup failed" : !cleared(r) ? "needs approval"
+    : !r.online ? (r.setup === "preparing" ? "preparing" : "offline") : r.job ? "busy" : "idle";
+  const approvalNote = (r) => r.relayOnly ? (s.inv.role === "owner" ? "needs your confirmation" : "approval not received here") : null;
+  const wantedLabels = () => labels.value.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+  const matches = (r) => target === "any" ? true : target === "labels" ? wantedLabels().every((l) => r.labels?.includes(l)) : `runner:${r.pub}` === target;
+
+  // null when a job could go now; otherwise { text, act }.
+  function blocker() {
+    // Until the first poll, or while it fails, the list may be stale: let the relay decide.
+    if (!s.runnersLoaded || s.connBad?.has("poll")) return null;
+    if (target === "labels" && !wantedLabels().length) return null; // submit() explains
+    const live = s.runners.filter((r) => !r.rejected);
+    const fit = live.filter(matches);
+    if (fit.some((r) => usable(r) && !r.job)) return null;
+    const pending = fit.find((r) => !cleared(r) && r.setup !== "failed");
+    const one = target.startsWith("runner:") ? fit[0] : null;
+    let why;
+    if (one) why = `${one.name} ${{ "needs approval": "needs approval", "setup failed": "failed to set up", preparing: "is still preparing its sandbox" }[runnerState(one)] || `is ${runnerState(one)}`}`;
+    else if (fit.some(usable)) why = target === "labels" ? "Every runner with those labels is busy" : "Every runner is busy";
+    else if (target === "labels" && !fit.length) why = `No runner has the labels ${wantedLabels().join(", ")}`;
+    else if (!live.length) why = "No runner has joined yet";
+    else why = target === "labels" ? "No approved runner with those labels is online" : "No approved runner is online";
+    return { text: `${why}, so a job sent now would fail right away.`, pending: s.inv.role === "owner" ? pending : null, none: !live.length,
+      busy: fit.some(usable) };
+  }
+
+  let wasBlocked = null; // announce only changes, not the state job mode opens in
+  function syncReady() {
+    if (!on) return (wasBlocked = null);
+    const b = locked ? null : blocker();
+    ready.hidden = !b;
+    if (wasBlocked !== null && wasBlocked !== !!b && s.announce) announce(b ? `Send job unavailable: ${b.text}` : "A runner is ready: you can send the job");
+    wasBlocked = !!b;
+    // Not while a send is in flight: that would allow a second one.
+    if (sendBtn && !sendBtn.dataset.busy) {
+      sendBtn.disabled = !!s.closed || !!b;
+      if (b) sendBtn.setAttribute("aria-describedby", "job-ready");
+      else sendBtn.removeAttribute("aria-describedby");
+    }
+    if (!b) return;
+    readyText.textContent = b.text;
+    const sig = `${b.pending?.pub || ""}|${b.none}|${b.busy}|${s.revokedRoles.has("runner")}`;
+    if (readyAct.dataset.sig === sig) return;
+    readyAct.dataset.sig = sig;
+    const owner = s.inv.role === "owner";
+    if (b.pending) {
+      readyAct.replaceChildren(el("button", { type: "button", class: "small", onclick: () => {
+        const sec = document.getElementById("runner-console");
+        sec?.scrollIntoView({ block: "start" });
+        (sec?.querySelector(`button[data-act=approve][data-pub="${CSS.escape(b.pending.pub)}"]`) || sec)?.focus({ preventScroll: true });
+      } }, `Review ${b.pending.name}`));
+    } else if (b.none && owner && !s.revokedRoles.has("runner")) {
+      const cmd = `airlox runner join --invite '${ac.memberInvite(location.origin, s.inv.roleSeed, "runner")}' --name my-runner --sandbox docker`;
+      const btn = el("button", { type: "button", class: "small", onclick: async () => {
+        if (!(await copyText(btn, cmd, "Copy runner command"))) btn.textContent = "Copy it from Invites";
+      } }, "Copy runner command");
+      readyAct.replaceChildren(btn);
+    } else readyAct.replaceChildren(...(owner || b.busy ? [] : [el("span", { class: "muted" }, "Ask the session owner to start and approve a runner.")]));
+  }
+
+  function drawChips() {
+    const live = s.runners.filter((r) => !r.rejected);
+    if (target.startsWith("runner:") && !live.some((r) => `runner:${r.pub}` === target)) target = "any";
+    labelField.hidden = target !== "labels";
+    const sig = JSON.stringify([target, locked, live.map((r) => [r.pub, r.name, r.labels, runnerState(r), approvalNote(r)])]);
+    if (sig === chipsSig) return;
+    chipsSig = sig;
+    const a = document.activeElement;
+    const keep = chips.contains(a) ? a.dataset.target : null;
+    const chip = (value, ...label) => el("button", { type: "button", class: "small runchip", "data-target": value, disabled: locked,
+      "aria-pressed": String(target === value), onclick: () => {
+        target = value;
+        refresh();
+        if (value === "labels") labels.focus();
+      } }, ...label);
+    chips.replaceChildren(
+      chip("any", "Any idle runner"),
+      ...live.map((r) => {
+        const st = runnerState(r);
+        return chip(`runner:${r.pub}`, el("span", { class: `dot ${st === "idle" ? "on" : st === "needs approval" ? "wait" : st === "busy" ? "busy" : ""}`, "aria-hidden": "true" }),
+          r.name, r.labels?.length ? el("span", { class: "muted" }, ` · ${r.labels.join(", ")}`) : null,
+          el("span", { class: "state" }, approvalNote(r) ? `${st} · ${approvalNote(r)}` : st));
+      }),
+      chip("labels", "By label…"));
+    if (keep) chips.querySelector(`[data-target="${CSS.escape(keep)}"]`)?.focus({ preventScroll: true });
+  }
 
   function refresh() {
     if (!on) return;
-    const cur = target.value;
-    const opts = [el("option", { value: "any" }, "Any idle runner"), el("option", { value: "labels" }, "Labels…")];
-    for (const r of s.runners) {
-      if (r.rejected) continue;
-      opts.push(el("option", { value: `runner:${r.pub}` }, `${r.name}${r.online ? "" : " (offline)"}${r.setup === "failed" ? " (setup failed)" : r.approved ? "" : r.relayOnly ? " (not approved here)" : " (not approved)"}`));
-    }
-    const sig = s.runners.map((r) => `${r.pub}${r.name}${r.online}${r.approved}${r.relayOnly}${r.rejected}${r.setup}`).join("|");
-    if (sig !== optsSig) {
-      optsSig = sig;
-      target.replaceChildren(...opts);
-    }
-    target.value = [...target.options].some((o) => o.value === cur) ? cur : "any";
-    labelField.hidden = target.value !== "labels";
+    drawChips();
+    syncReady();
     const cands = [...s.items.values()].filter((i) => i.kind === "file" && i.status === "ok" && i.ref).sort((a, b) => a.seq - b.seq);
     countPicked();
     const fsig = cands.map((i) => i.id).join("|");
@@ -1987,16 +2126,16 @@ function buildJobPanel(s, text, file) {
     const t = Number(timeout.value);
     if (!Number.isInteger(t) || t < 1 || t > lim.timeout_s) throw new Error(`timeout must be 1 to ${lim.timeout_s} seconds`);
     let tgt;
-    if (!target.value || target.value === "any") tgt = { type: "any" };
-    else if (target.value === "labels") {
-      const ls = labels.value.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+    if (target === "any") tgt = { type: "any" };
+    else if (target === "labels") {
+      const ls = wantedLabels();
       if (!ls.length) throw new Error("enter at least one label, such as gpu");
       if (ls.length > 16) throw new Error("use at most 16 labels");
       const bad = ls.find((l) => !/^[a-z0-9][a-z0-9._-]{0,62}$/.test(l));
       if (bad) throw new Error(`"${bad.slice(0, 20)}" is not a valid label: use letters, digits, . _ - (up to 63, starting with a letter or digit)`);
       tgt = { type: "labels", labels: ls };
     } else {
-      const r = s.runners.find((x) => `runner:${x.pub}` === target.value);
+      const r = s.runners.find((x) => `runner:${x.pub}` === target);
       if (!r) throw new Error("that runner is gone");
       tgt = { type: "runner", participant_pub: r.pub, name: r.name };
     }
@@ -2020,9 +2159,10 @@ function buildJobPanel(s, text, file) {
     locked = true;
     setOn(false);
     toggle.disabled = true;
-    for (const c of panel.querySelectorAll("select, input, summary")) c.disabled = true;
+    for (const c of panel.querySelectorAll("button, input, summary")) c.disabled = true;
   };
-  return { panel, toggle, refresh, submit, lock, off: () => setOn(false), active: () => on, setSend: (b) => (sendBtn = b) };
+  return { panel, toggle, refresh, submit, lock, off: () => setOn(false), active: () => on, setSend: (b) => (sendBtn = b),
+    blocked: () => on && !locked && !!blocker() };
 }
 
 // ---------- sending ----------
