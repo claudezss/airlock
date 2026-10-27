@@ -256,7 +256,8 @@ sig: Ed25519( P.priv, ctx "item", canonical(header) || sha256(blob) )
 - **Per-item keys** derived from `K` mean a leaked item key exposes one item.
 - **AAD = header** binds kind/size/author to the ciphertext, so the server
   cannot relabel a job as a message.
-- Max plaintext per item is set in the manifest (default 25 MB). Larger uploads
+- Max plaintext per item is set in the manifest (clients default to the
+  relay's own limit, up to 100 MB; 25 MB for relays that do not say). Larger uploads
   are rejected by the server by `size`; chunking is a v2 item.
 - Payloads by kind:
   - `text`: UTF-8 string.
@@ -910,8 +911,9 @@ format churn is where Rust is slowest.
    hosts, keep it as "warned, not blocked", or refuse to join a
    `network: false` session unless `--i-know-local-has-network`? Proposed:
    warn in v1.
-5. **Item size ceiling.** 25 MB single-blob in v1; chunked upload when someone
-   needs more.
+5. **Item size ceiling.** Single blob in v1, up to the relay's
+   `--max-item-bytes` (100 MiB by default; 1 GiB at most); chunked upload when
+   someone needs more.
 6. **Ephemeral or persistent by default.** Ephemeral mode removes storage cost
    entirely but ends sessions on every restart or deploy. Proposed:
    persistent by default, ephemeral as a flag.

@@ -325,6 +325,11 @@ pub struct CreateParams {
     pub job_timeout_s: Option<u32>,
     /// execute: job memory limit in MB (default 2048).
     pub job_memory_mb: Option<u32>,
+    /// A relay host participants may reach over plain http://, such as a
+    /// relay's service name inside a cluster. Bearer tokens and transfer
+    /// codes then cross that network in the clear; only set it when the
+    /// user asks for it.
+    pub insecure_http_host: Option<String>,
     /// execute: require the owner to approve each runner (default true).
     pub approve_runners: Option<bool>,
     /// What you are or do, shown to the other participants (default: the
@@ -606,13 +611,13 @@ should have that role. The owner link is never returned.")]
             job_limits: p.execute.then(|| JobLimits {
                 runtime: "python3.12".into(),
                 timeout_s: p.job_timeout_s.unwrap_or(60),
-                memory_mb: p.job_memory_mb.unwrap_or(crate::cli::DEFAULT_JOB_MEMORY_MB),
+                memory_mb: p.job_memory_mb.unwrap_or(JobLimits::default().memory_mb),
                 network: p.network,
                 packages: p.packages.clone(),
                 return_out: true,
                 approve_runners: p.approve_runners.unwrap_or(true),
             }),
-            insecure_http_host: None,
+            insecure_http_host: p.insecure_http_host.as_deref().map(|h| h.trim().to_ascii_lowercase()),
         };
         let me = self.profile(p.description.clone());
         let s = tool_try!(Session::create(&self.http, &self.relay, new, &me, &self.cache_root).await);

@@ -63,6 +63,7 @@ pub fn generate() -> Result<Value> {
         max_item_bytes: 26_214_400,
         job_limits: Some(JobLimits {
             packages: vec!["matplotlib".into(), "numpy".into(), "pandas".into()],
+            memory_mb: 512,
             ..JobLimits::default()
         }),
         insecure_http_host: None,

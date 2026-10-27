@@ -120,8 +120,16 @@ member: {base}/s/{session_id}#v=1&r={send|run|view}&k={K}&rk={role_seed}
   run the same check on the owner link before registering a session.
 - Over plain `http://`, content stays end-to-end encrypted, but bearer tokens
   and transfer codes (whose two words are 16 bits) cross the network in the
-  clear: `insecure_http_host` is for a network the owner trusts, such as a
-  cluster's service network.
+  clear, and a token is the participant toward the relay: the owner's can
+  close the session, revoke roles and approve runners; a runner's can claim
+  jobs. `insecure_http_host` is for a network the owner trusts, such as a
+  cluster's service network. Clients refuse to claim a transfer code over
+  plain http to another machine unless told to.
+- `base` must be ASCII without `\` or `%`: HTTP clients read `\` as `/` and
+  decode escapes, so the host they connect to must be the host checked.
+  `insecure_http_host` is a lowercase DNS name or dotted-quad IPv4 address;
+  hosts URL parsers read as IPv4 (a numeric last label) must be four decimal
+  octets, not loopback, link-local, unspecified, broadcast or multicast.
 
 ### 4.1 Transfer codes
 

@@ -60,6 +60,14 @@ fn split_base(base_url: &str) -> Result<(String, &str, String)> {
     if b.contains('#') || b.contains('?') || b.contains('@') || b.chars().any(|c| c.is_whitespace()) {
         return Err(Error::invalid("base_url", "must not contain a query, fragment, userinfo or spaces"));
     }
+    // HTTP clients read `\` as `/` and decode `%`: the host they connect to
+    // must be the host checked here.
+    if b.contains('\\') || b.contains('%') || !b.is_ascii() {
+        return Err(Error::invalid(
+            "base_url",
+            "must be plain ASCII, without backslashes or percent-escapes",
+        ));
+    }
     let authority = rest.split('/').next().unwrap_or("");
     let host = if let Some(v6) = authority.strip_prefix('[') {
         v6.split(']').next().map(|h| format!("[{h}]")).unwrap_or_default()
@@ -102,9 +110,13 @@ pub fn check_transport(base_url: &str, insecure_http_host: Option<&str>) -> Resu
     ))
 }
 
-/// A host an owner may allow over `http://`: a DNS name or IPv4 address,
-/// lowercase, without scheme, port or path. Loopback needs no opt-in.
+/// A host an owner may allow over `http://`: a DNS name or a dotted-quad
+/// IPv4 address, lowercase, without scheme, port or path. Loopback needs no
+/// opt-in. Numeric forms HTTP clients read as IPv4 (`2130706433`, `0x7f.1`,
+/// `10.1`) must be written as four decimal octets, and loopback, link-local,
+/// unspecified, broadcast and multicast addresses are refused.
 pub fn check_insecure_http_host(h: &str) -> Result<()> {
+    let bad = |why: &str| Err(Error::invalid("insecure_http_host", format!("{h:?} {why}")));
     let labels_ok = h.split('.').all(|l| {
         !l.is_empty()
             && l.len() <= 63
@@ -113,15 +125,28 @@ pub fn check_insecure_http_host(h: &str) -> Result<()> {
             && l.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
     });
     if h.is_empty() || h.len() > 253 || !labels_ok {
-        return Err(Error::invalid(
-            "insecure_http_host",
-            format!(
-                "{h:?} must be a lowercase host name such as airlox-relay.ns.svc, without scheme or port"
-            ),
-        ));
+        return bad("must be a lowercase host name such as airlox-relay.ns.svc, without scheme or port");
     }
     if is_loopback(h) {
         return Err(Error::invalid("insecure_http_host", "localhost needs no opt-in: leave it out"));
+    }
+    // As in the URL standard: a host whose last label is a number is IPv4.
+    let last = h.rsplit('.').next().unwrap_or("");
+    let numeric = !last.is_empty()
+        && (last.bytes().all(|c| c.is_ascii_digit())
+            || last.strip_prefix("0x").is_some_and(|x| x.bytes().all(|c| c.is_ascii_hexdigit())));
+    if numeric {
+        let Ok(ip) = h.parse::<std::net::Ipv4Addr>() else {
+            return bad("is read as an IPv4 address: write it as four decimal numbers, like 10.0.0.7");
+        };
+        if ip.is_loopback()
+            || ip.is_link_local()
+            || ip.is_unspecified()
+            || ip.is_broadcast()
+            || ip.is_multicast()
+        {
+            return bad("is a loopback, link-local or otherwise special address");
+        }
     }
     Ok(())
 }
@@ -316,6 +341,12 @@ mod tests {
         link("http://AIRLOX-RELAY.ns.svc").check_against(&named).unwrap();
         assert!(link("http://evil.example").check_against(&named).is_err());
         assert!(link("http://airlox-relay.ns.svc.evil.example").check_against(&named).is_err());
+        // What a client would connect to must be the host checked.
+        for base in
+            ["http://evil.example\\.localhost", "http://evil.example%2f.localhost", "http://evil.éxample"]
+        {
+            assert!(Invite::member(base, &s, Role::Sender).is_err(), "{base:?}");
+        }
         // What an owner may name.
         for ok in ["airlox-relay.ns.svc", "relay", "10.0.0.7", "a-b.c"] {
             check_insecure_http_host(ok).unwrap();

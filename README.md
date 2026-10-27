@@ -212,7 +212,10 @@ machine** next to any invite in the web UI, or with the owner invite run
 airlox session code runner             # prints the code; --wait waits until it is used
 ```
 
-(`owner.transfer_code("runner").code` in Python). On the other machine:
+(`owner.transfer_code("runner").code` in Python). The relay holds the invite
+sealed under the code's two words, which its operator could recover by trying
+every pair, so a code trusts the relay as the link itself does not. On the
+other machine:
 
 ```bash
 airlox runner join --code 7-guitar-orbit --name runner-01 --sandbox docker
@@ -223,8 +226,9 @@ You can also type the code in a browser at `/receive`.
 
 For a long-lived runner, `airlox session create --profile host-runner`
 starts from a session that never expires, with 30-minute jobs, 4096 MB of job
-memory, items as large as the relay allows and runner approval on. Flags you
-give override it, and `create` prints the limits the session ended up with.
+memory, items as large as the relay allows (up to 100 MB) and runner approval
+on. Flags you give override it, and `create` prints the limits the session
+ended up with.
 
 Approve the runner, then send it work:
 

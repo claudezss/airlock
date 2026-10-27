@@ -39,13 +39,18 @@ holds `invites.sender` (post messages and files, submit jobs),
 (for `airlox runner join` on the machine that runs the code). Give each link
 only to whoever should have that role.
 
-To get a link to another machine, prefer a one-time code to copying the link
-or a file: `AIRLOX_INVITE="$(cat ./owner.link)" airlox session code runner`
-prints a code such as `7-guitar-orbit` that works once, for 10 minutes, with
-`airlox runner join --code 7-guitar-orbit ...` or `airlox receive
-7-guitar-orbit` there. For a long-lived runner session,
-`airlox session create --profile host-runner` sets the usual limits (no
-expiry, 30-minute jobs, 4096 MB); `create` prints the limits it set.
+To get the runner invite to another machine, a one-time code avoids copying
+the link or a file: `AIRLOX_INVITE="$(cat ./owner.link)" airlox session code
+runner` prints a code such as `7-guitar-orbit` on stdout, and on stderr the
+exact command to run on the other machine (with `--relay` when the relay is
+not airlox.app); pass that line on as printed. The code works once, for 10
+minutes. The relay could recover what a code carries, so a code trusts the
+relay as the link does not; never make a code for the `owner` invite unless
+the user asks for exactly that.
+
+For a long-lived runner session, `airlox session create --profile
+host-runner` sets the usual limits (no expiry, 30-minute jobs, 4096 MB);
+`create` prints the limits it set.
 
 ## Send and read
 

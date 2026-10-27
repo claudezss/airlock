@@ -260,6 +260,14 @@ fn shim_source() -> &'static str {
     api::shim_source()
 }
 
+/// Raises ValidationError unless `base_url` is https, http to loopback, or
+/// http to `insecure_http_host`.
+#[pyfunction]
+#[pyo3(signature = (base_url, insecure_http_host=None))]
+fn check_transport(base_url: &str, insecure_http_host: Option<&str>) -> PyResult<()> {
+    ::airlox_core::invite::check_transport(base_url, insecure_http_host).map_err(err)
+}
+
 /// Seal an invite for a transfer code. Returns (secret, claim_hash, box).
 #[pyfunction]
 fn transfer_seal(invite: &str) -> PyResult<(String, String, String)> {
@@ -316,6 +324,7 @@ fn core_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_zip, m)?)?;
     m.add_function(wrap_pyfunction!(sanitize_image, m)?)?;
     m.add_function(wrap_pyfunction!(shim_source, m)?)?;
+    m.add_function(wrap_pyfunction!(check_transport, m)?)?;
     m.add_function(wrap_pyfunction!(transfer_seal, m)?)?;
     m.add_function(wrap_pyfunction!(transfer_claim, m)?)?;
     m.add_function(wrap_pyfunction!(transfer_open, m)?)?;

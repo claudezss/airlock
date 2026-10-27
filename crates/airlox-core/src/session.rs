@@ -121,7 +121,9 @@ impl Default for JobLimits {
         JobLimits {
             runtime: "python3.12".into(),
             timeout_s: 30,
-            memory_mb: 512,
+            // Enough for numpy-scale imports; a 512 MB cap (counted as commit
+            // under a Windows Job Object) does not fit them.
+            memory_mb: 2048,
             network: false,
             packages: vec![],
             return_out: true,

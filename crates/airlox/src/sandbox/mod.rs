@@ -128,11 +128,11 @@ impl Backend {
         }
     }
 
-    /// Memory (MB) importing the allowlist takes, where it can be measured
-    /// without leaving the sandbox (process mode).
-    pub async fn import_footprint_mb(&self, spec: &RuntimeSpec) -> Option<u64> {
+    /// What importing the allowlist takes, where it can be measured without
+    /// leaving the sandbox (process mode).
+    pub async fn import_footprint(&self, spec: &RuntimeSpec, cap_mb: u32) -> Option<local::Footprint> {
         match self {
-            Backend::Local(b) => b.import_footprint_mb(spec).await,
+            Backend::Local(b) => b.import_footprint(spec, cap_mb).await,
             Backend::Docker(_) => None,
         }
     }

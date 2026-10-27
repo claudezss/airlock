@@ -638,9 +638,25 @@ def test_cli_transfer_codes(relay, caches, tmp_path):
     code = p.stdout.readline().strip()
     assert cli("receive", code, "--relay", relay.url).stdout.strip() == created["invites"]["observer"]
     assert p.wait(timeout=30) == 0, p.stderr.read()
-    # Only the owner makes codes.
+    # Only the owner makes codes, and an owner code needs saying so.
     bad = cli("session", "code", "sender", invite=created["invites"]["sender"], cache=caches("s"), check=False)
     assert bad.returncode != 0 and "owner" in bad.stderr
+    bad = cli("session", "code", "owner", invite=owner, cache=caches("cli"), check=False)
+    assert bad.returncode != 0 and "--allow-owner" in bad.stderr
+    # --wait --json: one JSON object per line, the code first.
+    p = subprocess.Popen([BIN, "session", "code", "sender", "--wait", "--json"], env=env,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    first = json.loads(p.stdout.readline())
+    cli("receive", first["code"], "--relay", relay.url)
+    assert json.loads(p.stdout.readline()) == {"code": first["code"], "state": "picked_up"}
+    assert p.wait(timeout=30) == 0
+    # A code is not claimed over plain http to another machine unless asked.
+    other = relay.url.replace("127.0.0.1", "127.1")
+    made = json.loads(cli("session", "code", "sender", "--json", invite=owner, cache=caches("cli")).stdout)
+    refused = cli("receive", made["code"], "--relay", other, check=False)
+    assert refused.returncode != 0 and "--allow-insecure-http" in refused.stderr
+    got = cli("receive", made["code"], "--relay", other, "--allow-insecure-http")
+    assert got.stdout.strip() == created["invites"]["sender"]
 
 
 def test_cli_create_profile_and_effective_limits(relay, caches):
@@ -654,18 +670,18 @@ def test_cli_create_profile_and_effective_limits(relay, caches):
     assert lim["packages"] == ["pypowergem"]
     text = cli("session", "create", "--relay", relay.url, "--execute", "--max-item-mb", "5",
                cache=caches("cli")).stdout
-    assert "items     up to 5 MiB" in text
+    assert "items     up to 5 MB" in text
     assert re.search(r"jobs      python3\.12 · 60 s · 2048 MB · network off · packages \[\] · approval required", text)
 
 
-def test_cli_plain_http_needs_the_owner_to_name_the_host(relay, caches):
-    url = relay.url.replace("127.0.0.1", "127.1")
+def test_cli_plain_http_needs_the_owner_to_name_the_host(caches):
+    # Refused before anything is sent; the SDK test covers a working session.
+    url = "http://airlox-relay.invalid:8080"
     refused = cli("session", "create", "--relay", url, cache=caches("cli"), check=False)
     assert refused.returncode != 0 and "--insecure-http-host" in refused.stderr
-    v = json.loads(cli("session", "create", "--relay", url, "--insecure-http-host", "127.1", "--json",
-                       cache=caches("cli")).stdout)
-    assert v["insecure_http_host"] == "127.1"
-    sender = v["invites"]["sender"]
-    cli("send", "text", "hello over http", invite=sender, cache=caches("s"))
-    info = json.loads(cli("session", "info", "--json", invite=sender, cache=caches("s")).stdout)
-    assert info["insecure_http_host"] == "127.1"
+    numeric = cli("session", "create", "--relay", url, "--insecure-http-host", "2130706433", cache=caches("cli"),
+                  check=False)
+    assert numeric.returncode != 0 and "four decimal numbers" in numeric.stderr
+    other = cli("session", "create", "--relay", url, "--insecure-http-host", "relay.ns.svc", cache=caches("cli"),
+                check=False)
+    assert other.returncode != 0 and "does not name relay.ns.svc" in other.stderr

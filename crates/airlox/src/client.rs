@@ -145,12 +145,18 @@ pub async fn get_manifest(http: &reqwest::Client, base: &str, sid: &str) -> Resu
     v["signed_manifest"].as_str().map(str::to_string).context("relay sent no manifest")
 }
 
-/// The largest item a session on `relay` may allow, from `GET /v1/health`;
-/// `None` if the relay does not say (older relays) or cannot be reached.
+/// The largest default a relay's answer can raise a new session's item
+/// limit to: the relay is not trusted to pick a large one, so a bigger
+/// limit takes an explicit `--max-item-mb`.
+pub const MAX_DEFAULT_ITEM_BYTES: u64 = 100 * 1024 * 1024;
+
+/// The item limit for a new session on `relay`: the largest the relay
+/// allows (`GET /v1/health`), at most [`MAX_DEFAULT_ITEM_BYTES`]; `None` if
+/// the relay does not say (older relays) or does not answer within 5 s.
 pub async fn relay_max_item_bytes(http: &reqwest::Client, relay: &str) -> Option<u64> {
-    let r = http.get(format!("{}/v1/health", relay.trim_end_matches('/'))).timeout(REQUEST_TIMEOUT);
+    let r = http.get(format!("{}/v1/health", relay.trim_end_matches('/'))).timeout(Duration::from_secs(5));
     let v = read_json(check(r.send().await.ok()?).await.ok()?).await.ok()?;
-    v["max_item_bytes"].as_u64()
+    v["max_item_bytes"].as_u64().filter(|n| *n > 0).map(|n| n.min(MAX_DEFAULT_ITEM_BYTES))
 }
 
 /// `POST /v1/sessions`: register a session from its signed manifest.
@@ -163,9 +169,27 @@ pub async fn create_session(http: &reqwest::Client, base: &str, signed_manifest:
 /// `POST /v1/drops/{n}/claim`: trade a one-time transfer code for the
 /// invite link it carries. A right code is used up; a wrong one spends one
 /// of the few tries the code has.
-pub async fn receive_code(http: &reqwest::Client, relay: &str, code: &str) -> Result<String> {
+///
+/// Over plain `http://` to another machine the claim and the sealed invite
+/// cross the network in the clear, and the code's 16 bits of words would
+/// let anyone who saw them open it: that needs `allow_insecure_http`.
+pub async fn receive_code(
+    http: &reqwest::Client,
+    relay: &str,
+    code: &str,
+    allow_insecure_http: bool,
+) -> Result<String> {
     let code = airlox_core::transfer::Code::parse(code)?;
     let relay = relay.trim_end_matches('/');
+    if airlox_core::invite::check_transport(relay, None).is_err() && !allow_insecure_http {
+        let ok =
+            airlox_core::invite::check_transport(&relay.replacen("http://", "https://", 1), None).is_ok();
+        bail!(
+            "{}: a code claimed over plain http:// crosses the network in the clear, and anyone who sees it \
+             can open the invite. Use https, or pass --allow-insecure-http on a network you trust",
+            if ok { relay_text(relay) } else { format!("{} is not a relay URL", relay_text(relay)) }
+        );
+    }
     let req = http
         .post(format!("{relay}/v1/drops/{}/claim", code.nameplate))
         .timeout(REQUEST_TIMEOUT)

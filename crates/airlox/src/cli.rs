@@ -110,8 +110,9 @@ pub enum SessionCmd {
     /// Make a one-time code that carries one role's invite to another
     /// machine (owner invite only), like the web UI's "Send to another
     /// machine": type it there with `airlox runner join --code` or
-    /// `airlox receive`. The link itself never leaves this machine in the
-    /// clear.
+    /// `airlox receive`. The relay holds the invite sealed under the code's
+    /// two words, which a relay operator could recover by trying all 65,536
+    /// pairs: a code trusts the relay as the link's #fragment does not.
     Code(CodeArgs),
     /// Show the session's settings and participants.
     Info(Conn),
@@ -144,9 +145,13 @@ pub struct CodeArgs {
     #[arg(value_parser = ["runner", "sender", "observer", "owner"])]
     pub role: String,
     /// Wait until the code is used, expires or is cancelled; Ctrl-C cancels
-    /// it. Exits 0 once it is used, 1 otherwise.
+    /// it. Exits 0 once it is used, 1 otherwise. With --json, prints one
+    /// JSON object per line: the code, then how it ended.
     #[arg(long)]
     pub wait: bool,
+    /// Allow a code for the owner invite, which hands over the session.
+    #[arg(long)]
+    pub allow_owner: bool,
 }
 
 #[derive(Args, Debug)]
@@ -167,10 +172,6 @@ pub enum CreateProfile {
     HostRunner,
 }
 
-/// Job memory when nothing else says: enough for numpy-scale imports, which
-/// a 512 MB cap (counted as commit under a Windows Job Object) does not fit.
-pub const DEFAULT_JOB_MEMORY_MB: u32 = 2048;
-
 #[derive(Args, Debug)]
 pub struct CreateArgs {
     /// Relay URL.
@@ -182,7 +183,7 @@ pub struct CreateArgs {
     /// Allow running Python on runners.
     #[arg(long)]
     pub execute: bool,
-    /// Session lifetime, e.g. 30m, 1h, 1d (at most 30d), or `never` for a
+    /// Session lifetime, e.g. 30m, 6h, 1d (at most 30d), or `never` for a
     /// session that lasts until it is closed (if the relay allows it)
     /// [default: 1h].
     #[arg(long, value_parser = parse_lifetime)]
@@ -190,13 +191,14 @@ pub struct CreateArgs {
     /// Content types allowed, comma-separated (text, py, md, zip, image).
     #[arg(long, value_delimiter = ',', default_values_t = DEFAULT_TYPES.iter().map(|s| s.to_string()))]
     pub types: Vec<String>,
-    /// Largest item, in MB [default: the largest the relay allows, or 25].
+    /// Largest item, in MB (1 MB = 1024 × 1024 bytes) [default: the largest
+    /// the relay allows, up to 100; 25 if the relay does not say].
     #[arg(long)]
     pub max_item_mb: Option<u64>,
     /// execute: Python runtime.
     #[arg(long, default_value = "python3.12")]
     pub runtime: String,
-    /// execute: longest a job may run [default: 60s].
+    /// execute: longest a job may run, e.g. 90s, 30m, 6h [default: 60s].
     #[arg(long, value_parser = parse_duration)]
     pub job_timeout: Option<Duration>,
     /// execute: job memory limit (MB) [default: 2048].
@@ -246,17 +248,11 @@ fn new_session(a: &CreateArgs, relay_max: Option<u64>) -> Result<NewSession> {
     let execute = a.execute || host;
     let ttl = a.ttl.unwrap_or(if host { Lifetime(None) } else { Lifetime(Some(Duration::from_secs(3600))) });
     let job_timeout = a.job_timeout.unwrap_or(Duration::from_secs(if host { 30 * 60 } else { 60 }));
-    let job_memory = a.job_memory.unwrap_or(if host { 4096 } else { DEFAULT_JOB_MEMORY_MB });
+    let job_memory = a.job_memory.unwrap_or(if host { 4096 } else { JobLimits::default().memory_mb });
     let max_item_bytes = match a.max_item_mb {
         Some(mb) => mb.checked_mul(1024 * 1024).context("--max-item-mb is too large")?,
         None => relay_max.unwrap_or(DEFAULT_MAX_ITEM_BYTES),
     };
-    let packages = a
-        .packages
-        .iter()
-        .map(|p| airlox_core::policy::normalize_package(p.trim()))
-        .collect::<Result<Vec<_>, _>>()
-        .context("--package")?;
     Ok(NewSession {
         mode: if execute { Mode::Execute } else { Mode::Relay },
         ttl_ms: ttl.0.map(|t| t.as_millis() as u64),
@@ -267,7 +263,8 @@ fn new_session(a: &CreateArgs, relay_max: Option<u64>) -> Result<NewSession> {
             timeout_s: job_timeout.as_secs().max(1) as u32,
             memory_mb: job_memory,
             network: a.network,
-            packages,
+            // Normalized when the manifest is built.
+            packages: a.packages.iter().map(|p| p.trim().to_string()).collect(),
             return_out: !a.no_out_files,
             approve_runners: !a.no_approval,
         }),
@@ -316,11 +313,16 @@ pub struct ReceiveArgs {
     /// The relay the code was made on.
     #[arg(long, env = "AIRLOX_RELAY", default_value = "https://airlox.app")]
     pub relay: String,
+    /// Claim the code over plain http:// to a host other than this machine
+    /// (a relay inside a cluster). The code and the invite it carries then
+    /// cross that network in the clear: only for a network you trust.
+    #[arg(long)]
+    pub allow_insecure_http: bool,
 }
 
 /// Print the invite link a transfer code carries.
 pub async fn receive(a: ReceiveArgs) -> Result<()> {
-    let invite = client::receive_code(&client::http()?, &a.relay, &a.code).await?;
+    let invite = client::receive_code(&client::http()?, &a.relay, &a.code, a.allow_insecure_http).await?;
     println!("{invite}");
     eprintln!("The code is used up. Pass this link as --invite or AIRLOX_INVITE, and keep it private.");
     Ok(())
@@ -335,6 +337,16 @@ pub async fn session(cmd: SessionCmd) -> Result<()> {
                 None => client::relay_max_item_bytes(&http, &a.relay).await,
             };
             let new = new_session(&a, relay_max)?;
+            if let Some(h) = &new.insecure_http_host {
+                let host = reqwest::Url::parse(&a.relay).ok().and_then(|u| u.host_str().map(str::to_string));
+                if host.as_deref() != Some(h.as_str()) {
+                    eprintln!(
+                        "note: --relay {} does not name {h}; only links to http://{h} use plain http. \
+                         Invites carry the relay URL given here, so pass the URL the other machines use",
+                        a.relay
+                    );
+                }
+            }
             // Check the owner-invite file can be written before the session
             // exists, so a bad path cannot leave a session nobody can use.
             if let Some(f) = &a.owner_invite_file {
@@ -386,7 +398,7 @@ pub async fn session(cmd: SessionCmd) -> Result<()> {
                     println!("jobs      {}", jobs_line(l));
                 }
                 if let Some(h) = &m.insecure_http_host {
-                    println!("http      plain http:// allowed to {h}");
+                    println!("http      plain http:// allowed to {h}: tokens and codes cross that network in the clear");
                 }
                 println!("participants:");
                 for p in s.participants() {
@@ -446,7 +458,44 @@ pub async fn session(cmd: SessionCmd) -> Result<()> {
     }
 }
 
+/// `s` quoted for a POSIX shell, unless it is plainly safe to paste as is.
+fn shell_quote(s: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "-_./:@=+,[]".contains(c);
+    if !s.is_empty() && s.chars().all(safe) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+/// Resolves when the user asks the process to stop: Ctrl-C, or on Unix
+/// SIGTERM or SIGHUP (a closed terminal).
+async fn stop_requested() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut term), Ok(mut hup)) = (signal(SignalKind::terminate()), signal(SignalKind::hangup()))
+        else {
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+            _ = hup.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 async fn session_code(a: CodeArgs) -> Result<()> {
+    if a.role == "owner" && !a.allow_owner {
+        bail!(
+            "a code for the owner invite hands over control of the session, and the relay could recover it by \
+             trying every pair of words; pass --allow-owner if that is what you want"
+        );
+    }
     let s = a.conn.join().await?;
     let invites = s.invites().map_err(|_| anyhow::anyhow!("only the owner invite can make codes"))?;
     let Some(link) = invites.get(&a.role) else {
@@ -454,16 +503,29 @@ async fn session_code(a: CodeArgs) -> Result<()> {
     };
     let http = client::http()?;
     let code = client::send_code(&http, &s.base_url, link).await?;
-    let relay = match s.base_url.as_str() {
+    let insecure = airlox_core::invite::check_transport(&s.base_url, None).is_err();
+    let mut relay = match s.base_url.as_str() {
         crate::runner::DEFAULT_RELAY => String::new(),
-        r => format!(" --relay {r}"),
+        r => format!(" --relay {}", shell_quote(r)),
     };
+    if insecure {
+        relay.push_str(" --allow-insecure-http");
+    }
     let to_type = match a.role.as_str() {
-        "runner" => format!("airlox runner join --code {}{relay} --name NAME ...", code.code),
+        "runner" => format!("airlox runner join --code {}{relay} --name <name> ...", code.code),
         _ => format!("airlox receive {}{relay}", code.code),
     };
+    // With --wait, one compact JSON object per line (the code, then how it
+    // ended), so a script can read the code before the wait is over.
+    let emit = |v: Value| {
+        if a.wait {
+            println!("{v}");
+        } else {
+            print_json(&v);
+        }
+    };
     if a.conn.json {
-        print_json(&json!({
+        emit(json!({
             "code": code.code,
             "role": a.role,
             "relay": s.base_url,
@@ -480,9 +542,15 @@ async fn session_code(a: CodeArgs) -> Result<()> {
         if a.role == "owner" {
             eprintln!("It carries the owner link: whoever types it first controls the session.");
         }
+        if insecure {
+            eprintln!("The relay is plain http://: the code and the invite cross that network in the clear.");
+        }
     }
     if !a.wait {
         return Ok(());
+    }
+    if !a.conn.json {
+        eprintln!("Waiting for the code to be used (Ctrl-C cancels it)…");
     }
     let wait = async {
         loop {
@@ -494,19 +562,22 @@ async fn session_code(a: CodeArgs) -> Result<()> {
     };
     let state = tokio::select! {
         r = wait => r?,
-        _ = tokio::signal::ctrl_c() => {
+        _ = stop_requested() => {
             code.cancel(&http).await?;
-            "cancelled".to_string()
+            "stopped".to_string()
         }
     };
     if a.conn.json {
-        print_json(&json!({"code": code.code, "state": state}));
+        emit(json!({"code": code.code, "state": if state == "stopped" { "cancelled" } else { &state }}));
     }
     match state.as_str() {
         "picked_up" => {
-            eprintln!("The code was used.");
+            if !a.conn.json {
+                eprintln!("The code was used.");
+            }
             Ok(())
         }
+        "stopped" => bail!("you cancelled the code; it no longer works"),
         "expired" => bail!("the code expired unused"),
         "burned" => bail!("too many wrong tries cancelled the code"),
         "cancelled" => bail!("the code was cancelled"),
@@ -566,14 +637,15 @@ fn print_invites(s: &Session, json_out: bool, created: bool, owner_file: Option<
     Ok(())
 }
 
-/// "25 MiB", "100 MiB", "1.5 GiB".
+/// "25 MB", "100 MB", "1.5 GB", in the units the flags use (1 MB = 1024²).
 fn human_bytes(n: u64) -> String {
-    const MIB: u64 = 1024 * 1024;
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * MB;
     match n {
-        n if n >= 1024 * MIB && n % (1024 * MIB) == 0 => format!("{} GiB", n / (1024 * MIB)),
-        n if n >= 1024 * MIB => format!("{:.1} GiB", n as f64 / (1024 * MIB) as f64),
-        n if n % MIB == 0 => format!("{} MiB", n / MIB),
-        n if n >= MIB => format!("{:.1} MiB", n as f64 / MIB as f64),
+        n if n >= GB && n % GB == 0 => format!("{} GB", n / GB),
+        n if n >= GB => format!("{:.1} GB", n as f64 / GB as f64),
+        n if n % MB == 0 => format!("{} MB", n / MB),
+        n if n >= MB => format!("{:.1} MB", n as f64 / MB as f64),
         n => format!("{n} bytes"),
     }
 }
@@ -588,12 +660,19 @@ fn human_left(at_ms: u64) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let s = at_ms.saturating_sub(now) / 1000;
-    match s {
+    human_minutes((at_ms.saturating_sub(now) / 1000).div_ceil(60))
+}
+
+/// "5 min", "1 h", "3 h 5 min", "1 d", "2 d 3 h". Rounded up to the minute,
+/// so a lifetime of 1d just created reads "1 d", not "23 h 59 min".
+fn human_minutes(m: u64) -> String {
+    match m {
         0 => "expired".into(),
-        s if s < 3600 => format!("{} min", s.div_ceil(60)),
-        s if s < 86_400 => format!("{} h {} min", s / 3600, (s % 3600) / 60),
-        s => format!("{} d {} h", s / 86_400, (s % 86_400) / 3600),
+        m if m < 60 => format!("{m} min"),
+        m if m < 1440 && m % 60 == 0 => format!("{} h", m / 60),
+        m if m < 1440 => format!("{} h {} min", m / 60, m % 60),
+        m if (m % 1440) / 60 == 0 => format!("{} d", m / 1440),
+        m => format!("{} d {} h", m / 1440, (m % 1440) / 60),
     }
 }
 
@@ -1327,6 +1406,68 @@ mod tests {
 
     use super::*;
     use crate::session::OutFile;
+
+    fn create(args: &[&str]) -> CreateArgs {
+        #[derive(clap::Parser)]
+        struct T {
+            #[command(flatten)]
+            a: CreateArgs,
+        }
+        <T as clap::Parser>::try_parse_from(std::iter::once("create").chain(args.iter().copied())).unwrap().a
+    }
+
+    #[test]
+    fn flags_override_the_profile_and_the_relay_only_sets_a_default() {
+        let n = new_session(&create(&["--profile", "host-runner"]), Some(40 << 20)).unwrap();
+        let l = n.job_limits.unwrap();
+        assert_eq!((n.ttl_ms, n.max_item_bytes, l.timeout_s, l.memory_mb), (None, 40 << 20, 1800, 4096));
+        let n = new_session(
+            &create(&[
+                "--profile",
+                "host-runner",
+                "--ttl",
+                "1h",
+                "--job-timeout",
+                "60s",
+                "--job-memory",
+                "512",
+                "--max-item-mb",
+                "5",
+                "--no-approval",
+            ]),
+            None,
+        )
+        .unwrap();
+        let l = n.job_limits.unwrap();
+        assert_eq!((n.ttl_ms, n.max_item_bytes), (Some(3_600_000), 5 << 20));
+        assert_eq!((l.timeout_s, l.memory_mb, l.approve_runners), (60, 512, false));
+        // No profile: a relay session with the plain defaults.
+        let n = new_session(&create(&[]), None).unwrap();
+        assert_eq!((n.ttl_ms, n.max_item_bytes, n.job_limits.is_none()), (Some(3_600_000), 25 << 20, true));
+        let l = new_session(&create(&["--execute"]), None).unwrap().job_limits.unwrap();
+        assert_eq!((l.timeout_s, l.memory_mb), (60, 2048));
+        assert_eq!(
+            new_session(&create(&["--insecure-http-host", " Relay.NS.svc "]), None)
+                .unwrap()
+                .insecure_http_host,
+            Some("relay.ns.svc".into())
+        );
+    }
+
+    #[test]
+    fn durations_and_sizes_read_naturally() {
+        assert_eq!(human_minutes(1440), "1 d");
+        assert_eq!(human_minutes(1441), "1 d");
+        assert_eq!(human_minutes(1500), "1 d 1 h");
+        assert_eq!(human_minutes(60), "1 h");
+        assert_eq!(human_minutes(125), "2 h 5 min");
+        assert_eq!(human_minutes(0), "expired");
+        assert_eq!(human_bytes(100 << 20), "100 MB");
+        assert_eq!(human_bytes(1 << 30), "1 GB");
+        assert_eq!(shell_quote("http://relay.ns.svc:8080"), "http://relay.ns.svc:8080");
+        assert_eq!(shell_quote("https://x/$(id)"), "'https://x/$(id)'");
+        assert_eq!(shell_quote("a'b"), r"'a'\''b'");
+    }
 
     fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));

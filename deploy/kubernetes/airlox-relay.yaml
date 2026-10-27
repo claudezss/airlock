@@ -6,7 +6,8 @@
 #
 # Clients in the cluster reach it as http://airlox-relay.<namespace>.svc:8080.
 # Plain http is refused unless the session names that host, so create
-# sessions with the same host spelled the same way everywhere:
+# sessions (from a pod in the cluster, airlox 0.1.3 or later) with the same
+# host spelled the same way everywhere:
 #
 #   airlox session create --relay http://airlox-relay.airlox.svc:8080 \
 #     --insecure-http-host airlox-relay.airlox.svc --profile host-runner
@@ -40,8 +41,10 @@ spec:
       terminationGracePeriodSeconds: 20
       containers:
         - name: relay
-          # Pin the release you run; it is amd64 only.
-          image: ghcr.io/claudezss/airlox-server:0.1.2
+          # 0.1.3 or later: older relays reject sessions that use
+          # --insecure-http-host. Pin the release you run (better, by
+          # digest); the image is amd64 only.
+          image: ghcr.io/claudezss/airlox-server:0.1.3
           ports:
             - {name: http, containerPort: 8080}
           env:
@@ -87,8 +90,8 @@ spec:
   ports:
     - {name: http, port: 8080, targetPort: http}
 ---
-# Only pods in this namespace may connect, and the relay makes no outbound
-# connections at all. Enforced only where the cluster's network plugin
+# Only pods in this namespace may connect (give the relay a namespace of its
+# own), and the relay makes no outbound connections at all. Enforced only where the cluster's network plugin
 # supports NetworkPolicy; widen the ingress rule for runners elsewhere.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

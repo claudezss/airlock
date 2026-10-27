@@ -22,8 +22,10 @@ from .cache import Cache, default_root
 from .execute import Job, NoRunnerAvailable, Runner, RunnerBusy, RunnerFailed, signed_approvals
 
 DEFAULT_TYPES = ("text", "py", "md", "zip", "image")
-# The item limit for a relay that does not say what it allows.
+# The item limit for a relay that does not say what it allows, and the
+# largest default a relay's answer can raise it to.
 DEFAULT_MAX_ITEM_BYTES = 25 * 1024 * 1024
+MAX_DEFAULT_ITEM_BYTES = 100 * 1024 * 1024
 FILE_TYPES = {
     ".py": ("py", "text/x-python"),
     ".md": ("md", "text/markdown"),
@@ -54,10 +56,11 @@ def _relay_max_item_bytes(http: httpx.Client, base: str) -> Optional[int]:
     """The largest item a session on this relay may allow, from
     ``/v1/health``; ``None`` if the relay does not say."""
     try:
-        v = _check(http.get(base + "/v1/health")).json().get("max_item_bytes")
+        v = _check(http.get(base + "/v1/health", timeout=5.0)).json().get("max_item_bytes")
     except (httpx.HTTPError, RelayError, ValueError, AttributeError):
         return None
-    return v if isinstance(v, int) and v > 0 else None
+    # The relay is not trusted to pick a large limit: it caps the default only.
+    return min(v, MAX_DEFAULT_ITEM_BYTES) if type(v) is int and v > 0 else None
 
 
 def _canonical(obj) -> str:
@@ -197,8 +200,8 @@ class Session:
         or ``"never"`` makes a session that lasts until it is closed, if the
         relay allows it.
 
-        ``max_item_bytes`` defaults to the largest item the relay allows (25
-        MiB if it does not say). Package names in ``job_limits`` are PEP 503
+        ``max_item_bytes`` defaults to the largest item the relay allows, up
+        to 100 MB (25 MB if the relay does not say). Package names in ``job_limits`` are PEP 503
         normalized (``"pyPowerGEM"`` becomes ``"pypowergem"``).
 
         ``insecure_http_host`` lets participants reach the relay over plain
@@ -207,26 +210,30 @@ class Session:
         end-to-end encrypted, but bearer tokens cross that network in the
         clear."""
         http = httpx.Client(timeout=httpx.Timeout(30.0, connect=10.0))
-        base = relay.rstrip("/")
-        if max_item_bytes is None:
-            max_item_bytes = _relay_max_item_bytes(http, base) or DEFAULT_MAX_ITEM_BYTES
-        params = {
-            "mode": mode,
-            "created_at_ms": _now_ms(),
-            "ttl_ms": None if ttl is None or ttl == "never" else _duration_ms(ttl),
-            "allowed_types": list(allowed_types),
-            "max_item_bytes": max_item_bytes,
-            "job_limits": job_limits,
-        }
-        if insecure_http_host is not None:
-            params["insecure_http_host"] = insecure_http_host.strip().lower()
-        owner_seed, signed = ac.create_session(json.dumps(params))
-        url = ac.owner_invite(relay, owner_seed)
-        # Refuse a relay URL the session's own links could not use (plain
-        # http to a host it does not name) before the session exists.
-        ac.check_invite(url, signed)
-        _check(http.post(base + "/v1/sessions", content=signed))
-        return cls.join(url, display_name=display_name, description=description, cache_dir=cache_dir, _http=http)
+        try:
+            base = relay.rstrip("/")
+            if max_item_bytes is None:
+                max_item_bytes = _relay_max_item_bytes(http, base) or DEFAULT_MAX_ITEM_BYTES
+            params = {
+                "mode": mode,
+                "created_at_ms": _now_ms(),
+                "ttl_ms": None if ttl is None or ttl == "never" else _duration_ms(ttl),
+                "allowed_types": list(allowed_types),
+                "max_item_bytes": max_item_bytes,
+                "job_limits": job_limits,
+            }
+            if insecure_http_host is not None:
+                params["insecure_http_host"] = insecure_http_host.strip().lower()
+            owner_seed, signed = ac.create_session(json.dumps(params))
+            url = ac.owner_invite(relay, owner_seed)
+            # Refuse a relay URL the session's own links could not use (plain
+            # http to a host it does not name) before the session exists.
+            ac.check_invite(url, signed)
+            _check(http.post(base + "/v1/sessions", content=signed))
+            return cls.join(url, display_name=display_name, description=description, cache_dir=cache_dir, _http=http)
+        except BaseException:
+            http.close()
+            raise
 
     @classmethod
     def join(
@@ -335,12 +342,19 @@ class Session:
         out["owner"] = ac.owner_invite(self.relay, self._owner_seed)
         return out
 
-    def transfer_code(self, role: str) -> "TransferCode":
+    def transfer_code(self, role: str, *, allow_owner: bool = False) -> "TransferCode":
         """Park ``role``'s invite on the relay under a one-time code such as
         ``7-guitar-orbit`` (owner only), like the web UI's "Send to another
         machine". Type it on the other machine with ``airlox runner join
         --code`` or ``airlox receive``, or pass it to :func:`receive_code`.
-        The code works once and for a few minutes."""
+        The code works once and for a few minutes.
+
+        The relay holds the invite sealed under the code's two words, which
+        its operator could recover by trying all 65,536 pairs: a code trusts
+        the relay in a way the link itself does not. A code for the
+        ``owner`` invite hands over the session and needs ``allow_owner``."""
+        if role == "owner" and not allow_owner:
+            raise ValueError("a code for the owner invite hands over the session; pass allow_owner=True")
         invites = self.invites
         if role not in invites:
             raise ValueError(f"this session has no {role} invite")
@@ -976,9 +990,20 @@ class TransferCode:
         _check(self._http.delete(self._url(), headers={"Authorization": f"Bearer {self._token}"}))
 
 
-def receive_code(code: str, relay: str = "https://airlox.app") -> str:
+def receive_code(code: str, relay: str = "https://airlox.app", *, allow_insecure_http: bool = False) -> str:
     """Trade a one-time transfer code for the invite link it carries. The
-    code is used up; a wrong one spends one of its few tries."""
+    code is used up; a wrong one spends one of its few tries.
+
+    Over plain ``http://`` to another machine the code and the invite cross
+    the network in the clear, so that needs ``allow_insecure_http``."""
+    if not allow_insecure_http:
+        try:
+            ac.check_transport(relay.rstrip("/"))
+        except ac.ValidationError:
+            raise ValueError(
+                f"{relay}: a code claimed over plain http:// crosses the network in the clear; use https, "
+                "or pass allow_insecure_http=True on a network you trust"
+            ) from None
     nameplate, claim = ac.transfer_claim(code)
     with httpx.Client(timeout=httpx.Timeout(30.0, connect=10.0)) as http:
         r = _check(http.post(f"{relay.rstrip('/')}/v1/drops/{nameplate}/claim", json={"claim": claim}))

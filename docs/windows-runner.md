@@ -18,22 +18,25 @@ containers), and is the one to use for code you don't trust.
   runs jobs with that venv. At startup the runner checks that it is the
   session's Python version and has every package in the session's allowlist,
   and stops with the missing names if not. It never installs anything into
-  it. It logs where each allowlisted package resolves from, and warns when
-  one is an editable install (jobs import that checkout, not a wheel) or
-  when `import` would load a copy other than the installed one. Without `--python` it builds a runtime with `uv`, as `--sandbox local`
+  it. Without `--python` it builds a runtime with `uv`, as `--sandbox local`
   does.
+- **Where packages come from.** At startup the runner logs where each
+  allowlisted package resolves from. It warns when one is an editable install
+  (jobs import that checkout, not a wheel) or when `import` would load a copy
+  other than the installed one.
 - **One Job Object per job.** The job's memory (the session's limit, or less
   with `--memory`) is capped for its whole process tree, so `tara.exe` and
   anything it starts count together. Every process in it is killed when the
   job ends, times out, is cancelled, or the runner itself stops or crashes:
-  nothing a job starts outlives it. The cap counts committed memory, which
-  runs well above what Task Manager shows: importing numpy and a compiled
-  extension can take more than 512 MB. At join the runner imports the
-  allowlisted packages once and warns when that alone comes near the cap;
-  sessions created from the CLI, the MCP server or the web UI now default
-  to 2048 MB. Jobs get no clipboard, desktop or
+  nothing a job starts outlives it. Jobs get no clipboard, desktop or
   display-settings access, and a crash ends the job instead of opening a
   dialog.
+- **Memory is counted as commit.** That runs well above what Task Manager
+  shows: importing numpy and a compiled extension can take more than 512 MB.
+  At startup the runner imports the allowlisted packages once, in a Job
+  Object with the job's cap, and warns when that alone comes near the cap.
+  Sessions created from the CLI, the MCP server or the web UI default to
+  2048 MB.
 - **A fresh work folder per job**, under the system temp directory, deleted
   afterwards.
 - **A scrubbed environment.** A job sees only `PATH` (its interpreter and
@@ -100,14 +103,14 @@ file (for the service, `%ProgramData%\airlox\<service>\invite-runner.txt`,
 from an elevated prompt) and start it again (`sc.exe start <service>`).
 
 `--profile host-runner` stands for `--execute --ttl never --job-timeout 30m
---job-memory 4096`, with items as large as the relay allows and runner
-approval on; any flag you give wins, and `create` prints the limits the
-session got.
+--job-memory 4096`, with items as large as the relay allows (up to 100 MB)
+and runner approval on. Any flag you give wins, and `create` prints the
+limits the session got.
 
 Items are capped per session when it is created: by default at the largest
-item the relay allows (100 MiB unless its `--max-item-bytes` says otherwise;
-25 MB for relays that do not say), or what you pass (`--max-item-mb`, or
-`max_item_bytes=` in the SDK's `Session.create`).
+item the relay allows, up to 100 MB (25 MB for relays that do not say), or
+at what you pass (`--max-item-mb`, or `max_item_bytes=` in the SDK's
+`Session.create`). MB here means 1024 × 1024 bytes.
 
 ### Long jobs and dropped connections
 
