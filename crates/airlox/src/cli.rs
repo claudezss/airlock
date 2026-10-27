@@ -1342,6 +1342,53 @@ pub async fn watch(a: WatchArgs) -> Result<()> {
     Ok(())
 }
 
+/// For this participant's own recent items: who fetched each, and who it
+/// is still waiting for.
+pub async fn delivery(conn: Conn) -> Result<()> {
+    let mut s = conn.join().await?;
+    s.sync().await?;
+    let d = s.delivery().await?;
+    let names = |v: &Value| -> Vec<String> {
+        v.as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(|k| s.participant_name(k).unwrap_or_else(|| k.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut rows: Vec<(u64, &String, &Value)> = d
+        .as_object()
+        .map(|m| m.iter().map(|(id, v)| (v["seq"].as_u64().unwrap_or(0), id, v)).collect())
+        .unwrap_or_default();
+    rows.sort_by_key(|(seq, _, _)| *seq);
+    if conn.json {
+        let items: Vec<Value> = rows
+            .iter()
+            .map(|(seq, id, v)| json!({"seq": seq, "id": id, "delivered": names(&v["delivered"]), "waiting": names(&v["waiting"])}))
+            .collect();
+        print_json(&json!({"items": items}));
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("you have not posted anything the relay still tracks");
+    }
+    for (seq, id, v) in rows {
+        let (got, wait) = (names(&v["delivered"]), names(&v["waiting"]));
+        let wait = if wait.is_empty() {
+            String::new()
+        } else {
+            format!(" · waiting for {}", clean_line(&wait.join(", ")))
+        };
+        println!(
+            "#{seq:<4} {id}  fetched by {}{wait}",
+            if got.is_empty() { "no one yet".into() } else { clean_line(&got.join(", ")) }
+        );
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- listen --
 
 #[derive(Args, Debug)]

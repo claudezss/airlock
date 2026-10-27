@@ -291,7 +291,7 @@ meta. Only `file` carries a non-empty `body`.
 
 | type | meta fields |
 |---|---|
-| `text` | `text` |
+| `text` | `text`, and optionally `to` (absent, never `null` or empty, for a message to everyone): 1 to 64 distinct participant public keys the message is addressed to |
 | `file` | `name` (bare file name, ≤ 255 bytes), `mime` |
 | `job` | `filename`, `code`, `runtime`, `timeout_s`, `memory_mb` (nullable), `files` (item references), `requirements` (package names), `target`, and optionally `progress_file` (absent, never `null`, when not given) |
 | `result` | `job` (item reference), `exit_code` (nullable), `status`, `reason` (nullable), `wall_ms`, `peak_mem_mb`, `stdout`, `stderr`, `stdout_truncated`, `stderr_truncated`, `out_files` [`{name, size, item}`] where `item` is an item reference, `code_sha256`, `input_sha256` (lowercase hex) |
@@ -322,6 +322,14 @@ File type rules (checked after decryption):
 | `zip` | `.zip` | `application/zip` | `PK\x03\x04` or `PK\x05\x06` magic; passes every §9 inspection rule |
 | `image` | `.png` / `.jpg` `.jpeg` / `.webp` | `image/png` / `image/jpeg` / `image/webp` | magic bytes match the mime |
 
+**Replies and addressing.** A `text` or `file` item whose `refs` is
+non-empty replies to the item its first reference names; a `result` answers
+its `job` the same way. `to` says whose attention a message needs: clients
+use it, with replies, to decide which agents to wake (an item addressed to
+the reader, a reply to one of the reader's items, or the owner's message to
+everyone). `to` is advice, not access control: every participant can read
+every item. Clients that predate `to` reject messages that carry it.
+
 ## 8. Policy
 
 An author's role always comes from a role certificate that verifies against
@@ -343,7 +351,8 @@ Plus: runners may post only in execute mode; `size ≤ max_item_bytes`;
 `result` and `progress` need execute mode.
 
 **Client and runner** (after decryption): payload type equals header kind;
-file rules from §7; events other than `job_cancel` come from the owner only;
+file rules from §7; a text's `to`, when present, holds 1 to 64 distinct keys;
+events other than `job_cancel` come from the owner only;
 a `job_cancel` is honored only from the owner or the sender who authored the
 job. Results must satisfy: `stdout` and `stderr` ≤ 1 MiB each; hashes are 64
 lowercase hex characters; at most 64 `out_files`, each with a valid file name
@@ -473,6 +482,7 @@ sends nothing for 30 seconds is answered with `408`.
 | `POST /v1/sessions/{id}/items` | bearer | upload frame | `201 {"id", "seq"}`; `409 duplicate` if the item id exists |
 | `GET /v1/sessions/{id}/items/{item}/blob` | bearer | none | `200` ciphertext, or `410 evicted` |
 | `POST /v1/sessions/{id}/items/{item}/ack` | bearer, recipient | none | `204` |
+| `GET /v1/sessions/{id}/delivery` | bearer | none | `200 {"items": {id: {"seq", "delivered": [participant_pub…], "waiting": [participant_pub…]}}}` for the caller's own most recent 500 items: who acked each one, and which live recipients the relay still holds it for. Ack means stored, not read |
 | `POST /v1/sessions/{id}/items/{item}/want` | bearer, never received it | none | `202 {"open": true}`; `409 present` if the blob is on the relay |
 | `PUT /v1/sessions/{id}/items/{item}/blob` | bearer, while wanted | ciphertext | `204`; `409 present` or `409 not_wanted` |
 | `POST /v1/sessions/{id}/roles/{role}/revoke` | bearer, owner | none | `204`; `role` is `sender`, `observer` or `runner` |
