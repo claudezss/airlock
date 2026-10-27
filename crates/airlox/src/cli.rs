@@ -1207,6 +1207,10 @@ pub fn item_json(s: &Session, i: &Item, max_content: Option<usize>) -> Value {
             for k in ["status", "exit_code", "reason", "stdout", "stderr", "wall_ms"] {
                 v[k] = m[k].clone();
             }
+            if let Some(env) = m.get("env") {
+                // Signed by the runner: where and with what the job ran.
+                v["env"] = env.clone();
+            }
             v["out_files"] = json!(m["out_files"]
                 .as_array()
                 .map(|a| a.iter().map(|o| o["name"].clone()).collect::<Vec<_>>()));
