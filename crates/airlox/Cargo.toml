@@ -31,7 +31,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["signal", "process", "fs", "hostname", "user", "sched", "mount"] }
+nix = { version = "0.31", features = ["signal", "process", "fs", "hostname", "user", "sched", "mount"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
