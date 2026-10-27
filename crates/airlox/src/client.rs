@@ -188,6 +188,23 @@ impl Relay {
         }
     }
 
+    /// Ask holders to upload an evicted blob again. `false` when it is back
+    /// on the relay already.
+    pub async fn want(&self, item: &str) -> Result<bool> {
+        match check(self.post(&format!("/items/{item}/want")).send().await?).await {
+            Ok(_) => Ok(true),
+            Err(e) if e.downcast_ref::<RelayError>().is_some_and(|r| r.code == "present") => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Upload an evicted blob someone asked for (`PUT /items/:id/blob`).
+    pub async fn reseed(&self, item: &str, blob: Vec<u8>) -> Result<()> {
+        let req = self.http.put(self.url(&format!("/items/{item}/blob"))).bearer_auth(&self.token);
+        check(req.timeout(Duration::from_secs(300)).body(blob).send().await?).await?;
+        Ok(())
+    }
+
     /// `POST /items` with the upload frame `u32_be(len) || envelope || blob`.
     pub async fn post_item(&self, envelope_json: &str, blob: &[u8]) -> Result<()> {
         let mut frame = Vec::with_capacity(4 + envelope_json.len() + blob.len());

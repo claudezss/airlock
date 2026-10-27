@@ -221,3 +221,22 @@ pub async fn error_code(r: reqwest::Response) -> (StatusCode, String) {
     let v: Value = r.json().await.expect("error bodies are JSON");
     (status, v["error"].as_str().unwrap_or_default().to_string())
 }
+
+pub async fn want(env: &Env, s: &Sess, m: &Member, item: &str) -> reqwest::Response {
+    env.http
+        .post(env.url(&format!("/v1/sessions/{}/items/{item}/want", s.id)))
+        .bearer_auth(&m.token)
+        .send()
+        .await
+        .unwrap()
+}
+
+pub async fn reseed(env: &Env, s: &Sess, m: &Member, item: &str, blob: Vec<u8>) -> reqwest::Response {
+    env.http
+        .put(env.url(&format!("/v1/sessions/{}/items/{item}/blob", s.id)))
+        .bearer_auth(&m.token)
+        .body(blob)
+        .send()
+        .await
+        .unwrap()
+}

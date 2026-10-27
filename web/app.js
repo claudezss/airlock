@@ -401,6 +401,7 @@ async function sessionView() {
   }
   const me = ac.publicKey(identity.seed);
   const s = { sid, inv, manifest, signed, identity, me, participants: new Map(), items: new Map(), evicted: new Set(),
+    wanted: new Set(), asked: new Set(),
     lastSeq: -1, closed: null, jobs: new Map(), results: new Map(), runners: [], picked: new Set(), decisions: null,
     said: new Map(), announce: false, jobErrors: new Map(), runnerErrors: new Map(), runnerSeen: new Map(), open: new Set() };
   buildSessionLayout(s);
@@ -408,7 +409,12 @@ async function sessionView() {
   // Cached history first, then catch up, then stream. Blobs missing locally
   // are fetched again while the relay still has the session.
   const cached = await tx("events", "readonly", (o) => o.getAll(range(sid)));
-  for (const ev of cached) if (ev.kind === "evicted") s.evicted.add(ev.data.item);
+  // Which blobs the relay lacks now, so cached items without a blob show as
+  // removed rather than being fetched.
+  for (const ev of cached) {
+    if (ev.kind === "evicted") s.evicted.add(ev.data.item);
+    else if (ev.kind === "reseeded") s.evicted.delete(ev.data.item);
+  }
   for (const ev of cached) await applyEvent(s, ev, { fetch: !offline, record: false });
   s.render.scroll(true);
   if (offline) {
@@ -669,6 +675,15 @@ async function applyEvent(s, ev, { fetch, record }) {
       it.status = "evicted";
       s.render.item(it);
     }
+  } else if (ev.kind === "want") {
+    // Only live wants, and only for an item this browser verified: the id
+    // could be anything the relay made up.
+    if (record && ev.data.by !== s.me && s.items.get(ev.data.item)?.status === "ok") {
+      s.asked.add(ev.data.item);
+      tradeBlobs(s);
+    }
+  } else if (ev.kind === "reseeded") {
+    reappeared(s, ev.data.item);
   } else if (ev.kind === "job") {
     s.jobs.set(ev.data.job, ev.data);
     const it = s.items.get(ev.data.job);
@@ -690,6 +705,45 @@ async function applyEvent(s, ev, { fetch, record }) {
   s.lastSeq = Math.max(s.lastSeq, ev.seq);
 }
 
+// Re-seeding: a blob the relay deleted before this browser fetched it can
+// come back from a participant who still has it. Ask for it, and upload the
+// blobs others ask for that this browser holds; the relay takes an upload
+// only if it matches the author's signed hash.
+async function wantBlob(s, id) {
+  if (s.closed || s.wanted.has(id)) return;
+  s.wanted.add(id);
+  try {
+    await api("POST", `/v1/sessions/${s.sid}/items/${id}/want`, { token: s.identity.token });
+  } catch (e) {
+    // Already back: fetch it. It stays wanted, so a relay that says present
+    // but then serves 410 cannot make this loop.
+    if (e.code === "present") reappeared(s, id, { keepWanted: true });
+    // Too many open, or a busy relay: ask again when the page next loads.
+  }
+}
+
+async function tradeBlobs(s) {
+  for (const id of [...s.asked]) {
+    s.asked.delete(id);
+    const blob = await idbGet("blobs", [s.sid, id]);
+    if (!blob || s.closed) continue;
+    fetch(`/v1/sessions/${s.sid}/items/${id}/blob`, { method: "PUT", body: blob,
+      headers: { Authorization: `Bearer ${s.identity.token}` } }).catch(() => {});
+  }
+}
+
+// An evicted blob is on the relay again: fetch it.
+function reappeared(s, id, { keepWanted = false } = {}) {
+  s.evicted.delete(id);
+  if (!keepWanted) s.wanted.delete(id);
+  s.asked.delete(id);
+  const it = s.items.get(id);
+  if (it && it.status === "evicted") {
+    it.status = "retry";
+    receive(s, it.seq, it.envelope, true);
+  }
+}
+
 // Transient download failures (network, 429, 5xx) retry with backoff;
 // only a decrypted, verified and stored item counts as done.
 async function receive(s, seq, envelope, fetchBlob, attempt = 0) {
@@ -709,16 +763,19 @@ async function receive(s, seq, envelope, fetchBlob, attempt = 0) {
   if (!blob) {
     if (!fetchBlob || s.evicted.has(h.id)) {
       it.status = "evicted";
+      if (fetchBlob && h.author !== s.me) wantBlob(s, h.id);
       return s.render.item(it);
     }
     let r;
     try {
-      r = await fetch(`/v1/sessions/${s.sid}/items/${h.id}/blob`, { headers: { Authorization: `Bearer ${s.identity.token}` } });
+      r = await fetch(`/v1/sessions/${s.sid}/items/${h.id}/blob`, { cache: "no-store",
+        headers: { Authorization: `Bearer ${s.identity.token}` } });
     } catch {
       r = null;
     }
     if (r?.status === 410 || r?.status === 404) {
       it.status = "evicted";
+      if (h.author !== s.me) wantBlob(s, h.id);
       return s.render.item(it);
     }
     if (!r || !r.ok) {
@@ -776,7 +833,8 @@ function renderItem(s, it) {
     el("div", { class: `avatar ${av}`, "aria-hidden": "true" }, initials(it.authorName)),
     el("div", { class: "body" }, meta, card));
   if (it.status === "evicted") {
-    card.append(el("p", { class: "note" }, `A ${label} item was delivered and then removed from the relay before this browser downloaded it.`));
+    card.append(el("p", { class: "note" }, `A ${label} item was delivered and then removed from the relay before this browser downloaded it.`,
+      s.wanted.has(it.id) ? " Asked the participants who have it to send it again; it appears here if one of them is online." : ""));
     return node;
   }
   if (it.status === "retry") {

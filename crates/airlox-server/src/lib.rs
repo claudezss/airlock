@@ -16,6 +16,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::http::{header, HeaderValue};
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
 use tokio::sync::watch;
@@ -35,7 +37,8 @@ pub fn router(state: api::AppState) -> Router {
         .route("/v1/sessions/{id}/events", get(api::events))
         .route("/v1/sessions/{id}/stream", get(api::stream))
         .route("/v1/sessions/{id}/items", post(api::post_item))
-        .route("/v1/sessions/{id}/items/{item}/blob", get(api::get_blob))
+        .route("/v1/sessions/{id}/items/{item}/blob", get(api::get_blob).put(api::reseed))
+        .route("/v1/sessions/{id}/items/{item}/want", post(api::want))
         .route("/v1/sessions/{id}/items/{item}/ack", post(api::ack))
         .route("/v1/sessions/{id}/jobs", post(exec::post_job))
         .route("/v1/sessions/{id}/jobs/{job}", get(exec::get_job))
@@ -50,7 +53,16 @@ pub fn router(state: api::AppState) -> Router {
         .route("/new", get(web::new_page))
         .route("/s/{id}", get(web::session_page))
         .route("/assets/{*path}", get(web::asset))
+        .layer(axum::middleware::map_response(no_store))
         .with_state(state)
+}
+
+/// API answers depend on who asks and change as a session moves on (a blob
+/// that was gone can be re-seeded), so no cache may keep one. Pages and
+/// assets set their own policy.
+async fn no_store(mut r: Response) -> Response {
+    r.headers_mut().entry(header::CACHE_CONTROL).or_insert(HeaderValue::from_static("no-store"));
+    r
 }
 
 /// A running server.

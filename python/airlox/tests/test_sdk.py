@@ -220,3 +220,35 @@ def test_one_cache_holds_an_identity_per_role(relay, caches):
     again = Session.join(owner.invites["owner"], cache_dir=caches("shared"))
     assert again.participant_pub == owner.participant_pub
     assert observer.participant_pub != owner.participant_pub
+
+
+def test_a_late_joiner_gets_an_evicted_file_from_a_peer(relay, caches, tmp_path):
+    owner = Session.create(relay.url, cache_dir=caches("owner"))
+    sender = Session.join(owner.invites["sender"], display_name="sender", cache_dir=caches("sender"))
+    report = tmp_path / "report.md"
+    report.write_text("# Findings\n\nAll green.\n")
+    sent = sender.send_file(report)
+    # The only recipient stores and acks it, so the relay deletes the blob.
+    assert [i.name for i in owner.items() if i.kind == "file"] == ["report.md"]
+    deadline = time.monotonic() + 10
+    while sent["id"] not in owner._evicted:
+        assert time.monotonic() < deadline, "the relay never evicted the blob"
+        time.sleep(0.1)
+        owner.sync()
+
+    late = Session.join(owner.invites["observer"], display_name="late", cache_dir=caches("late"))
+    (item,) = [i for i in late.items() if i.kind == "file"]
+    assert item.status == "evicted"
+    # Its sync asked for the blob; the sender's next sync uploads it from its cache.
+    sender.sync()
+    (item,) = [i for i in late.items() if i.kind == "file"]
+    assert item.status == "ok" and item.body == report.read_bytes()
+    # The relay keeps a re-seeded blob only until its askers have it.
+    deadline = time.monotonic() + 10
+    while sent["id"] not in late._evicted:
+        assert time.monotonic() < deadline, "the re-seeded blob was never evicted"
+        time.sleep(0.1)
+        late.sync()
+    # Nothing is asked for again: the late joiner has the file now.
+    sender.sync()
+    assert [i.status for i in late.items() if i.kind == "file"] == ["ok"]

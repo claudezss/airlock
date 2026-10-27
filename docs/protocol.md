@@ -378,6 +378,8 @@ sends nothing for 30 seconds is answered with `408`.
 | `POST /v1/sessions/{id}/items` | bearer | upload frame | `201 {"id", "seq"}` |
 | `GET /v1/sessions/{id}/items/{item}/blob` | bearer | none | `200` ciphertext, or `410 evicted` |
 | `POST /v1/sessions/{id}/items/{item}/ack` | bearer, recipient | none | `204` |
+| `POST /v1/sessions/{id}/items/{item}/want` | bearer, never received it | none | `202 {"open": true}`; `409 present` if the blob is on the relay |
+| `PUT /v1/sessions/{id}/items/{item}/blob` | bearer, while wanted | ciphertext | `204`; `409 present` or `409 not_wanted` |
 | `POST /v1/sessions/{id}/close` | bearer, owner | none | `204`; the session is purged |
 
 **Create.** The relay verifies the manifest signature, requires
@@ -420,6 +422,8 @@ public event carries that line's `seq`. Events are `{"seq", "kind", "data"}`:
 | `item` | `{envelope, blob_len, blob_present}` |
 | `left` | `{participant_pub}`: no longer a recipient; its token is revoked |
 | `evicted` | `{item}`: the blob left the relay; the envelope stays |
+| `want` | `{item, by}`: participant `by` asks holders to upload the evicted blob again |
+| `reseeded` | `{item, by}`: participant `by` uploaded it; it is on the relay again |
 | `closed` | `{reason}`: the last event of a session |
 
 Clients must verify each `signed_join` themselves (§5) and take a
@@ -440,9 +444,25 @@ the ciphertext locally. The relay deletes a blob once every recipient has
 acked and a short grace period has passed, or when the hold limit expires,
 whichever comes first. A recipient that leaves stops counting. After that
 `GET …/blob` is `410 evicted`, and clients show the item as delivered but
-unavailable. A download that fails for any other reason (network, `429`,
-`5xx`) is retried; clients must not record the item as received or ack it
-until its blob is stored.
+unavailable until it is re-seeded. A download that fails for any other
+reason (network, `429`, `5xx`) is retried; clients must not record the item
+as received or ack it until its blob is stored.
+
+**Re-seeding.** A participant that never received an evicted blob (a late
+joiner, or a new device, which joins with a new key) posts `want`. The relay
+refuses it from a participant that acked the item, keeps it open for 10
+minutes, allows 16 open wants per participant and 1024 over the session, and
+emits a `want` event. Any participant holding the ciphertext answers with
+`PUT …/blob` and the raw ciphertext. The relay takes it only while a want
+from another participant is open and the blob is absent, and only if its
+length and SHA-256 match the author-signed envelope, so a re-seed cannot
+alter content. The first accepted upload closes the item's wants and emits
+`reseeded`; the askers become the blob's recipients, and it is evicted once
+they have acked (after the grace period) or after a short hold of at most 10
+minutes. Re-seeded bytes count against the session's transfer and storage
+limits. Clients answer only for items they have verified, and must take the
+item id of a `want` as a lookup in their own verified history, never as a
+file name.
 
 **Error codes.**
 
@@ -453,7 +473,7 @@ until its blob is stored.
 | 403 | `forbidden` | role, author or content policy not allowed |
 | 404 | `not_found` | no such session or item |
 | 408 | `timeout` | request body stalled or upload too slow |
-| 409 | `conflict` | duplicate session, item id, or participant key |
+| 409 | `conflict`, `present`, `not_wanted` | duplicate session, item id, or participant key; a want for a blob the relay has; a re-seed nobody asked for |
 | 410 | `closed`, `evicted` | session closed (or closed and not re-creatable), or blob already delivered |
 | 413 | `too_large` | body, envelope, item, session storage or session history limit |
 | 429 | `limit` | relay, address, participant, stream, item or transfer limit |
