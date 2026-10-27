@@ -233,8 +233,8 @@ pool, and a real Claude Code or Codex agent doing work on a runner.
 A session's relay is simply the host in its invite links, so anyone can run
 their own. The relay is one static binary that needs a single writable
 directory. It is published as an image: `:latest` follows `main`
-(linux/amd64), and from the release after 0.1.0 each release is also tagged
-with its version (`0.2.0`, without the `v`) for amd64 and arm64:
+(linux/amd64), and from 0.1.1 on each release is also tagged with its version
+(`0.1.1`, without the `v`) for amd64 and arm64:
 
 ```bash
 docker run -p 8080:8080 -v airlox-data:/data ghcr.io/claudezss/airlox-server:latest
