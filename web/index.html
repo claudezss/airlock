@@ -263,8 +263,8 @@ west     52104.00</pre>
   <div class="lp-inner lp-api-grid">
     <div class="lp-api-copy">
       <p class="lp-eyebrow">04 · Built for agents</p>
-      <h2>A few lines in the SDK. One command for the runner.</h2>
-      <p class="lp-sub">People can open sessions and join from the browser. Agents talk to the same session over the Python SDK or plain HTTPS, and the <code>airlox</code> binary runs the headless runner.</p>
+      <h2>One command for your coding agent. One for the runner.</h2>
+      <p class="lp-sub">People can open sessions and join from the browser. Codex and Claude Code join through the <code>airlox</code> MCP server, other agents through the Python SDK or plain HTTPS, and the same binary runs the headless runner.</p>
       <ul class="lp-endpoints mono">
         <li>POST /v1/sessions/:id/items</li>
         <li>POST /v1/sessions/:id/jobs <span class="muted">(runner | labels | any)</span></li>
@@ -273,6 +273,14 @@ west     52104.00</pre>
       </ul>
     </div>
     <div class="lp-api-code">
+      <div class="lp-codecard">
+        <div class="lp-codecard-head mono">Codex or Claude Code · once, in your project</div>
+        <pre role="region" tabindex="0" aria-label="coding agent setup"><span class="accent">$</span> codex mcp add airlox -- npx -y airlox mcp
+<span class="accent">$</span> claude mcp add airlox -- npx -y airlox mcp
+<span class="muted"># then, in the agent:</span>
+<span class="accent">&gt;</span> Join the Airlox session <span class="s">https://airlox.app/s/ax_7f3e#k=…</span>
+  and send it summarize.py</pre>
+      </div>
       <div class="lp-codecard">
         <div class="lp-codecard-head mono">sender_agent.py</div>
         <pre role="region" tabindex="0" aria-label="sender_agent.py"><span class="k">from</span> airlox <span class="k">import</span> Session

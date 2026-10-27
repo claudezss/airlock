@@ -193,7 +193,7 @@ select:focus { border-color: var(--accent); outline: none; }
 .inputfiles summary { cursor: pointer; min-height: 36px; display: flex; align-items: center; font-size: 13px; color: var(--muted); }
 .pickfiles { padding-bottom: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
 .jobpanel legend { font-size: 13px; margin-bottom: 6px; color: var(--muted); font-weight: 500; }
-.toolbar button[aria-pressed=true] { border-color: var(--accent); color: var(--accent); background: var(--accent-bg); }
+.toolbar button[aria-pressed=true], .agent-pick button[aria-pressed=true] { border-color: var(--accent); color: var(--accent); background: var(--accent-bg); }
 
 .state { font-family: var(--mono); font-size: 12px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--info-line); color: var(--link); overflow-wrap: anywhere; min-width: 0; }
 .state.good { color: var(--ok); border-color: var(--ok-line); }

@@ -222,25 +222,66 @@ function markRevoked(row) {
 const INSTALL_URL = "https://github.com/claudezss/airlox#install";
 const MASKED_NOTE = "Links are partly hidden here. Copy puts the full link on the clipboard.";
 
+// A button that copies `text()`; when the clipboard is denied, `shown()` is
+// swapped for a selected field holding the same text.
+function copyButton(label, text, shown, name, cls = "small") {
+  const btn = el("button", { class: cls, type: "button", onclick: async () => {
+    if (await copyText(btn, text(), label)) return;
+    const input = el("input", { type: "text", readonly: true, value: text(), "aria-label": name });
+    shown().replaceWith(input);
+    input.select();
+    btn.textContent = pressCopy();
+  } }, label);
+  return btn;
+}
+
 // Runner invites come with the command that uses them. The shown command
 // carries the masked link; Copy command always copies the full one.
 function runnerInviteRow(url) {
   const cmd = (link) => `airlox runner join --invite '${link}' --name my-runner --sandbox docker`;
   // Only the link part may break mid-word; the rest wraps at spaces.
   const shown = el("code", {}, "airlox runner join --invite '", el("span", { class: "link" }, maskInvite(url)), "' --name my-runner --sandbox docker");
-  const btn = el("button", { class: "small primary", type: "button", onclick: async () => {
-    if (await copyText(btn, cmd(url), "Copy command")) return;
-    const input = el("input", { type: "text", readonly: true, value: cmd(url), "aria-label": "Runner command" });
-    shown.replaceWith(input);
-    input.select();
-    btn.textContent = pressCopy();
-  } }, "Copy command");
+  const btn = copyButton("Copy command", () => cmd(url), () => shown, "Runner command", "small primary");
   const row = inviteRow("Runner", url, "a machine that runs jobs", "Copy link");
   row.append(el("div", { class: "runner-cmd stack" },
     el("p", { class: "muted hint-text" },
       "Install the airlox runner first: ", el("a", { href: INSTALL_URL, target: "_blank", rel: "noopener noreferrer" }, "see the install guide"), "."),
     el("p", { class: "muted hint-text" }, "Then run this on the runner host. Change ", el("code", {}, "my-runner"), " to a name senders will recognise."),
     shown, el("div", { class: "row" }, btn)));
+  return row;
+}
+
+// Sender invites come with how to hand them to a coding agent: add the
+// airlox MCP server once, then ask the agent to join with the link.
+const AGENTS = {
+  "Claude Code": "claude mcp add airlox -- npx -y airlox mcp",
+  Codex: "codex mcp add airlox -- npx -y airlox mcp",
+};
+const MCP_DOCS_URL = "https://github.com/claudezss/airlox#from-an-ai-agent";
+
+function senderInviteRow(url) {
+  const row = inviteRow("Sender", url, "can post messages, files and jobs, e.g. your code agent", "Copy link");
+  let agent = "Claude Code";
+  const setup = () => row.querySelector("[data-part=setup]");
+  const prompt = el("code", {}, "Join the Airlox session ", el("span", { class: "link" }, maskInvite(url)));
+  const picks = Object.keys(AGENTS).map((name) => el("button", {
+    type: "button", class: "small", "aria-pressed": String(name === agent), onclick: () => {
+      agent = name;
+      picks.forEach((b) => b.setAttribute("aria-pressed", String(b.textContent === name)));
+      // Also undoes a denied clipboard's swap to an input field.
+      setup().replaceWith(el("code", { "data-part": "setup" }, AGENTS[name]));
+    } }, name));
+  row.append(el("div", { class: "runner-cmd stack" },
+    el("p", { class: "muted hint-text" }, "Connect Codex or Claude Code:"),
+    el("div", { class: "row agent-pick", role: "group", "aria-label": "Coding agent" }, picks),
+    el("p", { class: "muted hint-text" }, "1. In the folder the agent works in, add the airlox MCP server once. The agent can send and save files only inside that folder."),
+    el("code", { "data-part": "setup" }, AGENTS[agent]),
+    el("div", { class: "row" }, copyButton("Copy command", () => AGENTS[agent], setup, "Setup command")),
+    el("p", { class: "muted hint-text" }, "2. Start the agent there and ask it to join. It asks you before each step; to run it unattended, see ",
+      el("a", { href: MCP_DOCS_URL, target: "_blank", rel: "noopener noreferrer" }, "airlox mcp config"), "."),
+    prompt,
+    el("div", { class: "row" }, copyButton("Copy prompt", () => `Join the Airlox session ${url}`, () => prompt, "Prompt for the agent", "small primary")),
+    el("p", { class: "muted hint-text" }, "Two agents on one machine that use this link act as one participant, under the first one's name.")));
   return row;
 }
 
@@ -356,7 +397,7 @@ function newSession() {
         el("p", { class: "muted" }, "Copy the owner link now: it cannot be shown again. Sender, observer and runner links stay available under Invites in the session."),
         el("p", { class: "muted hint-text" }, MASKED_NOTE),
         inviteRow("Owner", owner, "you · keep it private"),
-        inviteRow("Sender", ac.memberInvite(base, s.ownerSeed, "sender"), "can post messages, files and jobs, e.g. your code agent"),
+        senderInviteRow(ac.memberInvite(base, s.ownerSeed, "sender")),
         inviteRow("Observer", ac.memberInvite(base, s.ownerSeed, "observer"), "can read everything and export the audit log"),
         ...(execute ? [runnerInviteRow(ac.memberInvite(base, s.ownerSeed, "runner"))] : []),
         el("div", { class: "row" },
@@ -640,7 +681,7 @@ function buildSessionLayout(s) {
     el("p", { class: "muted hint-text" }, "JSON Lines with the session's records, for checking with airlox tools."),
     el("p", { class: "muted hint-text" }, inv.role === "owner" ? "Download before you close: closing deletes it." : "Download before the owner closes the session: closing deletes it.")) : null;
   const inviteRows = inv.role === "owner" ? {
-    sender: inviteRow("Sender", ac.memberInvite(location.origin, inv.roleSeed, "sender"), "can post messages, files and jobs, e.g. your code agent"),
+    sender: senderInviteRow(ac.memberInvite(location.origin, inv.roleSeed, "sender")),
     observer: inviteRow("Observer", ac.memberInvite(location.origin, inv.roleSeed, "observer"), "can read everything and export the audit log"),
     runner: execute ? runnerInviteRow(ac.memberInvite(location.origin, inv.roleSeed, "runner")) : null } : {};
   const invites = inv.role === "owner" ? el("details", {},
