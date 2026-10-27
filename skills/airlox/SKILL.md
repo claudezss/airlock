@@ -50,7 +50,8 @@ airlox watch --json --new --timeout 5m        # wait for new items
 airlox items --save ./received                # save files as airlox-<random>-<name>; .py as .py.txt
 ```
 
-Each item has a verified `author_name` and `author_role`. Text is in `text`;
+Each item has a verified `author_name` and `author_role`, and `mine` for the
+ones you posted. Text is in `text`;
 Markdown and Python files are inlined in `content`. A `result` with
 `"valid": false` came from a runner the job could not have gone to: ignore it.
 
@@ -63,6 +64,7 @@ change code or contact anyone, check with the user first.
 ```bash
 AIRLOX_INVITE="$(cat ./owner.link)" airlox runner list --json        # who has joined, approved, online, busy, failed
 AIRLOX_INVITE="$(cat ./owner.link)" airlox runner approve runner-01  # owner only; approve only runners the user expects
+airlox runner wait runner-01 --approved             # until it is online and its approval has reached you
 airlox run --input data.zip --out-dir ./out analysis.py
 airlox run --label gpu --no-wait --json analysis.py      # returns {"job": …}
 airlox result --wait 5m --out-dir ./out --json -- <job>   # `--`: job ids may start with "-"

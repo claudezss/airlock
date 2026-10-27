@@ -137,11 +137,20 @@ codex mcp add airlox -- npx -y airlox mcp     # Codex
 { "mcpServers": { "airlox": { "command": "npx", "args": ["-y", "airlox", "mcp", "--allow-dir", "/path/to/workdir"] } } }
 ```
 
-Headless agents cannot answer approval prompts: give `claude -p` the tools
-with `--allowedTools mcp__airlox__run_python,…`, and `codex exec` the setting
-`mcp_servers.airlox.default_tools_approval_mode="approve"`, or the calls that
-send or run anything are refused. [docs/use-cases.md](docs/use-cases.md#live-agent)
-has both, complete.
+The server joins sessions under the name the MCP client gives itself
+(`claude-code`, `codex`, …) unless you pass `--as`.
+
+Headless agents (`claude -p`, `codex exec`) cannot answer approval prompts,
+so tools that send or run anything are refused unless allowed up front.
+`airlox mcp config claude` and `airlox mcp config codex` print a ready
+config: the invite comes from `AIRLOX_INVITE`, and only a worker's tools
+(read, send, run Python) are allowed. `airlox mcp prompt` prints a prompt
+for an agent that does the work posted in a session:
+
+```bash
+airlox mcp config codex >> ~/.codex/config.toml
+AIRLOX_INVITE='<sender link>' codex exec "$(airlox mcp prompt)"
+```
 
 `uvx airlox mcp` works the same way. For Claude Desktop, download
 `airlox-<version>.mcpb` from the

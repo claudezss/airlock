@@ -960,6 +960,62 @@ pub async fn runner_list(conn: Conn) -> Result<()> {
     Ok(())
 }
 
+#[derive(Args, Debug)]
+pub struct WaitArgs {
+    #[command(flatten)]
+    pub conn: Conn,
+    /// Runner name or key.
+    pub runner: String,
+    /// Also wait until the owner's signed approval has reached you, so a job
+    /// sent next is not refused.
+    #[arg(long)]
+    pub approved: bool,
+    /// Give up after this long.
+    #[arg(long, default_value = "2m", value_parser = parse_duration)]
+    pub timeout: Duration,
+}
+
+pub async fn runner_wait(a: WaitArgs) -> Result<i32> {
+    let mut s = a.conn.join().await?;
+    let deadline = std::time::Instant::now() + a.timeout;
+    loop {
+        let rs = s.runners().await?;
+        let mut found = rs.iter().filter(|r| r.name == a.runner || r.participant_pub == a.runner);
+        if let Some(r) = found.next() {
+            let (code, what) = if r.state.as_deref() == Some("failed") {
+                (
+                    1,
+                    format!(
+                        "could not start: {}",
+                        clean_line(r.detail.as_deref().unwrap_or("no reason given"))
+                    ),
+                )
+            } else if r.rejected {
+                (1, "was rejected".into())
+            } else if r.online && (r.approved || !a.approved) {
+                (0, if r.approved { "is online and approved".into() } else { "is online".into() })
+            } else {
+                (-1, String::new())
+            };
+            if code >= 0 {
+                if a.conn.json {
+                    print_json(&json!({"runner": r}));
+                } else if code == 0 {
+                    println!("runner {} {what}", clean_line(&r.name));
+                } else {
+                    eprintln!("runner {} {what}", clean_line(&r.name));
+                }
+                return Ok(code);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!("runner {} is not ready after {}s", clean_line(&a.runner), a.timeout.as_secs());
+            return Ok(75); // EX_TEMPFAIL
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 pub async fn runner_approve(conn: Conn, name: String) -> Result<()> {
     let mut s = conn.join().await?;
     let r = s.approve_runner(&name).await?;

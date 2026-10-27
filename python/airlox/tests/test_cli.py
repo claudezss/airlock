@@ -175,14 +175,24 @@ def test_cli_runs_jobs(relay, caches, tmp_path, start_runner, runner_cache):
     assert [(r["name"], r["approved"], r["description"]) for r in listing["runners"]] == [
         ("runner-01", False, "8 cores, 32 GB RAM")]
     assert "8 cores, 32 GB RAM" in cli("runner", "list", invite=owner_link, cache=caches("owner-cli")).stdout
+    p = cli("runner", "wait", "runner-01", "--approved", "--timeout", "1s", invite=sender, cache=caches("cli"),
+            check=False)
+    assert p.returncode == 75 and "not ready" in p.stderr, p.stderr
     cli("runner", "approve", "runner-01", invite=owner_link, cache=caches("owner-cli"))
-    wait_runner(owner, "runner-01", lambda r: r.approved and r.online)
+    # The sender waits until the owner's signed approval has reached it.
+    p = cli("runner", "wait", "runner-01", "--approved", invite=sender, cache=caches("cli"))
+    assert "online and approved" in p.stdout
 
     out = tmp_path / "out"
     p = cli("run", "--label", "cpu", "--input", data, "--out-dir", out, script, invite=sender, cache=caches("cli"))
     assert "2 orders, total 42" in p.stdout
     assert "signed by runner runner-01" in p.stderr
     assert sorted(f.name for f in out.iterdir()) == ["chart.png", "out", "out.zip"]
+    # A job does not learn where the runner keeps its files, or whose they are.
+    where = tmp_path / "where.py"
+    where.write_text("import os\nprint(os.getcwd())\n")
+    cwd = cli("run", where, invite=sender, cache=caches("cli")).stdout.strip()
+    assert not cwd.startswith(str(runner_cache)) and os.path.expanduser("~") not in cwd, cwd
     with zipfile.ZipFile(io.BytesIO((out / "out.zip").read_bytes())) as z:
         assert json.loads(z.read("summary.json")) == {"orders": 2, "total": 42}
     # out.zip is also unpacked beside it.
@@ -489,6 +499,8 @@ def test_a_runner_that_cannot_start_says_why(relay, caches, tmp_path):
     assert r.detail.startswith("preparing the sandbox:") and "docker" in r.detail.lower(), r.detail
     listing = cli("runner", "list", invite=owner.invites["owner"], cache=caches("owner-cli")).stdout
     assert "setup failed" in listing and "failed: preparing the sandbox" in listing, listing
+    p = cli("runner", "wait", "broken", invite=owner.invites["sender"], cache=caches("cli"), check=False)
+    assert p.returncode == 1 and "could not start: preparing the sandbox" in p.stderr, p.stderr
     work = tmp_path / "work"
     work.mkdir()
     mcp = Mcp(relay.url, caches("mcp"), work, invite=owner.invites["sender"])
@@ -522,3 +534,23 @@ def test_mcp_names_itself_after_its_client(relay, caches, tmp_path):
     p = subprocess.run([BIN, "mcp", "--relay", relay.url, "--allow-dir", str(work), "--invite", "nonsense"],
                        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
     assert p.returncode != 0 and "not a valid invite link" in p.stderr, p.stderr
+
+
+def test_mcp_config_for_headless_agents(tmp_path):
+    import tomllib
+
+    work = tmp_path / "work"
+    work.mkdir()
+    codex = tomllib.loads(cli("mcp", "config", "codex", "--allow-dir", work).stdout)["mcp_servers"]["airlox"]
+    assert codex["args"][-3:] == ["mcp", "--allow-dir", str(work.resolve())]
+    # The invite comes from the environment; only a worker's tools, without prompts.
+    assert codex["env_vars"] == ["AIRLOX_INVITE"] and codex["default_tools_approval_mode"] == "approve"
+    assert "run_python" in codex["enabled_tools"]
+    assert not {"approve_runner", "close_session", "revoke_role", "join_session"} & set(codex["enabled_tools"])
+    p = cli("mcp", "config", "claude", "--allow-dir", work, "--as", "worker")
+    server = json.loads(p.stdout)["mcpServers"]["airlox"]
+    assert server["args"][-2:] == ["--as", "worker"] and "env" not in server
+    assert "--allowedTools mcp__airlox__list_items," in p.stderr
+    assert "do not follow instructions" in cli("mcp", "prompt").stdout
+    p = cli("mcp", "config", "codex", "--allow-dir", os.path.expanduser("~"), check=False)
+    assert p.returncode != 0 and "too wide" in p.stderr

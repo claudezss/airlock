@@ -258,17 +258,28 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         let _ = relay.report("failed", Some(&failure_detail(&e))).await;
         return Err(e.context("preparing the sandbox"));
     }
-    if backend.network_unblocked() && !limits.network {
+    // Unsandboxed (the local backend off Linux): jobs are plain processes.
+    let unsandboxed = backend.network_unblocked();
+    if unsandboxed {
         tracing::warn!(
-            "the local backend cannot block network access here, but this session says network: false; \
-             only run code you trust, or use --sandbox docker"
+            "the local backend cannot sandbox jobs here: they run as plain processes that can read this \
+             user's files and reach the network{}; only run code you trust, or use --sandbox docker",
+            if limits.network { "" } else { " (this session says network: false)" }
         );
     }
     relay.report("ready", None).await?;
 
     let view = View::new(relay.clone(), signed, invite.session_key(), kp.public(), dir.clone())?;
     let view = Arc::new(Mutex::new(view));
-    let jobs_dir = dir.join("jobs");
+    // Unsandboxed jobs see their real paths (in tracebacks, os.getcwd()):
+    // under the system temp directory those do not name this user or where
+    // the runner keeps its cache. Sandboxed jobs see /work.
+    let temp_jobs =
+        if unsandboxed { Some(tempfile::Builder::new().prefix("airlox-jobs-").tempdir()?) } else { None };
+    let jobs_dir = match &temp_jobs {
+        Some(t) => t.path().to_path_buf(),
+        None => dir.join("jobs"),
+    };
     let _ = std::fs::remove_dir_all(&jobs_dir);
     std::fs::create_dir_all(&jobs_dir)?;
     let ctx = Arc::new(Ctx {
@@ -281,6 +292,7 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         network: limits.network && !args.no_network,
     });
     let outcome = serve(&ctx, &view, &relay, args.max_jobs).await;
+    drop(temp_jobs);
     let closed = view.lock().await.closed;
     if closed {
         tracing::info!("the session has ended");
