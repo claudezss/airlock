@@ -678,7 +678,13 @@ job writes to $AIRLOX_OUT come back as out files; use get_result with save_dir t
         };
         let wait = wait_for(p.wait_s, 120);
         if wait.is_zero() {
-            return ok(json!({"job": job, "runner": runner, "status": "submitted"}));
+            let runner_name = match runner.as_deref() {
+                Some(k) => slot.lock().await.s.participant_name(k),
+                None => None,
+            };
+            return ok(
+                json!({"job": job, "runner": runner, "runner_name": runner_name, "status": "submitted"}),
+            );
         }
         match tool_try!(Self::wait_job(&slot, &job, wait).await) {
             Some(r) => ok(json!({"note": UNTRUSTED, "result": r})),

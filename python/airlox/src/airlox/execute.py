@@ -83,7 +83,9 @@ class Result:
     out_files: List[OutFile] = field(default_factory=list)
     code_sha256: Optional[str] = None
     input_sha256: Optional[str] = None
+    #: The runner's key, and the name it joined with.
     runner: Optional[str] = None
+    runner_name: Optional[str] = None
     signed: bool = True
 
     @property
@@ -156,6 +158,7 @@ class Job:
                     exit_code=None,
                     reason=reason,
                     runner=st.get("runner"),
+                    runner_name=self.session._participants.get(st.get("runner"), {}).get("display_name"),
                     signed=False,
                 )
             if deadline is not None and time.monotonic() >= deadline:
@@ -201,6 +204,7 @@ class Job:
                 code_sha256=m["code_sha256"],
                 input_sha256=m["input_sha256"],
                 runner=item.author,
+                runner_name=item.author_name,
             )
         return None
 

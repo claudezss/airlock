@@ -181,7 +181,7 @@ def test_cli_runs_jobs(relay, caches, tmp_path, start_runner, runner_cache):
     out = tmp_path / "out"
     p = cli("run", "--label", "cpu", "--input", data, "--out-dir", out, script, invite=sender, cache=caches("cli"))
     assert "2 orders, total 42" in p.stdout
-    assert "signed by the runner" in p.stderr
+    assert "signed by runner runner-01" in p.stderr
     assert sorted(f.name for f in out.iterdir()) == ["chart.png", "out.zip"]
     with zipfile.ZipFile(io.BytesIO((out / "out.zip").read_bytes())) as z:
         assert json.loads(z.read("summary.json")) == {"orders": 2, "total": 42}
@@ -189,11 +189,14 @@ def test_cli_runs_jobs(relay, caches, tmp_path, start_runner, runner_cache):
     # The exit status is the job's; --no-wait plus `result` gets it later.
     failing = tmp_path / "fail.py"
     failing.write_text("import sys\nprint('bad input', file=sys.stderr)\nsys.exit(7)\n")
-    job = json.loads(cli("run", "--no-wait", "--json", failing, invite=sender, cache=caches("cli")).stdout)["job"]
+    submitted = json.loads(cli("run", "--no-wait", "--json", failing, invite=sender, cache=caches("cli")).stdout)
+    assert submitted["runner_name"] == "runner-01"
+    job = submitted["job"]
     p = cli("result", job, "--wait", "60s", "--json", invite=sender, cache=caches("cli"), check=False)
     assert p.stdout, p.stderr
     res = json.loads(p.stdout)
     assert p.returncode == 7 and res["exit_code"] == 7 and res["signed"] and "bad input" in res["stderr"]
+    assert res["runner_name"] == "runner-01"
 
     # The SDK sees the same signed result.
     owner.sync()
@@ -381,6 +384,7 @@ def test_mcp_server(relay, caches, tmp_path, start_runner):
 
         res = mcp.call("run_python", code=SUMMARIZE, filename="summarize.py", files=[data_id], wait_s=120)["result"]
         assert res["signed"] and res["exit_code"] == 0 and "2 orders, total 42" in res["stdout"]
+        assert res["runner_name"] == "runner-01"
         saved = mcp.call("get_result", job=res["job"], save_dir="out")["saved"]
         assert sorted(os.path.basename(p) for p in saved) == ["chart.png", "out.zip"]
 

@@ -87,16 +87,16 @@ def scenario(relay: str, start_runner, workdir: pathlib.Path, step=quiet) -> dic
         assert res.ok and res.signed, (res.status, res.stderr)
         with zipfile.ZipFile(io.BytesIO(res.out_file("out.zip").data)) as z:
             total.update(json.loads(z.read("counts.json")))
-        ran_on.append(res.runner)
+        ran_on.append(res.runner_name)
 
     step("planner", "Merges the two signed results", "for job in jobs: total.update(counts(job.wait()))",
          out=", ".join(f"{w} {n}" for w, n in total.most_common(4)) + ", …")
-    by_key = {r.participant_pub: r for r in owner.runners()}
+    rejected = [r.name for r in owner.runners() if r.rejected]
     expected = collections.Counter(re.findall(r"[a-z']+", " ".join(CORPUS.values()).lower()))
     owner.close()
     return {
-        "ran_on": [by_key[k].name for k in ran_on],
-        "rejected": [r.name for r in by_key.values() if r.rejected],
+        "ran_on": ran_on,
+        "rejected": rejected,
         "top_words": total.most_common(5),
         "matches_local_count": total == expected,
     }

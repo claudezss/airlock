@@ -545,7 +545,8 @@ pub async fn run(a: RunArgs) -> Result<i32> {
     };
     if a.no_wait {
         if a.conn.json {
-            print_json(&json!({"job": job, "runner": runner}));
+            let runner_name = runner.as_deref().and_then(|k| s.participant_name(k));
+            print_json(&json!({"job": job, "runner": runner, "runner_name": runner_name}));
         } else {
             println!("submitted job {job}; get its result with: airlox result -- {job}");
         }
@@ -647,7 +648,11 @@ fn print_outcome(r: &Outcome, saved: &[String], hint: bool) {
     }
     let code = r.exit_code.map(|c| format!("exit {c}")).unwrap_or_else(|| "no exit code".into());
     let reason = r.reason.as_deref().map(|x| format!(" ({})", clean_line(x))).unwrap_or_default();
-    let signed = if r.signed { "signed by the runner" } else { "reported by the relay, unsigned" };
+    let signed = match (r.signed, &r.runner_name) {
+        (true, Some(n)) => format!("signed by runner {}", clean_line(n)),
+        (true, None) => "signed by the runner".into(),
+        (false, _) => "reported by the relay, unsigned".into(),
+    };
     eprintln!("── {} · {code}{reason} · {} ms · {signed}", r.status, r.wall_ms);
     if r.stdout_truncated || r.stderr_truncated {
         eprintln!("   output was truncated by the runner");

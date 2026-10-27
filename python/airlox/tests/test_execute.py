@@ -83,6 +83,7 @@ def test_unapproved_runners_get_nothing_then_summarize_runs(execute):
     res = job.wait(timeout=60)
     assert res.signed and res.status == "completed", (res, runner.output())
     assert res.ok and res.stdout.strip() == "2 orders, total 42"
+    assert (res.runner, res.runner_name) == (r.participant_pub, "runner-01")
     assert {f.name for f in res.out_files} == {"chart.png", "out.zip"}
     assert res.out_file("chart.png").data.startswith(b"\x89PNG")
     z = zipfile.ZipFile(io.BytesIO(res.out_file("out.zip").data))

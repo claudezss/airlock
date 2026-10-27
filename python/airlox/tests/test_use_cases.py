@@ -43,7 +43,7 @@ def test_code_review_over_mcp(relay, start_runner, tmp_path):
 def test_remote_tests_with_the_cli(relay, start_runner, tmp_path):
     out = load("remote-tests").scenario(relay.url, start_runner, tmp_path)
     first, second = out["first"], out["second"]
-    assert first["exit_code"] == 1 and first["signed"]
+    assert first["exit_code"] == 1 and first["signed"] and first["runner"] == "ci-box"
     assert first["report"]["failed"] == ["tests.test_stats.StatsTest.test_median_even"]
     assert second["exit_code"] == 0 and second["report"] == {**second["report"], "ran": 3, "failed": []}
     assert out["jobs_seen_by_owner"] == out["results_seen_by_owner"] == 2

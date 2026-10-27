@@ -349,12 +349,20 @@ pub struct Outcome {
     pub wall_ms: u64,
     pub peak_mem_mb: u64,
     pub out_files: Vec<OutFile>,
+    /// The runner's key, and the name it joined with.
     pub runner: Option<String>,
+    pub runner_name: Option<String>,
     pub signed: bool,
 }
 
 impl Outcome {
-    fn unsigned(job: &str, status: &str, reason: Option<String>, runner: Option<String>) -> Outcome {
+    fn unsigned(
+        job: &str,
+        status: &str,
+        reason: Option<String>,
+        runner: Option<String>,
+        runner_name: Option<String>,
+    ) -> Outcome {
         Outcome {
             job: job.into(),
             status: status.into(),
@@ -368,6 +376,7 @@ impl Outcome {
             peak_mem_mb: 0,
             out_files: vec![],
             runner,
+            runner_name,
             signed: false,
         }
     }
@@ -646,6 +655,11 @@ impl Session {
     /// first sync).
     pub fn my_description(&self) -> Option<Option<&str>> {
         self.participants.get(&self.me).map(|p| p.description.as_deref())
+    }
+
+    /// The name a participant joined with, from its verified join.
+    pub fn participant_name(&self, key: &str) -> Option<String> {
+        self.participants.get(key).map(|p| p.display_name.clone())
     }
 
     pub fn participants(&self) -> Vec<Participant> {
@@ -964,6 +978,7 @@ impl Session {
                 peak_mem_mb: m["peak_mem_mb"].as_u64().unwrap_or(0),
                 out_files: outs,
                 runner: Some(item.author.clone()),
+                runner_name: item.author_name.clone(),
                 signed: true,
             });
         }
@@ -1015,7 +1030,9 @@ impl Session {
         }
         let reason = st["reason"].as_str().map(String::from);
         let status = if reason.as_deref() == Some("cancelled") { "cancelled" } else { "failed" };
-        Ok(Some(Outcome::unsigned(job, status, reason, st["runner"].as_str().map(String::from))))
+        let runner = st["runner"].as_str().map(String::from);
+        let runner_name = runner.as_deref().and_then(|k| self.participant_name(k));
+        Ok(Some(Outcome::unsigned(job, status, reason, runner, runner_name)))
     }
 
     /// `participant_pub -> approved?` from the owner's signed events. A

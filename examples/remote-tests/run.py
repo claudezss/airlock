@@ -59,7 +59,7 @@ def run_suite(workdir: pathlib.Path, invite: str, cache: pathlib.Path, attempt: 
     failed = ", ".join(t.rsplit(".", 1)[-1] for t in report["failed"])
     step("coding-agent", f"Gets the signed result: exit {p.returncode}", "out/out.zip → report.json",
          out=f"{report['ran']} tests, failed: {failed}" if failed else f"{report['ran']} tests, all passed")
-    return {"exit_code": p.returncode, "signed": res["signed"], "report": report}
+    return {"exit_code": p.returncode, "signed": res["signed"], "runner": res["runner_name"], "report": report}
 
 
 def scenario(relay: str, start_runner, workdir: pathlib.Path, step=quiet) -> dict:
