@@ -380,3 +380,40 @@ def test_plain_http_only_to_the_host_the_session_names(relay, caches, monkeypatc
     # Hosts URL parsers read as IPv4 must be plain dotted quads.
     with pytest.raises(airlox.ValidationError, match="four decimal numbers"):
         Session.create(url, insecure_http_host="2130706433", cache_dir=caches("numeric"))
+
+
+def test_addressed_messages_replies_and_waking(relay, caches):
+    owner = Session.create(relay.url, display_name="lead", cache_dir=caches("owner"))
+    planner = Session.join(owner.invites["sender"], display_name="planner", cache_dir=caches("planner"))
+    coder = Session.join(owner.invites["sender"], display_name="coder", cache_dir=caches("coder"))
+    planner.sync()
+
+    planner.send_text("FYI only")  # to everyone: wakes no one
+    ask = planner.send_text("@coder write the parser", to=["coder"])
+    with pytest.raises(ValueError, match="no other participant"):
+        planner.send_text("hi", to=["nobody"])
+    with pytest.raises(ValueError, match="no other participant"):
+        planner.send_text("hi", to=["planner"])  # never yourself
+
+    batch = coder.wait_for_messages(timeout=10, settle=0.2)
+    assert [(i.text, coder.wake_reason(i)) for i in batch] == [("@coder write the parser", "addressed")]
+    assert batch[0].to == [coder.participant_pub]
+    # The cursor is saved: nothing more until something new arrives.
+    assert coder.wait_for_messages(timeout=1, settle=0) == []
+    assert coder.handled_seq >= batch[0].seq
+
+    done = coder.send_text("done", reply_to=ask["id"])
+    got = planner.wait_for_messages(timeout=10, settle=0.2)
+    assert [(i.text, i.reply_to, planner.wake_reason(i)) for i in got] == [("done", ask["id"], "reply")]
+
+    # The owner's broadcasts concern everyone; another sender's do not.
+    owner.send_text("wrap up by noon")
+    assert [i.text for i in coder.wait_for_messages(timeout=10, settle=0.2)] == ["wrap up by noon"]
+
+    # Agent-only reply chains stop waking past max_hops.
+    planner.send_text("thanks", reply_to=done["id"])
+    assert coder.wait_for_messages(timeout=2, settle=0, max_hops=2) == []
+
+    # Delivery: the author sees who fetched its items; fetched, not read.
+    assert wait_for(lambda: coder.participant_pub in planner.delivery()[ask["id"]]["delivered"])
+    assert planner.synced_at_ms and planner.latest_seq

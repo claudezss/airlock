@@ -63,6 +63,16 @@ class Cache:
         _write_atomic(self.dir / f"identity-{role}.json", json.dumps(identity).encode())
 
     # manifest --------------------------------------------------------
+    def handled(self, role: str) -> Optional[int]:
+        """This role's listener cursor (shared with the CLI's ``airlox listen``)."""
+        try:
+            return int(json.loads((self.dir / f"handled-{role}.json").read_text())["seq"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    def save_handled(self, role: str, seq: int) -> None:
+        _write_atomic(self.dir / f"handled-{role}.json", json.dumps({"seq": seq}).encode())
+
     def load_manifest(self) -> Optional[str]:
         p = self.dir / "manifest.json"
         return p.read_text() if p.exists() else None

@@ -17,6 +17,7 @@ from airlox import Session
 
 from conftest import REPO
 from test_execute import LIMITS, SUMMARIZE, dataset, wait_runner
+from test_sdk import wait_for
 
 BIN = os.environ.get("AIRLOX_BIN", str(REPO / "target/debug/airlox"))
 
@@ -378,6 +379,23 @@ def test_mcp_server(relay, caches, tmp_path, start_runner):
         assert [(i["author_name"], i["text"]) for i in listed["items"] if i["kind"] == "text"] == [
             ("sdk-agent", "please summarize the data")]
         assert mcp.call("list_items", after=listed["next_after"])["items"] == []
+        assert listed["latest_seq"] and listed["synced_at_ms"]
+
+        # Addressing, replies and waking only for what concerns this agent.
+        ask = listed["items"][0]
+        sent = mcp.call("send_text", text="on it", to=["sdk-agent"], reply_to=ask["id"])
+        assert sent["to"] == ["sdk-agent"]
+        mine = [i for i in agent.items() if i.id == sent["sent"]][0]
+        assert mine.to == [agent.participant_pub] and mine.reply_to == ask["id"]
+        assert agent.wake_reason(mine) == "addressed"
+        agent.send_text("FYI, not for you")
+        long_text = "x" * 9000
+        agent.send_text(long_text, to=["pytest"])
+        got = mcp.call("list_items", after=listed["next_after"], for_me=True, wait_s=5)
+        assert [i["for_me"] for i in got["items"]] == ["addressed"]
+        assert len(got["items"][0]["text"]) == 4000 and "text_truncated" in got["items"][0]
+        assert mcp.call("get_item", item=got["items"][0]["id"])["item"]["text"] == long_text
+        assert wait_for(lambda: mcp.call("delivery_status")["items"][sent["sent"]]["delivered"] == ["sdk-agent"])
 
         # Files: only inside the allowed directory.
         for bad in [str(tmp_path / "secret.md"), "../secret.md"]:
@@ -685,3 +703,46 @@ def test_cli_plain_http_needs_the_owner_to_name_the_host(caches):
     other = cli("session", "create", "--relay", url, "--insecure-http-host", "relay.ns.svc", cache=caches("cli"),
                 check=False)
     assert other.returncode != 0 and "does not name relay.ns.svc" in other.stderr
+
+
+def test_listen_wakes_only_for_what_concerns_you(relay, caches, tmp_path):
+    owner = Session.create(relay.url, display_name="lead", cache_dir=caches("owner"))
+    sender = owner.invites["sender"]
+    planner = Session.join(sender, display_name="planner", cache_dir=caches("planner"))
+    cli("session", "info", "--as", "coder", invite=sender, cache=caches("coder"))
+    planner.send_text("FYI for everyone")
+    # Nothing for the coder yet: listen gives up with 75.
+    p = cli("listen", "--once", "--timeout", "2s", invite=sender, cache=caches("coder"), check=False)
+    assert p.returncode == 75 and p.stdout == ""
+
+    ask = planner.send_text("please review", to=["coder"])
+    p = cli("listen", "--once", "--json", "--timeout", "20s", invite=sender, cache=caches("coder"))
+    [woke] = [json.loads(line) for line in p.stdout.splitlines()]
+    assert (woke["id"], woke["for_me"], woke["to"][0]["me"]) == (ask["id"], "addressed", True)
+
+    # A reply links to its item and wakes its author.
+    cli("send", "text", "looks good", "--reply-to", ask["id"], invite=sender, cache=caches("coder"))
+    [reply] = planner.wait_for_messages(timeout=10, settle=0.2)
+    assert (reply.text, reply.reply_to) == ("looks good", ask["id"])
+
+    # --exec gets a batch on stdin, ids in the environment, never text in argv.
+    out = tmp_path / "hook.out"
+    hook = tmp_path / "hook.sh"
+    hook.write_text('#!/bin/sh\necho "$AIRLOX_ITEMS $AIRLOX_WAKE" > "$OUT"; cat >> "$OUT"\n')
+    hook.chmod(0o755)
+    env_out = dict(os.environ, OUT=str(out))
+    proc = subprocess.Popen([BIN, "listen", "--exec", str(hook), "--new", "--settle", "1s", "--timeout", "15s"],
+                            env={**env_out, "AIRLOX_INVITE": sender, "AIRLOX_CACHE_DIR": str(caches("coder"))})
+    time.sleep(2)
+    a = owner.send_text("one", to=["coder"])
+    b = owner.send_text("two", to=["coder"])
+    assert wait_for(lambda: out.exists() and out.read_text().count("\n") >= 3, timeout=10)
+    first, *lines = out.read_text().splitlines()
+    assert first == f"{a['id']},{b['id']} addressed,addressed"
+    assert [json.loads(line)["text"] for line in lines] == ["one", "two"]
+    proc.terminate()
+    proc.wait(timeout=10)
+
+    # Reads say how fresh they are.
+    p = cli("items", "--not-mine", "--after", "0", invite=sender, cache=caches("coder"))
+    assert "checked the relay at" in p.stderr and "latest #" in p.stderr
