@@ -30,8 +30,8 @@ Every push to `main` runs `.github/workflows/deploy.yml`:
    - if that fails, restores the previous image and files, and the workflow
      fails.
 
-Releases publish the same image separately, for linux/amd64 and linux/arm64,
-as `ghcr.io/claudezss/airlox-server:<version>` (see
+Releases publish the same image separately, for linux/amd64 only (other
+architectures build it from the `Dockerfile`), as `ghcr.io/claudezss/airlox-server:<version>` (see
 [releasing.md](releasing.md)); the Droplet keeps deploying `sha-<commit>` from
 `main`, and `:latest` always means the newest `main`, not the newest release.
 Anyone can run a release image with `docker run -p 8080:8080 -v airlox-data:/data

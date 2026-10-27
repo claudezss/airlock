@@ -64,8 +64,7 @@ jobs:
               - *build
               - 'crates/airlox-core/**'
               - 'bindings/wasm/**'
-            # Everything a release ships: the binary on every platform, the
-            # wheels, the npm packages and the MCPB bundle.
+            # What build.yml packages: the binary and the Linux x64 wheel.
             dist:
               - *build
               - 'crates/airlox-core/**'
@@ -129,8 +128,8 @@ jobs:
       - run: cargo install wasm-bindgen-cli --version 0.2.100 --locked
       - run: make test-wasm
 
-  # Builds and smoke-tests every package a release ships (build.yml), so a
-  # packaging or platform breakage shows up before a tag.
+  # Builds and smoke-tests the Linux x64 binary and wheel (build.yml), so a
+  # packaging breakage shows up before a tag. Only a tag builds every platform.
   dist:
     needs: changes
     if: needs.changes.outputs.dist == 'true'

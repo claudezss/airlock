@@ -17,14 +17,15 @@ and publishes the result. Every package's version is
 
 The workflow refuses a tag whose commit is not on `main` or whose version does
 not match the workspace version. It builds the `airlox` binary for macOS
-(arm64, x64), Linux (arm64, x64; static musl) and Windows (x64), and from them:
+(arm64, x64), Linux (arm64, x64; static musl) and Windows (x64), and from them
+(pull requests build only the Linux x64 binary and wheel):
 
 | Where | What |
 |---|---|
 | PyPI | `airlox`: abi3 wheels for each platform, with the Rust core as `airlox._core` and the binary as a script, and an sdist (no binary) |
 | npm | `airlox`, a wrapper whose `bin` runs the binary from `@airlox/<os>-<cpu>`, one package per platform |
 | GitHub release | each binary archived with the licenses, the MCPB bundle `airlox-<version>.mcpb`, and `SHA256SUMS` |
-| GHCR | `ghcr.io/claudezss/airlox-server:<version>` (no `v`): the relay image for linux/amd64 and linux/arm64, built from the `Dockerfile` (the arm64 half under QEMU, so it takes a while). `:latest` is not touched: `deploy.yml` moves it with `main` |
+| GHCR | `ghcr.io/claudezss/airlox-server:<version>` (no `v`): the relay image for linux/amd64 only, built from the `Dockerfile`; other architectures build it themselves. `:latest` is not touched: `deploy.yml` moves it with `main` |
 | MCP registry | `io.github.claudezss/airlox`, naming the npm and PyPI packages and the bundle |
 
 Nothing is published unless every build succeeded. PyPI, npm, the GitHub
