@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use airlox_core::cert::{RunnerInfo, SignedJoinRequest};
 use airlox_core::encoding::{parse_canonical, sha256};
-use airlox_core::item::ItemEnvelope;
+use airlox_core::item::{ItemEnvelope, ItemKind};
 use airlox_core::session::{is_session_id, Mode, Role, SignedManifest};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -35,13 +35,23 @@ use crate::util::{now_ms, random_bytes, random_suffix};
 pub const MAX_PARTICIPANTS: usize = 64;
 /// Concurrent SSE streams per participant.
 pub const MAX_STREAMS_PER_PARTICIPANT: usize = 4;
-/// How long a `want` stays open for holders to answer.
+/// How long a `want` stays open for holders to answer. Clients ask again
+/// while they still lack the blob.
 pub const WANT_TTL_MS: u64 = 10 * 60 * 1000;
-/// Open wants per participant, and wants per participant over the session.
+/// Open wants per participant, and distinct items a participant may ask
+/// for over the session.
 pub const MAX_OPEN_WANTS: usize = 16;
-pub const MAX_WANTS: u32 = 1024;
+pub const MAX_WANTS: usize = 1024;
+/// `want` log lines per participant and per session (about 140 bytes
+/// each), so asking cannot fill the session log.
+pub const MAX_WANT_LINES: u32 = 256;
+pub const MAX_WANT_LINES_SESSION: u32 = 2048;
 /// The longest a re-seeded blob stays (capped by the blob hold).
 pub const RESEED_HOLD_MS: u64 = 10 * 60 * 1000;
+/// The owner's signed events (runner approvals and rejections, close) up to
+/// this size stay on the relay for the session's life, so a late joiner can
+/// always check who the owner approved.
+pub const KEEP_EVENT_BYTES: u64 = 16 * 1024;
 const EVENT_BUFFER: usize = 1024;
 
 /// One state change. Serialized as a line of `log.jsonl`.
@@ -59,6 +69,10 @@ pub enum Rec {
         envelope: String,
         recipients: Vec<String>,
         blob_len: u64,
+        /// base64url SHA-256 of the blob, which the author's signature
+        /// covers; absent in logs written before it was recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blob_sha256: Option<String>,
     },
     Ack {
         item: String,
@@ -80,6 +94,11 @@ pub enum Rec {
         item: String,
         by: String,
     },
+    /// The owner revoked a role: its participants are cut off and its
+    /// invite admits no one.
+    Revoke {
+        role: Role,
+    },
     Close {
         reason: String,
     },
@@ -99,6 +118,10 @@ pub enum Rec {
         runner: Option<String>,
         reason: Option<String>,
     },
+    /// A record from a newer relay, read by an older one after a rollback:
+    /// skipped, so the session survives instead of being purged.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +205,8 @@ pub struct ItemRec {
     pub blob_len: u64,
     pub blob_present: bool,
     pub evict_at: u64,
+    /// Never evicted: a small signed event from the owner.
+    pub keep: bool,
 }
 
 pub struct Inner {
@@ -208,8 +233,15 @@ pub struct Inner {
     evictions: BTreeMap<u64, Vec<String>>,
     /// Open wants: item → (participant → when asked).
     pub wants: HashMap<String, HashMap<String, u64>>,
-    /// Wants each participant has made.
-    pub want_counts: HashMap<String, u32>,
+    /// The items each participant has asked for.
+    pub wanted_items: HashMap<String, HashSet<String>>,
+    /// `want` log lines per participant.
+    pub want_lines: HashMap<String, u32>,
+    /// When each open want was last logged (and so announced to holders):
+    /// item → (participant → when).
+    pub want_announced: HashMap<String, HashMap<String, u64>>,
+    /// Roles the owner revoked.
+    pub revoked: HashSet<Role>,
     hold_ms: u64,
     grace_ms: u64,
     /// Whether runners need the owner's approval before they get jobs.
@@ -231,7 +263,7 @@ impl Inner {
     fn check_delivered(&mut self, item: &str, ts: u64) {
         let grace = self.grace_ms;
         if let Some(r) = self.items.get_mut(item) {
-            if r.blob_present && !r.recipients.is_empty() && r.recipients.is_subset(&r.acked) {
+            if r.blob_present && !r.keep && !r.recipients.is_empty() && r.recipients.is_subset(&r.acked) {
                 let t = ts.saturating_add(grace);
                 if t < r.evict_at {
                     r.evict_at = t;
@@ -244,10 +276,11 @@ impl Inner {
     /// Stop counting `who` as a recipient and revoke its token.
     fn depart(&mut self, who: &str, ts: u64) {
         self.tokens.retain(|_, pk| pk != who);
-        for w in self.wants.values_mut() {
+        for w in self.wants.values_mut().chain(self.want_announced.values_mut()) {
             w.remove(who);
         }
         self.wants.retain(|_, w| !w.is_empty());
+        self.want_announced.retain(|_, w| !w.is_empty());
         // Stop waiting for this participant on blobs still held.
         let waiting: Vec<String> = self
             .items
@@ -303,24 +336,31 @@ impl Inner {
                 self.last_activity_ms = self.last_activity_ms.max(ts);
                 Ok(self.push_event(line.seq, "participant", public))
             }
-            Rec::Item { envelope, recipients, blob_len } => {
+            Rec::Item { envelope, recipients, blob_len, .. } => {
                 let env: ItemEnvelope =
                     parse_canonical(envelope, "item envelope").map_err(|e| e.to_string())?;
                 let id = env.header.id.clone();
-                let evict_at = ts.saturating_add(self.hold_ms);
+                let author = env.header.author.to_b64();
+                let keep = env.header.kind == ItemKind::Event
+                    && *blob_len <= KEEP_EVENT_BYTES
+                    && self.participants.get(&author).is_some_and(|p| p.role == Role::Owner);
+                let evict_at = if keep { u64::MAX } else { ts.saturating_add(self.hold_ms) };
                 self.items.insert(
                     id.clone(),
                     ItemRec {
                         seq: line.seq,
-                        author: env.header.author.to_b64(),
+                        author,
                         recipients: recipients.iter().cloned().collect(),
                         acked: HashSet::new(),
                         blob_len: *blob_len,
                         blob_present: true,
                         evict_at,
+                        keep,
                     },
                 );
-                self.evictions.entry(evict_at).or_default().push(id);
+                if !keep {
+                    self.evictions.entry(evict_at).or_default().push(id);
+                }
                 self.held_bytes += blob_len;
                 self.transfer_bytes += blob_len;
                 self.last_activity_ms = self.last_activity_ms.max(ts);
@@ -401,15 +441,27 @@ impl Inner {
             }
             Rec::Want { item, by } => {
                 self.wants.entry(item.clone()).or_default().insert(by.clone(), ts);
-                *self.want_counts.entry(by.clone()).or_default() += 1;
-                self.last_activity_ms = self.last_activity_ms.max(ts);
+                self.want_announced.entry(item.clone()).or_default().insert(by.clone(), ts);
+                self.wanted_items.entry(by.clone()).or_default().insert(item.clone());
+                *self.want_lines.entry(by.clone()).or_default() += 1;
+                // Not activity: asking alone must not keep a session alive.
                 Ok(self.push_event(line.seq, "want", json!({"item": item, "by": by})))
             }
             Rec::Reseed { item, by } => {
                 // The wanters become the blob's recipients: it goes once they
-                // have all acked, or when its short hold ends.
-                let wanters: HashSet<String> =
-                    self.wants.remove(item).map(|w| w.into_keys().collect()).unwrap_or_default();
+                // have all acked, or when its short hold ends. Expired wants
+                // are dropped here too, so a replay matches what happened live.
+                self.want_announced.remove(item);
+                let wanters: HashSet<String> = self
+                    .wants
+                    .remove(item)
+                    .map(|w| {
+                        w.into_iter()
+                            .filter(|(_, t)| ts.saturating_sub(*t) < WANT_TTL_MS)
+                            .map(|(k, _)| k)
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let hold = self.hold_ms.min(RESEED_HOLD_MS);
                 if let Some(r) = self.items.get_mut(item) {
                     if !r.blob_present {
@@ -425,11 +477,35 @@ impl Inner {
                 self.last_activity_ms = self.last_activity_ms.max(ts);
                 Ok(self.push_event(line.seq, "reseeded", json!({"item": item, "by": by})))
             }
+            Rec::Revoke { role } => {
+                self.revoked.insert(*role);
+                let mut cut: Vec<String> = self
+                    .participants
+                    .iter()
+                    .filter(|(_, p)| p.role == *role && !p.left && !p.rejected)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                cut.sort();
+                for who in &cut {
+                    if let Some(p) = self.participants.get_mut(who) {
+                        p.left = true;
+                    }
+                    self.depart(who, ts);
+                }
+                self.last_activity_ms = self.last_activity_ms.max(ts);
+                Ok(self.push_event(line.seq, "revoked", json!({"role": role, "participants": cut})))
+            }
             Rec::Close { reason } => {
                 self.closed = true;
                 Ok(self.push_event(line.seq, "closed", json!({"reason": reason})))
             }
+            Rec::Unknown => Ok(None),
         }
+    }
+
+    /// Whether `who` is still in the session: not left, rejected or revoked.
+    pub fn is_live(&self, who: &str) -> bool {
+        self.participants.get(who).is_some_and(|p| !p.left && !p.rejected)
     }
 
     /// `(participant_pub, role)` for a live token.
@@ -539,7 +615,10 @@ impl Session {
             presence: HashMap::new(),
             evictions: BTreeMap::new(),
             wants: HashMap::new(),
-            want_counts: HashMap::new(),
+            wanted_items: HashMap::new(),
+            want_lines: HashMap::new(),
+            want_announced: HashMap::new(),
+            revoked: HashSet::new(),
             hold_ms: cfg.blob_hold_ms,
             grace_ms: cfg.blob_grace_ms,
             approve_runners,
@@ -746,6 +825,112 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// The audit trail as JSONL: one line per log record, with who did
+    /// what to which item and the signed material to check it, but without
+    /// token hashes or the creator's address hash. Blocks on disk.
+    pub fn audit(&self) -> io::Result<Vec<u8>> {
+        let len = self.lock().log_len;
+        let mut raw = vec![0; len as usize];
+        File::open(self.dir.join("log.jsonl"))?.read_exact(&mut raw)?;
+        let owner = self.signed.manifest.owner_pub.to_b64();
+        // Who holds each role at this point in the log, for `revoke` lines.
+        let mut live: HashMap<String, Role> = HashMap::new();
+        let mut out = Vec::with_capacity(raw.len());
+        for line in raw.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+            let line: LogLine = serde_json::from_slice(line).map_err(invalid)?;
+            let mut a = json!({"seq": line.seq, "ts_ms": line.ts_ms});
+            let mut set = |k: &str, v: Value| {
+                a[k] = v;
+            };
+            match line.rec {
+                Rec::Create { .. } => {
+                    set("action", json!("create"));
+                    set("actor", json!(owner));
+                    set("signed_manifest", json!(self.manifest_json));
+                }
+                Rec::Join { signed_join, .. } => {
+                    let j: SignedJoinRequest = parse_canonical(&signed_join, "join").map_err(invalid)?;
+                    let pk = j.join.cert.participant().to_b64();
+                    live.insert(pk.clone(), j.join.cert.role());
+                    set("action", json!("join"));
+                    set("actor", json!(pk));
+                    set("role", json!(j.join.cert.role()));
+                    set("signed_join", json!(signed_join));
+                }
+                Rec::Item { envelope, blob_len, blob_sha256, .. } => {
+                    let env: ItemEnvelope = parse_canonical(&envelope, "item envelope").map_err(invalid)?;
+                    set("action", json!("item"));
+                    set("actor", json!(env.header.author.to_b64()));
+                    set("item", json!(env.header.id));
+                    set("kind", json!(env.header.kind));
+                    set("blob_len", json!(blob_len));
+                    set("blob_sha256", json!(blob_sha256));
+                    set("envelope", json!(envelope));
+                }
+                Rec::Ack { item, by } => {
+                    set("action", json!("ack"));
+                    set("actor", json!(by));
+                    set("item", json!(item));
+                }
+                Rec::Leave { who } => {
+                    live.remove(&who);
+                    set("action", json!("leave"));
+                    set("actor", json!(who));
+                }
+                Rec::Evict { item } => {
+                    set("action", json!("evict"));
+                    set("item", json!(item));
+                }
+                Rec::Want { item, by } => {
+                    set("action", json!("want"));
+                    set("actor", json!(by));
+                    set("item", json!(item));
+                }
+                Rec::Reseed { item, by } => {
+                    set("action", json!("reseed"));
+                    set("actor", json!(by));
+                    set("item", json!(item));
+                }
+                Rec::Approve { who } => {
+                    set("action", json!("runner_approve"));
+                    set("actor", json!(owner));
+                    set("runner", json!(who));
+                }
+                Rec::Reject { who } => {
+                    live.remove(&who);
+                    set("action", json!("runner_reject"));
+                    set("actor", json!(owner));
+                    set("runner", json!(who));
+                }
+                Rec::Job { job, state, runner, reason } => {
+                    set("action", json!("job"));
+                    set("item", json!(job));
+                    set("state", json!(state));
+                    set("runner", json!(runner));
+                    set("reason", json!(reason));
+                }
+                Rec::Revoke { role } => {
+                    let mut cut: Vec<String> =
+                        live.iter().filter(|(_, r)| **r == role).map(|(k, _)| k.clone()).collect();
+                    cut.sort();
+                    live.retain(|_, r| *r != role);
+                    set("action", json!("revoke"));
+                    set("actor", json!(owner));
+                    set("role", json!(role));
+                    set("participants", json!(cut));
+                }
+                Rec::Close { reason } => {
+                    set("action", json!("close"));
+                    set("reason", json!(reason));
+                }
+                Rec::Unknown => set("action", json!("unknown")),
+            }
+            serde_json::to_writer(&mut out, &a).map_err(invalid)?;
+            out.push(b'\n');
+        }
+        Ok(out)
     }
 
     pub fn blob_path(&self, item: &str) -> PathBuf {
@@ -1063,5 +1248,19 @@ impl Store {
             }
             keep
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_records_are_skipped() {
+        let line: LogLine =
+            serde_json::from_str(r#"{"seq":3,"ts_ms":1,"type":"from_the_future","x":[1,2]}"#).unwrap();
+        assert!(matches!(line.rec, Rec::Unknown));
+        let line: LogLine = serde_json::from_str(r#"{"seq":4,"ts_ms":1,"type":"evict","item":"a"}"#).unwrap();
+        assert!(matches!(line.rec, Rec::Evict { .. }));
     }
 }

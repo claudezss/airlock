@@ -252,3 +252,29 @@ def test_a_late_joiner_gets_an_evicted_file_from_a_peer(relay, caches, tmp_path)
     # Nothing is asked for again: the late joiner has the file now.
     sender.sync()
     assert [i.status for i in late.items() if i.kind == "file"] == ["ok"]
+
+
+def test_revoking_a_role_and_exporting_the_audit_trail(relay, caches):
+    owner = Session.create(relay.url, cache_dir=caches("owner"))
+    agent = Session.join(owner.invites["sender"], display_name="agent", cache_dir=caches("agent"))
+    viewer = Session.join(owner.invites["observer"], display_name="viewer", cache_dir=caches("viewer"))
+    agent.send_text("before")
+    with pytest.raises(PermissionError):
+        agent.revoke("observer")
+    owner.revoke("sender")
+    # The revoked participant learns it from the event, or from a dead token.
+    agent.sync()
+    assert agent.closed and "revoked" in agent.closed
+    with pytest.raises(airlox.RelayError) as e:
+        Session.join(owner.invites["sender"], display_name="again", cache_dir=caches("again"))
+    assert e.value.code == "revoked"
+    viewer.sync()
+    assert {p["display_name"]: p["left"] for p in viewer.participants()}["agent"] is True
+    assert not viewer.closed
+
+    trail = viewer.audit()
+    # The viewer's own acks land wherever its syncs happened to run.
+    trail = [a for a in trail if a["action"] != "ack"]
+    assert [a["action"] for a in trail] == ["create", "join", "join", "join", "item", "revoke"]
+    assert trail[-1]["participants"] == [agent.participant_pub]
+    assert trail[4]["actor"] == agent.participant_pub and trail[4]["blob_sha256"]

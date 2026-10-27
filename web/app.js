@@ -99,17 +99,21 @@ function announce(msg) {
   }, 100);
 }
 
-function deadEnd(title, cause) {
+// Only the owner of an ended session is offered a new one; a retry reloads the page.
+function deadEnd(title, cause, { newSession = false, retry = false } = {}) {
+  document.title = `${title} · Airlox`;
   show(el("div", { class: "panel stack dead-end", role: "alert" },
     el("h1", {}, title), el("p", { class: "muted" }, cause),
-    el("div", { class: "row" }, el("a", { class: "button primary", href: "/new" }, "New session"))));
+    newSession || retry ? el("div", { class: "row" },
+      newSession ? el("a", { class: "button primary", href: "/new" }, "New session") : null,
+      retry ? el("button", { class: "primary", type: "button", onclick: () => location.reload() }, "Try again") : null) : null));
 }
 
 // Plain-language reasons for items that fail verification.
 function explain(err) {
   const msg = String(err?.message || err);
   const cls = msg.split(":")[0];
-  if (cls === "SignatureError") return "The signature does not match a member of this session.";
+  if (cls === "SignatureError") return "It does not come from a member of this session.";
   if (cls === "DecryptError") return "It could not be decrypted with this session's key.";
   if (cls === "PolicyError") return "This session's rules do not allow it.";
   return "It is malformed.";
@@ -176,33 +180,68 @@ function maskInvite(url) {
   return `${base}#${parts.join("&")}`;
 }
 
-function inviteRow(name, url, hint) {
-  const shown = el("code", { title: "Hidden: Copy puts the full link on the clipboard" }, maskInvite(url));
+// Copy to the clipboard and say so on the button and the live region.
+// Returns false when the clipboard is denied.
+async function copyText(btn, text, label) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    return false;
+  }
+  btn.textContent = "Copied";
+  announce("Copied");
+  setTimeout(() => (btn.textContent = label), 1500);
+  return true;
+}
+const touchOnly = () => matchMedia("(hover: none) and (pointer: coarse)").matches;
+const pressCopy = () => (touchOnly() ? "Long-press to copy" : navigator.platform.startsWith("Mac") ? "Press ⌘C" : "Press Ctrl+C");
+
+function inviteRow(name, url, hint, label = "Copy") {
+  const shown = el("code", {}, maskInvite(url));
   const box = el("div", { class: "invite" }, shown);
   const btn = el("button", { class: "small", type: "button", onclick: async () => {
-    try {
-      await navigator.clipboard.writeText(url);
-      btn.textContent = "Copied";
-      setTimeout(() => (btn.textContent = "Copy"), 1500);
-    } catch {
-      // Clipboard denied: reveal the link in a selected field for manual copy.
-      const input = el("input", { type: "text", readonly: true, value: url, "aria-label": `${name} invite link` });
-      shown.replaceWith(input);
-      input.select();
-      btn.textContent = navigator.platform.startsWith("Mac") ? "Press ⌘C" : "Press Ctrl+C";
-    }
-  } }, "Copy");
+    if (await copyText(btn, url, label)) return;
+    // Clipboard denied: reveal the link in a selected field for manual copy.
+    const input = el("input", { type: "text", readonly: true, value: url, "aria-label": `${name} invite link` });
+    shown.replaceWith(input);
+    input.select();
+    btn.textContent = pressCopy();
+  } }, label);
   box.append(btn);
-  return el("div", { class: "invite-row" },
+  return el("div", { class: "invite-row", "data-role": name.toLowerCase() },
     el("div", { class: "head" }, el("strong", {}, name), hint ? el("span", { class: "muted" }, hint) : null), box);
 }
 
+// A revoked role's invite no longer works: drop its link and Copy buttons.
+function markRevoked(row) {
+  if (!row || row.querySelector(".revoked-note")) return;
+  row.querySelectorAll(".invite, .runner-cmd").forEach((n) => n.remove());
+  row.append(el("p", { class: "muted revoked-note" }, "Revoked for good · this link no longer works"));
+}
+
+const INSTALL_URL = "https://github.com/claudezss/airlox#install";
+const MASKED_NOTE = "Links are partly hidden here. Copy puts the full link on the clipboard.";
+
 // Runner invites come with the command that uses them. The shown command
-// carries the masked link; Copy always copies the full link.
+// carries the masked link; Copy command always copies the full one.
 function runnerInviteRow(url) {
-  return el("div", { class: "stack" }, inviteRow("Runner", url, "your sandboxed machine"),
-    el("p", { class: "muted hint-text" }, "Run on the runner host: ",
-      el("code", {}, `airlox runner join --invite '${maskInvite(url)}' --name runner-01 --sandbox docker`)));
+  const cmd = (link) => `airlox runner join --invite '${link}' --name my-runner --sandbox docker`;
+  // Only the link part may break mid-word; the rest wraps at spaces.
+  const shown = el("code", {}, "airlox runner join --invite '", el("span", { class: "link" }, maskInvite(url)), "' --name my-runner --sandbox docker");
+  const btn = el("button", { class: "small primary", type: "button", onclick: async () => {
+    if (await copyText(btn, cmd(url), "Copy command")) return;
+    const input = el("input", { type: "text", readonly: true, value: cmd(url), "aria-label": "Runner command" });
+    shown.replaceWith(input);
+    input.select();
+    btn.textContent = pressCopy();
+  } }, "Copy command");
+  const row = inviteRow("Runner", url, "a machine that runs jobs", "Copy link");
+  row.append(el("div", { class: "runner-cmd stack" },
+    el("p", { class: "muted hint-text" },
+      "Install the airlox runner first: ", el("a", { href: INSTALL_URL, target: "_blank", rel: "noopener noreferrer" }, "see the install guide"), "."),
+    el("p", { class: "muted hint-text" }, "Then run this on the runner host. Change ", el("code", {}, "my-runner"), " to a name senders will recognise."),
+    shown, el("div", { class: "row" }, btn)));
+  return row;
 }
 
 // Open the session as its owner without ever putting the key in a URL the
@@ -254,7 +293,7 @@ function newSession() {
       field("j-memory", "Memory (MB)", lim.memory, "32 to 65536")),
     field("j-packages", "Packages", lim.packages, "Comma-separated. Only these can be requested by jobs."),
     el("label", { class: "option check" }, lim.approve, "Require owner approval for runners"),
-    el("p", { class: "muted" }, "Network access is always off and runners return their output files."));
+    el("p", { class: "muted" }, "Jobs ask runners to run without network access. Runners that cannot block it are flagged before you approve them."));
   const pyBox = types.querySelector('input[value="py"]');
   const isExecute = () => form.elements.mode.value === "execute";
   const pyNote = el("p", { class: "muted hint-text", hidden: true, id: "py-note" }, "Python is always allowed in Execute sessions: jobs are Python.");
@@ -313,10 +352,11 @@ function newSession() {
       aside.replaceChildren(
         el("div", { class: "eyebrow" }, `Created · ${session_id.slice(0, 7)}`),
         heading,
-        el("p", { class: "muted" }, "Copy these now. They are not stored anywhere and cannot be shown again."),
+        el("p", { class: "muted" }, "Copy the owner link now: it cannot be shown again. Sender, observer and runner links stay available under Invites in the session."),
+        el("p", { class: "muted hint-text" }, MASKED_NOTE),
         inviteRow("Owner", owner, "you · keep it private"),
-        inviteRow("Sender", ac.memberInvite(base, s.ownerSeed, "sender"), "your code agent"),
-        inviteRow("Observer", ac.memberInvite(base, s.ownerSeed, "observer"), "read-only, optional"),
+        inviteRow("Sender", ac.memberInvite(base, s.ownerSeed, "sender"), "can post messages, files and jobs, e.g. your code agent"),
+        inviteRow("Observer", ac.memberInvite(base, s.ownerSeed, "observer"), "can read everything and export the audit log"),
         ...(execute ? [runnerInviteRow(ac.memberInvite(base, s.ownerSeed, "runner"))] : []),
         el("div", { class: "row" },
           // A button, not a link: the owner key must not show in the status bar on hover.
@@ -351,6 +391,8 @@ function takeInvite() {
   return frag ? `${location.origin}${path}#${frag}` : null;
 }
 
+const REMOVED_UNSURE = "This browser's access was removed (it left, or the owner revoked its role). The session may still be open for others; you keep what this browser already received.";
+
 async function sessionView() {
   const url = takeInvite();
   let inv;
@@ -368,8 +410,8 @@ async function sessionView() {
   try {
     signed = (await (await api("GET", `/v1/sessions/${sid}`)).json()).signed_manifest;
   } catch (e) {
-    if (e.status !== 404) return deadEnd("Cannot reach the relay", e.message);
-    if (!identity?.signed) return deadEnd("This session has ended", "It expired or its owner closed it. Nothing is left on the relay.");
+    if (e.status !== 404) return deadEnd("Cannot reach the relay", "Could not reach the relay. Check your connection and try again.", { retry: true });
+    if (!identity?.signed) return deadEnd("This session has ended", "It expired or its owner closed it. Nothing is left on the relay.", { newSession: inv.role === "owner" });
     signed = identity.signed;
     offline = true;
   }
@@ -391,7 +433,9 @@ async function sessionView() {
     try {
       resp = await (await api("POST", `/v1/sessions/${sid}/participants`, { body })).json();
     } catch (e) {
-      return deadEnd("Could not join", e.message);
+      if (e.code === "revoked") return deadEnd("This invite was revoked",
+        "The owner removed this link. They would need to start a new session to invite you again.");
+      return deadEnd("Could not join", e.message, { retry: !e.status });
     }
     identity = { seed, token: resp.token, role: inv.role, signed };
     await idbPut("identity", [sid, inv.role], identity);
@@ -401,7 +445,8 @@ async function sessionView() {
   }
   const me = ac.publicKey(identity.seed);
   const s = { sid, inv, manifest, signed, identity, me, participants: new Map(), items: new Map(), evicted: new Set(),
-    wanted: new Set(), asked: new Set(),
+    wanted: new Map(), askOk: new Set(), askErrors: new Map(), asked: new Set(), uploads: new Set(), uploaded: new Map(), uploading: 0,
+    revokedRoles: new Set(),
     lastSeq: -1, closed: null, jobs: new Map(), results: new Map(), runners: [], picked: new Set(), decisions: null,
     said: new Map(), announce: false, jobErrors: new Map(), runnerErrors: new Map(), runnerSeen: new Map(), open: new Set() };
   buildSessionLayout(s);
@@ -424,34 +469,38 @@ async function sessionView() {
   try {
     const q = s.lastSeq >= 0 ? `?after=${s.lastSeq}` : "";
     const evs = (await (await api("GET", `/v1/sessions/${sid}/events${q}`, { token: identity.token })).json()).events;
-    for (const ev of evs) await applyEvent(s, ev, { fetch: true, record: true });
+    for (const ev of evs) await applyEvent(s, ev, { fetch: true, record: true, batch: true });
     s.render.scroll(true);
+    tradeBlobs(s); // wants the batch left standing, once per item
   } catch (e) {
     if (e.status === 404 || e.status === 410) return s.render.closed("it is no longer on the relay");
+    if (e.status === 401) return s.render.removed(REMOVED_UNSURE);
   }
   s.announce = true;
   streamLoop(s);
+  reaskLoop(s);
 }
 
 function buildSessionLayout(s) {
   const { sid, inv, manifest, identity } = s;
   app.classList.add("wide");
-  const timeline = el("div", { class: "timeline", role: "log", "aria-live": "off", "aria-label": "Session timeline" },
-    el("div", { class: "pill" }, `you opened the session · keys stay in this browser`),
+  const timeline = el("div", { class: "timeline", role: "log", "aria-live": "off", "aria-label": "Session timeline", tabindex: -1 },
+    el("div", { class: "pill" }, `${inv.role === "owner" ? "you opened the session" : `you joined as ${inv.role}`} · keys stay in this browser`),
     el("p", { class: "empty" }, "No messages yet. Items appear here as soon as someone sends one."));
   const people = el("ul", { class: "people" });
-  const banner = el("div", { class: "banner", role: "status", hidden: true });
+  const banner = el("div", { class: "banner", tabindex: -1, hidden: true });
   const canSend = ["owner", "sender"].includes(inv.role);
 
   // composer
   const status = el("p", { class: "status", role: "alert" });
   const text = el("textarea", { id: "msg", rows: 2, placeholder: "Message the session…" });
-  const file = el("input", { type: "file", id: "file", class: "sr-only", accept: Object.keys(FILE_TYPES).join(",") });
+  // The attach button opens the picker; the input itself stays out of the tab order.
+  const file = el("input", { type: "file", id: "file", class: "sr-only", tabindex: -1, "aria-hidden": "true", accept: Object.keys(FILE_TYPES).join(",") });
   const pending = el("span", { class: "pending-file", hidden: true });
   const sendBtn = el("button", { class: "primary", type: "submit" }, "Send");
   const execute = manifest.mode === "execute";
   const jobUi = canSend && execute ? buildJobPanel(s, text, file) : null;
-  const attach = el("label", { class: "button icon-btn", for: "file", title: "Attach a file", "aria-label": "Attach a file" }, svg(ICON_CLIP));
+  const attach = el("button", { class: "icon-btn", type: "button", title: "Attach a file", "aria-label": "Attach a file", onclick: () => file.click() }, svg(ICON_CLIP));
   const showPending = () => {
     const f = file.files?.[0];
     pending.hidden = !f;
@@ -473,21 +522,31 @@ function buildSessionLayout(s) {
           file.value = "";
           showPending();
           text.value = "";
+          jobUi.off();
+          announce("Job submitted");
         }
         return;
       }
+      let sent = false;
       if (file.files?.[0]) {
         await sendFile(s, file.files[0]);
         file.value = "";
         showPending();
+        sent = true;
       }
       const value = text.value.trim();
       if (value) {
         await sendPayload(s, "text", null, { type: "text", text: value }, new Uint8Array());
         text.value = "";
+        sent = true;
       }
+      if (sent) announce("Sent");
     } catch (e) {
-      status.textContent = e.final ? e.message : `Not sent: ${e.message || e}`;
+      if (e.clearFile) {
+        file.value = "";
+        showPending();
+      }
+      status.replaceChildren(...[e.final ? e.message : `Not sent: ${e.message || e}`, e.detail && el("span", { class: "detail" }, e.detail)].filter(Boolean));
     } finally {
       sendBtn.disabled = !!s.closed;
     }
@@ -507,14 +566,14 @@ function buildSessionLayout(s) {
           jobUi?.panel,
           el("label", { for: "msg", class: "sr-only" }, "Message the session"), text,
           el("div", { class: "toolbar" }, attach, file, pending, jobUi?.toggle,
-            el("span", { class: "hint" }, navigator.platform.startsWith("Mac") ? "⌘↵ to send" : "Ctrl+↵ to send"), sendBtn)),
+            touchOnly() ? null : el("span", { class: "hint" }, navigator.platform.startsWith("Mac") ? "⌘↵ to send" : "Ctrl+↵ to send"), sendBtn)),
         status)
-    : el("div", { class: "panel readonly" }, `You joined as ${inv.role}. You can read this session but not post to it.`);
+    : el("div", { class: "panel readonly", tabindex: -1 }, `You joined as ${inv.role}. You can read this session but not post to it.`);
 
   // rail
   const closeErr = el("p", { class: "error", role: "alert" });
   const closeBtn = inv.role === "owner" ? el("button", { class: "danger", type: "button", onclick: async () => {
-    if (!confirm("Close the session and purge it from the relay for everyone?")) return;
+    if (!confirm("Close the session and purge it from the relay for everyone? Export the audit log first: closing deletes it.")) return;
     closeErr.textContent = "";
     try {
       await api("POST", `/v1/sessions/${sid}/close`, { token: identity.token });
@@ -522,12 +581,70 @@ function buildSessionLayout(s) {
       closeErr.textContent = `Could not close: ${e.message}`;
     }
   } }, "Close & purge") : null;
+  // Revoking cuts off a role's participants and disables its invite.
+  const revokeErr = el("p", { class: "error", role: "alert" });
+  const revokeNote = el("p", { class: "muted revoke-note", tabindex: -1 });
+  const revokeBtns = inv.role === "owner"
+    ? ["sender", "observer", ...(execute ? ["runner"] : [])].map((role) => {
+      const b = el("button", { class: "small danger", type: "button", "data-role": role, onclick: async () => {
+        const ps = [...s.participants.values()].filter((p) => p.role === role && !p.left && !p.revoked && p.participant_pub !== s.me);
+        const n = ps.length;
+        const names = ps.slice(0, 4).map((p) => p.display_name).join(", ") + (n > 4 ? ` and ${n - 4} more` : "");
+        const effect = n ? `${n} ${n === 1 ? "person" : "people"} (${names}) ${n === 1 ? "is" : "are"} cut off now and the ${role} link stops working.`
+          : `No one has joined with the ${role} link yet; the link stops working.`;
+        if (!confirm(`Revoke the ${role} role? ${effect} This is permanent for this session: you cannot issue a new ${role} link. To let someone back in, start a new session. ` +
+          "Revoking does not change the session key: anyone who kept the link or copies of files still has them. To end access completely, close the session.")) return;
+        revokeErr.textContent = "";
+        try {
+          await api("POST", `/v1/sessions/${sid}/roles/${role}/revoke`, { token: identity.token });
+          revokeNote.textContent = `Revoked the ${role} role.`;
+          announce(`Revoked the ${role} role`);
+          revokeNote.focus();
+        } catch (e) {
+          revokeErr.textContent = `Could not revoke: ${e.message}`;
+        }
+      } }, `Revoke ${role}s`);
+      return b;
+    })
+    : [];
+  const access = revokeBtns.length ? el("details", {},
+    el("summary", {}, "Revoke access"),
+    el("div", { class: "stack" },
+      el("p", { class: "muted" }, "Cuts off everyone who joined with that role's link, and the link stops working for good. To end access to what was shared, close the session."),
+      el("div", { class: "chips" }, revokeBtns), revokeNote, revokeErr)) : null;
+  // The audit trail goes with the session when it is purged.
+  const auditErr = el("p", { class: "error", role: "alert" });
+  const auditDone = el("p", { class: "muted audit-done" });
+  let auditTimer;
+  const auditBtn = ["owner", "observer"].includes(inv.role) ? el("button", { type: "button", onclick: async () => {
+    auditErr.textContent = "";
+    try {
+      const r = await api("GET", `/v1/sessions/${sid}/audit.jsonl`, { token: identity.token });
+      const url = URL.createObjectURL(new Blob([await r.arrayBuffer()], { type: "application/x-ndjson" }));
+      const name = `${sid}-audit.jsonl`;
+      const a = el("a", { href: url, download: name, hidden: true });
+      document.body.append(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      auditDone.textContent = `Downloaded ${name}`;
+      announce(auditDone.textContent);
+      clearTimeout(auditTimer);
+      auditTimer = setTimeout(() => (auditDone.textContent = ""), 6000);
+    } catch (e) {
+      auditErr.textContent = `Could not export: ${e.message}`;
+    }
+  } }, "Export audit log") : null;
+  const auditHint = auditBtn ? el("div", { class: "stack hint-lines" },
+    el("p", { class: "muted hint-text" }, "JSON Lines with the session's records, for checking with airlox tools."),
+    el("p", { class: "muted hint-text" }, inv.role === "owner" ? "Download before you close: closing deletes it." : "Download before the owner closes the session: closing deletes it.")) : null;
+  const inviteRows = inv.role === "owner" ? {
+    sender: inviteRow("Sender", ac.memberInvite(location.origin, inv.roleSeed, "sender"), "can post messages, files and jobs, e.g. your code agent"),
+    observer: inviteRow("Observer", ac.memberInvite(location.origin, inv.roleSeed, "observer"), "can read everything and export the audit log"),
+    runner: execute ? runnerInviteRow(ac.memberInvite(location.origin, inv.roleSeed, "runner")) : null } : {};
   const invites = inv.role === "owner" ? el("details", {},
     el("summary", {}, "Invites"),
-    el("div", { class: "stack" },
-      inviteRow("Sender", ac.memberInvite(location.origin, inv.roleSeed, "sender"), "your code agent"),
-      inviteRow("Observer", ac.memberInvite(location.origin, inv.roleSeed, "observer"), "read-only"),
-      execute ? runnerInviteRow(ac.memberInvite(location.origin, inv.roleSeed, "runner")) : null)) : null;
+    el("div", { class: "stack" }, el("p", { class: "muted hint-text" }, MASKED_NOTE), Object.values(inviteRows))) : null;
   const runnerList = el("ul", { class: "runners" });
   const runnerNote = el("p", { class: "muted" });
   const rail = el("aside", { class: "rail" },
@@ -538,7 +655,7 @@ function buildSessionLayout(s) {
       el("p", { class: "mono muted" }, sid),
       el("p", { class: "muted" }, `Expires ${new Date(manifest.expires_at_ms).toLocaleString()}`),
       el("p", { class: "muted" }, `Files up to ${fmtBytes(manifest.max_item_bytes)}`),
-      invites, closeBtn, closeErr),
+      invites, access, auditBtn, auditDone, auditHint, auditErr, closeBtn, closeErr),
     el("section", { class: "stack" }, el("h2", {}, "This browser"),
       el("p", { class: "muted" }, "Received items are kept here, still encrypted, so they survive the relay deleting them."),
       el("button", { type: "button", onclick: async () => {
@@ -558,7 +675,15 @@ function buildSessionLayout(s) {
       sec?.scrollIntoView({ block: "start" });
       (sec?.querySelector("button.primary") || sec)?.focus({ preventScroll: true });
     } }, "Review runners"));
-  show(el("div", { class: "session" }, rail, el("div", { class: "main-col" }, approvalBanner, banner, timeline, composer)));
+  show(el("div", { class: "session" }, el("h1", { class: "sr-only" }, `Session ${sid.slice(0, 7)}, ${manifest.mode} mode, ${inv.role}`),
+    rail, el("div", { class: "main-col" }, approvalBanner, banner, timeline, composer)));
+  // A #fragment would replace the stored invite on reload: move focus instead.
+  const skip = (label, to) => el("a", { class: "skip", href: "#", onclick: (ev) => {
+    ev.preventDefault();
+    to().focus();
+  } }, label);
+  const skipMsg = canSend ? skip("Skip to message box", () => text) : null;
+  document.body.prepend(...[skipMsg, skip("Skip to timeline", () => timeline)].filter(Boolean));
   // The sticky composer must not cover the newest card when it scrolls into view.
   if (canSend && typeof ResizeObserver !== "undefined") {
     const wrap = document.querySelector(".composer-wrap");
@@ -570,10 +695,15 @@ function buildSessionLayout(s) {
   document.getElementById("title").hidden = false;
   document.getElementById("title-name").textContent = `Session ${sid.slice(0, 7)}`;
   document.getElementById("title-sub").textContent = `${manifest.mode} · ${inv.role}`;
-  document.getElementById("badge").hidden = false;
+  const setTitle = (state) => (document.title = `Session ${sid.slice(0, 7)} · ${state || inv.role} · Airlox`);
+  setTitle();
+  const badge = document.getElementById("badge");
+  badge.hidden = false;
   document.getElementById("badge-text").textContent = "E2E sealed";
   const expiry = document.getElementById("expiry");
   expiry.hidden = false;
+  const conn = el("span", { class: "conn mono", role: "status", hidden: true });
+  expiry.before(conn);
   const tick = () => {
     const left = manifest.expires_at_ms - Date.now();
     if (left <= 0 || s.closed) {
@@ -593,13 +723,41 @@ function buildSessionLayout(s) {
 
   if (execute) runnerLoop(s);
   const nearBottom = () => window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 160;
+  // Timeline entries are kept in event order.
+  const place = (node, seq, old) => {
+    node.dataset.seq = seq;
+    if (old) return old.replaceWith(node);
+    const next = [...timeline.children].find((n) => n.dataset?.seq !== undefined && Number(n.dataset.seq) > seq);
+    if (next) next.before(node);
+    else timeline.append(node);
+  };
+  // The session is closed or this browser lost access: nothing can be posted
+  // or decided any more. Focus on a control that goes away moves to the banner.
+  const lock = (why) => {
+    const a = document.activeElement;
+    for (const c of [sendBtn, text, file, attach, closeBtn, auditBtn, ...revokeBtns]) if (c) c.disabled = true;
+    jobUi?.lock();
+    if (auditHint) auditHint.hidden = true;
+    approvalBanner.hidden = true;
+    skipMsg?.remove();
+    composer.replaceWith(el("div", { class: "panel readonly", id: "composer-note" }, why));
+    document.documentElement.style.removeProperty("--composer-h");
+    s.render.runners();
+    if (a && a !== document.body && (!a.isConnected || a.disabled)) banner.focus({ preventScroll: true });
+  };
+  const gone = (msg) => {
+    banner.hidden = false;
+    banner.textContent = msg;
+    announce(msg);
+    s.render.conn(false);
+  };
   s.render = {
     people: () => people.replaceChildren(...[...s.participants.values()].map((p) =>
       el("li", {},
         el("span", { class: "dot", "aria-hidden": "true" }),
         el("div", { class: "who" },
-          el("div", { class: "name" }, p.display_name, p.participant_pub === s.me ? el("span", { class: "you" }, "you") : null),
-          el("div", { class: "sub" }, `${p.role} · ${p.kind}${p.left ? " · left" : ""}`),
+          el("div", { class: "name", title: p.display_name }, p.display_name, p.participant_pub === s.me ? el("span", { class: "you" }, "you") : null),
+          el("div", { class: "sub" }, `${p.role} · ${p.kind}${p.revoked ? " · revoked" : p.left ? " · left" : ""}`),
           p.description ? el("div", { class: "desc", title: "Their own description, not verified" }, el("span", { class: "claim" }, "says "), p.description) : null),
         el("span", { class: "key", title: "Key fingerprint" }, ac.fingerprint(p.participant_pub).slice(0, 4))))),
     item: (it) => {
@@ -615,15 +773,19 @@ function buildSessionLayout(s) {
         document.getElementById(`item-${it.id}`)?.remove();
         it = host;
       }
-      const node = renderItem(s, it);
-      node.dataset.seq = it.seq;
       const old = document.getElementById(`item-${it.id}`);
-      if (old) old.replaceWith(node);
-      else {
-        const next = [...timeline.children].find((n) => n.dataset?.seq !== undefined && Number(n.dataset.seq) > it.seq);
-        if (next) next.before(node);
-        else timeline.append(node);
-      }
+      // Owner events (approvals) that left the relay unread have nothing to show.
+      if (it.status === "evicted" && it.kind === "event") return old?.remove();
+      // Keep keyboard focus across the redraw: on the same control, or on the
+      // card when that control is gone. The clicked button may already be
+      // disabled (focus on the page), hence s.refocus.
+      const a = document.activeElement;
+      const idle = !a || a === document.body || !a.isConnected;
+      const held = old && old.contains(a) ? { keep: a.dataset?.keep } : old && idle && s.refocus === it.id ? { keep: "ask" } : null;
+      if (s.refocus === it.id) s.refocus = null;
+      const node = renderItem(s, it);
+      place(node, it.seq, old);
+      if (held) (held.keep && node.querySelector(`[data-keep="${held.keep}"]:not(:disabled)`) || node).focus({ preventScroll: true });
       if (stick && !old) node.scrollIntoView({ block: "end" });
       settle(s, it);
       if (it.kind === "job") announceJob(s, it);
@@ -633,19 +795,51 @@ function buildSessionLayout(s) {
     },
     runners: () => {
       renderRunners(s, runnerList, runnerNote);
-      const n = s.runners.filter((r) => !r.approved && !r.rejected && !r.relayOnly).length;
+      const n = s.runners.filter((r) => !r.approved && !r.rejected).length;
       approvalBanner.hidden = !(inv.role === "owner" && n && !s.closed);
       approvalText.textContent = `${n} runner${n === 1 ? "" : "s"} awaiting approval`;
       jobUi?.refresh();
     },
     scroll: () => timeline.lastElementChild?.scrollIntoView({ block: "end" }),
+    conn: (bad) => {
+      conn.textContent = bad && !s.closed ? "Reconnecting…" : "";
+      conn.hidden = !conn.textContent;
+    },
+    revoked: () => {
+      for (const b of revokeBtns) {
+        const gone = s.revokedRoles.has(b.dataset.role);
+        b.disabled = gone || !!s.closed;
+        b.textContent = gone ? `${b.dataset.role}s revoked` : `Revoke ${b.dataset.role}s`;
+      }
+      for (const role of s.revokedRoles) markRevoked(inviteRows[role]);
+      s.render.runners();
+    },
+    // A local line in the timeline: the relay's revoke event is not a signed item.
+    note: (seq, text, at) => {
+      const id = `note-${seq}`;
+      if (document.getElementById(id)) return;
+      place(el("article", { class: "item evline", id }, el("div", { class: "pill" }, text, at ? ` · ${hhmm(at)}` : "")), seq);
+    },
     closed: (reason) => {
-      banner.hidden = false;
-      banner.textContent = `This session is closed: ${reason}. Its history stays in this browser until you clear it.`;
-      for (const c of [sendBtn, text, file, closeBtn]) if (c) c.disabled = true;
-      attach.setAttribute("aria-disabled", "true");
-      approvalBanner.hidden = true;
+      s.closed ||= "closed";
+      gone(`This session is closed: ${reason}. Its history stays in this browser until you clear it.`);
+      lock(canSend ? "This session is closed." : "This session is closed. You can still read what this browser received.");
+      if (auditBtn) auditBtn.textContent = "Audit log deleted with the session";
       if (invites) invites.hidden = true;
+      setTitle("closed");
+      tick();
+    },
+    // This browser lost its access but the session lives on for others.
+    removed: (msg) => {
+      s.closed ||= "removed";
+      s.removed = true;
+      gone(msg);
+      lock("Your access was removed. You can still read what this browser received.");
+      if (auditBtn) auditBtn.textContent = "Audit log unavailable";
+      badge.classList.add("off");
+      document.getElementById("badge-text").textContent = "access removed";
+      expiry.hidden = true;
+      setTitle("access removed");
       tick();
     },
   };
@@ -653,7 +847,7 @@ function buildSessionLayout(s) {
 
 // Participants come only from verified signed joins, never from the
 // relay's unsigned event fields.
-async function applyEvent(s, ev, { fetch, record }) {
+async function applyEvent(s, ev, { fetch, record, batch = false }) {
   if (record && ev.seq <= s.lastSeq) return;
   if (ev.kind === "participant") {
     try {
@@ -670,20 +864,24 @@ async function applyEvent(s, ev, { fetch, record }) {
     await receive(s, ev.seq, ev.data.envelope, fetch);
   } else if (ev.kind === "evicted") {
     s.evicted.add(ev.data.item);
+    s.asked.delete(ev.data.item); // evicted again: an older ask for it no longer stands
     const it = s.items.get(ev.data.item);
     if (it && it.status === "retry") {
       it.status = "evicted";
       s.render.item(it);
     }
+    // Cached history (record false) never asks; the catch-up batch and the stream do.
+    if (fetch && record && it?.status === "evicted" && it.author !== s.me) wantBlob(s, it.id);
   } else if (ev.kind === "want") {
-    // Only live wants, and only for an item this browser verified: the id
-    // could be anything the relay made up.
+    // Not from cached history, and only for an item this browser verified: the
+    // id could be anything the relay made up. A catch-up batch uploads once at
+    // its end, for the wants no later event has settled.
     if (record && ev.data.by !== s.me && s.items.get(ev.data.item)?.status === "ok") {
       s.asked.add(ev.data.item);
-      tradeBlobs(s);
+      if (!batch) tradeBlobs(s);
     }
   } else if (ev.kind === "reseeded") {
-    reappeared(s, ev.data.item);
+    reappeared(s, ev.data.item, { live: fetch && record });
   } else if (ev.kind === "job") {
     s.jobs.set(ev.data.job, ev.data);
     const it = s.items.get(ev.data.job);
@@ -695,6 +893,20 @@ async function applyEvent(s, ev, { fetch, record }) {
     if (p) {
       p.left = true;
       s.render.people();
+    }
+  } else if (ev.kind === "revoked") {
+    const cut = ev.data.participants || [];
+    s.revokedRoles.add(ev.data.role);
+    for (const pk of cut) {
+      const p = s.participants.get(pk);
+      if (p) p.revoked = true;
+    }
+    s.render.people();
+    s.render.revoked();
+    s.render.note(ev.seq, `owner revoked the ${ev.data.role} role (${cut.length} ${cut.length === 1 ? "person" : "people"})`, ev.at);
+    if (cut.includes(s.me)) {
+      s.closed = "revoked";
+      s.render.removed("The owner removed your access. The session is still open for others; you keep what this browser already received.");
     }
   } else if (ev.kind === "closed") {
     s.closed = ev.data.reason;
@@ -708,37 +920,109 @@ async function applyEvent(s, ev, { fetch, record }) {
 // Re-seeding: a blob the relay deleted before this browser fetched it can
 // come back from a participant who still has it. Ask for it, and upload the
 // blobs others ask for that this browser holds; the relay takes an upload
-// only if it matches the author's signed hash.
-async function wantBlob(s, id) {
-  if (s.closed || s.wanted.has(id)) return;
-  s.wanted.add(id);
+// only if it matches the author's signed hash. A want expires on the relay
+// after 10 minutes, so s.wanted (item -> time of the last ask) is asked again
+// every REASK_MS for as long as the item is missing.
+const REASK_MS = 5 * 60 * 1000;
+const ASK_GRACE_MS = 30 * 1000;
+
+// "ok", "limit" (the relay has too many open wants: stop this round) or "error".
+async function wantBlob(s, id, { force = false } = {}) {
+  if (s.closed) return "ok";
+  const last = s.wanted.get(id);
+  if (!force && last !== undefined && Date.now() - last <= REASK_MS) return "ok";
+  s.wanted.set(id, Date.now());
+  // Let the card say nobody has answered yet.
+  setTimeout(() => {
+    const it = s.items.get(id);
+    if (it?.status === "evicted") s.render.item(it);
+  }, ASK_GRACE_MS + 500);
   try {
     await api("POST", `/v1/sessions/${s.sid}/items/${id}/want`, { token: s.identity.token });
+    s.askOk.add(id);
+    s.askErrors.delete(id);
   } catch (e) {
-    // Already back: fetch it. It stays wanted, so a relay that says present
-    // but then serves 410 cannot make this loop.
-    if (e.code === "present") reappeared(s, id, { keepWanted: true });
-    // Too many open, or a busy relay: ask again when the page next loads.
+    // The blob is on the relay: fetch it. It stays wanted, so a relay that
+    // says present but then serves 410 cannot make this loop.
+    if (e.code === "present") reappeared(s, id, { keepWanted: true, live: true });
+    else {
+      // Ask again in about half a minute rather than waiting a full interval.
+      s.wanted.set(id, Date.now() - REASK_MS + 30000);
+      s.askOk.delete(id);
+      s.askErrors.set(id, e.status ? e.message || `the relay answered ${e.status}` : "no connection to the relay");
+      const it = s.items.get(id);
+      if (it?.status === "evicted") s.render.item(it);
+      return e.status === 429 ? "limit" : "error";
+    }
+  }
+  return "ok";
+}
+
+// Ask again for everything still missing whose last ask is old. Wants the
+// relay already has open come first (refreshing one needs no new slot), then
+// the rest; each group oldest first. The relay's limit on open wants only
+// ends the round once it reaches the ones that need a new slot.
+async function reask(s) {
+  if (s.closed || s.reasking) return;
+  s.reasking = true;
+  try {
+    const due = [...s.wanted].filter(([id, at]) => s.items.get(id)?.status === "evicted" && Date.now() - at > REASK_MS)
+      .sort((a, b) => s.askOk.has(b[0]) - s.askOk.has(a[0]) || a[1] - b[1]);
+    for (const [id] of due) {
+      const open = s.askOk.has(id);
+      if ((await wantBlob(s, id)) === "limit" && !open) break;
+    }
+  } finally {
+    s.reasking = false;
   }
 }
 
+function reaskLoop(s) {
+  const tick = () => document.visibilityState === "visible" && reask(s);
+  setInterval(tick, 60000);
+  document.addEventListener("visibilitychange", tick);
+}
+
+// Upload what others asked for: at most MAX_UPLOADS at once, one per item at a
+// time, each after a random wait so every holder does not upload together. An
+// item whose ask was settled in the meantime (reseeded, evicted again) is
+// skipped. A refused upload (409, 429, ...) is dropped like any other.
+const MAX_UPLOADS = 2;
 async function tradeBlobs(s) {
-  for (const id of [...s.asked]) {
-    s.asked.delete(id);
-    const blob = await idbGet("blobs", [s.sid, id]);
-    if (!blob || s.closed) continue;
-    fetch(`/v1/sessions/${s.sid}/items/${id}/blob`, { method: "PUT", body: blob,
-      headers: { Authorization: `Bearer ${s.identity.token}` } }).catch(() => {});
+  if (s.uploading >= MAX_UPLOADS) return;
+  s.uploading++;
+  try {
+    for (;;) {
+      const id = [...s.asked].find((x) => !s.uploads.has(x));
+      if (!id) break;
+      s.uploads.add(id);
+      try {
+        await sleep(Math.random() * 2000);
+        if (!s.asked.delete(id) || s.closed) continue;
+        if (Date.now() - (s.uploaded.get(id) ?? 0) < 20000) continue;
+        const blob = await idbGet("blobs", [s.sid, id]);
+        if (!blob || s.closed) continue;
+        s.uploaded.set(id, Date.now());
+        await fetch(`/v1/sessions/${s.sid}/items/${id}/blob`, { method: "PUT", body: blob,
+          headers: { Authorization: `Bearer ${s.identity.token}` } }).catch(() => {});
+      } finally {
+        s.uploads.delete(id);
+      }
+    }
+  } finally {
+    s.uploading--;
   }
 }
 
-// An evicted blob is on the relay again: fetch it.
-function reappeared(s, id, { keepWanted = false } = {}) {
+// An evicted blob is on the relay again: fetch it, unless this is a replay of
+// history (offline, closed, cached) where nothing should touch the network.
+function reappeared(s, id, { keepWanted = false, live = false } = {}) {
   s.evicted.delete(id);
   if (!keepWanted) s.wanted.delete(id);
+  s.askErrors.delete(id);
   s.asked.delete(id);
   const it = s.items.get(id);
-  if (it && it.status === "evicted") {
+  if (live && !s.closed && it && it.status === "evicted") {
     it.status = "retry";
     receive(s, it.seq, it.envelope, true);
   }
@@ -809,6 +1093,7 @@ async function receive(s, seq, envelope, fetchBlob, attempt = 0) {
         .catch(() => {});
     }
   }
+  s.wanted.delete(h.id);
   if (it.kind === "result" && it.meta?.job?.id) {
     const list = s.results.get(it.meta.job.id) || [];
     if (!list.some((r) => r.id === it.id)) list.push(it);
@@ -829,12 +1114,27 @@ function renderItem(s, it) {
     el("span", { class: "when" }, hhmm(it.created),
       it.status === "ok" ? el("span", { class: "verified" }, " · ✓ verified") : null));
   const card = el("div", { class: "card" });
-  const node = el("article", { class: cls, id: `item-${it.id}` },
+  const node = el("article", { class: cls, id: `item-${it.id}`, tabindex: -1 },
     el("div", { class: `avatar ${av}`, "aria-hidden": "true" }, initials(it.authorName)),
     el("div", { class: "body" }, meta, card));
   if (it.status === "evicted") {
-    card.append(el("p", { class: "note" }, `A ${label} item was delivered and then removed from the relay before this browser downloaded it.`,
-      s.wanted.has(it.id) ? " Asked the participants who have it to send it again; it appears here if one of them is online." : ""));
+    const noun = { text: "message", file: "file", job: "job", result: "result" }[it.kind] || "item";
+    if (mine) card.append(el("p", { class: "note" }, `You sent this ${noun}, but this browser no longer has it and it is no longer on the relay.`));
+    else {
+      const asked = s.wanted.get(it.id);
+      const silent = asked !== undefined && Date.now() - asked > ASK_GRACE_MS;
+      const failed = s.askErrors.get(it.id);
+      card.append(el("p", { class: "note" }, `A ${noun} from ${it.authorName} was sent before this browser got it and is no longer on the relay. ` +
+        (failed ? `Could not ask: ${failed.replace(/\.$/, "")}. Try again.`
+          : silent ? "No one has answered yet. It appears when someone who has it opens this session."
+          : "Asking the others for a copy; it appears here if one of them has the session open.")),
+        el("div", { class: "row note-actions" }, el("button", { type: "button", class: "small", "data-keep": "ask", onclick: async (ev) => {
+          ev.currentTarget.disabled = true;
+          s.refocus = it.id;
+          await wantBlob(s, it.id, { force: true });
+          s.render.item(it);
+        } }, "Ask again")));
+    }
     return node;
   }
   if (it.status === "retry") {
@@ -850,15 +1150,17 @@ function renderItem(s, it) {
   if (m.type === "event") return renderEvent(s, it, meta);
   if (m.type === "text") card.append(el("p", {}, m.text));
   else if (m.type === "file") {
-    if (it.role === "runner") card.append(el("p", { class: "note" }, `Output file from runner ${it.authorName}, not listed by an accepted result.`));
+    if (it.role === "runner") card.append(el("p", { class: "note" }, s.runners.find((x) => x.pub === it.author)?.relayOnly
+      ? `Output file from runner ${it.authorName}. ${NOT_SHOWN_YET.replace("Not shown yet", "Not accepted yet")}`
+      : `Output file from runner ${it.authorName}, not listed by an accepted result.`));
     appendFileView(card, it);
   }
   else if (m.type === "job") renderJob(s, it, card);
   else if (m.type === "result") {
     const chk = resultCheck(s, it);
-    card.append(chk.ok ? renderResult(s, it) : rejectedResult(chk.error));
-    if (!chk.ok) node.classList.add("rejected");
-  } else card.append(el("pre", {}, JSON.stringify(m, null, 2)));
+    card.append(chk.ok ? renderResult(s, it) : rejectedResult(chk.error, chk.pending));
+    if (!chk.ok && !chk.pending) node.classList.add("rejected");
+  } else card.append(el("pre", { tabindex: 0 }, JSON.stringify(m, null, 2)));
   if (it.note) card.append(el("p", { class: "note" }, it.note));
   return node;
 }
@@ -876,13 +1178,13 @@ function appendFileView(card, it) {
     try {
       const entries = JSON.parse(ac.inspectZip(it.body));
       const files = entries.filter((e) => !e.is_dir);
-      card.append(el("ul", { class: "ziplist" }, entries.map((e) =>
+      card.append(el("ul", { class: "ziplist", tabindex: 0, "aria-label": "Files in the ZIP" }, entries.map((e) =>
         el("li", {}, el("span", {}, e.is_dir ? `${e.path}/` : e.path), el("span", {}, e.is_dir ? "" : fmtBytes(e.size))))),
         el("div", { class: "zipnote" }, `${files.length} file${files.length === 1 ? "" : "s"} · paths and sizes checked`));
     } catch (e) {
-      card.append(el("p", { class: "error" }, String(e.message || e)));
+      card.append(el("p", { class: "error" }, "This file is not a valid ZIP."), el("div", { class: "detail" }, String(e.message || e)));
     }
-  } else card.append(el("pre", {}, new TextDecoder().decode(it.body)));
+  } else card.append(el("pre", { tabindex: 0 }, new TextDecoder().decode(it.body)));
 }
 
 // ---------- execute mode: jobs, results, events ----------
@@ -915,8 +1217,9 @@ function notAvailableText(tgt) {
 function failureText(s, tgt, st) {
   if (st.reason === "not_available") return notAvailableText(tgt);
   if (st.reason === "cancelled") return "cancelled";
+  if (st.reason === "author_revoked") return "cancelled · its sender's access was revoked";
   const name = (st.runner ? memberName(s, st.runner) : null) || (tgt?.type === "runner" ? tgt.name : null) || "the runner";
-  const tail = { runner_unresponsive: "did not claim it", runner_lost: "went offline", runner_left: "left", runner_rejected: "was rejected" }[st.reason];
+  const tail = { runner_unresponsive: "did not claim it", runner_lost: "went offline", runner_left: "left", runner_rejected: "was rejected", runner_revoked: "was revoked" }[st.reason];
   return tail ? `failed · ${name} ${tail}` : `failed${st.reason ? ` · ${st.reason}` : ""}`;
 }
 
@@ -944,6 +1247,7 @@ function approvedRunners(s) {
 // Approvals changed: results that arrived earlier are checked again.
 function approvalsChanged(s) {
   s.decisions = null;
+  if (s.runnersLoaded) pollRunners(s); // runner cards depend on the signed approvals too
   for (const it of s.items.values()) if (it.kind === "result") delete it.check;
   for (const it of [...s.items.values()]) {
     if (it.status === "ok" && (it.kind === "result" || (it.kind === "file" && it.role === "runner"))) s.render.item(it);
@@ -957,12 +1261,20 @@ function hostJob(s, it) {
   return job && job.status === "ok" && job.kind === "job" ? job : null;
 }
 
+const NOT_SHOWN_YET = "Not shown yet: this browser has not received the owner's approval of this runner.";
+
 // Cached: does this result belong to its job and come from an approved runner?
 function resultCheck(s, r) {
   if (r.check) return r.check;
   if (r.role !== "runner") return { ok: false, error: "the author is not a runner" };
   const approved = approvedRunners(s);
-  if (approved && !approved.includes(r.author)) return { ok: false, error: "the author is not an approved runner" };
+  if (approved && !approved.includes(r.author)) {
+    // The relay's word is not enough: until the owner's approval reaches this
+    // browser (it may have left the relay before this browser joined), the
+    // result is not accepted. Not cached: the approval can still arrive.
+    if (s.runners.find((x) => x.pub === r.author)?.relayOnly) return { ok: false, pending: true, error: NOT_SHOWN_YET };
+    return { ok: false, error: "the author is not an approved runner" };
+  }
   const job = s.items.get(r.meta.job?.id);
   if (!job || job.status !== "ok" || !job.ref) return { ok: true, unbound: true };
   let chk;
@@ -1003,14 +1315,15 @@ function settle(s, it) {
   }
 }
 
-function rejectedResult(reason) {
-  return el("div", {}, el("p", { class: "note error" }, `✕ Result not accepted: ${reason}`));
+// `pending`: a neutral note, since the owner's approval may still arrive.
+function rejectedResult(reason, pending) {
+  return el("div", {}, pending ? el("p", { class: "note" }, reason) : el("p", { class: "note error" }, `✕ Result not accepted: ${reason}`));
 }
 
 function logBlock(label, text, truncated) {
   if (!text && !truncated) return null;
   return el("div", { class: "logblock" }, el("div", { class: "logname" }, label, truncated ? el("span", { class: "chip" }, "truncated") : null),
-    el("pre", {}, text || "(empty)"));
+    el("pre", { tabindex: 0 }, text || "(empty)"));
 }
 
 function renderResult(s, r, extra = "") {
@@ -1067,7 +1380,7 @@ function jobStatus(s, it) {
   for (const r of s.results.get(it.id) || []) {
     if (r.status !== "ok") continue;
     const chk = resultCheck(s, r);
-    if (!chk.ok) entries.push({ r, error: chk.error });
+    if (!chk.ok) entries.push({ r, error: chk.error, pending: chk.pending });
     else if (!accepted) {
       accepted = r;
       entries.push({ r });
@@ -1097,9 +1410,9 @@ function announceJob(s, it) {
 function renderJob(s, it, card) {
   const m = it.meta;
   const { st, entries, accepted, text, tone, runner } = jobStatus(s, it);
-  const rendered = entries.map((e) => (e.error ? rejectedResult(e.error) : renderResult(s, e.r, e.dup ? "ignored: duplicate" : "")));
+  const rendered = entries.map((e) => (e.error ? rejectedResult(e.error, e.pending) : renderResult(s, e.r, e.dup ? "ignored: duplicate" : "")));
   const lines = m.code.split("\n");
-  const code = el("pre", {}, m.code);
+  const code = el("pre", { tabindex: 0 }, m.code);
   const files = (m.files || []).map((ref) => s.items.get(ref.id)?.meta?.name || `item ${short(ref.id)}`);
   const active = !accepted && (st?.state === "assigned" || st?.state === "running");
   const canCancel = active && (s.inv.role === "owner" || it.author === s.me);
@@ -1185,17 +1498,29 @@ async function pollRunners(s) {
     }
     const first = !s.runnersLoaded;
     for (const x of list) {
-      // relayOnly counts as approved here, so the signed approval decrypting
-      // after the first poll is not announced as a change.
-      const label = x.rejected ? "rejected" : x.approved || x.relayOnly ? "approved" : "awaiting approval";
+      const label = x.rejected ? "rejected" : x.approved ? "approved" : "awaiting approval";
       if (!first && s.announce && s.runnerSeen.get(x.pub) !== label) announce(`Runner ${x.name}: ${label}`);
       s.runnerSeen.set(x.pub, label);
     }
     s.runnersLoaded = true;
     s.runners = list;
+    connState(s, "poll", true);
+    // Results from runners only the relay vouches for are held back until the approval arrives.
+    const relaySig = list.filter((x) => x.relayOnly).map((x) => x.pub).sort().join("|");
+    if (relaySig !== s.relaySig) {
+      s.relaySig = relaySig;
+      approvalsChanged(s);
+    }
     s.render.runners();
   } catch (e) {
-    if (e.status === 404 || e.status === 410 || e.status === 401) s.closed ||= "gone";
+    if (s.closed) return;
+    if (e.status === 404 || e.status === 410) {
+      s.closed = "gone";
+      s.render.closed("it is no longer on the relay");
+    } else if (e.status === 401) {
+      s.closed = "gone";
+      s.render.removed(REMOVED_UNSURE);
+    } else connState(s, "poll", false);
   } finally {
     s.polling = false;
   }
@@ -1212,8 +1537,9 @@ function runnerLoop(s) {
 
 // A runner's approval as the owner signed it (and whether approval is
 // required, from the signed manifest), never the relay's unsigned listing.
-// `relayOnly`: the relay says approved but no signed approval is readable
-// here (it may have left the relay before this browser joined).
+// `relayOnly`: the relay says approved but no approval signed by the owner has
+// reached this browser (it may have left the relay before this browser joined).
+// Such a runner counts as awaiting approval here.
 function runnerStatus(s, e) {
   const signed = approvedRunners(s);
   const rejected = !!e.rejected || signedDecisions(s).rejected.has(e.participant_pub);
@@ -1223,35 +1549,72 @@ function runnerStatus(s, e) {
 }
 
 function renderRunners(s, list, note) {
-  note.textContent = s.runners.length ? "" : "No runners yet. Hand out the runner invite from Invites.";
+  const owner = s.inv.role === "owner";
+  const text = (r) => {
+    const approval = r.rejected ? "rejected"
+      : r.approved ? "approved"
+      : r.relayOnly ? (owner ? "needs your confirmation" : "approval not received here")
+      : "awaiting approval";
+    const live = r.rejected ? "rejected" : !r.approved ? "awaiting approval" : r.online ? (r.job ? `busy · #${short(r.job)}` : "idle") : "offline";
+    return { approval, live, err: s.runnerErrors.get(r.pub) };
+  };
+  const revoked = s.revokedRoles.has("runner");
+  // The poll runs every few seconds: leave the list (and keyboard focus) alone
+  // unless something it shows has changed.
+  const sig = JSON.stringify([!!s.closed, revoked, s.runners.map((r) => [r.pub, r.name, r.description, r.labels, r.host, r.sandbox, r.networkUnblocked,
+    r.rejected, r.approved, r.relayOnly, text(r)])]);
+  if (list.dataset.sig === sig) return;
+  list.dataset.sig = sig;
+  const a = document.activeElement;
+  const idle = !a || a === document.body || !a.isConnected;
+  const focus = list.contains(a) && a.dataset?.act ? { pub: a.dataset.pub, act: a.dataset.act }
+    : idle && s.runnerFocus && Date.now() - s.runnerFocus.at < 10000 ? s.runnerFocus : null;
+  s.runnerFocus = null;
+  note.textContent = revoked ? "Runner access was revoked. Runners cannot join this session any more."
+    : s.runners.length ? "" : owner ? "No runners yet. Hand out the runner invite from Invites." : "No runners have joined yet.";
   list.replaceChildren(...s.runners.map((r) => {
-    const approval = r.rejected ? "rejected" : r.approved ? "approved" : r.relayOnly ? "approved by relay · no signed approval here" : "awaiting approval";
-    const owner = s.inv.role === "owner";
-    const live = r.rejected ? "rejected" : !r.approved && !r.relayOnly ? "awaiting approval" : r.online ? (r.job ? `busy · #${short(r.job)}` : "idle") : "offline";
+    const { approval, live, err } = text(r);
     const dot = r.rejected ? "" : !r.approved ? "wait" : r.online ? "on" : "";
-    const err = s.runnerErrors.get(r.pub);
+    // Kept after a failed approval: the relay may say approved while the
+    // owner's approval never got posted, and the owner must be able to retry.
+    const canApprove = owner && !r.rejected && (!r.approved || !!err);
+    const warn = r.networkUnblocked && !r.rejected
+      ? el("span", { class: "chip warn", title: "This runner's sandbox cannot block network access" }, "⚠ network not blocked") : null;
+    const act = (name, label, cls, approve) => el("button", { type: "button", class: `small ${cls}`, "data-pub": r.pub, "data-act": name,
+      disabled: !!s.closed, onclick: (ev) => decideRunner(s, r, approve, ev.currentTarget) }, label);
     return el("li", { class: `runner${r.rejected ? " is-rejected" : ""}` },
       el("div", { class: "rhead" },
         el("span", { class: `dot ${dot}`, "aria-hidden": "true" }),
-        el("strong", { class: "name" }, r.name),
-        el("span", { class: "sub" }, live)),
+        el("strong", { class: "name", title: r.name }, r.name),
+        el("span", { class: "sub" }, live),
+        el("span", { class: "key", title: "Key fingerprint" }, ac.fingerprint(r.pub).slice(0, 4))),
       el("div", { class: "sub" }, `${r.sandbox} · ${r.host}`),
       r.description ? el("div", { class: "desc", title: "The runner's own description, not verified" }, el("span", { class: "claim" }, "says "), r.description) : null,
       r.labels.length ? el("div", { class: "chips" }, r.labels.map((l) => el("span", { class: "chip" }, l))) : null,
       el("div", { class: "chips" },
         el("span", { class: `chip approval ${r.rejected ? "bad" : r.approved ? "good" : "wait"}` }, approval),
-        r.networkUnblocked && !r.rejected ? el("span", { class: "chip warn", title: "This runner's sandbox cannot block network access" }, "⚠ network not blocked") : null),
+        canApprove ? null : warn),
+      owner && r.relayOnly && !r.rejected ? el("p", { class: "sub confirm-note" },
+        "The relay says this runner is approved, but this browser has no approval from you on record. Confirm only if you approved it. Its key: ",
+        el("span", { class: "mono" }, ac.fingerprint(r.pub).slice(0, 16).replace(/(.{4})(?=.)/g, "$1 ")), ".") : null,
+      owner && canApprove && warn ? el("p", { class: "sub net-note" }, "Jobs on this runner can reach the internet. Approve only if you trust the code senders submit.") : null,
       owner && !r.rejected ? el("div", { class: "row" },
-        // Kept after a failed approval: the relay may say approved while the
-        // signed approval never got posted, and the owner must be able to retry.
-        r.approved && !err ? null : el("button", { type: "button", class: "small primary", onclick: (ev) => decideRunner(s, r, true, ev.currentTarget) }, "Approve"),
-        el("button", { type: "button", class: "small danger", onclick: (ev) => decideRunner(s, r, false, ev.currentTarget) }, "Reject")) : null,
+        canApprove ? [warn, act("approve", r.relayOnly ? "Confirm approval" : "Approve", "primary", true)] : null,
+        act("reject", "Reject", "danger", false)) : null,
       err ? el("p", { class: "error", role: "alert" }, err) : null);
   }));
+  if (focus) {
+    const btns = [...list.querySelectorAll("button[data-act]")].filter((b) => b.dataset.pub === focus.pub && !b.disabled);
+    // The same button, or its runner's remaining one when the clicked one is gone.
+    (btns.find((b) => b.dataset.act === focus.act) || btns[0] || document.getElementById("runner-console"))?.focus({ preventScroll: true });
+  }
 }
 
 async function decideRunner(s, r, approve, btn) {
   if (!approve && !confirm(`Reject runner ${r.name}? It is removed from the session and its job fails.`)) return;
+  // The poll redraws the list: remember what had focus, since the clicked
+  // button is disabled (and unfocused) by then.
+  s.runnerFocus = { pub: r.pub, act: btn.dataset.act, at: Date.now() };
   btn.disabled = true;
   s.runnerErrors.delete(r.pub);
   try {
@@ -1259,8 +1622,9 @@ async function decideRunner(s, r, approve, btn) {
       : { type: "event", event: "runner_reject", participant_pub: r.pub, reason: null };
     const relay = () => api("POST", `/v1/sessions/${s.sid}/runners/${encodeURIComponent(r.pub)}/${approve ? "approve" : "reject"}`, { token: s.identity.token });
     // Approve on the relay first: a runner awaiting approval is not a
-    // recipient, so the relay would not keep the signed event for it.
-    if (approve) await relay();
+    // recipient, so the relay would not keep the owner's event for it.
+    // (A runner the relay already approved needs only the event.)
+    if (approve && !r.relayOnly) await relay();
     await sendPayload(s, "event", null, meta, new Uint8Array());
     if (!approve) await relay();
     await pollRunners(s);
@@ -1269,6 +1633,7 @@ async function decideRunner(s, r, approve, btn) {
     s.render.runners();
   } finally {
     btn.disabled = false;
+    if (btn.isConnected && (!document.activeElement || document.activeElement === document.body)) btn.focus({ preventScroll: true });
   }
 }
 
@@ -1277,8 +1642,9 @@ function buildJobPanel(s, text, file) {
   const lim = s.manifest.job_limits;
   let on = false;
   let sendBtn;
-  let optsSig = "";
+  let optsSig = null; // null: the options are not drawn yet (an empty list has an empty signature too)
   let filesSig = null;
+  let locked = false;
   const target = el("select", { id: "job-target" });
   const labels = el("input", { type: "text", id: "job-labels", placeholder: "gpu, cpu", autocomplete: "off", "aria-label": "Runner labels" });
   const labelField = el("div", { class: "stack field", hidden: true }, el("label", { for: "job-labels" }, "Labels"), labels);
@@ -1298,17 +1664,21 @@ function buildJobPanel(s, text, file) {
     const n = s.picked.size;
     filesSummary.textContent = `Input files · ${n ? `${n} selected` : "none selected"}`;
   };
-  const toggle = el("button", { type: "button", class: "small", "aria-pressed": "false", onclick: () => {
-    on = !on;
+  const setOn = (v) => {
+    on = v;
     toggle.setAttribute("aria-pressed", String(on));
     toggle.classList.toggle("on", on);
     panel.hidden = !on;
-    optsSig = "";
+    optsSig = null;
     filesSig = null;
     text.placeholder = on ? "Python code to run (or attach a .py file)…" : "Message the session…";
+    text.classList.toggle("code", on);
+    text.spellcheck = !on;
+    text.rows = on ? 7 : 2;
     if (sendBtn) sendBtn.textContent = on ? "Send job" : "Send";
     refresh();
-  } }, "Send as job");
+  };
+  const toggle = el("button", { type: "button", class: "small", "aria-pressed": "false", onclick: () => setOn(!on) }, "Send as job");
   target.addEventListener("change", () => (labelField.hidden = target.value !== "labels"));
 
   function refresh() {
@@ -1317,9 +1687,9 @@ function buildJobPanel(s, text, file) {
     const opts = [el("option", { value: "any" }, "Any idle runner"), el("option", { value: "labels" }, "Labels…")];
     for (const r of s.runners) {
       if (r.rejected) continue;
-      opts.push(el("option", { value: `runner:${r.pub}` }, `${r.name}${r.online ? "" : " (offline)"}${r.approved ? "" : " (not approved)"}`));
+      opts.push(el("option", { value: `runner:${r.pub}` }, `${r.name}${r.online ? "" : " (offline)"}${r.approved ? "" : r.relayOnly ? " (not approved here)" : " (not approved)"}`));
     }
-    const sig = s.runners.map((r) => `${r.pub}${r.name}${r.online}${r.approved}${r.rejected}`).join("|");
+    const sig = s.runners.map((r) => `${r.pub}${r.name}${r.online}${r.approved}${r.relayOnly}${r.rejected}`).join("|");
     if (sig !== optsSig) {
       optsSig = sig;
       target.replaceChildren(...opts);
@@ -1332,7 +1702,7 @@ function buildJobPanel(s, text, file) {
     if (fsig === filesSig) return;
     filesSig = fsig;
     files.replaceChildren(...(cands.length ? cands.map((i) => el("label", { class: "option check" },
-      el("input", { type: "checkbox", checked: s.picked.has(i.id), onchange: (ev) => {
+      el("input", { type: "checkbox", checked: s.picked.has(i.id), disabled: locked, onchange: (ev) => {
         if (ev.target.checked) s.picked.add(i.id);
         else s.picked.delete(i.id);
         countPicked();
@@ -1344,9 +1714,13 @@ function buildJobPanel(s, text, file) {
     let filename = "main.py";
     let code;
     if (f) {
-      if (!/\.py$/i.test(f.name)) throw new Error("attach a .py file, or write the code in the message box");
+      if (!/\.py$/i.test(f.name)) throw rejectFile(f, "is not a .py file: attach a .py file, or write the code in the message box");
       filename = f.name;
-      code = new TextDecoder("utf-8", { fatal: true }).decode(await f.arrayBuffer());
+      try {
+        code = new TextDecoder("utf-8", { fatal: true }).decode(await f.arrayBuffer());
+      } catch {
+        throw rejectFile(f, "is not valid UTF-8 text");
+      }
     } else {
       code = text.value;
       if (!code.trim()) throw new Error("attach a .py file or write code in the message box");
@@ -1355,7 +1729,7 @@ function buildJobPanel(s, text, file) {
     const t = Number(timeout.value);
     if (!Number.isInteger(t) || t < 1 || t > lim.timeout_s) throw new Error(`timeout must be 1 to ${lim.timeout_s} seconds`);
     let tgt;
-    if (target.value === "any") tgt = { type: "any" };
+    if (!target.value || target.value === "any") tgt = { type: "any" };
     else if (target.value === "labels") {
       const ls = labels.value.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
       if (!ls.length) throw new Error("enter at least one label, such as gpu");
@@ -1383,7 +1757,14 @@ function buildJobPanel(s, text, file) {
     return true;
   }
 
-  return { panel, toggle, refresh, submit, active: () => on, setSend: (b) => (sendBtn = b) };
+  // Access gone or session closed: job mode off, nothing in the panel live.
+  const lock = () => {
+    locked = true;
+    setOn(false);
+    toggle.disabled = true;
+    for (const c of panel.querySelectorAll("select, input, summary")) c.disabled = true;
+  };
+  return { panel, toggle, refresh, submit, lock, off: () => setOn(false), active: () => on, setSend: (b) => (sendBtn = b) };
 }
 
 // ---------- sending ----------
@@ -1405,18 +1786,34 @@ async function sendPayload(s, kind, subkind, meta, body, { path = "items", heade
   return item.id;
 }
 
+// A file that can never be sent is dropped from the composer, not kept to fail again.
+function rejectFile(f, why) {
+  const e = new Error(`"${f.name}" ${why}`);
+  e.clearFile = true;
+  return e;
+}
+
 async function sendFile(s, f) {
   const dot = f.name.lastIndexOf(".");
   const ext = dot < 0 ? "" : f.name.slice(dot).toLowerCase();
   const t = FILE_TYPES[ext];
-  if (!t) throw new Error(`${ext || "files without an extension"} cannot be shared (allowed: .py .md .zip .png .jpg .webp)`);
+  if (!t) throw rejectFile(f, `cannot be shared: ${ext ? `${ext} files are not` : "files without an extension are not"} allowed (allowed: .py .md .zip .png .jpg .webp)`);
   let [subkind, mime] = t;
+  if (!s.manifest.allowed_types.includes(subkind)) throw rejectFile(f, `cannot be shared: ${subkind} files are not allowed in this session`);
   let bytes = new Uint8Array(await f.arrayBuffer());
-  if (subkind === "image") {
-    const clean = ac.sanitizeImage(bytes);
-    mime = clean.mime;
-    bytes = clean.data;
-  } else if (subkind === "zip") ac.inspectZip(bytes);
+  try {
+    if (subkind === "image") {
+      const clean = ac.sanitizeImage(bytes);
+      mime = clean.mime;
+      bytes = clean.data;
+    } else if (subkind === "zip") ac.inspectZip(bytes);
+  } catch (e) {
+    const why = String(e.message || e).replace(/^\w+Error: /, "");
+    if (subkind !== "zip") throw rejectFile(f, `cannot be shared: ${why}`);
+    const err = new Error(`"${f.name}" is not a valid ZIP.`);
+    Object.assign(err, { clearFile: true, detail: why });
+    throw err;
+  }
   await sendPayload(s, "file", subkind, { type: "file", name: f.name, mime }, bytes);
 }
 
@@ -1435,36 +1832,76 @@ function parseSse(block) {
   return ev.kind && ev.data ? { seq: ev.seq, kind: ev.kind, data: JSON.parse(ev.data) } : null;
 }
 
+// Show "Reconnecting…" only once the stream or the runner poll has been failing
+// for a moment, so a reconnect that works at once shows nothing.
+function connState(s, key, ok) {
+  s.connBad ||= new Set();
+  if (ok) s.connBad.delete(key);
+  else s.connBad.add(key);
+  if (!s.connBad.size) {
+    clearTimeout(s.connTimer);
+    s.connTimer = 0;
+    return s.render.conn(false);
+  }
+  s.connTimer ||= setTimeout(() => {
+    s.connTimer = 0;
+    s.render.conn(s.connBad.size > 0);
+  }, 2500);
+}
+
+// The relay's keep-alive comment arrives about every 15 s; a stream silent for
+// much longer is dead even if the browser has not noticed.
+const STREAM_SILENCE_MS = 45000;
+
 async function streamLoop(s) {
   let delay = 1000;
+  addEventListener("offline", () => connState(s, "net", false));
+  addEventListener("online", () => connState(s, "net", true));
+  if (navigator.onLine === false) connState(s, "net", false);
   while (!s.closed) {
+    let watchdog;
     try {
       const headers = { Authorization: `Bearer ${s.identity.token}` };
       if (s.lastSeq >= 0) headers["Last-Event-ID"] = String(s.lastSeq);
-      const r = await fetch(`/v1/sessions/${s.sid}/stream`, { headers });
-      if (r.status === 404 || r.status === 410) {
+      const ctl = new AbortController();
+      const arm = () => {
+        clearTimeout(watchdog);
+        watchdog = setTimeout(() => ctl.abort(), STREAM_SILENCE_MS);
+      };
+      arm();
+      const r = await fetch(`/v1/sessions/${s.sid}/stream`, { headers, signal: ctl.signal });
+      if (r.status === 404 || r.status === 410 || r.status === 401) {
         s.closed = "gone";
-        s.render.closed("it is no longer on the relay");
+        if (r.status === 401) s.render.removed(REMOVED_UNSURE);
+        else s.render.closed("it is no longer on the relay");
         return;
       }
       if (!r.ok) throw new Error(`stream ${r.status}`);
       delay = 1000;
+      connState(s, "stream", true);
+      reask(s); // wants may have run out while the stream was down
       const reader = r.body.pipeThrough(new TextDecoderStream()).getReader();
       let buf = "";
       for (;;) {
         const { value, done } = await reader.read();
         if (done) break;
+        arm();
         buf += value;
         let i;
         while ((i = buf.indexOf("\n\n")) >= 0) {
           const ev = parseSse(buf.slice(0, i));
           buf = buf.slice(i + 2);
-          if (ev) await applyEvent(s, ev, { fetch: true, record: true });
+          if (ev) {
+            ev.at = Date.now();
+            await applyEvent(s, ev, { fetch: true, record: true });
+          }
         }
       }
     } catch (e) {
       console.warn("stream interrupted", e);
+      if (!s.closed) connState(s, "stream", false);
     }
+    clearTimeout(watchdog);
     if (!s.closed) {
       await sleep(delay);
       delay = Math.min(delay * 2, 30000);

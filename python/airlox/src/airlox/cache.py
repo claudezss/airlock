@@ -49,6 +49,8 @@ def _write_atomic(path: Path, data: bytes, mode: int = 0o600) -> None:
 class Cache:
     def __init__(self, root: Path, session_id: str) -> None:
         self.dir = Path(root) / session_id
+        # A new cache root is private too: its entries name the sessions.
+        Path(root).mkdir(mode=0o700, parents=True, exist_ok=True)
         (self.dir / "blobs").mkdir(parents=True, exist_ok=True)
         os.chmod(self.dir, 0o700)
 

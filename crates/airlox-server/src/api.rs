@@ -2,7 +2,7 @@
 //! author's certificate; the relay never sees plaintext. Log writes fsync,
 //! so they run on the blocking pool, never on the async workers.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -30,7 +30,7 @@ use tokio::sync::{broadcast, watch};
 use crate::error::{ApiError, ApiResult};
 use crate::store::{
     sync_dir, CreateError, Event, Inner, JobState, Rec, Session, Store, MAX_OPEN_WANTS, MAX_PARTICIPANTS,
-    MAX_STREAMS_PER_PARTICIPANT, MAX_WANTS,
+    MAX_STREAMS_PER_PARTICIPANT, MAX_WANTS, MAX_WANT_LINES, MAX_WANT_LINES_SESSION, WANT_TTL_MS,
 };
 use crate::util::{new_token, now_ms, random_suffix, sha256_hex};
 
@@ -44,6 +44,13 @@ pub const MAX_CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
 pub const BODY_IDLE: Duration = Duration::from_secs(30);
 /// Log space reserved per line beyond its payload (seq, timestamps, token hash).
 const LOG_LINE_OVERHEAD: u64 = 512;
+/// Re-seed uploads one participant may have in flight, and uploads of one
+/// blob in flight at once.
+const MAX_RESEEDS_IN_FLIGHT: usize = 4;
+const MAX_RESEEDS_PER_ITEM: usize = 3;
+/// Audit exports built at once, relay-wide: each holds about twice its log
+/// in memory.
+static AUDITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -245,6 +252,13 @@ pub async fn join(
         if g.closed {
             return Err(ApiError::gone("closed", "session is closed"));
         }
+        if g.revoked.contains(&role) {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "revoked",
+                "the owner revoked this invite's role",
+            ));
+        }
         if g.participants.contains_key(&pk2) {
             return Err(ApiError::conflict(
                 "this key has already joined; a client that lost its token joins again with a new key",
@@ -389,9 +403,18 @@ pub async fn stream(
                 _ = st.shutdown.changed() => return None,
             }
         };
-        if ev.kind == "closed" {
-            st.done = true;
-        }
+        // The last event a participant gets: the session closed, or it left,
+        // was rejected or was revoked (its token no longer works).
+        let me = &st._slot.who;
+        st.done = match ev.kind {
+            "closed" => true,
+            "left" => ev.data["participant_pub"] == me.as_str(),
+            "runner" => ev.data["participant_pub"] == me.as_str() && ev.data["status"] == "rejected",
+            "revoked" => {
+                ev.data["participants"].as_array().is_some_and(|a| a.iter().any(|p| p == me.as_str()))
+            }
+            _ => false,
+        };
         Some((Ok(sse_event(&ev)), st))
     });
     Ok(Sse::new(out).keep_alive(KeepAlive::default()))
@@ -431,6 +454,7 @@ pub(crate) struct Upload {
     env_json: String,
     pub(crate) env: ItemEnvelope,
     blob_len: u64,
+    blob_sha256: String,
     tmp_path: std::path::PathBuf,
     reservation: Reservation,
 }
@@ -520,24 +544,27 @@ pub(crate) async fn receive_upload(
     };
 
     let first = Bytes::copy_from_slice(&buf[4 + n..]);
-    let tmp_path = receive_blob(s, &env, blob_len, first, chunks, &mut reservation).await?;
-    Ok(Upload { env_json, env, blob_len, tmp_path, reservation })
+    // A steady trickle still has to finish: allow two minutes plus 16 KiB/s.
+    let deadline = Duration::from_secs(120 + blob_len / (16 * 1024));
+    let (tmp_path, digest) =
+        receive_blob(s, &env, blob_len, first, chunks, deadline, &mut reservation).await?;
+    let blob_sha256 = airlox_core::encoding::b64e(&digest);
+    Ok(Upload { env_json, env, blob_len, blob_sha256, tmp_path, reservation })
 }
 
 /// Stream a blob (`first`, then the rest of the body) to a temp file in the
 /// session's blob directory, checking its length and its SHA-256 against
-/// the signed envelope. Returns the temp file's path.
+/// the signed envelope. Returns the temp file's path and the SHA-256.
 async fn receive_blob(
     s: &Session,
     env: &ItemEnvelope,
     blob_len: u64,
     first: Bytes,
     mut chunks: BodyDataStream,
+    deadline: Duration,
     reservation: &mut Reservation,
-) -> ApiResult<std::path::PathBuf> {
+) -> ApiResult<(std::path::PathBuf, [u8; 32])> {
     let tmp_path = s.dir.join("blobs").join(format!(".{}.{}.tmp", env.header.id, random_suffix()));
-    // A steady trickle still has to finish: allow two minutes plus 16 KiB/s.
-    let deadline = Duration::from_secs(120 + blob_len / (16 * 1024));
     let mut written: u64 = 0;
     let upload = async {
         let mut file = tokio::fs::OpenOptions::new()
@@ -571,11 +598,13 @@ async fn receive_blob(
         Err(_) => Err(ApiError::timeout()),
     };
     reservation.received = written;
-    if let Err(e) = result.and_then(|d| env.verify_blob_digest(blob_len, &d).map_err(ApiError::from)) {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(e);
+    match result.and_then(|d| env.verify_blob_digest(blob_len, &d).map(|()| d).map_err(ApiError::from)) {
+        Ok(d) => Ok((tmp_path, d)),
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            Err(e)
+        }
     }
-    Ok(tmp_path)
 }
 
 /// Move the blob into place and append the item to the log. `then` runs
@@ -587,7 +616,7 @@ pub(crate) fn commit_upload<T>(
     up: Upload,
     then: impl FnOnce(&Session, &mut Inner, u64) -> ApiResult<T>,
 ) -> ApiResult<(u64, T)> {
-    let Upload { env_json, env, blob_len, tmp_path, mut reservation } = up;
+    let Upload { env_json, env, blob_len, blob_sha256, tmp_path, mut reservation } = up;
     let final_path = s.blob_path(&env.header.id);
     let commit = || -> ApiResult<(u64, T)> {
         std::fs::rename(&tmp_path, &final_path).map_err(closed_if_missing)?;
@@ -596,13 +625,18 @@ pub(crate) fn commit_upload<T>(
         if g.closed {
             return Err(ApiError::gone("closed", "session is closed"));
         }
+        // The author may have left, been rejected or revoked while uploading.
+        if !g.is_live(who) {
+            return Err(ApiError::unauthorized());
+        }
         let recipients: Vec<String> = g.active_participants().filter(|k| *k != who).cloned().collect();
         g.pending.remove(&reservation.id);
         g.pending_bytes -= blob_len;
         // Applying the Item record charges the transfer for real.
         g.transfer_bytes -= blob_len;
         reservation.committed = true;
-        let seq = match s.append(&mut g, Rec::Item { envelope: env_json, recipients, blob_len }) {
+        let rec = Rec::Item { envelope: env_json, recipients, blob_len, blob_sha256: Some(blob_sha256) };
+        let seq = match s.append(&mut g, rec) {
             Ok(ev) => ev.map(|e| e.seq).unwrap_or_default(),
             Err(e) => {
                 g.transfer_bytes += blob_len;
@@ -747,7 +781,7 @@ pub async fn ack(
     blocking(move || {
         let mut g = s.lock();
         let r = g.items.get(&item).ok_or_else(|| ApiError::not_found("no such item"))?;
-        if r.recipients.contains(&who) && !r.acked.contains(&who) && !g.closed {
+        if r.recipients.contains(&who) && !r.acked.contains(&who) && !g.closed && g.is_live(&who) {
             s.append(&mut g, Rec::Ack { item, by: who })?;
         }
         Ok(())
@@ -758,7 +792,12 @@ pub async fn ack(
 
 /// `POST /v1/sessions/:id/items/:item/want` — ask the participants still
 /// holding an evicted blob to upload it again. Only for a participant that
-/// never received it; rate-limited per participant.
+/// never received it, and for a runner only once it is approved;
+/// rate-limited per participant. Asking again while the want is open
+/// refreshes it in memory, with no log line or event, except every
+/// `WANT_TTL_MS`, when it is announced to holders again. A re-seed upload in
+/// progress does not answer a want: it may fail, and the wanter must stay a
+/// recipient if it succeeds.
 pub async fn want(
     State(st): State<AppState>,
     Path((id, item)): Path<(String, String)>,
@@ -766,29 +805,49 @@ pub async fn want(
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     item_path_ok(&item)?;
     let s = session(&st, &id)?;
-    let (who, _) = auth(&s, &headers)?;
+    let (who, role) = auth(&s, &headers)?;
     let max_log = st.store.cfg.max_log_bytes;
     blocking(move || {
         let mut g = s.lock();
         if g.closed {
             return Err(ApiError::gone("closed", "session is closed"));
         }
+        if !g.is_live(&who) {
+            return Err(ApiError::unauthorized());
+        }
+        if role == Role::Runner && !g.runner_eligible(&who) {
+            return Err(ApiError::forbidden("this runner is not approved"));
+        }
         let r = g.items.get(&item).ok_or_else(|| ApiError::not_found("no such item"))?;
-        if r.blob_present || g.pending.contains(&item) {
+        if r.blob_present {
             return Err(ApiError::conflict_code("present", "the blob is on the relay; download it"));
         }
         if r.acked.contains(&who) {
             return Err(ApiError::forbidden("you have already received this item"));
         }
-        g.prune_wants(now_ms());
-        if g.wants.get(&item).is_some_and(|w| w.contains_key(&who)) {
-            return Ok((StatusCode::ACCEPTED, Json(json!({"open": true}))));
+        let now = now_ms();
+        g.prune_wants(now);
+        if let Some(t) = g.wants.get_mut(&item).and_then(|w| w.get_mut(&who)) {
+            // Open: keep it open. Tell holders again (a logged line) only
+            // every WANT_TTL_MS, for those whose earlier upload was refused.
+            *t = now;
+            let announced = g.want_announced.get(&item).and_then(|w| w.get(&who)).copied().unwrap_or(0);
+            if now.saturating_sub(announced) < WANT_TTL_MS {
+                return Ok((StatusCode::ACCEPTED, Json(json!({"open": true}))));
+            }
+        } else {
+            if g.open_wants(&who) >= MAX_OPEN_WANTS {
+                return Err(ApiError::limit("too many open wants; wait for some to be answered"));
+            }
+            let asked = g.wanted_items.get(&who);
+            if asked.is_some_and(|a| a.len() >= MAX_WANTS && !a.contains(&item)) {
+                return Err(ApiError::limit("this participant has asked for too many blobs"));
+            }
         }
-        if g.open_wants(&who) >= MAX_OPEN_WANTS {
-            return Err(ApiError::limit("too many open wants; wait for some to be answered"));
-        }
-        if g.want_counts.get(&who).copied().unwrap_or(0) >= MAX_WANTS {
-            return Err(ApiError::limit("this participant has asked for too many blobs"));
+        if g.want_lines.get(&who).copied().unwrap_or(0) >= MAX_WANT_LINES
+            || g.want_lines.values().sum::<u32>() >= MAX_WANT_LINES_SESSION
+        {
+            return Err(ApiError::limit("this session has had too many requests for evicted blobs"));
         }
         if g.log_len() + LOG_LINE_OVERHEAD > max_log {
             return Err(ApiError::too_large("session history limit reached"));
@@ -802,6 +861,8 @@ pub async fn want(
 /// `PUT /v1/sessions/:id/items/:item/blob` — re-seed an evicted blob: the
 /// raw ciphertext, accepted only while a want for it is open and it is
 /// absent, and only if its SHA-256 matches the author-signed envelope.
+/// Holders may upload at once and the first to finish wins, so one slow or
+/// stalled uploader cannot hold the others off.
 pub async fn reseed(
     State(st): State<AppState>,
     Path((id, item)): Path<(String, String)>,
@@ -810,21 +871,45 @@ pub async fn reseed(
 ) -> ApiResult<StatusCode> {
     item_path_ok(&item)?;
     let s = session(&st, &id)?;
-    let (who, _) = auth(&s, &headers)?;
+    let (who, role) = auth(&s, &headers)?;
     if !st.store.disk_ok() {
         return Err(ApiError::storage_full());
     }
     let cfg = st.store.cfg.clone();
+    // Pending under its own key, apart from the item id and from other
+    // holders' uploads of the same blob.
+    let key = format!("{item}/reseed/{who}");
     let (env, mut reservation) = {
         let mut g = s.lock();
+        if !g.is_live(&who) {
+            return Err(ApiError::unauthorized());
+        }
+        if role == Role::Runner && !g.runner_eligible(&who) {
+            return Err(ApiError::forbidden("this runner is not approved"));
+        }
         let r = g.items.get(&item).ok_or_else(|| ApiError::not_found("no such item"))?;
-        if r.blob_present || g.pending.contains(&item) {
-            return Err(ApiError::conflict_code("present", "the blob is on the relay or being uploaded"));
+        if r.blob_present {
+            return Err(ApiError::conflict_code("present", "the blob is on the relay"));
         }
         let blob_len = r.blob_len;
+        if g.pending.contains(&key) {
+            return Err(ApiError::conflict_code("uploading", "you are already uploading this blob"));
+        }
+        let prefix = format!("{item}/reseed/");
+        if g.pending.iter().filter(|k| k.starts_with(&prefix)).count() >= MAX_RESEEDS_PER_ITEM {
+            return Err(ApiError::conflict_code("uploading", "others are already uploading this blob"));
+        }
+        let suffix = format!("/reseed/{who}");
+        if g.pending.iter().filter(|k| k.ends_with(&suffix)).count() >= MAX_RESEEDS_IN_FLIGHT {
+            return Err(ApiError::limit("too many re-seed uploads at once"));
+        }
         g.prune_wants(now_ms());
         if !g.wants.get(&item).is_some_and(|w| w.keys().any(|k| *k != who)) {
             return Err(ApiError::conflict_code("not_wanted", "no one is waiting for this blob"));
+        }
+        let declared = headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
+        if declared.is_some_and(|n| n != blob_len) {
+            return Err(ApiError::bad_request("body", "the body is not the size the envelope signs"));
         }
         let env_json = g
             .item_event(&item)
@@ -837,12 +922,12 @@ pub async fn reseed(
         if g.transfer_bytes + blob_len > cfg.max_session_transfer {
             return Err(ApiError::limit("session transfer limit reached"));
         }
-        g.pending.insert(item.clone());
+        g.pending.insert(key.clone());
         g.pending_bytes += blob_len;
         g.transfer_bytes += blob_len;
         let res = Reservation {
             session: s.clone(),
-            id: item.clone(),
+            id: key.clone(),
             bytes: blob_len,
             received: 0,
             committed: false,
@@ -850,25 +935,53 @@ pub async fn reseed(
         (env, res)
     };
     let blob_len = reservation.bytes;
-    let tmp_path =
-        receive_blob(&s, &env, blob_len, Bytes::new(), body.into_data_stream(), &mut reservation).await?;
+    // Holders have the whole blob at hand: a shorter deadline than first
+    // uploads, so a stalled upload holds its slot briefly.
+    let deadline = Duration::from_secs(30 + blob_len / (128 * 1024));
+    let (tmp_path, _) =
+        receive_blob(&s, &env, blob_len, Bytes::new(), body.into_data_stream(), deadline, &mut reservation)
+            .await?;
     blocking(move || {
         let final_path = s.blob_path(&item);
-        let commit = || -> ApiResult<()> {
-            std::fs::rename(&tmp_path, &final_path).map_err(closed_if_missing)?;
-            sync_dir(final_path.parent().expect("blob has a parent")).map_err(closed_if_missing)?;
+        // Checked and moved into place under the lock: another holder's
+        // upload may have won meanwhile, and its file must not be touched.
+        let mut placed = false;
+        // An upload that lost to another holder, or that nobody waits for
+        // any more, is not charged: honest holders answer the same want.
+        let mut lost = false;
+        let mut commit = || -> ApiResult<()> {
             let mut g = s.lock();
             if g.closed {
                 return Err(ApiError::gone("closed", "session is closed"));
             }
-            g.pending.remove(&item);
+            if !g.is_live(&who) {
+                return Err(ApiError::unauthorized());
+            }
+            if g.items.get(&item).is_some_and(|r| r.blob_present) {
+                lost = true;
+                return Err(ApiError::conflict_code("present", "another holder re-seeded it first"));
+            }
+            // The wanters may have left, been revoked or stopped asking
+            // during the upload; then nobody would fetch it.
+            g.prune_wants(now_ms());
+            if !g.wants.get(&item).is_some_and(|w| w.keys().any(|k| *k != who)) {
+                lost = true;
+                return Err(ApiError::conflict_code(
+                    "not_wanted",
+                    "no one is waiting for this blob any more",
+                ));
+            }
+            std::fs::rename(&tmp_path, &final_path).map_err(closed_if_missing)?;
+            placed = true;
+            sync_dir(final_path.parent().expect("blob has a parent")).map_err(closed_if_missing)?;
+            g.pending.remove(&key);
             g.pending_bytes -= blob_len;
             // Applying the Reseed record charges the transfer for real.
             g.transfer_bytes -= blob_len;
             reservation.committed = true;
-            if let Err(e) = s.append(&mut g, Rec::Reseed { item: item.clone(), by: who }) {
+            if let Err(e) = s.append(&mut g, Rec::Reseed { item: item.clone(), by: who.clone() }) {
                 g.transfer_bytes += blob_len;
-                g.pending.insert(item.clone());
+                g.pending.insert(key.clone());
                 g.pending_bytes += blob_len;
                 reservation.committed = false;
                 reservation.received = blob_len;
@@ -879,11 +992,104 @@ pub async fn reseed(
         let r = commit();
         if r.is_err() && !reservation.committed {
             let _ = std::fs::remove_file(&tmp_path);
-            let _ = std::fs::remove_file(&final_path);
+            if placed {
+                let _ = std::fs::remove_file(&final_path);
+            }
+            if lost {
+                reservation.received = 0;
+            }
         }
         drop(reservation);
         r
     })
     .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /v1/sessions/:id/roles/:role/revoke` — owner only. The role's
+/// participants are cut off (their tokens stop working, a runner's active
+/// job fails) and its invite admits no one from then on. Anyone who kept the
+/// invite still holds the session key and can decrypt what they copied;
+/// only closing the session ends access to the rest.
+pub async fn revoke_role(
+    State(st): State<AppState>,
+    Path((id, role)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    let s = session(&st, &id)?;
+    let (_, by) = auth(&s, &headers)?;
+    if by != Role::Owner {
+        return Err(ApiError::forbidden("only the owner may revoke a role"));
+    }
+    let role = Role::parse(&role)
+        .ok()
+        .filter(|r| *r != Role::Owner)
+        .ok_or_else(|| ApiError::not_found("no such role; revoke sender, observer or runner"))?;
+    blocking(move || {
+        let mut g = s.lock();
+        if g.closed {
+            return Err(ApiError::gone("closed", "session is closed"));
+        }
+        if g.revoked.contains(&role) {
+            return Ok(());
+        }
+        let cut: HashSet<String> = g
+            .participants
+            .iter()
+            .filter(|(_, p)| p.role == role && !p.left && !p.rejected)
+            .map(|(k, _)| k.clone())
+            .collect();
+        // A cut-off runner's job fails, and so does any job a cut-off
+        // sender still has queued or running.
+        for r in cut.iter().filter(|_| role == Role::Runner) {
+            s.fail_runner_job(&mut g, r, "runner_revoked")?;
+        }
+        let mut authored: Vec<(String, Option<String>)> = g
+            .jobs
+            .iter()
+            .filter(|(_, j)| j.state.active() && cut.contains(&j.author))
+            .map(|(id, j)| (id.clone(), j.runner.clone()))
+            .collect();
+        authored.sort();
+        for (job, runner) in authored {
+            s.set_job(&mut g, &job, JobState::Failed, runner.clone(), Some("author_revoked"))?;
+            if let Some(r) = &runner {
+                s.tell_runner(r, "job_cancel", json!({"job": job}));
+            }
+        }
+        s.append(&mut g, Rec::Revoke { role })?;
+        Ok(())
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /v1/sessions/:id/audit.jsonl` — owner or observer. The session's
+/// history as JSONL, derived from its log (envelopes, hashes and events,
+/// never ciphertext). It is purged with the session, so export it first.
+pub async fn audit(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let s = session(&st, &id)?;
+    let (_, role) = auth(&s, &headers)?;
+    if !matches!(role, Role::Owner | Role::Observer) {
+        return Err(ApiError::forbidden("only the owner and observers may export the audit trail"));
+    }
+    let name = format!("attachment; filename=\"{}-audit.jsonl\"", s.id);
+    let permit =
+        AUDITS.try_acquire().map_err(|_| ApiError::limit("the relay is busy exporting; try again"))?;
+    // The permit goes with the work: a client that hangs up does not free
+    // it while the export is still being built.
+    let body = blocking(move || {
+        let _permit = permit;
+        s.audit().map_err(closed_if_missing)
+    })
+    .await?;
+    Ok((
+        [(header::CONTENT_TYPE, "application/x-ndjson".to_string()), (header::CONTENT_DISPOSITION, name)],
+        body,
+    )
+        .into_response())
 }

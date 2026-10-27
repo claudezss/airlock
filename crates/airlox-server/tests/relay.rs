@@ -537,6 +537,9 @@ async fn evicted_blobs_are_reseeded_for_late_joiners() {
     let evs = events(&env, &s, &late).await;
     assert!(evs.iter().any(|e| e["kind"] == "reseeded" && e["data"]["item"] == id.as_str()));
     assert_eq!(blob(&env, &s, &late, &id).await.bytes().await.unwrap().to_vec(), item.blob);
+    // A restart replays the re-seed: the blob and its recipients come back.
+    env.restart(|_| {}).await;
+    assert_eq!(blob(&env, &s, &late, &id).await.status(), StatusCode::OK);
     // The first upload closed the want.
     let r = reseed(&env, &s, &sender, &id, item.blob.clone()).await;
     assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "present".into()));
@@ -580,4 +583,232 @@ async fn wants_are_rate_limited() {
     assert_eq!(r.status(), StatusCode::NO_CONTENT);
     let r = reseed(&env, &s, &sender, &ids[0], vec![0; 4]).await;
     assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "not_wanted".into()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoking_a_role_cuts_off_its_participants_and_invite() {
+    let mut env = Env::new().await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let sender = join(&env, &s, Role::Sender, "sender").await;
+    let viewer = join(&env, &s, Role::Observer, "viewer").await;
+    let stream = env
+        .http
+        .get(env.url(&format!("/v1/sessions/{}/stream", s.id)))
+        .bearer_auth(&sender.token)
+        .send()
+        .await
+        .unwrap();
+
+    // Only the owner revokes, and never the owner role.
+    assert_eq!(revoke(&env, &s, &sender, "observer").await.status(), StatusCode::FORBIDDEN);
+    assert_eq!(revoke(&env, &s, &owner, "owner").await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(revoke(&env, &s, &owner, "sender").await.status(), StatusCode::NO_CONTENT);
+    assert_eq!(revoke(&env, &s, &owner, "sender").await.status(), StatusCode::NO_CONTENT);
+
+    // The sender's open stream ends with the revocation; its token is dead.
+    let text = read_sse_until(stream, "event: revoked").await;
+    assert!(text.contains(&sender.kp.public().to_b64()));
+    let r = env
+        .http
+        .get(env.url(&format!("/v1/sessions/{}/events", s.id)))
+        .bearer_auth(&sender.token)
+        .send()
+        .await;
+    assert_eq!(r.unwrap().status(), StatusCode::UNAUTHORIZED);
+    // The sender invite admits no one, now or after a restart.
+    let (_, body) = join_body(&s, Role::Sender, "again");
+    assert_eq!(error_code(post_join(&env, &s, body).await).await, (StatusCode::FORBIDDEN, "revoked".into()));
+    env.restart(|_| {}).await;
+    let (_, body) = join_body(&s, Role::Sender, "again");
+    assert_eq!(error_code(post_join(&env, &s, body).await).await, (StatusCode::FORBIDDEN, "revoked".into()));
+
+    // Other roles carry on, and see one revocation.
+    let evs = events(&env, &s, &viewer).await;
+    let revoked: Vec<&Value> = evs.iter().filter(|e| e["kind"] == "revoked").collect();
+    assert_eq!(revoked.len(), 1);
+    assert_eq!(revoked[0]["data"]["role"], "sender");
+    assert_eq!(revoked[0]["data"]["participants"][0], sender.kp.public().to_b64().as_str());
+    join(&env, &s, Role::Observer, "another viewer").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn audit_export_is_verifiable_and_holds_no_secrets() {
+    let env = Env::new().await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let sender = join(&env, &s, Role::Sender, "sender").await;
+    let viewer = join(&env, &s, Role::Observer, "viewer").await;
+    let item = seal_text(&s, &sender, "audited");
+    let id = item.envelope.header.id.clone();
+    post(&env, &s, &sender, frame(&item)).await;
+    ack(&env, &s, &owner, &id).await;
+    revoke(&env, &s, &owner, "sender").await;
+
+    assert_eq!(audit(&env, &s, &sender).await.status(), StatusCode::UNAUTHORIZED);
+    join(&env, &s, Role::Observer, "late").await;
+    let r = audit(&env, &s, &viewer).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(r.headers()["content-type"], "application/x-ndjson");
+    let text = r.text().await.unwrap();
+    // No bearer-token hashes, no address hash.
+    assert!(!text.contains("token") && !text.contains("ip_hash"), "{text}");
+    let lines: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let actions: Vec<&str> = lines.iter().map(|l| l["action"].as_str().unwrap()).collect();
+    assert_eq!(actions, ["create", "join", "join", "join", "item", "ack", "revoke", "join"]);
+    assert!(lines.windows(2).all(|w| w[0]["seq"].as_u64() < w[1]["seq"].as_u64()));
+    // The item line carries what the author signed: the envelope and the blob hash.
+    let it = &lines[4];
+    assert_eq!(
+        (it["actor"].as_str(), it["item"].as_str()),
+        (Some(sender.kp.public().to_b64().as_str()), Some(id.as_str()))
+    );
+    let env_json: airlox_core::item::ItemEnvelope =
+        serde_json::from_str(it["envelope"].as_str().unwrap()).unwrap();
+    let digest: [u8; 32] =
+        airlox_core::encoding::b64d(it["blob_sha256"].as_str().unwrap()).unwrap().try_into().unwrap();
+    env_json.verify_blob_digest(it["blob_len"].as_u64().unwrap(), &digest).unwrap();
+    assert_eq!(lines[6]["participants"][0], sender.kp.public().to_b64().as_str());
+    // Owners may export too; senders and runners may not.
+    assert_eq!(audit(&env, &s, &owner).await.status(), StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_in_flight_when_its_author_is_revoked_is_refused() {
+    let env = Env::new().await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let sender = join(&env, &s, Role::Sender, "sender").await;
+    let item = seal_text(&s, &sender, "sent after the revoke");
+    let body = frame(&item);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(1);
+    let stream = futures_util::stream::unfold(rx, |mut rx| async { rx.recv().await.map(|c| (c, rx)) });
+    let upload = tokio::spawn(
+        env.http
+            .post(env.url(&format!("/v1/sessions/{}/items", s.id)))
+            .bearer_auth(&sender.token)
+            .body(reqwest::Body::wrap_stream(stream))
+            .send(),
+    );
+    // Half the frame, so the relay has checked the token and is reading the blob.
+    let half = body.len() / 2;
+    tx.send(Ok(body[..half].to_vec())).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(revoke(&env, &s, &owner, "sender").await.status(), StatusCode::NO_CONTENT);
+    tx.send(Ok(body[half..].to_vec())).await.unwrap();
+    drop(tx);
+    let r = upload.await.unwrap().unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    let evs = events(&env, &s, &owner).await;
+    assert!(!evs.iter().any(|e| e["kind"] == "item"), "the item must not land");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_reseed_does_not_hold_off_other_holders() {
+    let env = Env::new().await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let sender = join(&env, &s, Role::Sender, "sender").await;
+    let item = seal_text(&s, &sender, &"x".repeat(4096));
+    let id = item.envelope.header.id.clone();
+    post(&env, &s, &sender, frame(&item)).await;
+    ack(&env, &s, &owner, &id).await;
+    assert!(eventually(|| async { blob(&env, &s, &owner, &id).await.status() == StatusCode::GONE }).await);
+    let late = join(&env, &s, Role::Observer, "late").await;
+    assert_eq!(want(&env, &s, &late, &id).await.status(), StatusCode::ACCEPTED);
+
+    // The sender starts an upload and stalls halfway.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(1);
+    let stream = futures_util::stream::unfold(rx, |mut rx| async { rx.recv().await.map(|c| (c, rx)) });
+    let stalled = tokio::spawn(
+        env.http
+            .put(env.url(&format!("/v1/sessions/{}/items/{id}/blob", s.id)))
+            .bearer_auth(&sender.token)
+            .body(reqwest::Body::wrap_stream(stream))
+            .send(),
+    );
+    let half = item.blob.len() / 2;
+    tx.send(Ok(item.blob[..half].to_vec())).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // While the want stays open, and the owner's upload wins.
+    assert_eq!(want(&env, &s, &late, &id).await.status(), StatusCode::ACCEPTED);
+    let r = reseed(&env, &s, &owner, &id, item.blob.clone()).await;
+    assert_eq!(r.status(), StatusCode::NO_CONTENT, "{}", r.text().await.unwrap());
+    tx.send(Ok(item.blob[half..].to_vec())).await.unwrap();
+    drop(tx);
+    let r = stalled.await.unwrap().unwrap();
+    assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "present".into()));
+    assert_eq!(blob(&env, &s, &late, &id).await.bytes().await.unwrap().to_vec(), item.blob);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_reseeds_are_capped_and_losers_are_not_charged() {
+    let env = Env::with(|c| c.max_session_transfer = 20_000).await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let sender = join(&env, &s, Role::Sender, "sender").await;
+    let obs = join(&env, &s, Role::Observer, "obs").await;
+    let obs2 = join(&env, &s, Role::Observer, "obs2").await;
+    let item = seal_text(&s, &sender, &"x".repeat(4096));
+    let id = item.envelope.header.id.clone();
+    post(&env, &s, &sender, frame(&item)).await;
+    for m in [&owner, &obs, &obs2] {
+        ack(&env, &s, m, &id).await;
+    }
+    // Polling the blob would charge transfer: watch for the event instead.
+    assert!(
+        eventually(|| async { events(&env, &s, &owner).await.iter().any(|e| e["kind"] == "evicted") }).await
+    );
+    let late = join(&env, &s, Role::Observer, "late").await;
+    assert_eq!(want(&env, &s, &late, &id).await.status(), StatusCode::ACCEPTED);
+
+    // Three holders upload at once; a fourth is turned away.
+    let half = item.blob.len() / 2;
+    let mut ups = vec![];
+    for m in [&sender, &owner, &obs] {
+        let (tx, h) = stalled_put(&env, &s, m, &id);
+        tx.send(Ok(item.blob[..half].to_vec())).await.unwrap();
+        ups.push((tx, h));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let r = reseed(&env, &s, &obs2, &id, item.blob.clone()).await;
+    assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "uploading".into()));
+    let mut codes = vec![];
+    for (tx, h) in ups {
+        tx.send(Ok(item.blob[half..].to_vec())).await.unwrap();
+        drop(tx);
+        codes.push(h.await.unwrap().unwrap().status());
+    }
+    codes.sort();
+    assert_eq!(codes, [StatusCode::NO_CONTENT, StatusCode::CONFLICT, StatusCode::CONFLICT]);
+    // Only the winner counted against the transfer cap: the wanter can
+    // still download (one upload, one download, plus the first round trip).
+    assert_eq!(blob(&env, &s, &late, &id).await.status(), StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn asking_again_writes_nothing_and_needs_a_live_participant() {
+    let env = Env::new().await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let sender = join(&env, &s, Role::Sender, "sender").await;
+    let item = seal_text(&s, &sender, "x");
+    let id = item.envelope.header.id.clone();
+    post(&env, &s, &sender, frame(&item)).await;
+    ack(&env, &s, &owner, &id).await;
+    assert!(eventually(|| async { blob(&env, &s, &owner, &id).await.status() == StatusCode::GONE }).await);
+    let late = join(&env, &s, Role::Observer, "late").await;
+    for _ in 0..5 {
+        assert_eq!(want(&env, &s, &late, &id).await.status(), StatusCode::ACCEPTED);
+    }
+    let audit_wants = |text: String| text.lines().filter(|l| l.contains(r#""action":"want""#)).count();
+    assert_eq!(audit_wants(audit(&env, &s, &owner).await.text().await.unwrap()), 1);
+    let evs = events(&env, &s, &sender).await;
+    assert_eq!(evs.iter().filter(|e| e["kind"] == "want").count(), 1);
 }

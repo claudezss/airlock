@@ -28,6 +28,9 @@ use crate::view::write_atomic;
 /// participant sees (gaps are only events meant for others, such as job
 /// routing). Small, so one forged event cannot hide the session's future.
 const MAX_SEQ_JUMP: u64 = 10_000;
+/// Ask again for an evicted blob nobody re-seeded after this long; the
+/// relay drops a want after ten minutes.
+const REASK: Duration = Duration::from_secs(5 * 60);
 
 /// Content types a new session allows unless told otherwise.
 pub const DEFAULT_TYPES: &[&str] = &["text", "py", "md", "zip", "image"];
@@ -103,6 +106,12 @@ struct Identity {
 impl Cache {
     fn open(root: &Path, sid: &str) -> Result<Cache> {
         let dir = root.join(sid);
+        // A new cache root is private too: its entries name the sessions.
+        #[cfg(unix)]
+        if !root.exists() {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new().recursive(true).mode(0o700).create(root)?;
+        }
         fs::create_dir_all(dir.join("blobs"))?;
         #[cfg(unix)]
         {
@@ -185,6 +194,16 @@ impl Cache {
                 let _ = fs::remove_dir_all(e.path());
             }
         }
+    }
+}
+
+/// Why the relay stopped answering: the session is gone, or (401) this
+/// participant left or its role was revoked.
+fn gone_reason(e: &anyhow::Error) -> String {
+    if status_of(e) == Some(401) {
+        "the relay no longer accepts this participant (it left, or its role was revoked)".into()
+    } else {
+        "no longer on the relay".into()
     }
 }
 
@@ -401,8 +420,8 @@ pub struct Session {
     index: HashMap<String, usize>,
     envelopes: HashMap<String, String>,
     evicted: HashSet<String>,
-    /// Evicted items this client asked holders for.
-    wanted: HashSet<String>,
+    /// Evicted items this client asked holders for, and when it last asked.
+    wanted: HashMap<String, Instant>,
     /// Evicted items others asked for, which this client may hold.
     asked: HashSet<String>,
     /// Evicted items back on the relay, to fetch.
@@ -537,7 +556,7 @@ impl Session {
             index: HashMap::new(),
             envelopes: HashMap::new(),
             evicted: HashSet::new(),
-            wanted: HashSet::new(),
+            wanted: HashMap::new(),
             asked: HashSet::new(),
             reseeded: HashSet::new(),
             unacked: HashSet::new(),
@@ -579,6 +598,37 @@ impl Session {
             out.insert(r.to_string(), api::member_invite(&self.base_url, seed, r)?);
         }
         out.insert("owner".into(), api::owner_invite(&self.base_url, seed)?);
+        Ok(out)
+    }
+
+    /// Revoke a role (owner only): its participants are cut off and its
+    /// invite admits no one. Whoever kept that invite still holds the session
+    /// key, so what they already copied stays readable to them.
+    pub async fn revoke(&mut self, role: &str) -> Result<()> {
+        if self.role != Role::Owner {
+            bail!("only the owner can revoke a role");
+        }
+        let role = Role::parse(role)
+            .ok()
+            .filter(|r| *r != Role::Owner)
+            .context("revoke one of sender, observer or runner")?;
+        self.relay.post_raw(&format!("/roles/{}/revoke", role.as_str()), vec![], &[]).await?;
+        Ok(())
+    }
+
+    /// The session's audit trail as JSONL (owner or observer): who joined,
+    /// posted, acked, approved and revoked, with the signed joins and item
+    /// envelopes to check it against. It is purged with the session. Each
+    /// line is parsed and re-serialized: JSON from the relay, never raw bytes.
+    pub async fn audit(&self) -> Result<String> {
+        let raw = self.relay.audit().await?;
+        let mut out = String::new();
+        for line in raw.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+            let v: Value =
+                serde_json::from_slice(line).context("the relay sent an audit line that is not JSON")?;
+            out.push_str(&v.to_string());
+            out.push('\n');
+        }
         Ok(out)
     }
 
@@ -1009,8 +1059,8 @@ impl Session {
         let mut out = self.retry().await?;
         let evs = match self.relay.events(self.last_seq).await {
             Ok(e) => e,
-            Err(e) if matches!(status_of(&e), Some(404 | 410)) => {
-                self.closed.get_or_insert_with(|| "no longer on the relay".into());
+            Err(e) if matches!(status_of(&e), Some(401 | 404 | 410)) => {
+                self.closed.get_or_insert_with(|| gone_reason(&e));
                 return Ok(out);
             }
             Err(e) => return Err(e),
@@ -1054,6 +1104,13 @@ impl Session {
         if self.closed.is_some() {
             return;
         }
+        // Every holder sees the same want: wait a moment at random, so the
+        // first upload usually lands before the others start.
+        if !self.asked.is_empty() {
+            let jitter =
+                SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos() % 2000).unwrap_or(0);
+            tokio::time::sleep(Duration::from_millis(u64::from(jitter))).await;
+        }
         for id in self.asked.clone() {
             let Some(blob) = self.cache.read_blob(&id) else {
                 self.asked.remove(&id);
@@ -1069,31 +1126,36 @@ impl Session {
                 }
             }
         }
-        let evicted: Vec<String> = self
+        // Never asked first, then the longest ago; a want lapses on the
+        // relay, so one still unanswered is asked for again.
+        let mut evicted: Vec<(Option<Instant>, String)> = self
             .items
             .iter()
-            .filter(|i| i.status == Status::Evicted && i.author != self.me && !self.wanted.contains(&i.id))
-            .map(|i| i.id.clone())
+            .filter(|i| i.status == Status::Evicted && i.author != self.me)
+            .map(|i| (self.wanted.get(&i.id).copied(), i.id.clone()))
+            .filter(|(at, _)| at.is_none_or(|t| t.elapsed() >= REASK))
             .collect();
-        for id in evicted {
+        evicted.sort();
+        for (_, id) in evicted {
             match self.relay.want(&id).await {
-                Ok(true) => {
-                    self.wanted.insert(id);
-                }
+                Ok(true) => {}
                 // Already back: fetch it. It stays wanted, so a relay that
-                // says present but then serves 410 gets asked once per sync.
-                Ok(false) => {
-                    self.reappeared(&id);
-                    self.wanted.insert(id);
-                }
+                // says present but then serves 410 gets asked again later.
+                Ok(false) => self.reappeared(&id),
                 // Too many open, or a busy relay: ask again on a later sync.
                 Err(e) if is_transient(&e) => break,
-                Err(e) => {
-                    tracing::debug!(item = %id, "want refused: {e:#}");
-                    self.wanted.insert(id);
-                }
+                Err(e) => tracing::debug!(item = %id, "want refused: {e:#}"),
             }
+            self.wanted.insert(id, Instant::now());
         }
+    }
+
+    /// Whether an unanswered want is due to be asked again.
+    fn reask_due(&self) -> bool {
+        self.closed.is_none()
+            && self.wanted.iter().any(|(id, t)| {
+                t.elapsed() >= REASK && self.get(id).is_some_and(|i| i.status == Status::Evicted)
+            })
     }
 
     /// An evicted blob is on the relay again: fetch it on the next retry.
@@ -1131,8 +1193,8 @@ impl Session {
             }
             let resp = match self.relay.session_stream(self.last_seq).await {
                 Ok(r) => r,
-                Err(e) if matches!(status_of(&e), Some(404 | 410)) => {
-                    self.closed.get_or_insert_with(|| "no longer on the relay".into());
+                Err(e) if matches!(status_of(&e), Some(401 | 404 | 410)) => {
+                    self.closed.get_or_insert_with(|| gone_reason(&e));
                     return Ok(());
                 }
                 Err(e) if is_transient(&e) => {
@@ -1174,7 +1236,7 @@ impl Session {
                         return Ok(());
                     }
                 }
-                if trade {
+                if trade || self.reask_due() {
                     self.trade_blobs().await;
                     for i in self.fetch_reseeded().await? {
                         if !on_item(self, &self.items[i])? {
@@ -1260,6 +1322,19 @@ impl Session {
             "left" => {
                 if let Some(p) = data["participant_pub"].as_str().and_then(|k| self.participants.get_mut(k)) {
                     p.left = true;
+                }
+            }
+            "revoked" => {
+                let cut: Vec<&str> =
+                    data["participants"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                for k in &cut {
+                    if let Some(p) = self.participants.get_mut(*k) {
+                        p.left = true;
+                    }
+                }
+                if cut.contains(&self.me.as_str()) {
+                    let role = data["role"].as_str().unwrap_or("this");
+                    self.closed = Some(format!("the owner revoked the {role} role"));
                 }
             }
             "closed" => {

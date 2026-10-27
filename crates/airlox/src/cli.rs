@@ -99,6 +99,32 @@ pub enum SessionCmd {
     Info(Conn),
     /// Close the session and purge it from the relay (owner invite only).
     Close(Conn),
+    /// Cut off a role (owner invite only): its participants lose access and
+    /// its invite admits no one. Anyone who kept that invite can still
+    /// decrypt what they already copied; close the session to end the rest.
+    Revoke(RevokeArgs),
+    /// Print the audit trail as JSON lines (owner or observer invite): who
+    /// joined, posted, acked, approved and revoked, with the signed material
+    /// to check it. It is purged with the session.
+    Audit(AuditArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct RevokeArgs {
+    #[command(flatten)]
+    pub conn: Conn,
+    /// The role to revoke.
+    #[arg(value_parser = ["sender", "observer", "runner"])]
+    pub role: String,
+}
+
+#[derive(Args, Debug)]
+pub struct AuditArgs {
+    #[command(flatten)]
+    pub conn: Conn,
+    /// Write it to this new file instead of printing it.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -255,6 +281,37 @@ pub async fn session(cmd: SessionCmd) -> Result<()> {
                 if let Some(c) = &s.closed {
                     println!("closed: {}", clean_line(c));
                 }
+            }
+            Ok(())
+        }
+        SessionCmd::Revoke(a) => {
+            let mut s = a.conn.join().await?;
+            s.revoke(&a.role).await?;
+            if a.conn.json {
+                print_json(&json!({"revoked": a.role}));
+            } else {
+                println!(
+                    "revoked the {} role: its participants are cut off and its invite no longer works",
+                    a.role
+                );
+            }
+            Ok(())
+        }
+        SessionCmd::Audit(a) => {
+            let s = a.conn.join().await?;
+            let out = s.audit().await?;
+            match &a.out {
+                Some(path) => {
+                    let mut opts = std::fs::OpenOptions::new();
+                    opts.write(true).create_new(true);
+                    #[cfg(unix)]
+                    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+                    let mut f =
+                        opts.open(path).with_context(|| format!("{}: choose a new file", path.display()))?;
+                    std::io::Write::write_all(&mut f, out.as_bytes())?;
+                    eprintln!("wrote {} lines to {}", out.lines().count(), path.display());
+                }
+                None => print!("{out}"),
             }
             Ok(())
         }

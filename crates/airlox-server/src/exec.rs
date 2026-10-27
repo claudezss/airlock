@@ -445,7 +445,14 @@ pub async fn runner_stream(
                 },
                 r = st.closed_rx.recv() => match r {
                     Ok(e) if e.kind == "closed" => return None,
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Ok(e) if e.kind == "revoked"
+                        && e.data["participants"].as_array().is_some_and(|a| a.iter().any(|p| p == st.who.as_str())) =>
+                    {
+                        return None
+                    }
+                    Ok(_) => continue,
+                    // Lagged: it may have missed its own revocation; end, and
+                    // a reconnect re-checks its token.
                     Err(_) => return None,
                 },
                 _ = st.shutdown.changed() => return None,

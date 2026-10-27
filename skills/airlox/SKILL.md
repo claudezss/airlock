@@ -85,7 +85,13 @@ received from a session on this machine.
 ## Finish
 
 ```bash
+AIRLOX_INVITE="$(cat ./owner.link)" airlox session audit --out audit.jsonl   # owner/observer: keep the history
 AIRLOX_INVITE="$(cat ./owner.link)" airlox session close   # owner: purge the session for everyone
 ```
+
+If an invite leaked, `airlox session revoke sender` (or `observer`,
+`runner`) with the owner invite cuts off everyone who joined with it and
+disables it; they keep what they already copied. Revoke only when the user
+asks.
 
 Sessions also expire on their own (`--ttl`, default 1h).

@@ -430,3 +430,27 @@ def test_cli_reseeds_evicted_files(relay, caches, tmp_path):
     cli("items", "--json", invite=owner.invites["sender"], cache=caches("sender"))
     (f,) = late_files()
     assert (f["status"], f["name"]) == ("ok", "plan.md")
+
+
+def test_cli_revoke_and_audit(relay, caches, tmp_path):
+    created = json.loads(cli("session", "create", "--relay", relay.url, "--json", cache=caches("cli")).stdout)
+    invites = created["invites"]
+    cli("send", "text", "hello", invite=invites["sender"], cache=caches("sender"))
+    p = cli("session", "revoke", "observer", invite=invites["sender"], cache=caches("sender"), check=False)
+    assert p.returncode != 0 and "only the owner" in p.stderr
+    assert "revoked the sender role" in cli("session", "revoke", "sender", invite=invites["owner"],
+                                            cache=caches("cli")).stdout
+    p = cli("send", "text", "after", invite=invites["sender"], cache=caches("sender"), check=False)
+    assert p.returncode != 0
+    p = cli("send", "text", "new key", invite=invites["sender"], cache=caches("sender2"), check=False)
+    assert p.returncode != 0 and "revoked" in p.stderr
+
+    out = tmp_path / "audit.jsonl"
+    cli("session", "audit", "--out", out, invite=invites["observer"], cache=caches("viewer"))
+    actions = [json.loads(l)["action"] for l in out.read_text().splitlines()]
+    assert actions[:2] == ["create", "join"] and "revoke" in actions and actions.count("item") == 1
+    # Never over an existing file.
+    p = cli("session", "audit", "--out", out, invite=invites["observer"], cache=caches("viewer"), check=False)
+    assert p.returncode != 0 and "new file" in p.stderr
+    printed = cli("session", "audit", invite=invites["owner"], cache=caches("cli")).stdout
+    assert len(printed.splitlines()) == len(actions)

@@ -91,3 +91,10 @@ in `crates/airlox-server/src/config.rs`; set them under `environment:` in
 To use your own domain, add a DNS `A` record for it, re-run
 `setup-droplet.sh <domain> ...`, update the `AIRLOX_DOMAIN` variable, and
 redeploy.
+
+**Rolling back.** From this release on, a relay skips log records it does
+not know, so rolling back to it from a newer build keeps sessions (their
+newer features just stop applying). Builds before it purge a session whose
+log they cannot read, so rolling back past it, which `airlox-deploy` does by
+itself when a new build fails its health check, ends every session that used
+re-seeding or revocation. Roll forward with a fix instead where you can.

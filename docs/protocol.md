@@ -285,6 +285,9 @@ PEP 503-normalized, is in `packages`; the target is well-formed. Runners also
 verify the author's certificate chains to the sender (or owner) role, that a
 `runner_approve` event for themselves is signed by an owner-role participant,
 and keep a per-session set of job ids so a relayed duplicate never runs twice.
+Runners install the manifest's `packages` from wheels only (`--only-binary
+:all:`) when they join, before approval: a source distribution's build script
+would otherwise run outside the sandbox.
 
 ## 9. ZIP handling
 
@@ -380,6 +383,8 @@ sends nothing for 30 seconds is answered with `408`.
 | `POST /v1/sessions/{id}/items/{item}/ack` | bearer, recipient | none | `204` |
 | `POST /v1/sessions/{id}/items/{item}/want` | bearer, never received it | none | `202 {"open": true}`; `409 present` if the blob is on the relay |
 | `PUT /v1/sessions/{id}/items/{item}/blob` | bearer, while wanted | ciphertext | `204`; `409 present` or `409 not_wanted` |
+| `POST /v1/sessions/{id}/roles/{role}/revoke` | bearer, owner | none | `204`; `role` is `sender`, `observer` or `runner` |
+| `GET /v1/sessions/{id}/audit.jsonl` | bearer, owner or observer | none | `200` JSON lines, see below |
 | `POST /v1/sessions/{id}/close` | bearer, owner | none | `204`; the session is purged |
 
 **Create.** The relay verifies the manifest signature, requires
@@ -424,6 +429,7 @@ public event carries that line's `seq`. Events are `{"seq", "kind", "data"}`:
 | `evicted` | `{item}`: the blob left the relay; the envelope stays |
 | `want` | `{item, by}`: participant `by` asks holders to upload the evicted blob again |
 | `reseeded` | `{item, by}`: participant `by` uploaded it; it is on the relay again |
+| `revoked` | `{role, participants}`: the owner revoked `role`; those participants' tokens are revoked |
 | `closed` | `{reason}`: the last event of a session |
 
 Clients must verify each `signed_join` themselves (§5) and take a
@@ -434,7 +440,9 @@ durable before it is sent, so a sequence number is never reused.
 **Stream.** `GET /stream` is Server-Sent Events with `id: <seq>`,
 `event: <kind>` and `data: <event data JSON>`. It first replays every event
 after `Last-Event-ID` (or all events when the header is absent), then streams
-live ones. It ends after `closed`, on server shutdown, or when the client
+live ones. It ends after `closed`, after a `left`, `revoked` or (for a
+runner) `runner … rejected` event that names the stream's own participant,
+on server shutdown, or when the client
 falls too far behind; clients reconnect with `Last-Event-ID`. A participant
 may hold 4 streams at once; a fifth is `429`. Browsers use
 `fetch` rather than `EventSource` so the token stays in a header.
@@ -442,7 +450,10 @@ may hold 4 streams at once; a fifth is `429`. Browsers use
 **Delivery and eviction.** A recipient acks an item only after it has stored
 the ciphertext locally. The relay deletes a blob once every recipient has
 acked and a short grace period has passed, or when the hold limit expires,
-whichever comes first. A recipient that leaves stops counting. After that
+whichever comes first. A recipient that leaves stops counting. The owner's
+signed `event` items up to 16 KiB (runner approvals and rejections, close)
+are never evicted, so a participant that joins later can always verify which
+runners the owner approved. After that
 `GET …/blob` is `410 evicted`, and clients show the item as delivered but
 unavailable until it is re-seeded. A download that fails for any other
 reason (network, `429`, `5xx`) is retried; clients must not record the item
@@ -450,19 +461,58 @@ as received or ack it until its blob is stored.
 
 **Re-seeding.** A participant that never received an evicted blob (a late
 joiner, or a new device, which joins with a new key) posts `want`. The relay
-refuses it from a participant that acked the item, keeps it open for 10
-minutes, allows 16 open wants per participant and 1024 over the session, and
-emits a `want` event. Any participant holding the ciphertext answers with
-`PUT …/blob` and the raw ciphertext. The relay takes it only while a want
-from another participant is open and the blob is absent, and only if its
-length and SHA-256 match the author-signed envelope, so a re-seed cannot
-alter content. The first accepted upload closes the item's wants and emits
-`reseeded`; the askers become the blob's recipients, and it is evicted once
+refuses it from a participant that acked the item and from a runner not yet
+approved (`403`), keeps it open for 10 minutes, allows 16 open wants and
+1024 distinct items per participant, and logs it and emits a `want` event.
+Asking again for an open want only refreshes it in memory, with no log line
+or event, except once every 10 minutes, when it is logged and announced
+again for holders whose earlier upload was refused. At most 256 `want` log lines per participant and 2048 per session are
+kept; past that, `429`. A want stays open while a re-seed upload is in
+progress (the upload may fail); `409 present` means the blob is on the relay
+to download. Clients ask again, about every 5 minutes, for items still
+evicted, and a holder waits a random moment (up to 2 s) before answering.
+Any participant holding the ciphertext answers with `PUT …/blob` and the
+raw ciphertext. The relay takes it only while a want from another
+participant is open and the blob is absent, and only if its length and
+SHA-256 match the author-signed envelope, so a re-seed cannot alter content.
+Up to 3 holders may upload one blob at once (a fourth gets `409 uploading`)
+and the first to finish wins; a participant may have 4 re-seeds in flight
+(`429`), and each must finish within 30 s plus 128 KiB/s of its size. An
+upload that lost, or whose wanters all left or lapsed meanwhile, is `409
+present` or `409 not_wanted` and is not charged to the transfer limit.
+The first accepted upload closes the item's wants and emits `reseeded`; the askers become the blob's recipients, and it is evicted once
 they have acked (after the grace period) or after a short hold of at most 10
 minutes. Re-seeded bytes count against the session's transfer and storage
 limits. Clients answer only for items they have verified, and must take the
 item id of a `want` as a lookup in their own verified history, never as a
 file name.
+
+**Revocation.** The owner revokes a role: every participant holding it
+departs at once (as with `leave`: a runner's active job fails with
+`runner_revoked`, and jobs a revoked sender has queued or running fail with
+`author_revoked`), and any later join with that role is `403 revoked`, also
+after a restart. Revoking twice is a no-op. The owner role cannot be revoked.
+A revoked participant still holds the session key from its invite, so what
+it already copied stays readable to it; only closing the session ends access
+to the rest. Clients treat `401` from `events` or `stream` as the session
+having ended for them.
+
+**Audit export.** `GET …/audit.jsonl` returns one JSON object per log
+record, oldest first: `{"seq", "ts_ms", "action", "actor"?, …}`, where
+`action` is `create` (with `signed_manifest`), `join` (with `role` and
+`signed_join`), `item` (with `item`, `kind`, `blob_len`, `blob_sha256` and the
+signed `envelope`), `ack`, `leave`, `evict`, `want`, `reseed`,
+`runner_approve`, `runner_reject`, `job` (with `state`, `runner`, `reason`),
+`revoke` (with `role` and the `participants` cut off) or `close`. `actor` is a
+participant key. With the signed joins and envelopes, and `blob_sha256` (the
+digest each author signed), anyone can check every item line against its
+author without the relay. Only those lines are signed: the rest (acks,
+evictions, approvals as the relay recorded them, revocations, job states) are
+the relay's word, and the relay could leave lines out, so the export is a
+record to check items against, not a tamper-evident log. The export never
+contains ciphertext, bearer-token hashes or the creator's address hash. It is
+purged with the session. The relay builds two exports at a time; more are
+`429`.
 
 **Error codes.**
 
@@ -470,13 +520,13 @@ file name.
 |---|---|---|
 | 400 | `invalid`, `signature`, `body`, `clock`, `ttl`, `item_size` | malformed or unverifiable input |
 | 401 | `unauthorized` | missing or unknown bearer token |
-| 403 | `forbidden` | role, author or content policy not allowed |
+| 403 | `forbidden`, `revoked` | role, author or content policy not allowed; a join with a revoked role's invite |
 | 404 | `not_found` | no such session or item |
 | 408 | `timeout` | request body stalled or upload too slow |
-| 409 | `conflict`, `present`, `not_wanted` | duplicate session, item id, or participant key; a want for a blob the relay has; a re-seed nobody asked for |
+| 409 | `conflict`, `present`, `not_wanted`, `uploading` | duplicate session, item id, or participant key; a want or re-seed for a blob the relay has; a re-seed nobody asked for; enough re-seeds of that blob already in flight |
 | 410 | `closed`, `evicted` | session closed (or closed and not re-creatable), or blob already delivered |
-| 413 | `too_large` | body, envelope, item, session storage or session history limit |
-| 429 | `limit` | relay, address, participant, stream, item or transfer limit |
+| 413 | `too_large` | body, envelope, item, session storage or session history limit (re-seeds included) |
+| 429 | `limit` | relay, address, participant, stream, item, transfer, want or re-seed limit; two audit exports already being built |
 | 507 | `storage_full` | relay disk above its high watermark |
 
 **Address limits.** The per-address session limit counts IPv4 addresses
@@ -531,7 +581,8 @@ or `failed` with a reason:
 | `not_available` | no candidate at submission |
 | `runner_unresponsive` | not claimed within the claim timeout (default 5 s); the runner is offline until its next heartbeat |
 | `runner_lost` | no heartbeat within the runner timeout (default 30 s), or a heartbeat reported a different job |
-| `runner_left`, `runner_rejected` | its runner left or was rejected |
+| `runner_left`, `runner_rejected`, `runner_revoked` | its runner left, was rejected, or its role was revoked |
+| `author_revoked` | the sender who submitted it had its role revoked |
 | `cancelled` | cancelled before it was claimed |
 
 Every change is a `job` event `{job, state, runner, reason}` on the session
@@ -541,7 +592,8 @@ metadata, unsigned: clients decide what happened from signed items.
 
 **Runner stream.** `GET /runners/me/stream` is SSE without event ids:
 `job_assigned {job, envelope}`, `job_cancel {job}` and `rejected {}` (the
-stream then ends). On connect it repeats the runner's active assignment, so a
+stream then ends; it also ends when the runner's role is revoked or the
+session closes). On connect it repeats the runner's active assignment, so a
 runner that reconnects does not lose it. A runner is **online** while it
 holds this stream and has sent a heartbeat within the runner timeout;
 heartbeats go every 10 seconds. At most 2 streams per runner.
@@ -550,7 +602,8 @@ heartbeats go every 10 seconds. At most 2 streams per runner.
 verifies and runs it, then posts its output files and the `result` item
 through `POST /items`. A claim for a job that has failed or was reassigned is
 `409`, and the runner drops the job. The relay takes items from a runner only
-while it is eligible (approved when approval is required, not rejected), and
+while it is eligible (approved when approval is required, not rejected, not
+left or revoked, checked again when an upload commits), and
 a `result` only if its `refs` include a job assigned to that runner.
 
 Clients accept a result for a job only if, besides the §8 rules, its author

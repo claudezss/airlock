@@ -40,6 +40,8 @@ pub fn router(state: api::AppState) -> Router {
         .route("/v1/sessions/{id}/items/{item}/blob", get(api::get_blob).put(api::reseed))
         .route("/v1/sessions/{id}/items/{item}/want", post(api::want))
         .route("/v1/sessions/{id}/items/{item}/ack", post(api::ack))
+        .route("/v1/sessions/{id}/roles/{role}/revoke", post(api::revoke_role))
+        .route("/v1/sessions/{id}/audit.jsonl", get(api::audit))
         .route("/v1/sessions/{id}/jobs", post(exec::post_job))
         .route("/v1/sessions/{id}/jobs/{job}", get(exec::get_job))
         .route("/v1/sessions/{id}/jobs/{job}/claim", post(exec::claim_job))

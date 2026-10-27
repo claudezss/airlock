@@ -7,6 +7,7 @@ module is HTTP plumbing, the local cache, and ergonomics.
 from __future__ import annotations
 
 import json
+import random
 import re
 import struct
 import time
@@ -105,6 +106,10 @@ class Item:
 
 #: Largest believable gap between consecutive event sequence numbers.
 MAX_SEQ_JUMP = 10_000
+#: Ask again for an evicted blob nobody re-seeded after this long; the
+#: relay drops a want after ten minutes.
+REASK_S = 5 * 60.0
+
 
 class Session:
     """A participant's view of one session."""
@@ -140,7 +145,7 @@ class Session:
         self._order: List[str] = []
         self._envelopes: Dict[str, str] = {}
         self._evicted: set = set()
-        self._wanted: set = set()  # evicted items this client asked holders for
+        self._wanted: Dict[str, float] = {}  # evicted items this client asked holders for → when
         self._asked: set = set()  # evicted items others asked for, which this cache may hold
         self._reseeded: set = set()  # evicted items back on the relay, to fetch
         self._unacked: set = set()
@@ -298,6 +303,23 @@ class Session:
         """Close and purge the session on the relay (owner only)."""
         self._req("POST", "/close")
         self.closed = "closed by owner"
+
+    def revoke(self, role: str) -> None:
+        """Revoke a role (owner only): its participants are cut off and its
+        invite admits no one. Whoever kept that invite still holds the session
+        key, so what they already copied stays readable to them."""
+        if self.role != "owner":
+            raise PermissionError("only the owner can revoke a role")
+        if role not in ("sender", "observer", "runner"):
+            raise ValueError("revoke one of sender, observer or runner")
+        self._req("POST", f"/roles/{role}/revoke")
+
+    def audit(self) -> List[dict]:
+        """The session's audit trail (owner or observer): one dict per
+        record, oldest first, with the signed joins and item envelopes to
+        check it against. It is purged with the session."""
+        text = self._req("GET", "/audit.jsonl").text
+        return [json.loads(line) for line in text.splitlines() if line]
 
     def leave(self, *, delete_cache: bool = False) -> None:
         """Stop receiving: the relay no longer waits for this participant
@@ -516,8 +538,8 @@ class Session:
         try:
             evs = self._req("GET", f"/events{query}").json()["events"]
         except RelayError as e:
-            if e.status in (404, 410):
-                self.closed = self.closed or "no longer on the relay"
+            if e.status in (401, 404, 410):
+                self.closed = self.closed or _gone_reason(e.status)
                 return out
             raise
         out += [i for i in (self._apply(e) for e in evs) if i is not None and i.status != "pending"]
@@ -555,17 +577,17 @@ class Session:
                     headers=headers,
                     timeout=httpx.Timeout(read, connect=10.0),
                 ) as r:
-                    if r.status_code in (404, 410):
-                        self.closed = self.closed or "no longer on the relay"
+                    if r.status_code in (401, 404, 410):
+                        self.closed = self.closed or _gone_reason(r.status_code)
                         return
                     if r.status_code != 200:
                         r.read()
                         _check(r)
                     for ev in _sse_events(r.iter_lines()):
-                        item = self._apply(ev)
+                        item = None if ev is None else self._apply(ev)
                         if item is not None and item.status != "pending":
                             yield item
-                        if ev["kind"] in ("want", "reseeded", "evicted"):
+                        if (ev is not None and ev["kind"] in ("want", "reseeded", "evicted")) or self._reask_due():
                             self._trade_blobs()
                             if self._reseeded:
                                 yield from self._retry(set(self._reseeded))
@@ -616,6 +638,8 @@ class Session:
                 pass  # a relay cannot make us accept a forged participant
         elif kind == "item":
             item = self._receive(seq, data["envelope"], fetch)
+        elif kind in ("evicted", "want", "reseeded") and not isinstance(data.get("item"), str):
+            pass  # malformed: these name an item
         elif kind == "evicted":
             self._evicted.add(data["item"])
             pending = self._items.get(data["item"])
@@ -624,7 +648,7 @@ class Session:
         elif kind == "want":
             # Only live wants: replayed ones were answered or expired.
             # Only for an item this client verified, never a name the relay made up.
-            known = self._items.get(data.get("item"))
+            known = self._items.get(data["item"])
             if fetch and data.get("by") != self.participant_pub and known is not None and known.status == "ok":
                 self._asked.add(data["item"])
         elif kind == "reseeded":
@@ -633,6 +657,14 @@ class Session:
             p = self._participants.get(data.get("participant_pub"))
             if p is not None:
                 p["left"] = True
+        elif kind == "revoked":
+            cut = data.get("participants") or []
+            for pk in cut:
+                p = self._participants.get(pk)
+                if p is not None:
+                    p["left"] = True
+            if self.participant_pub in cut:
+                self.closed = f"the owner revoked the {data.get('role', 'this')} role"
         elif kind == "closed":
             self.closed = data.get("reason", "closed")
         if record:
@@ -648,6 +680,10 @@ class Session:
         if self.closed:
             return
         auth = {"Authorization": f"Bearer {self._token}"}
+        if self._asked:
+            # Every holder sees the same want: wait a moment at random, so
+            # the first upload usually lands before the others start.
+            time.sleep(random.uniform(0, 2))
         for item_id in list(self._asked):
             blob = self._cache.read_blob(item_id)
             if blob is not None:
@@ -658,23 +694,39 @@ class Session:
                 if r.status_code == 429 or r.status_code >= 500:
                     continue
             self._asked.discard(item_id)
-        for item_id in [i for i in self._order if self._items[i].status == "evicted"]:
-            if item_id in self._wanted or self._items[item_id].author == self.participant_pub:
-                continue
+        # Never asked first, then the longest ago; a want lapses on the
+        # relay, so one still unanswered is asked for again.
+        now = time.monotonic()
+        due = [
+            i
+            for i in self._order
+            if self._items[i].status == "evicted"
+            and self._items[i].author != self.participant_pub
+            and now - self._wanted.get(i, -REASK_S) >= REASK_S
+        ]
+        for item_id in sorted(due, key=lambda i: self._wanted.get(i, -REASK_S)):
             try:
                 r = self._http.post(self._url(f"/items/{item_id}/want"), headers=auth)
             except httpx.TransportError:
                 return
             if r.status_code == 429 or r.status_code >= 500:
                 return  # too many open, or a busy relay: ask again on a later sync
-            if r.status_code == 409 and r.json().get("error") == "present":
+            if r.status_code == 409 and _error_code(r) == "present":
                 self._reappeared(item_id)  # already back: fetch it
-            self._wanted.add(item_id)
+            self._wanted[item_id] = time.monotonic()
+
+    def _reask_due(self) -> bool:
+        """Whether an unanswered want is due to be asked again."""
+        now = time.monotonic()
+        return not self.closed and any(
+            now - t >= REASK_S and getattr(self._items.get(i), "status", None) == "evicted"
+            for i, t in self._wanted.items()
+        )
 
     def _reappeared(self, item_id: str) -> None:
         """An evicted blob is on the relay again: fetch it on the next retry."""
         self._evicted.discard(item_id)
-        self._wanted.discard(item_id)
+        self._wanted.pop(item_id, None)
         self._asked.discard(item_id)
         item = self._items.get(item_id)
         if item is not None and item.status == "evicted":
@@ -776,6 +828,14 @@ class Session:
         return item
 
 
+def _gone_reason(status: int) -> str:
+    """Why the relay stopped answering: the session is gone, or (401) this
+    participant left or its role was revoked."""
+    if status == 401:
+        return "the relay no longer accepts this participant (it left, or its role was revoked)"
+    return "no longer on the relay"
+
+
 def _check(r: httpx.Response) -> httpx.Response:
     if r.status_code >= 400:
         try:
@@ -787,8 +847,17 @@ def _check(r: httpx.Response) -> httpx.Response:
     return r
 
 
-def _sse_events(lines: Iterator[str]) -> Iterator[dict]:
-    """Minimal SSE parser yielding ``{seq, kind, data}``."""
+def _error_code(r: httpx.Response) -> Optional[str]:
+    try:
+        body = r.json()
+    except ValueError:
+        return None
+    return body.get("error") if isinstance(body, dict) else None
+
+
+def _sse_events(lines: Iterator[str]) -> Iterator[Optional[dict]]:
+    """Minimal SSE parser yielding ``{seq, kind, data}``, and ``None`` for
+    each comment (keepalive)."""
     event = data = ident = None
     for line in lines:
         if line == "":
@@ -796,7 +865,7 @@ def _sse_events(lines: Iterator[str]) -> Iterator[dict]:
                 yield {"seq": int(ident) if ident else -1, "kind": event, "data": json.loads(data)}
             event = data = ident = None
         elif line.startswith(":"):
-            continue
+            yield None  # a keepalive: lets the caller do periodic work
         else:
             name, _, value = line.partition(":")
             value = value[1:] if value.startswith(" ") else value
