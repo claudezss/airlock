@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "airlox"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "airlox-core",
  "airlox-server",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "airlox-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "airlox-core-py"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "airlox-core",
  "pyo3",
@@ -114,7 +114,7 @@ dependencies = [
 
 [[package]]
 name = "airlox-core-wasm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "airlox-core",
  "getrandom 0.2.17",
@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "airlox-server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "airlox-core",
  "axum",
