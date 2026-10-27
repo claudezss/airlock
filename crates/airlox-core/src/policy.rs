@@ -13,8 +13,8 @@ use crate::cert::{is_runner_token, SignedRoleCert};
 use crate::item::{ItemHeader, ItemKind, ItemRef};
 use crate::keys::PublicKey;
 use crate::payload::{
-    Event, JobResult, JobSpec, JobStatus, Meta, Payload, Target, MAX_OUT_FILES, MAX_REASON_CHARS,
-    MAX_STDIO_BYTES,
+    Event, JobProgress, JobResult, JobSpec, JobStatus, Meta, Payload, Target, MAX_OUT_FILES,
+    MAX_PROGRESS_TAIL_BYTES, MAX_REASON_CHARS, MAX_STDIO_BYTES,
 };
 use crate::session::{ContentType, Manifest, Mode, Role};
 use crate::validate::{check_name_component, sniff};
@@ -39,7 +39,7 @@ pub fn role_may_post(role: Role, kind: ItemKind) -> bool {
     match role {
         Role::Owner => true,
         Role::Sender => matches!(kind, Text | File | Job | Event),
-        Role::Runner => matches!(kind, Result | File),
+        Role::Runner => matches!(kind, Result | File | Progress),
         Role::Observer => false,
     }
 }
@@ -74,7 +74,7 @@ pub fn check_header(m: &Manifest, author_role: Role, h: &ItemHeader) -> Result<(
             require_execute(m)?;
             require_type(m, ContentType::Py)?;
         }
-        ItemKind::Result => require_execute(m)?,
+        ItemKind::Result | ItemKind::Progress => require_execute(m)?,
         ItemKind::Event => {}
     }
     Ok(())
@@ -108,7 +108,39 @@ pub fn check_payload(m: &Manifest, author_role: Role, h: &ItemHeader, p: &Payloa
         Meta::Job(spec) => check_job(m, spec),
         Meta::Result(r) => check_result(r),
         Meta::Event(e) => check_event(author_role, e),
+        Meta::Progress(p) => check_progress(p),
     }
+}
+
+/// Shape checks on a progress item.
+pub fn check_progress(p: &JobProgress) -> Result<()> {
+    p.job.validate()?;
+    if p.tail.as_ref().is_some_and(|t| t.len() > MAX_PROGRESS_TAIL_BYTES) {
+        return Err(Error::policy("a progress tail is limited to 64 KiB"));
+    }
+    Ok(())
+}
+
+/// A job's `progress_file`: a relative, `/`-separated path of portable
+/// components, none starting with a dot, at most 8 deep and 255 bytes.
+pub fn check_progress_file(path: &str) -> Result<()> {
+    let bad = |why: &str| Err(Error::policy(format!("bad progress_file {path:?}: {why}")));
+    if path.is_empty() || path.len() > 255 {
+        return bad("1 to 255 bytes");
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() > 8 {
+        return bad("at most 8 components");
+    }
+    for part in parts {
+        if part.starts_with('.') {
+            return bad("no component may start with a dot");
+        }
+        if let Err(why) = check_name_component(part) {
+            return bad(why);
+        }
+    }
+    Ok(())
 }
 
 fn check_event(author_role: Role, e: &Event) -> Result<()> {
@@ -242,6 +274,9 @@ pub fn check_job(m: &Manifest, job: &JobSpec) -> Result<()> {
     }
     for f in &job.files {
         f.validate()?;
+    }
+    if let Some(p) = &job.progress_file {
+        check_progress_file(p)?;
     }
     for r in &job.requirements {
         let n = normalize_package(r)?;
@@ -385,6 +420,7 @@ mod tests {
             files: vec![iref(1)],
             requirements: vec!["Pandas".into()],
             target: Target::Any,
+            progress_file: None,
         }
     }
 

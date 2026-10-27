@@ -5,7 +5,8 @@
 //! `Airlox-Target` header next to the sealed job item. The relay routes on
 //! that copy; the runner refuses a job whose signed target does not match
 //! it. Routing is "no queue": a job either goes to an idle runner at once or
-//! fails with `no_runner_available`.
+//! fails with `runner_busy` (a matching runner is online but busy) or
+//! `no_runner_available`.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -89,10 +90,25 @@ fn pick_runner(g: &Inner, target: &Target, now: u64, timeout_ms: u64) -> Option<
     candidates.first().map(|(_, pk)| (*pk).clone())
 }
 
+/// The name of a runner that would take the job if it were idle: eligible,
+/// online, matching, and busy with another job.
+fn busy_runner(g: &Inner, target: &Target, now: u64, timeout_ms: u64) -> Option<String> {
+    g.participants
+        .iter()
+        .filter(|(pk, p)| p.job.is_some() && g.runner_eligible(pk) && g.runner_online(pk, now, timeout_ms))
+        .filter(|(pk, p)| {
+            let labels = p.runner.as_ref().map(|r| r.labels.as_slice()).unwrap_or_default();
+            PublicKey::from_b64(pk).is_ok_and(|key| target_matches(target, key, labels))
+        })
+        .map(|(_, p)| p.runner.as_ref().map(|r| r.name.clone()).unwrap_or_default())
+        .next()
+}
+
 /// `POST /v1/sessions/:id/jobs` — header `Airlox-Target`, body an upload
 /// frame holding a `job` item. `201` once a runner has it; otherwise the
 /// job is stored as failed (so the timeline shows it) and the answer is
-/// `409 no_runner_available`.
+/// `409 runner_busy` when a matching runner is online but busy, otherwise
+/// `409 no_runner_available`. Jobs are never queued.
 pub async fn post_job(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -113,27 +129,36 @@ pub async fn post_job(
     let job = up.env.header.id.clone();
     let timeout_ms = st.store.cfg.runner_timeout_ms;
     let job2 = job.clone();
-    let (seq, runner) = blocking(move || {
-        commit_upload(&s, &who, up, |s, g, _| match pick_runner(g, &target, now_ms(), timeout_ms) {
-            Some(r) => {
-                s.set_job(g, &job2, JobState::Assigned, Some(r.clone()), None)?;
-                let envelope = g.item_event(&job2).map(|e| e.data["envelope"].clone());
-                s.tell_runner(&r, "job_assigned", json!({"job": job2, "envelope": envelope}));
-                Ok(Some(r))
-            }
-            None => {
-                s.set_job(g, &job2, JobState::Failed, None, Some("not_available"))?;
-                Ok(None)
+    let (seq, routed) = blocking(move || {
+        commit_upload(&s, &who, up, |s, g, _| {
+            let now = now_ms();
+            match pick_runner(g, &target, now, timeout_ms) {
+                Some(r) => {
+                    s.set_job(g, &job2, JobState::Assigned, Some(r.clone()), None)?;
+                    let envelope = g.item_event(&job2).map(|e| e.data["envelope"].clone());
+                    s.tell_runner(&r, "job_assigned", json!({"job": job2, "envelope": envelope}));
+                    Ok(Ok(r))
+                }
+                None => {
+                    let busy = busy_runner(g, &target, now, timeout_ms);
+                    let reason = if busy.is_some() { "runner_busy" } else { "not_available" };
+                    s.set_job(g, &job2, JobState::Failed, None, Some(reason))?;
+                    Ok(Err(busy))
+                }
             }
         })
     })
     .await?;
-    match runner {
-        Some(r) => Ok((
+    match routed {
+        Ok(r) => Ok((
             StatusCode::CREATED,
             Json(json!({"id": job, "seq": seq, "state": JobState::Assigned, "runner": r})),
         )),
-        None => Err(ApiError::no_runner(format!(
+        Err(Some(name)) => Err(ApiError::conflict_code(
+            "runner_busy",
+            format!("runner {name} matches job {job} but is busy with another job; it was not queued"),
+        )),
+        Err(None) => Err(ApiError::no_runner(format!(
             "no approved, online, idle runner matches job {job}; it was not queued"
         ))),
     }
@@ -245,6 +270,7 @@ pub async fn runners(
                 "rejected": p.rejected,
                 "online": g.runner_online(pk, now, timeout_ms),
                 "job": p.job,
+                "busy": p.job.is_some(),
                 "state": g.presence.get(pk).and_then(|x| x.state.clone()),
                 "detail": g.presence.get(pk).and_then(|x| x.detail.clone()),
                 "signed_join": p.public["signed_join"],
@@ -337,7 +363,8 @@ pub const MAX_DETAIL_CHARS: usize = 300;
 /// `POST /v1/sessions/:id/runners/me/heartbeat` — body `{"job": id|null,
 /// "state": "preparing"|"ready"|"failed", "detail": text}` (all optional). A
 /// runner that reports idle while the relay has it running a job has lost
-/// that job, which then fails.
+/// that job, which then fails. A runner that reports a job the relay failed
+/// as `runner_lost` (it was cut off, not gone) gets that job back.
 pub async fn heartbeat(
     State(st): State<AppState>,
     Path(id): Path<String>,
@@ -371,6 +398,11 @@ pub async fn heartbeat(
         if hb.state.is_some() {
             presence.state = hb.state;
             presence.detail = hb.detail;
+        }
+        let idle = g.participants.get(&who).is_some_and(|p| p.job.is_none());
+        if let Some(job) = hb.job.as_deref().filter(|j| idle && g.lost_by(j, &who)) {
+            tracing::info!(session = %s.id, job, "runner reconnected; its job is running again");
+            s.set_job(&mut g, job, JobState::Running, Some(who.clone()), None)?;
         }
         let current = g.participants.get(&who).and_then(|p| p.job.clone());
         if let Some(job) = current {

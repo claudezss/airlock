@@ -2,10 +2,12 @@
 //!
 //! One job at a time. The loop holds the assignment stream open, claims each
 //! assignment at once, sends a heartbeat (and catches up on session events)
-//! every 10 seconds, and forwards cancels to the running job.
+//! every 10 seconds, and forwards cancels to the running job. A dropped
+//! connection does not stop a running job: the stream and heartbeats
+//! reconnect with backoff, and the result is posted once the relay answers.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use airlox_core::cert::{is_runner_token, issue_cert, sign_join, ClientKind, JoinRequest, RunnerInfo};
@@ -22,31 +24,55 @@ use tokio::task::JoinHandle;
 
 use crate::client::{self, status_of, Relay};
 use crate::job::{self, Ctx};
-use crate::sandbox::{docker::Docker, local::Local, Backend, RuntimeSpec};
+use crate::sandbox::local::{probe_python, Local, LocalOpts};
+use crate::sandbox::{docker::Docker, Backend, RuntimeSpec};
 use crate::sse::SseParser;
 use crate::view::{write_atomic, View};
 
 pub const HEARTBEAT: Duration = Duration::from_secs(10);
 
+/// Where `--code` is claimed when no relay is named.
+pub const DEFAULT_RELAY: &str = "https://airlox.app";
+
+/// Set to `true` to stop the runner the way Ctrl-C does (the running job is
+/// cancelled and its files removed): the Windows service's stop control.
+pub static SHUTDOWN: LazyLock<watch::Sender<bool>> = LazyLock::new(|| watch::channel(false).0);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum SandboxArg {
+    /// uv runtime; namespaces and Landlock on Linux, a plain process elsewhere.
     Local,
+    /// A container per job.
     Docker,
+    /// A plain process with the --python interpreter (or a uv runtime); on
+    /// Windows each job runs in a Job Object. No network isolation.
+    Process,
 }
 
 #[derive(clap::Args, Debug)]
-#[command(group(clap::ArgGroup::new("source").args(["invite", "code"]).required(true).multiple(true)))]
+#[command(group(
+    clap::ArgGroup::new("source").args(["invite", "code", "invite_file"]).required(true).multiple(true)
+))]
 pub struct JoinArgs {
     /// The runner invite link (or set AIRLOX_INVITE).
     #[arg(long, env = "AIRLOX_INVITE", hide_env_values = true)]
     pub invite: Option<String>,
+    /// Read the runner invite link from this file instead: nothing secret on
+    /// the command line or in the environment. Keep the file readable only
+    /// by the user the runner runs as.
+    #[arg(long, conflicts_with = "code")]
+    pub invite_file: Option<PathBuf>,
     /// A one-time transfer code for the runner invite, like 7-guitar-orbit,
     /// instead of --invite. The invite is saved for restarts.
     #[arg(long)]
     pub code: Option<String>,
-    /// The relay the --code was made on.
-    #[arg(long, env = "AIRLOX_RELAY", default_value = "https://airlox.app")]
-    pub relay: String,
+    /// The relay to talk to: where --code is claimed (default
+    /// https://airlox.app), and, when given, where the runner connects
+    /// instead of the host in the invite, such as a port-forward
+    /// (http://127.0.0.1:8080). The session's keys still come only from the
+    /// invite, and the relay is never trusted with them.
+    #[arg(long, env = "AIRLOX_RELAY")]
+    pub relay: Option<String>,
     /// This runner's name, shown to senders: [a-z0-9][a-z0-9._-]{0,62}.
     #[arg(long)]
     pub name: String,
@@ -57,8 +83,26 @@ pub struct JoinArgs {
     /// characters), e.g. "A100 80 GB, CUDA 12; data team".
     #[arg(long, env = "AIRLOX_RUNNER_DESCRIPTION")]
     pub description: Option<String>,
+    /// How jobs are isolated. `process` must be chosen explicitly; nothing
+    /// falls back to it.
     #[arg(long, value_enum, default_value = "docker")]
     pub sandbox: SandboxArg,
+    /// local, process: run jobs with this interpreter, e.g. an existing
+    /// venv's Scripts\python.exe, instead of building one with uv. It must
+    /// be the session's Python version and already have every allowlisted
+    /// package; the runner never installs anything into it.
+    #[arg(long)]
+    pub python: Option<PathBuf>,
+    /// local, process: also give jobs these variables from the runner's
+    /// environment, comma-separated (a license server, say). PATH is
+    /// appended to the job's own. AIRLOX_* variables are never passed.
+    #[arg(long, value_delimiter = ',')]
+    pub pass_env: Vec<String>,
+    /// process: run the jobs of a session that says network: false although
+    /// this sandbox cannot block network access. Without it such a session
+    /// is refused.
+    #[arg(long)]
+    pub accept_network_gap: bool,
     /// Keep jobs off the network even if the session allows it.
     #[arg(long)]
     pub no_network: bool,
@@ -81,9 +125,24 @@ pub struct JoinArgs {
     /// Only for trusted code.
     #[arg(long)]
     pub unsandboxed: bool,
+    /// Jobs run at once. Only 1 is supported: while busy, the relay refuses
+    /// new jobs for this runner with `runner_busy` instead of queueing them.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=1))]
+    pub max_jobs: u32,
+    /// How often a running job's progress is posted (elapsed time and the
+    /// tail of its progress file); 0s for never.
+    #[arg(long, default_value = "60s", value_parser = crate::cli::parse_duration)]
+    pub progress_interval: Duration,
+    /// Most bytes of a job's progress file sent each time.
+    #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(0..=32768))]
+    pub progress_tail: u32,
     /// Exit after this many jobs (for tests and one-shot use).
     #[arg(long, hide = true)]
-    pub max_jobs: Option<usize>,
+    pub exit_after: Option<usize>,
+    /// Run under the Windows service manager as this service (set by
+    /// `airlox runner service install`).
+    #[arg(long, hide = true)]
+    pub windows_service: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -136,9 +195,11 @@ fn seed_from_hex(s: &str) -> Result<[u8; 32]> {
 /// Join as a new runner participant; returns `(keypair, token)`.
 async fn join(
     http: &reqwest::Client,
+    base_url: &str,
     invite: &Invite,
     args: &JoinArgs,
     backend: &Backend,
+    python: Option<&str>,
 ) -> Result<(Keypair, String)> {
     let kp = Keypair::generate();
     let sid = &invite.session_id;
@@ -163,11 +224,13 @@ async fn join(
                 host: hostname(),
                 sandbox: backend.kind(),
                 network_unblocked: backend.network_unblocked(),
+                version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                python: python.map(String::from),
             }),
             created_at_ms: now_ms(),
         },
     )?;
-    let token = client::join(http, &invite.base_url, sid, String::from_utf8(canonical_json(&j)?)?).await?;
+    let token = client::join(http, base_url, sid, String::from_utf8(canonical_json(&j)?)?).await?;
     Ok((kp, token))
 }
 
@@ -194,31 +257,78 @@ fn save_invite(dir: &std::path::Path, invite: &Invite, link: &str) -> Result<Pat
     Ok(path)
 }
 
-pub async fn run(args: JoinArgs) -> Result<()> {
+/// Flags that only make sense with some sandboxes, and environment names a
+/// job must never get.
+fn check_args(args: &JoinArgs) -> Result<()> {
     for t in std::iter::once(&args.name).chain(&args.labels) {
         if !is_runner_token(t) {
             bail!("{t:?} is not a valid runner name or label: use [a-z0-9][a-z0-9._-]{{0,62}}");
         }
     }
-    let http = client::http()?;
-    let root = args.cache_dir.clone().unwrap_or_else(default_cache_root);
-    let link = match (&args.code, &args.invite) {
+    let docker = args.sandbox == SandboxArg::Docker;
+    if docker && (args.python.is_some() || !args.pass_env.is_empty()) {
+        bail!("--python and --pass-env are for --sandbox local or process");
+    }
+    if args.sandbox == SandboxArg::Local
+        && !args.unsandboxed
+        && cfg!(target_os = "linux")
+        && !args.pass_env.is_empty()
+    {
+        bail!("--pass-env does not reach jobs in the Linux sandbox; use --sandbox process or --unsandboxed");
+    }
+    if args.accept_network_gap && args.sandbox != SandboxArg::Process {
+        bail!("--accept-network-gap is for --sandbox process");
+    }
+    for name in &args.pass_env {
+        let ok = !name.is_empty()
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            && !name.to_ascii_uppercase().starts_with("AIRLOX_");
+        if !ok {
+            bail!("--pass-env {name:?}: use variable names of [A-Za-z0-9_]; AIRLOX_* variables are never passed");
+        }
+    }
+    Ok(())
+}
+
+/// The invite link, from wherever the operator put it.
+pub(crate) async fn invite_link(
+    http: &reqwest::Client,
+    args: &JoinArgs,
+    root: &std::path::Path,
+) -> Result<String> {
+    if let Some(path) = &args.invite_file {
+        if args.invite.is_some() {
+            eprintln!("note: using --invite-file; ignoring the invite from --invite or AIRLOX_INVITE");
+        }
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("could not read the invite file {}", path.display()))?;
+        return Ok(text.trim().to_string());
+    }
+    match (&args.code, &args.invite) {
         (Some(code), invite) => {
             if invite.is_some() {
                 eprintln!("note: using --code; ignoring the invite from --invite or AIRLOX_INVITE");
             }
-            client::receive_code(&http, &args.relay, code).await.map_err(|e| {
+            let relay = args.relay.as_deref().unwrap_or(DEFAULT_RELAY);
+            client::receive_code(http, relay, code).await.map_err(|e| {
                 anyhow::anyhow!(
                     "{e:#}\nA code works once. If this runner already used it, restart it with the invite it saved:\n  \
-                     AIRLOX_INVITE=\"$(cat '{}/<session>/invite-runner.txt')\" airlox runner join --name {} ...",
-                    root.display(),
+                     airlox runner join --invite-file '{}' --name {} ...",
+                    root.join("<session>").join("invite-runner.txt").display(),
                     args.name
                 )
-            })?
+            })
         }
-        (None, Some(link)) => link.clone(),
-        (None, None) => bail!("pass --invite or --code"),
-    };
+        (None, Some(link)) => Ok(link.clone()),
+        (None, None) => bail!("pass --invite, --invite-file or --code"),
+    }
+}
+
+pub async fn run(args: JoinArgs) -> Result<()> {
+    check_args(&args)?;
+    let http = client::http()?;
+    let root = args.cache_dir.clone().unwrap_or_else(default_cache_root);
+    let link = invite_link(&http, &args, &root).await?;
     let invite = Invite::parse(&link).context("not a valid invite link")?;
     let sid = invite.session_id.clone();
     let dir = root.join(&sid);
@@ -230,7 +340,7 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         eprintln!("Saved the {} invite to {quoted}.", invite.role.as_str());
         if invite.role == Role::Runner {
             eprintln!(
-                "To restart this runner later:\n  AIRLOX_INVITE=\"$(cat {quoted})\" airlox runner join --name {} ...",
+                "To restart this runner later:\n  airlox runner join --invite-file {quoted} --name {} ...",
                 args.name
             );
         }
@@ -242,6 +352,16 @@ pub async fn run(args: JoinArgs) -> Result<()> {
     let id_path = dir.join(format!("identity-runner-{}.json", args.name));
     let saved: Option<Identity> = std::fs::read(&id_path).ok().and_then(|b| serde_json::from_slice(&b).ok());
     let base = invite.base_url.trim_end_matches('/').to_string();
+    // Where requests go: the invite's relay, or the operator's route to it.
+    // The identity stays bound to the invite's relay either way.
+    let url = match args.relay.as_deref() {
+        Some(r) if r.trim_end_matches('/') != base => {
+            let r = r.trim_end_matches('/').to_string();
+            tracing::info!(relay = %r, invite_relay = %base, "connecting through the given relay URL");
+            r
+        }
+        _ => base.clone(),
+    };
     // The saved token belongs to the relay that issued it. An invite with
     // this session's keys but another relay (an altered link) must not get
     // it: that relay could take jobs as this approved runner. A token saved
@@ -257,7 +377,7 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         ),
         _ => None,
     };
-    let signed = client::get_manifest(&http, &invite.base_url, &sid).await?;
+    let signed = client::get_manifest(&http, &url, &sid).await?;
     let manifest = SignedManifest::from_json(&signed)?.manifest;
     invite.check_against(&manifest)?;
     if manifest.mode != Mode::Execute {
@@ -275,26 +395,51 @@ pub async fn run(args: JoinArgs) -> Result<()> {
             args.docker_runtime.clone(),
             &state_dir,
         )),
-        SandboxArg::Local => Backend::Local(Local::new(&state_dir, !args.unsandboxed)),
+        SandboxArg::Local | SandboxArg::Process => Backend::Local(Local::new(
+            &state_dir,
+            LocalOpts {
+                sandboxed: !args.unsandboxed,
+                process: args.sandbox == SandboxArg::Process,
+                python: args.python.clone(),
+                pass_env: args.pass_env.clone(),
+            },
+        )),
     };
     // The Linux sandbox maps the runner's own uid into the job: as root, the
     // job could read every root-only file on the host (/etc/shadow, keys).
     #[cfg(unix)]
-    if nix::unistd::getuid().is_root() && matches!(args.sandbox, SandboxArg::Local) {
+    if nix::unistd::getuid().is_root() && args.sandbox != SandboxArg::Docker {
         bail!("refusing to run the local sandbox as root; run the runner as an unprivileged user, or use --sandbox docker");
     }
+    // Jobs run as the runner's own user: an administrator's or SYSTEM's
+    // rights would be theirs too.
+    #[cfg(windows)]
+    if args.sandbox != SandboxArg::Docker {
+        if let Some(who) = crate::sandbox::winjob::privileged() {
+            bail!(
+                "refusing to run jobs as {who}: they would get the same rights. Run the runner as an ordinary \
+                 user (`airlox runner service install` runs it as its own virtual account)"
+            );
+        }
+    }
+    // The interpreter's version is part of the join; a bad --python shows
+    // up below as a failed setup, with why.
+    let python = match &args.python {
+        Some(p) => probe_python(p, &[], &args.pass_env).await.ok().map(|i| i.version),
+        None => None,
+    };
     // Join before preparing the sandbox, and say how that goes: a runner
     // that cannot start then shows as failed, with why, rather than missing.
     let (kp, token) = match saved {
         Some(i) => (Keypair::from_seed(&seed_from_hex(&i.participant_seed)?), i.token),
-        None => join(&http, &invite, &args, &backend).await?,
+        None => join(&http, &url, &invite, &args, &backend, python.as_deref()).await?,
     };
-    let mut relay = Relay::new(http.clone(), &invite.base_url, &sid, &token);
+    let mut relay = Relay::new(http.clone(), &url, &sid, &token);
     let (kp, relay) = match relay.report("preparing", None).await {
         Err(e) if status_of(&e) == Some(401) => {
             tracing::info!("saved identity is no longer valid; joining again");
-            let (kp, token) = join(&http, &invite, &args, &backend).await?;
-            relay = Relay::new(http.clone(), &invite.base_url, &sid, &token);
+            let (kp, token) = join(&http, &url, &invite, &args, &backend, python.as_deref()).await?;
+            relay = Relay::new(http.clone(), &url, &sid, &token);
             save_identity(&id_path, &kp, &token, &base)?;
             relay.report("preparing", None).await?;
             (kp, relay)
@@ -310,17 +455,29 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         sandbox = ?backend.kind(), "joined as a runner"
     );
     let spec = RuntimeSpec { runtime: limits.runtime.clone(), packages: limits.packages.clone() };
+    // A session that keeps jobs off the network cannot have that from the
+    // process sandbox, unless the operator accepted the gap.
+    let no_network = !limits.network || args.no_network;
+    if args.sandbox == SandboxArg::Process && no_network && !args.accept_network_gap {
+        let e = anyhow::anyhow!(
+            "this session runs jobs without network access, but --sandbox process cannot block it; restart \
+             with --accept-network-gap to run them anyway, or use --sandbox docker"
+        );
+        let _ = relay.report("failed", Some(&failure_detail(&e))).await;
+        return Err(e);
+    }
     if let Err(e) = backend.prepare(&spec).await {
         let _ = relay.report("failed", Some(&failure_detail(&e))).await;
         return Err(e.context("preparing the sandbox"));
     }
-    // Unsandboxed (the local backend off Linux): jobs are plain processes.
+    // Unsandboxed (the local backend off Linux, or process mode): jobs are
+    // plain processes.
     let unsandboxed = backend.network_unblocked();
     if unsandboxed {
         tracing::warn!(
-            "the local backend cannot sandbox jobs here: they run as plain processes that can read this \
-             user's files and reach the network{}; only run code you trust, or use --sandbox docker",
-            if limits.network { "" } else { " (this session says network: false)" }
+            "jobs run as plain processes that can read this user's files and reach the network{}; only run \
+             code you trust, or use --sandbox docker",
+            if no_network { " (this session says network: false)" } else { "" }
         );
     }
     relay.report("ready", None).await?;
@@ -346,8 +503,11 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         done_file: dir.join(format!("jobs-done-{}.txt", args.name)),
         memory_cap_mb: args.memory,
         network: limits.network && !args.no_network,
+        progress_interval: args.progress_interval,
+        progress_tail: args.progress_tail as usize,
     });
-    let outcome = serve(&ctx, &view, &relay, args.max_jobs).await;
+    job::report_interrupted(&ctx, &view).await;
+    let outcome = serve(&ctx, &view, &relay, args.exit_after).await;
     drop(temp_jobs);
     let closed = view.lock().await.closed;
     if closed {
@@ -458,13 +618,35 @@ async fn heartbeats(relay: Relay, current: Arc<std::sync::Mutex<Option<String>>>
     }
 }
 
+/// Ctrl-C, or SIGTERM on unix. Never resolves if they cannot be watched.
+async fn signals() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                r = tokio::signal::ctrl_c() => {
+                    if r.is_err() {
+                        std::future::pending::<()>().await
+                    }
+                }
+                _ = term.recv() => {}
+            }
+            return;
+        }
+    }
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 /// The assignment loop. Returns when the session ends, the runner is
 /// rejected, or on Ctrl-C.
 async fn serve(
     ctx: &Arc<Ctx>,
     view: &Arc<Mutex<View>>,
     relay: &Relay,
-    max_jobs: Option<usize>,
+    exit_after: Option<usize>,
 ) -> Result<()> {
     view.lock().await.sync().await?;
     if !view.lock().await.approved {
@@ -482,24 +664,15 @@ async fn serve(
     let mut handled = 0usize;
     let mut tick = tokio::time::interval(HEARTBEAT);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Ctrl-C, or SIGTERM from `kill` or a service manager: stop cleanly, so
-    // the running job is cancelled and its files are removed.
-    let stop = async {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            match signal(SignalKind::terminate()) {
-                Ok(mut term) => tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = term.recv() => {}
-                },
-                Err(_) => {
-                    let _ = tokio::signal::ctrl_c().await;
-                }
-            }
+    // Ctrl-C, SIGTERM from `kill` or a service manager, or the Windows
+    // service's stop: stop cleanly, so the running job is cancelled and its
+    // files are removed.
+    let mut shutdown = SHUTDOWN.subscribe();
+    let stop = async move {
+        tokio::select! {
+            _ = signals() => {}
+            _ = shutdown.wait_for(|s| *s) => {}
         }
-        #[cfg(not(unix))]
-        let _ = tokio::signal::ctrl_c().await;
     };
     tokio::pin!(stop);
 
@@ -571,7 +744,7 @@ async fn serve(
                 }
                 handled += 1;
                 let _ = relay.heartbeat(None).await;
-                if max_jobs.is_some_and(|m| handled >= m) {
+                if exit_after.is_some_and(|m| handled >= m) {
                     break Ok(());
                 }
                 if let Some(job) = pending.take() {

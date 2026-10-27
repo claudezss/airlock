@@ -122,6 +122,8 @@ async fn auth_and_policy_are_enforced() {
                 host: "h".into(),
                 sandbox: airlox_core::cert::SandboxKind::Docker,
                 network_unblocked: false,
+                version: None,
+                python: None,
             }),
             created_at_ms: now_ms(),
         },

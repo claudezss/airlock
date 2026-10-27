@@ -248,6 +248,7 @@ impl Docker {
             killed_on_timeout: waited.killed_on_timeout,
             cancelled: waited.cancelled,
             oom_killed: oom,
+            peak_mem_kb: None,
             error,
         })
     }

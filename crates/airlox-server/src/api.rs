@@ -720,7 +720,8 @@ pub async fn post_item(
         }
         if role == Role::Runner {
             // A runner posts only as an eligible runner, and a result only
-            // for a job the relay gave it.
+            // for a job the relay gave it; progress only while that job runs
+            // (or after the relay lost track of the runner).
             let g = s2.lock();
             if !g.runner_eligible(&who2) {
                 return Err(ApiError::forbidden("this runner is not approved"));
@@ -729,6 +730,13 @@ pub async fn post_item(
                 h.refs.iter().any(|r| g.jobs.get(&r.id).is_some_and(|j| j.runner.as_deref() == Some(&who2)));
             if h.kind == ItemKind::Result && !assigned {
                 return Err(ApiError::forbidden("results must reference a job assigned to this runner"));
+            }
+            let running = h.refs.iter().any(|r| {
+                g.jobs.get(&r.id).is_some_and(|j| j.state.active() && j.runner.as_deref() == Some(&who2))
+                    || g.lost_by(&r.id, &who2)
+            });
+            if h.kind == ItemKind::Progress && !running {
+                return Err(ApiError::forbidden("progress must reference a job this runner is running"));
             }
         }
         Ok(())
@@ -739,12 +747,14 @@ pub async fn post_item(
     let refs: Vec<String> = up.env.header.refs.iter().map(|r| r.id.clone()).collect();
     let (seq, ()) = blocking(move || {
         commit_upload(&s, &who.clone(), up, |s, g, _| {
-            // A result from the runner a job is assigned to finishes that job.
+            // A result from the runner a job is assigned to finishes that job,
+            // also one the relay failed when it lost the runner's connection.
             if is_result {
                 let done: Vec<String> = refs
                     .iter()
                     .filter(|j| {
                         g.jobs.get(*j).is_some_and(|r| r.state.active() && r.runner.as_deref() == Some(&who))
+                            || g.lost_by(j, &who)
                     })
                     .cloned()
                     .collect();

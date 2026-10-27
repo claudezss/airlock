@@ -516,7 +516,7 @@ function newSession() {
     el("div", { class: "size" }, size, el("span", { class: "muted" }, "MB")));
   const lim = {
     runtime: el("input", { type: "text", id: "j-runtime", value: "python3.12", autocomplete: "off" }),
-    timeout: el("input", { type: "number", id: "j-timeout", min: 1, max: 3600, step: 1, value: 30 }),
+    timeout: el("input", { type: "number", id: "j-timeout", min: 1, max: 86400, step: 1, value: 30 }),
     memory: el("input", { type: "number", id: "j-memory", min: 32, max: 65536, step: 1, value: 512 }),
     packages: el("input", { type: "text", id: "j-packages", placeholder: "numpy, pandas", autocomplete: "off" }),
     approve: el("input", { type: "checkbox", id: "j-approve", checked: true }),
@@ -525,7 +525,7 @@ function newSession() {
     hint ? el("span", { class: "muted hint-text" }, hint) : null);
   const jobBox = el("fieldset", { class: "stack", hidden: true }, el("legend", {}, "Job limits"),
     el("div", { class: "limits" },
-      field("j-runtime", "Runtime", lim.runtime), field("j-timeout", "Timeout (seconds)", lim.timeout, "1 to 3600"),
+      field("j-runtime", "Runtime", lim.runtime), field("j-timeout", "Timeout (seconds)", lim.timeout, "1 to 86400"),
       field("j-memory", "Memory (MB)", lim.memory, "32 to 65536")),
     field("j-packages", "Packages", lim.packages, "Comma-separated. Only these can be requested by jobs."),
     el("label", { class: "option check" }, lim.approve, "Require owner approval for runners"),
@@ -564,7 +564,7 @@ function newSession() {
       const memory_mb = Number(lim.memory.value);
       const runtime = lim.runtime.value.trim();
       if (!/^python3\.\d{1,2}$/.test(runtime)) return (err.textContent = "Runtime must look like python3.12.");
-      if (!Number.isInteger(timeout_s) || timeout_s < 1 || timeout_s > 3600) return (err.textContent = "Timeout must be 1 to 3600 seconds.");
+      if (!Number.isInteger(timeout_s) || timeout_s < 1 || timeout_s > 86400) return (err.textContent = "Timeout must be 1 to 86400 seconds.");
       if (!Number.isInteger(memory_mb) || memory_mb < 32 || memory_mb > 65536) return (err.textContent = "Memory must be 32 to 65536 MB.");
       const packages = [];
       for (const raw of lim.packages.value.split(",").map((x) => x.trim()).filter(Boolean)) {
@@ -1416,7 +1416,7 @@ function renderItem(s, it) {
     el("div", { class: `avatar ${av}`, "aria-hidden": "true" }, initials(it.authorName)),
     el("div", { class: "body" }, meta, card));
   if (it.status === "evicted") {
-    const noun = { text: "message", file: "file", job: "job", result: "result" }[it.kind] || "item";
+    const noun = { text: "message", file: "file", job: "job", result: "result", progress: "progress report" }[it.kind] || "item";
     if (mine) card.append(el("p", { class: "note" }, `You sent this ${noun}, but this browser no longer has it and it is no longer on the relay.`));
     else {
       const asked = s.wanted.get(it.id);
@@ -1458,6 +1458,11 @@ function renderItem(s, it) {
     const chk = resultCheck(s, it);
     card.append(chk.ok ? renderResult(s, it) : rejectedResult(chk.error, chk.pending));
     if (!chk.ok && !chk.pending) node.classList.add("rejected");
+  } else if (m.type === "progress") {
+    const t = Math.floor(m.elapsed_ms / 1000);
+    const took = t >= 3600 ? `${Math.floor(t / 3600)} h ${Math.floor((t % 3600) / 60)} min` : t >= 60 ? `${Math.floor(t / 60)} min` : `${t} s`;
+    card.append(el("p", { class: "note" }, `Job still running after ${took}.`));
+    if (m.tail) card.append(el("details", {}, el("summary", {}, m.tail_truncated ? "End of its log" : "Its log"), el("pre", { tabindex: 0 }, m.tail)));
   } else card.append(el("pre", { tabindex: 0 }, JSON.stringify(m, null, 2)));
   if (it.note) card.append(el("p", { class: "note" }, it.note));
   return node;

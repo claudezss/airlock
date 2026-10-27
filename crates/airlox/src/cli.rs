@@ -512,6 +512,10 @@ pub struct RunArgs {
     /// A package from the session's allowlist the job needs (repeat).
     #[arg(long = "requirement")]
     pub requirements: Vec<String>,
+    /// A file in the job's work dir (e.g. a simulator's log) whose tail the
+    /// runner posts as progress while the job runs.
+    #[arg(long)]
+    pub progress_file: Option<String>,
     /// Save the job's out files here.
     #[arg(long)]
     pub out_dir: Option<PathBuf>,
@@ -545,6 +549,7 @@ pub async fn run(a: RunArgs) -> Result<i32> {
         timeout_s: a.timeout.map(|t| t.as_secs().max(1) as u32),
         memory_mb: a.memory,
         requirements: a.requirements.clone(),
+        progress_file: a.progress_file.clone(),
     };
     let (job, runner) = match s.run_python(spec).await {
         Ok(j) => j,
@@ -552,7 +557,7 @@ pub async fn run(a: RunArgs) -> Result<i32> {
             if let Some(n) = e.downcast_ref::<NoRunnerAvailable>() {
                 if a.conn.json {
                     print_json(
-                        &json!({"job": n.job, "status": "failed", "reason": "no_runner_available", "message": client::relay_text(&n.message)}),
+                        &json!({"job": n.job, "status": "failed", "reason": n.reason, "message": client::relay_text(&n.message)}),
                     );
                     return Ok(1);
                 }
@@ -976,8 +981,14 @@ pub async fn runner_list(conn: Conn) -> Result<()> {
             "idle"
         };
         let net = if r.network_unblocked { " · cannot block network" } else { "" };
+        let versions = match (&r.version, &r.python) {
+            (Some(v), Some(p)) => format!(" · airlox {} · python {}", clean_line(v), clean_line(p)),
+            (Some(v), None) => format!(" · airlox {}", clean_line(v)),
+            (None, Some(p)) => format!(" · python {}", clean_line(p)),
+            (None, None) => String::new(),
+        };
         println!(
-            "{:<20} {:<18} {} on {} [{}]{net}",
+            "{:<20} {:<18} {} on {} [{}]{net}{versions}",
             clean_line(&r.name),
             state,
             clean_line(&r.sandbox),
@@ -1158,8 +1169,10 @@ mod tests {
             (".git/config", b"x"),
         ]));
         let (saved, notes) = save_out_files(&r, d.path());
-        let mut names: Vec<_> =
-            saved.iter().map(|p| p.strip_prefix(&*d.path().to_string_lossy()).unwrap()).collect();
+        let mut names: Vec<_> = saved
+            .iter()
+            .map(|p| p.strip_prefix(&*d.path().to_string_lossy()).unwrap().replace('\\', "/"))
+            .collect();
         names.sort();
         assert_eq!(
             names,

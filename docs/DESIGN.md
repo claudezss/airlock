@@ -379,6 +379,20 @@ calls `setsid()` can outlive it there, and network cannot be blocked. The CLI
 prints a one-line warning when it is selected in a session whose manifest says
 `network: false`.
 
+A fourth backend, **process** (`--sandbox process`, reported as `process`),
+is for Windows hosts that run licensed tools no container can hold (a power
+system simulator, say). It is never a fallback: the operator names it. Jobs
+run with the operator's own interpreter (`--python`, an existing venv's,
+checked against the allowlist and never changed) as plain processes, each in
+a fresh work dir that is deleted afterwards and, on Windows, in its own Job
+Object: committed memory capped for the whole process tree, every process in
+it killed when the job ends (or the runner dies), no clipboard or desktop
+access. The environment is the shim's allowlist plus variables the operator
+passes with `--pass-env`. The runner refuses to start as an administrator or
+SYSTEM. Network cannot be blocked, so a `network: false` session is refused
+unless the operator passes `--accept-network-gap`. It suits trusted pairs
+only, like local off Linux. See [windows-runner.md](windows-runner.md).
+
 ### Job routing ("no queue")
 
 Submission is synchronous with respect to assignment:
@@ -593,11 +607,12 @@ refuses a manifest or an upload that exceeds a limit.
 | Setting | Default | Effect |
 |---|---|---|
 | `AIRLOX_MAX_TTL` | never | Rejects manifests that live longer (the protocol allows 30 days). `never` also accepts sessions that never expire; any duration refuses them. The web UI defaults to 1 h. |
-| `AIRLOX_MAX_ITEM_BYTES` | 25 MiB | A manifest's `max_item_bytes` may not exceed it. |
+| `AIRLOX_MAX_ITEM_BYTES` | 100 MiB | A manifest's `max_item_bytes` may not exceed it. |
 | `AIRLOX_BLOB_HOLD` | 1 h | Longest a blob stays on the relay after upload, delivered or not. |
 | `AIRLOX_BLOB_GRACE` | 5 min | How long a blob stays after its last recipient acked. It absorbs a recipient that acks and then immediately re-fetches; late joiners need re-seeding (M4). |
-| `AIRLOX_MAX_SESSION_BYTES` | 200 MiB | Ciphertext a session may have held on the relay at once; uploads past it get `413`. |
-| `AIRLOX_MAX_SESSION_TRANSFER` | 1 GiB | Total bytes uploaded plus downloaded per session, the bandwidth cap; past it, `429`. |
+| `AIRLOX_MAX_SESSION_BYTES` | 1 GiB | Ciphertext a session may have held on the relay at once; uploads past it get `413`. |
+| `AIRLOX_MAX_SESSION_TRANSFER` | 4 GiB | Total bytes uploaded plus downloaded per session, the bandwidth cap; past it, `429`. |
+| `AIRLOX_JOB_RECONNECT_GRACE` | 15 min | How long a running job outlives its runner's silence before it fails as `runner_lost`; a runner that reconnects meanwhile carries on. |
 | `AIRLOX_MAX_ITEMS` | 5 000 | Items per session. |
 | `AIRLOX_MAX_LOG_BYTES` | 4 MiB | Session log size (joins and envelopes). It bounds the per-session memory index; past it, joins and items get `413`. |
 | `AIRLOX_IDLE_TTL` | 2 h | Purges a session early after this long with no joins, items, acks or downloads, and no upload in progress. |
@@ -784,8 +799,8 @@ server always runs on the user's machine.
 
 Distribution: one `airlox` binary per platform (macOS arm64 and x64, Linux
 arm64 and x64 as static musl binaries, Windows x64 with the C runtime linked
-in; on Windows only the client and the MCP server, since the runner's
-sandboxes need macOS or Linux), built and smoke-tested by
+in; on Windows the runner offers the docker and process backends), built
+and smoke-tested by
 `.github/workflows/build.yml` and published on a version tag by
 `release.yml`. Each one ships:
 - on npm: a wrapper package `airlox` whose `bin` runs the binary from a

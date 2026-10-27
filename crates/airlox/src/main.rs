@@ -9,6 +9,8 @@ mod job;
 mod mcp;
 mod runner;
 mod sandbox;
+#[cfg(windows)]
+mod service;
 mod session;
 mod sse;
 mod view;
@@ -52,7 +54,11 @@ enum Cmd {
 #[derive(Subcommand)]
 enum RunnerCmd {
     /// Join a session with a runner invite and run its jobs until it ends.
-    Join(runner::JoinArgs),
+    Join(Box<runner::JoinArgs>),
+    /// Run a runner as a Windows service: install or uninstall it.
+    #[cfg(windows)]
+    #[command(subcommand)]
+    Service(service::ServiceCmd),
     /// List the session's runners.
     List(cli::Conn),
     /// Wait until a runner is online (and approved, with --approved); exits
@@ -101,12 +107,34 @@ fn main() -> std::process::ExitCode {
         }
     }
     let cli = Cli::parse();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "airlox=info".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    let filter =
+        || tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "airlox=info".into());
+    // Under the service manager there is no console: log to a file, and let
+    // the service code build the runtime on the thread the manager gives it.
+    #[cfg(windows)]
+    if let Cmd::Runner(RunnerCmd::Join(a)) = &cli.cmd {
+        if a.windows_service.is_some() {
+            let log = match service::log_file(a) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("airlox: could not open the service log: {e:#}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            let log = std::sync::Mutex::new(log);
+            tracing_subscriber::fmt().with_env_filter(filter()).with_ansi(false).with_writer(log).init();
+            let Cmd::Runner(RunnerCmd::Join(a)) = cli.cmd else { unreachable!() };
+            return match service::run(*a) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(e) => {
+                    tracing::error!("{e:#}");
+                    eprintln!("airlox: {e:#}");
+                    std::process::ExitCode::FAILURE
+                }
+            };
+        }
+    }
+    tracing_subscriber::fmt().with_env_filter(filter()).with_writer(std::io::stderr).init();
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
@@ -124,7 +152,15 @@ fn main() -> std::process::ExitCode {
             Cmd::Items(a) => cli::items(a).await.map(|()| 0),
             Cmd::Watch(a) => cli::watch(a).await.map(|()| 0),
             Cmd::Receive(a) => cli::receive(a).await.map(|()| 0),
-            Cmd::Runner(RunnerCmd::Join(args)) => runner::run(args).await.map(|()| 0),
+            Cmd::Runner(RunnerCmd::Join(args)) => runner::run(*args).await.map(|()| 0),
+            #[cfg(windows)]
+            Cmd::Runner(RunnerCmd::Service(service::ServiceCmd::Install(a))) => {
+                service::install(*a).await.map(|()| 0)
+            }
+            #[cfg(windows)]
+            Cmd::Runner(RunnerCmd::Service(service::ServiceCmd::Uninstall(a))) => {
+                service::uninstall(a).map(|()| 0)
+            }
             Cmd::Mcp(mcp::McpArgs { cmd: Some(mcp::McpCmd::Config(c)), .. }) => {
                 mcp::print_config(&c).map(|()| 0)
             }

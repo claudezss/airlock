@@ -6,8 +6,12 @@
 //! signed target names this runner, the owner's signed approval exists, and
 //! the job has not run here before. Any failure becomes a `refused` result;
 //! nothing runs.
+//!
+//! While a job runs the runner posts signed `progress` items (elapsed time
+//! and the tail of the job's `progress_file`). Its result is posted with
+//! retries for as long as the relay is unreachable, so a job that outlives a
+//! dropped connection still reports.
 
-use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -17,7 +21,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use airlox_core::encoding::{b64e, canonical_json, hex, sha256};
 use airlox_core::item::{new_item_id, seal, ItemKind, ItemRef, NewItem};
 use airlox_core::keys::Keypair;
-use airlox_core::payload::{JobResult, JobSpec, JobStatus, Meta, OutFile, Payload, MAX_STDIO_BYTES};
+use airlox_core::payload::{
+    JobProgress, JobResult, JobSpec, JobStatus, Meta, OutFile, Payload, MAX_PROGRESS_TAIL_BYTES,
+    MAX_STDIO_BYTES,
+};
 use airlox_core::policy::{check_file_name, target_matches};
 use airlox_core::session::{ContentType, Role};
 use airlox_core::validate::zip::{check_entry_path, extract_zip, ZipLimits};
@@ -25,13 +32,17 @@ use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use tokio::sync::{watch, Mutex};
 
-use crate::client::is_transient;
+use crate::client::{is_transient, Relay};
 use crate::sandbox::{Backend, PreparedJob, RawResult};
 use crate::view::View;
 
 /// How long a job that arrives just ahead of the owner's signed approval
 /// waits for it before being refused.
 const APPROVAL_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a finished job's result keeps being offered to an unreachable
+/// relay before the runner gives up on it.
+const RESULT_PATIENCE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// What stays fixed for a runner across jobs.
 pub struct Ctx {
@@ -40,24 +51,65 @@ pub struct Ctx {
     pub backend: Backend,
     /// Parent of per-job directories.
     pub jobs_dir: PathBuf,
-    /// Job ids this runner has handled, so a relayed duplicate never runs twice.
+    /// Job ids this runner has started (`<id>`) and answered (`<id> posted`),
+    /// so a relayed duplicate never runs twice, even across restarts.
     pub done_file: PathBuf,
     /// Upper bound on job memory from `--memory`, below the manifest's.
     pub memory_cap_mb: Option<u32>,
     pub network: bool,
+    /// How often a running job's progress is posted; zero for never.
+    pub progress_interval: Duration,
+    /// Most bytes of a job's `progress_file` sent with each progress item.
+    pub progress_tail: usize,
 }
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
-fn done_set(ctx: &Ctx) -> HashSet<String> {
-    fs::read_to_string(&ctx.done_file).unwrap_or_default().lines().map(str::to_string).collect()
+/// What this runner did with a job before: `None` never saw it,
+/// `Some(false)` started it without posting a result (it restarted
+/// mid-job), `Some(true)` posted its result.
+fn run_record(ctx: &Ctx, id: &str) -> Option<bool> {
+    let text = fs::read_to_string(&ctx.done_file).unwrap_or_default();
+    let (mut started, mut posted) = (false, false);
+    for line in text.lines() {
+        match line.split_once(' ') {
+            Some((j, "posted")) if j == id => posted = true,
+            None if line == id => started = true,
+            _ => {}
+        }
+    }
+    (started || posted).then_some(posted)
 }
 
-fn mark_done(ctx: &Ctx, id: &str) -> Result<()> {
+/// Jobs this runner started but never answered: it stopped while they ran.
+fn interrupted(ctx: &Ctx) -> Vec<String> {
+    let text = fs::read_to_string(&ctx.done_file).unwrap_or_default();
+    let mut started: Vec<&str> = text.lines().filter(|l| !l.contains(' ')).collect();
+    started.retain(|id| !text.lines().any(|l| l.strip_suffix(" posted") == Some(*id)));
+    started.dedup();
+    started.into_iter().map(String::from).collect()
+}
+
+/// After a restart, answer each job that was running when the runner
+/// stopped with a signed `failed` result (it is never run again), so its
+/// sender learns why instead of only that the relay lost the runner.
+pub async fn report_interrupted(ctx: &Arc<Ctx>, view: &Arc<Mutex<View>>) {
+    for id in interrupted(ctx) {
+        let (_, never) = watch::channel(false);
+        if let Err(e) = handle(ctx.clone(), view.clone(), id.clone(), never).await {
+            tracing::warn!(job = %id, "could not report the interrupted job: {e:#}");
+            // Do not try again on every start.
+            let _ = record(ctx, &format!("{id} posted"));
+        }
+    }
+}
+
+fn record(ctx: &Ctx, line: &str) -> Result<()> {
     let mut f = fs::OpenOptions::new().create(true).append(true).open(&ctx.done_file)?;
-    writeln!(f, "{id}")?;
+    writeln!(f, "{line}")?;
+    f.sync_data()?;
     Ok(())
 }
 
@@ -72,6 +124,8 @@ struct Accepted {
 enum Verdict {
     Run(Box<Accepted>),
     Refuse(String),
+    /// It started here before the runner restarted; it does not run again.
+    Interrupted,
 }
 
 /// Fetch, verify and check a job and its inputs.
@@ -95,8 +149,10 @@ async fn verify(ctx: &Ctx, view: &mut View, job_id: &str) -> Result<(ItemRef, Ve
     if !matches!(job.role, Role::Sender | Role::Owner) {
         return refuse("jobs must come from the sender or owner role".into());
     }
-    if done_set(ctx).contains(job_id) {
-        bail!("job {job_id} already ran here; ignoring the duplicate");
+    match run_record(ctx, job_id) {
+        Some(true) => bail!("job {job_id} already ran here; ignoring the duplicate"),
+        Some(false) => return Ok((job_ref, Verdict::Interrupted)),
+        None => {}
     }
     if !target_matches(&spec.target, ctx.keypair.public(), &ctx.labels) {
         return refuse("the job's signed target does not match this runner".into());
@@ -342,42 +398,147 @@ fn outcome(raw: &RawResult, timeout_s: u32, memory_mb: u32) -> (JobStatus, Optio
     }
 }
 
-async fn retry<T, Fut: std::future::Future<Output = Result<T>>>(f: impl Fn() -> Fut) -> Result<T> {
+/// Retry transient failures (network trouble, a busy or restarting relay)
+/// with backoff for up to `patience`.
+async fn retry<T, Fut: std::future::Future<Output = Result<T>>>(
+    patience: Duration,
+    f: impl Fn() -> Fut,
+) -> Result<T> {
+    let until = tokio::time::Instant::now() + patience;
     let mut delay = Duration::from_millis(500);
-    for _ in 0..6 {
+    loop {
         match f().await {
-            Err(e) if is_transient(&e) => {
-                tracing::warn!("relay busy, retrying: {e:#}");
+            Err(e) if is_transient(&e) && tokio::time::Instant::now() + delay < until => {
+                tracing::warn!("relay unavailable, retrying in {} s: {e:#}", delay.as_secs_f32());
                 tokio::time::sleep(delay).await;
-                delay *= 2;
+                delay = (delay * 2).min(Duration::from_secs(60));
             }
             r => return r,
         }
     }
-    f().await
 }
 
-/// Seal and upload an item; returns its reference.
-async fn post(
-    view: &View,
-    kp: &Keypair,
-    kind: ItemKind,
-    subkind: Option<ContentType>,
-    refs: Vec<ItemRef>,
-    p: Payload,
-) -> Result<ItemRef> {
-    let new = NewItem {
-        id: new_item_id(),
-        session_id: view.manifest.session_id.clone(),
-        kind,
-        subkind,
-        created_at_ms: now_ms(),
-        refs,
+/// What it takes to post items without holding the session view.
+#[derive(Clone)]
+struct Poster {
+    relay: Relay,
+    key: [u8; 32],
+    session_id: String,
+}
+
+impl Poster {
+    fn of(view: &View) -> Self {
+        Poster {
+            relay: view.relay.clone(),
+            key: *view.session_key(),
+            session_id: view.manifest.session_id.clone(),
+        }
+    }
+
+    /// Seal and upload an item, retrying for up to `patience`; returns its reference.
+    async fn post(
+        &self,
+        kp: &Keypair,
+        kind: ItemKind,
+        subkind: Option<ContentType>,
+        refs: Vec<ItemRef>,
+        p: Payload,
+        patience: Duration,
+    ) -> Result<ItemRef> {
+        let new = NewItem {
+            id: new_item_id(),
+            session_id: self.session_id.clone(),
+            kind,
+            subkind,
+            created_at_ms: now_ms(),
+            refs,
+        };
+        let sealed = seal(&self.key, kp, new, &p.encode()?)?;
+        let env = String::from_utf8(canonical_json(&sealed.envelope)?)?;
+        retry(patience, || self.relay.post_item(&env, &sealed.blob)).await?;
+        Ok(ItemRef::to(&sealed))
+    }
+}
+
+/// The last `max` bytes of `path`, a file inside `work`, as text starting at
+/// a line, and whether more came before. `None` while the file does not
+/// exist (or is not a regular file inside `work`).
+fn read_tail(work: &Path, path: &Path, max: usize) -> (Option<String>, bool) {
+    use std::io::{Read, Seek, SeekFrom};
+    let inside = |p: &Path| {
+        let (Ok(w), Ok(p)) = (fs::canonicalize(work), fs::canonicalize(p)) else { return None };
+        p.starts_with(&w).then_some(p)
     };
-    let sealed = seal(view.session_key(), kp, new, &p.encode()?)?;
-    let env = String::from_utf8(canonical_json(&sealed.envelope)?)?;
-    retry(|| view.relay.post_item(&env, &sealed.blob)).await?;
-    Ok(ItemRef::to(&sealed))
+    let Some(real) = inside(path) else { return (None, false) };
+    let mut o = fs::OpenOptions::new();
+    o.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut o, nix::fcntl::OFlag::O_NONBLOCK.bits());
+    let Ok(mut f) = o.open(&real) else { return (None, false) };
+    let len = match f.metadata() {
+        Ok(m) if m.is_file() => m.len(),
+        _ => return (None, false),
+    };
+    let max = max.min(MAX_PROGRESS_TAIL_BYTES / 2);
+    let truncated = len > max as u64;
+    if truncated && f.seek(SeekFrom::Start(len - max as u64)).is_err() {
+        return (None, false);
+    }
+    let mut buf = Vec::with_capacity(max);
+    if f.take(max as u64).read_to_end(&mut buf).is_err() {
+        return (None, false);
+    }
+    let mut text = String::from_utf8_lossy(&buf).into_owned();
+    // Start at a line: the cut lands mid-line (or mid-character).
+    if truncated {
+        if let Some(nl) = text.find('\n') {
+            text.drain(..=nl);
+        }
+    }
+    (Some(text), truncated)
+}
+
+/// Post the job's progress every `ctx.progress_interval` until aborted.
+fn spawn_progress(
+    ctx: &Arc<Ctx>,
+    poster: &Poster,
+    job_ref: &ItemRef,
+    work: PathBuf,
+    file: Option<String>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if ctx.progress_interval.is_zero() {
+        return None;
+    }
+    let (ctx, poster, job_ref) = (ctx.clone(), poster.clone(), job_ref.clone());
+    Some(tokio::spawn(async move {
+        let start = tokio::time::Instant::now();
+        let mut tick = tokio::time::interval_at(start + ctx.progress_interval, ctx.progress_interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let (work, path, max) = (work.clone(), file.as_ref().map(|f| work.join(f)), ctx.progress_tail);
+            let (tail, tail_truncated) = match path {
+                Some(p) => {
+                    tokio::task::spawn_blocking(move || read_tail(&work, &p, max)).await.unwrap_or_default()
+                }
+                None => (None, false),
+            };
+            let p = JobProgress {
+                job: job_ref.clone(),
+                elapsed_ms: start.elapsed().as_millis() as u64,
+                tail,
+                tail_truncated,
+            };
+            let refs = vec![job_ref.clone()];
+            // One try: the next tick says the same, and newer.
+            let posted = poster
+                .post(&ctx.keypair, ItemKind::Progress, None, refs, Payload::progress(p), Duration::ZERO)
+                .await;
+            if let Err(e) = posted {
+                tracing::warn!(job = %job_ref.id, "could not post progress: {e:#}");
+            }
+        }
+    }))
 }
 
 /// Handle one assigned (and already claimed) job to the end.
@@ -410,10 +571,21 @@ pub async fn handle(
         input_sha256: hex(&sha256(b"")),
     };
     let mut refs = vec![job_ref.clone()];
+    let poster = Poster::of(&*view.lock().await);
     // At most once: recorded before anything runs, so a relay that refuses
     // the result cannot get the same signed job run again.
-    mark_done(&ctx, &job_id)?;
+    if !matches!(verdict, Verdict::Interrupted) {
+        record(&ctx, &job_id)?;
+    }
     match verdict {
+        Verdict::Interrupted => {
+            tracing::warn!(job = %job_id, "this job was running when the runner stopped; not running it again");
+            result.status = JobStatus::Failed;
+            result.reason = Some(
+                "the runner restarted while this job was running; a job never runs twice, so resubmit it"
+                    .into(),
+            );
+        }
         Verdict::Refuse(why) => {
             tracing::warn!(job = %job_id, "refusing: {why}");
             result.reason = Some(why);
@@ -454,23 +626,28 @@ pub async fn handle(
                 result.reason = Some(format!("could not stage inputs: {e:#}"));
             } else {
                 tracing::info!(job = %job_id, entry = %job.entry, "running");
+                let progress =
+                    spawn_progress(&ctx, &poster, &job_ref, job.work_dir(), a.spec.progress_file.clone());
                 let raw = ctx.backend.run(&job, cancel).await.unwrap_or_else(|e| RawResult {
                     error: Some(format!("the sandbox could not run the job: {e:#}")),
                     ..Default::default()
                 });
+                if let Some(p) = progress {
+                    p.abort();
+                }
                 let (status, exit_code, reason) = outcome(&raw, job.timeout_s, memory_mb);
                 result.status = status;
                 result.exit_code = exit_code;
                 result.reason = reason;
                 result.wall_ms = raw.shim.as_ref().map(|s| s.wall_ms).unwrap_or(raw.wall_ms);
-                result.peak_mem_mb = raw.shim.as_ref().map(|s| (s.peak_rss_kb / 1024) as u32).unwrap_or(0);
+                let peak_kb = raw.peak_mem_kb.or(raw.shim.as_ref().map(|s| s.peak_rss_kb)).unwrap_or(0);
+                result.peak_mem_mb = (peak_kb / 1024) as u32;
                 (result.stdout, result.stdout_truncated) = stdio(&job.meta_dir().join("stdout.txt"));
                 (result.stderr, result.stderr_truncated) = stdio(&job.meta_dir().join("stderr.txt"));
                 let mut notes = Vec::new();
                 if limits.return_out {
-                    let v = view.lock().await;
                     // The payload adds a few hundred bytes of meta to the file.
-                    let max = v.manifest.max_item_bytes.saturating_sub(4096);
+                    let max = view.lock().await.manifest.max_item_bytes.saturating_sub(4096);
                     let outs = collect_out(&job.out_dir(), max, &mut notes).unwrap_or_else(|e| {
                         notes.push(format!("could not collect /out: {e:#}"));
                         vec![]
@@ -479,7 +656,17 @@ pub async fn handle(
                         let size = o.body.len() as u64;
                         let name = o.name.clone();
                         let file = Payload::file(&o.name, &o.mime, o.body);
-                        match post(&v, &ctx.keypair, ItemKind::File, Some(o.subkind), vec![], file).await {
+                        let posted = poster
+                            .post(
+                                &ctx.keypair,
+                                ItemKind::File,
+                                Some(o.subkind),
+                                vec![],
+                                file,
+                                RESULT_PATIENCE,
+                            )
+                            .await;
+                        match posted {
                             Ok(r) => {
                                 result.out_files.push(OutFile { name: o.name, size, item: r.clone() });
                                 refs.push(r);
@@ -505,8 +692,9 @@ pub async fn handle(
         }
     }
     let status = result.status;
-    let v = view.lock().await;
-    post(&v, &ctx.keypair, ItemKind::Result, None, refs, Payload::result(result)).await?;
+    let result = Payload::result(result);
+    poster.post(&ctx.keypair, ItemKind::Result, None, refs, result, RESULT_PATIENCE).await?;
+    record(&ctx, &format!("{job_id} posted"))?;
     tracing::info!(job = %job_id, ?status, "result posted");
     Ok(())
 }

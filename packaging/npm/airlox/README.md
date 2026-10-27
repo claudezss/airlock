@@ -22,4 +22,4 @@ owner invite link to the model.
 This package runs a prebuilt binary from a platform package (`@airlox/<os>-<cpu>`)
 that npm installs as an optional dependency; nothing runs at install time.
 Supported: macOS (arm64, x64), Linux (arm64, x64; static, any distribution)
-and Windows (x64; the client and the MCP server, not the runner).
+and Windows (x64; runners there use Docker or the process sandbox).

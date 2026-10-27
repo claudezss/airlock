@@ -834,16 +834,15 @@ inline in out_text; use get_result with save_dir to save them all.")]
                 timeout_s: p.timeout_s,
                 memory_mb: p.memory_mb,
                 requirements: p.requirements,
+                progress_file: None,
             };
             match s.run_python(spec).await {
                 Ok(j) => j,
                 Err(e) => match e.downcast_ref::<NoRunnerAvailable>() {
                     Some(n) => {
-                        return fail(
-                            json!({"job": n.job, "status": "failed", "reason": "no_runner_available",
+                        return fail(json!({"job": n.job, "status": "failed", "reason": n.reason,
                             "message": client::relay_text(&n.message),
-                            "hint": "list_runners: a runner must be online, idle and approved; jobs are not queued"}),
-                        )
+                            "hint": "list_runners: a runner must be online, idle and approved; jobs are not queued"}))
                     }
                     None => return fail(format!("{e:#}")),
                 },

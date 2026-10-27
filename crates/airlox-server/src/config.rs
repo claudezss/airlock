@@ -30,13 +30,13 @@ pub struct Config {
     #[arg(long = "max-ttl", env = "AIRLOX_MAX_TTL", default_value = "never", value_parser = parse_duration_or_never)]
     pub max_ttl_ms: u64,
     /// Largest per-item limit a manifest may set.
-    #[arg(long, env = "AIRLOX_MAX_ITEM_BYTES", default_value = "25MiB", value_parser = parse_size)]
+    #[arg(long, env = "AIRLOX_MAX_ITEM_BYTES", default_value = "100MiB", value_parser = parse_size)]
     pub max_item_bytes: u64,
     /// Ciphertext a session may have held on the relay at once.
-    #[arg(long, env = "AIRLOX_MAX_SESSION_BYTES", default_value = "200MiB", value_parser = parse_size)]
+    #[arg(long, env = "AIRLOX_MAX_SESSION_BYTES", default_value = "1GiB", value_parser = parse_size)]
     pub max_session_bytes: u64,
     /// Total bytes uploaded plus downloaded per session.
-    #[arg(long, env = "AIRLOX_MAX_SESSION_TRANSFER", default_value = "1GiB", value_parser = parse_size)]
+    #[arg(long, env = "AIRLOX_MAX_SESSION_TRANSFER", default_value = "4GiB", value_parser = parse_size)]
     pub max_session_transfer: u64,
     #[arg(long, env = "AIRLOX_MAX_ITEMS", default_value_t = 5000)]
     pub max_items: usize,
@@ -78,6 +78,11 @@ pub struct Config {
     /// A runner without a heartbeat for this long is offline, and its job fails.
     #[arg(long = "runner-timeout", env = "AIRLOX_RUNNER_TIMEOUT", default_value = "30s", value_parser = parse_duration_ms)]
     pub runner_timeout_ms: u64,
+    /// How long a running job outlives its runner's silence (at least
+    /// `--runner-timeout`): a runner that reconnects within it carries on,
+    /// and its result still finishes the job.
+    #[arg(long = "job-reconnect-grace", env = "AIRLOX_JOB_RECONNECT_GRACE", default_value = "15m", value_parser = parse_duration_ms)]
+    pub job_reconnect_grace_ms: u64,
     /// How long a one-time transfer code stays claimable.
     #[arg(long = "drop-ttl", env = "AIRLOX_DROP_TTL", default_value = "10m", value_parser = parse_duration_ms)]
     pub drop_ttl_ms: u64,
@@ -170,7 +175,8 @@ mod tests {
         assert_eq!(parse_size_or_unlimited("2GiB").unwrap(), 2 << 30);
         let c = Config::with_data("/tmp/x");
         assert_eq!(c.blob_hold_ms, 3_600_000);
-        assert_eq!(c.max_session_bytes, 200 << 20);
+        assert_eq!(c.max_session_bytes, 1 << 30);
+        assert_eq!(c.job_reconnect_grace_ms, 900_000);
         assert_eq!((c.max_ttl_ms, c.max_bytes_per_ip), (u64::MAX, u64::MAX));
     }
 }

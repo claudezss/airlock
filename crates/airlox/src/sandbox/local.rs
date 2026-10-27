@@ -8,18 +8,40 @@
 //! - **Elsewhere**: a plain process with the shim's scrubbed environment,
 //!   rlimits and process-group kill. Network cannot be blocked and a job that
 //!   calls `setsid()` can outlive the shim, so this is for trusted code only.
+//! - **`--sandbox process`**: a plain process as above. On Windows each job
+//!   runs in its own Job Object ([`super::winjob`]): memory capped for the
+//!   whole process tree, and every process in it killed when the job ends.
+//!   Network cannot be blocked.
 //!
 //! The runtime is a `uv` virtual environment with the package allowlist,
-//! built once at prepare time.
+//! built once at prepare time, or the interpreter the operator names with
+//! `--python` (such as an existing venv's), which is checked against the
+//! allowlist and never changed.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use airlox_core::cert::SandboxKind;
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 use tokio::process::Command;
 use tokio::sync::watch;
 
 use super::{read_shim_result, supervise, PreparedJob, RawResult, RuntimeSpec, KILL_GRACE};
+
+/// How the local backend runs jobs, from the runner's flags.
+#[derive(Clone, Debug, Default)]
+pub struct LocalOpts {
+    /// Namespaces and Landlock; only honoured on Linux, never in process mode.
+    pub sandboxed: bool,
+    /// `--sandbox process`: report as such and, on Windows, contain each job
+    /// in a Job Object.
+    pub process: bool,
+    /// Run jobs with this interpreter instead of building a runtime with uv.
+    pub python: Option<PathBuf>,
+    /// Variables from the runner's environment that jobs also get.
+    pub pass_env: Vec<String>,
+}
 
 pub struct Local {
     state_dir: PathBuf,
@@ -28,7 +50,70 @@ pub struct Local {
     /// Directories the interpreter needs, mounted read-only in the sandbox.
     runtime_dirs: Vec<PathBuf>,
     shim: PathBuf,
-    sandboxed: bool,
+    opts: LocalOpts,
+}
+
+/// What an interpreter reports about itself.
+#[derive(Debug, Deserialize)]
+pub struct PythonInfo {
+    /// e.g. "3.12.4"
+    pub version: String,
+    /// Allowlisted packages it does not have.
+    pub missing: Vec<String>,
+}
+
+/// Lists the interpreter's version and which of the package names in argv
+/// (PEP 503 normalized) are not installed. Standard library only.
+const PROBE_PY: &str = r#"
+import json, platform, re, sys
+from importlib import metadata
+have = {re.sub(r"[-_.]+", "-", d.metadata.get("Name") or "").lower() for d in metadata.distributions()}
+print(json.dumps({"version": platform.python_version(), "missing": [p for p in sys.argv[1:] if p not in have]}))
+"#;
+
+/// The environment every process the backend starts begins with: nothing
+/// of the runner's (its invite, its keys) but what the OS needs, then the
+/// operator's `--pass-env` variables.
+fn base_env(cmd: &mut Command, pass_env: &[String]) {
+    cmd.env_clear();
+    #[cfg(windows)]
+    {
+        let root = std::env::var_os("SYSTEMROOT").unwrap_or_else(|| r"C:\Windows".into());
+        let mut path = PathBuf::from(&root);
+        path.push("System32");
+        let path = std::env::join_paths([path, PathBuf::from(&root)]).unwrap_or_default();
+        cmd.env("SYSTEMROOT", &root).env("PATH", path);
+    }
+    #[cfg(not(windows))]
+    cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin");
+    for name in pass_env {
+        if let Some(v) = std::env::var_os(name) {
+            cmd.env(name, v);
+        }
+    }
+}
+
+/// Ask `python` for its version and which `packages` it lacks.
+pub async fn probe_python(python: &Path, packages: &[String], pass_env: &[String]) -> Result<PythonInfo> {
+    let mut cmd = Command::new(python);
+    base_env(&mut cmd, pass_env);
+    cmd.args(["-I", "-c", PROBE_PY]).args(packages).stdin(Stdio::null()).kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(super::winjob::NO_WINDOW);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output())
+        .await
+        .with_context(|| format!("{} did not answer within 60 s", python.display()))?
+        .with_context(|| format!("could not run {}", python.display()))?;
+    if !out.status.success() {
+        bail!(
+            "{} failed ({}):\n{}",
+            python.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&out.stdout)
+        .with_context(|| format!("unexpected answer from {}", python.display()))
 }
 
 /// Every symlink met while resolving `p` (e.g. uv's `cpython-3.12-…` link
@@ -59,7 +144,28 @@ fn symlinks_on_path(p: &Path) -> Vec<PathBuf> {
 
 fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file())
+    let names: Vec<String> =
+        if cfg!(windows) { vec![format!("{name}.exe"), name.to_string()] } else { vec![name.to_string()] };
+    std::env::split_paths(&path).flat_map(|d| names.iter().map(move |n| d.join(n))).find(|p| p.is_file())
+}
+
+/// An exclusive lock on `path`, held until the returned file is dropped:
+/// opened sharing nothing, which Windows releases when the process dies.
+#[cfg(windows)]
+async fn lock(path: PathBuf) -> Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const SHARING_VIOLATION: i32 = 32;
+    loop {
+        let opened =
+            std::fs::OpenOptions::new().create(true).truncate(false).write(true).share_mode(0).open(&path);
+        match opened {
+            Ok(f) => return Ok(f),
+            Err(e) if e.raw_os_error() == Some(SHARING_VIOLATION) => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await
+            }
+            Err(e) => return Err(anyhow::anyhow!("locking {}: {e}", path.display())),
+        }
+    }
 }
 
 /// An exclusive lock on `path`, held until the returned guard is dropped.
@@ -82,37 +188,104 @@ async fn run_ok(cmd: &mut Command, what: &str) -> Result<()> {
 }
 
 impl Local {
-    /// `sandboxed` is only honoured on Linux.
-    pub fn new(state_dir: &Path, sandboxed: bool) -> Self {
+    pub fn new(state_dir: &Path, mut opts: LocalOpts) -> Self {
+        opts.sandboxed = opts.sandboxed && !opts.process && cfg!(target_os = "linux");
         Local {
             state_dir: state_dir.to_path_buf(),
             python: None,
             runtime_dirs: vec![],
             shim: state_dir.join("shim.py"),
-            sandboxed: sandboxed && cfg!(target_os = "linux"),
+            opts,
         }
     }
 
     pub fn sandboxed(&self) -> bool {
-        self.sandboxed
+        self.opts.sandboxed
+    }
+
+    pub fn kind(&self) -> SandboxKind {
+        if self.opts.process {
+            SandboxKind::Process
+        } else {
+            SandboxKind::Local
+        }
     }
 
     pub async fn prepare(&mut self, spec: &RuntimeSpec) -> Result<()> {
         std::fs::create_dir_all(&self.state_dir)?;
-        crate::view::write_atomic(&self.shim, airlox_core::shim::SHIM_PY.as_bytes(), 0o644)?;
+        // Runners sharing a cache start together; on Windows replacing a
+        // file another one is replacing (or reading) fails, so only write a
+        // shim that differs, and accept the race if the result is right.
+        let shim = airlox_core::shim::SHIM_PY.as_bytes();
+        let current = || std::fs::read(&self.shim).ok();
+        if current().as_deref() != Some(shim) {
+            if let Err(e) = crate::view::write_atomic(&self.shim, shim, 0o644) {
+                if current().as_deref() != Some(shim) {
+                    return Err(e);
+                }
+            }
+        }
+        let python = match self.opts.python.clone() {
+            Some(p) => self.check_python(&p, spec).await?,
+            None => self.build_runtime(spec).await?,
+        };
+        // The venv's interpreter is a link into a Python installation that
+        // the sandbox must also see.
+        if self.opts.sandboxed {
+            let venv = python.parent().and_then(Path::parent).context("unexpected interpreter layout")?;
+            let real = std::fs::canonicalize(&python)?;
+            let install = real.parent().and_then(Path::parent).context("unexpected interpreter layout")?;
+            self.runtime_dirs = vec![std::fs::canonicalize(venv)?, install.to_path_buf()];
+            self.runtime_dirs.extend(symlinks_on_path(&python));
+        }
+        self.python = Some(python);
+        Ok(())
+    }
+
+    /// The operator's interpreter: it must run the session's Python and
+    /// already have every allowlisted package. Nothing is installed.
+    async fn check_python(&self, python: &Path, spec: &RuntimeSpec) -> Result<PathBuf> {
+        if !python.is_file() {
+            bail!("--python {} is not a file", python.display());
+        }
+        let python = std::path::absolute(python)?;
+        let info = probe_python(&python, &spec.packages, &self.opts.pass_env).await?;
+        let want = spec.python_version();
+        if info.version != want && !info.version.starts_with(&format!("{want}.")) {
+            bail!(
+                "--python {} is Python {}, but the session runs {}; point --python at a Python {want} interpreter",
+                python.display(),
+                info.version,
+                spec.runtime
+            );
+        }
+        if !info.missing.is_empty() {
+            bail!(
+                "packages the session allows are missing from --python: {}. Install them into {}; the runner \
+                 never installs anything into it",
+                info.missing.join(", "),
+                python.display()
+            );
+        }
+        tracing::info!(python = %python.display(), version = %info.version, "using the operator's interpreter");
+        Ok(python)
+    }
+
+    /// A uv venv with the allowlist, shared by runners using the same cache.
+    async fn build_runtime(&self, spec: &RuntimeSpec) -> Result<PathBuf> {
         let venv = self.state_dir.join("runtimes").join(spec.hash());
         let python = venv.join(if cfg!(windows) { "Scripts/python.exe" } else { "bin/python" });
         // Runners sharing a cache (the default) may start together: one
         // builds the runtime while the others wait, instead of each deleting
         // the venv another is building.
         std::fs::create_dir_all(self.state_dir.join("runtimes"))?;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _building = lock(self.state_dir.join("runtimes").join(format!("{}.lock", spec.hash()))).await?;
         if !venv.join(".ready").exists() {
             let Some(uv) = which("uv") else {
                 bail!(
-                    "the local backend builds its runtime with uv; install it (https://docs.astral.sh/uv/) \
-                     or use --sandbox docker"
+                    "the local backend builds its runtime with uv; install it (https://docs.astral.sh/uv/), \
+                     pass --python with an existing interpreter, or use --sandbox docker"
                 );
             };
             let _ = std::fs::remove_dir_all(&venv);
@@ -136,20 +309,13 @@ impl Local {
             }
             std::fs::write(venv.join(".ready"), b"")?;
         }
-        // The venv's interpreter is a link into a Python installation that
-        // the sandbox must also see.
-        let real = std::fs::canonicalize(&python)?;
-        let install = real.parent().and_then(Path::parent).context("unexpected interpreter layout")?;
-        self.runtime_dirs = vec![std::fs::canonicalize(&venv)?, install.to_path_buf()];
-        self.runtime_dirs.extend(symlinks_on_path(&python));
-        self.python = Some(python);
-        Ok(())
+        Ok(python)
     }
 
     fn command(&self, job: &PreparedJob) -> Result<Command> {
         let python = self.python.as_ref().context("local backend was not prepared")?;
         #[cfg(target_os = "linux")]
-        if self.sandboxed {
+        if self.opts.sandboxed {
             let spec = super::linux::SandboxSpec {
                 rootfs: job.root.join("rootfs"),
                 work: job.work_dir(),
@@ -179,14 +345,17 @@ impl Local {
             .arg("--out")
             .arg(job.out_dir())
             .args(["--memory-mb", &job.memory_mb.to_string()]);
+        for name in &self.opts.pass_env {
+            c.args(["--pass-env", name]);
+        }
         Ok(c)
     }
 
     pub async fn run(&self, job: &PreparedJob, cancel: watch::Receiver<bool>) -> Result<RawResult> {
         let mut cmd = self.command(job)?;
-        cmd.env_clear()
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-            .current_dir(&job.root)
+        // The sandboxed path builds its own environment inside the namespaces.
+        base_env(&mut cmd, if self.opts.sandboxed { &[] } else { &self.opts.pass_env });
+        cmd.current_dir(&job.root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -195,14 +364,44 @@ impl Local {
         // namespace init) but not the runner.
         #[cfg(unix)]
         cmd.process_group(0);
+        // On Windows the shim starts suspended and runs only once it is in
+        // its Job Object, so nothing it starts is ever outside it.
+        #[cfg(windows)]
+        let winjob = if self.opts.process {
+            cmd.creation_flags(super::winjob::SUSPENDED);
+            Some(super::winjob::WinJob::new(job.memory_mb)?)
+        } else {
+            None
+        };
         let mut child = cmd.spawn().context("could not start the sandbox")?;
         let pid = child.id();
+        #[cfg(windows)]
+        if let Some(j) = &winjob {
+            let adopted = match (child.raw_handle(), pid) {
+                (Some(h), Some(pid)) => j.adopt(h as _, pid),
+                _ => Err(anyhow::anyhow!("the shim exited before it could start")),
+            };
+            if let Err(e) = adopted {
+                let _ = child.start_kill();
+                return Err(e.context("could not put the job in a Job Object"));
+            }
+        }
         let deadline = std::time::Duration::from_secs(job.timeout_s as u64) + KILL_GRACE;
         #[cfg(unix)]
         let (stop, kill) = (async { super::signal_group(pid, nix::sys::signal::Signal::SIGTERM) }, async {
             super::signal_group(pid, nix::sys::signal::Signal::SIGKILL)
         });
-        #[cfg(not(unix))]
+        // Windows has no polite stop: the Job Object ends the whole tree.
+        #[cfg(windows)]
+        let (stop, kill) = (
+            async {
+                if let Some(j) = &winjob {
+                    j.terminate();
+                }
+            },
+            async {},
+        );
+        #[cfg(not(any(unix, windows)))]
         let (stop, kill) = (async {}, async {});
         let _ = pid;
         let waited = supervise(&mut child, deadline, cancel, stop, kill).await?;
@@ -212,6 +411,17 @@ impl Local {
             let _ = e.read_to_string(&mut stderr).await;
         }
         let shim = read_shim_result(job);
+        #[allow(unused_mut)]
+        let (mut peak_mem_kb, mut oom_killed) = (None, false);
+        #[cfg(windows)]
+        if let Some(j) = winjob {
+            peak_mem_kb = Some(j.peak_kb());
+            // An allocation the cap refused usually ends the job with an error.
+            oom_killed =
+                j.hit_memory_limit() && shim.as_ref().is_some_and(|s| s.exit_code.is_some_and(|c| c != 0));
+            // Dropping the job kills anything the job left running.
+            drop(j);
+        }
         let error = match (&shim, waited.status) {
             (None, Some(s)) if !waited.cancelled && !waited.killed_on_timeout => {
                 Some(format!("sandbox failed ({s}): {}", stderr.trim()))
@@ -223,7 +433,8 @@ impl Local {
             wall_ms: waited.wall_ms,
             killed_on_timeout: waited.killed_on_timeout,
             cancelled: waited.cancelled,
-            oom_killed: false,
+            oom_killed,
+            peak_mem_kb,
             error,
         })
     }

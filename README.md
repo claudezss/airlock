@@ -96,8 +96,8 @@ pip install airlox           # with the Python SDK; or run it with uvx airlox â€
 There are prebuilt binaries for macOS (arm64, x64), Linux (arm64, x64; static,
 so any distribution) and Windows (x64), also on the
 [releases page](https://github.com/claudezss/airlox/releases), each with
-`SHA256SUMS`. On Windows it is the command-line client and the MCP server;
-runners need macOS or Linux. Elsewhere (and wherever pip finds no wheel, such
+`SHA256SUMS`. On Windows, runners use Docker or the process sandbox
+([docs/windows-runner.md](docs/windows-runner.md)). Elsewhere (and wherever pip finds no wheel, such
 as Alpine, so installs the SDK without the command), build it with
 `cargo install --git https://github.com/claudezss/airlox airlox`.
 
@@ -233,7 +233,13 @@ The runner builds its job image once (`python:3.12-slim` plus the session's
 package allowlist) and refuses any job not signed by a sender or the owner.
 `--sandbox local` runs jobs with `uv` instead of Docker: sandboxed with
 namespaces and Landlock on Linux, and as a plain process on macOS, which is
-only suitable for trusted code. A complete example is in
+only suitable for trusted code. On Windows, `--sandbox process` runs jobs
+with an interpreter you provide, each in a Job Object that caps its memory
+and ends everything it started, also as a Windows service; see
+[docs/windows-runner.md](docs/windows-runner.md). Runners take one job at a
+time (a busy one refuses new jobs with `runner_busy`), post progress while
+long jobs run, and finish jobs across dropped connections. A complete
+example is in
 [examples/summarize](examples/summarize), and
 [docs/use-cases.md](docs/use-cases.md) walks through four more: a code
 review handoff over MCP, remote CI from the CLI, fan-out across a runner
@@ -271,6 +277,8 @@ make web && cargo run --release -p airlox-server -- --data ./data
 Limits such as session lifetime, item and session size, transfer, session
 counts and the disk watermark are flags and `AIRLOX_*` environment variables;
 see `airlox-server --help`. `--ephemeral` keeps nothing across restarts.
+`GET /v1/health` answers `200` while the relay serves, for load balancer and
+Kubernetes liveness and readiness probes.
 [docs/deploy.md](docs/deploy.md) describes the production setup behind
 airlox.app: Caddy for HTTPS and automatic deploys from CI.
 

@@ -14,6 +14,8 @@ pub mod docker;
 #[cfg(target_os = "linux")]
 pub mod linux;
 pub mod local;
+#[cfg(windows)]
+pub mod winjob;
 
 use std::path::PathBuf;
 use std::process::ExitStatus;
@@ -91,6 +93,9 @@ pub struct RawResult {
     pub cancelled: bool,
     /// The container was killed for exceeding its memory limit.
     pub oom_killed: bool,
+    /// Peak memory measured by the sandbox (a Windows Job Object), when the
+    /// shim cannot measure it itself.
+    pub peak_mem_kb: Option<u64>,
     /// Why the sandbox itself failed, if it did.
     pub error: Option<String>,
 }
@@ -103,7 +108,7 @@ pub enum Backend {
 impl Backend {
     pub fn kind(&self) -> SandboxKind {
         match self {
-            Backend::Local(_) => SandboxKind::Local,
+            Backend::Local(l) => l.kind(),
             Backend::Docker(_) => SandboxKind::Docker,
         }
     }
@@ -224,7 +229,23 @@ pub fn make_removable(path: &std::path::Path) {
         }
     }
     #[cfg(not(unix))]
-    let _ = path;
+    {
+        // A job may have marked its files read-only, which Windows will not delete.
+        let Ok(meta) = std::fs::symlink_metadata(path) else { return };
+        if meta.permissions().readonly() {
+            let mut p = meta.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            p.set_readonly(false);
+            let _ = std::fs::set_permissions(path, p);
+        }
+        if meta.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for e in entries.flatten() {
+                    make_removable(&e.path());
+                }
+            }
+        }
+    }
 }
 
 /// Send `sig` to a process group (the sandbox's), ignoring "already gone".

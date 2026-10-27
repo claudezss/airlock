@@ -115,6 +115,8 @@ pub fn generate() -> Result<Value> {
                 host: "build-box".into(),
                 sandbox: SandboxKind::Docker,
                 network_unblocked: false,
+                version: None,
+                python: None,
             }),
             created_at_ms: params.created_at_ms + 2,
         },
@@ -192,6 +194,7 @@ pub fn generate() -> Result<Value> {
         files: vec![ItemRef::to(&readme)],
         requirements: vec!["pandas".into()],
         target: Target::Runner { participant_pub: runner_p.public(), name: "runner-01".into() },
+        progress_file: None,
     };
     let job = seal_case(
         "job",

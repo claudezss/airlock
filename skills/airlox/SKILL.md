@@ -81,7 +81,11 @@ code; 1 if the job produced none, 75 if `--wait` ran out (check `status` in
 `--json` output rather than relying on the code). The result is signed by the
 runner (`"signed": true`); a job that never ran has an unsigned relay `reason`
 such as `no_runner_available` (no approved, online, idle runner matched: jobs
-are not queued) or `runner_lost`. Files the
+are not queued), `runner_busy` (the runner that matched is running another
+job; submit again once `runner list` no longer shows it busy) or
+`runner_lost`. For long jobs, `--progress-file logs/run.log` has the runner
+post the end of that log while it runs (`airlox items` shows these
+`progress` items). Files the
 job writes to `$AIRLOX_OUT` come back: top-level images as they are,
 everything else in `out.zip`. `--out-dir` saves them and unpacks `out.zip`
 into a new `out/` directory beside it, skipping hidden files and adding
