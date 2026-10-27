@@ -84,6 +84,8 @@ const show = (...nodes) => app.replaceChildren(...nodes);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const fmtBytes = (n) => (n < 1024 ? `${n} B` : n < MB ? `${(n / 1024).toFixed(1)} KB` : `${(n / MB).toFixed(1)} MB`);
 const hhmm = (ms) => new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+// Status symbols are decoration next to words: screen readers skip them.
+const sym = (c) => el("span", { "aria-hidden": "true" }, c);
 const initials = (name) => (name.split(/[^\p{L}\p{N}]+/u).filter(Boolean).slice(0, 2).map((w) => w[0]).join("") || "?").toUpperCase();
 
 // One polite live region for job and runner transitions.
@@ -946,7 +948,7 @@ function buildSessionLayout(s) {
       (sec?.querySelector("button.primary") || sec)?.focus({ preventScroll: true });
     } }, "Review runners"));
   show(el("div", { class: "session" }, el("h1", { class: "sr-only" }, `Session ${sid.slice(0, 7)}, ${manifest.mode} mode, ${inv.role}`),
-    rail, el("div", { class: "main-col" }, approvalBanner, banner, timeline, composer)));
+    el("div", { class: "main-col" }, approvalBanner, banner, timeline, composer), rail));
   // A #fragment would replace the stored invite on reload: move focus instead.
   const skip = (label, to) => el("a", { class: "skip", href: "#", onclick: (ev) => {
     ev.preventDefault();
@@ -1402,7 +1404,7 @@ function renderItem(s, it) {
     el("strong", {}, it.authorName),
     it.role ? el("span", { class: "muted" }, it.role) : null,
     el("span", { class: "when" }, hhmm(it.created),
-      it.status === "ok" ? el("span", { class: "verified" }, " · ✓ verified") : null));
+      it.status === "ok" ? el("span", { class: "verified" }, " · ", sym("✓"), " verified") : null));
   const card = el("div", { class: "card" });
   const node = el("article", { class: cls, id: `item-${it.id}`, tabindex: -1 },
     el("div", { class: `avatar ${av}`, "aria-hidden": "true" }, initials(it.authorName)),
@@ -1432,7 +1434,7 @@ function renderItem(s, it) {
     return node;
   }
   if (it.status === "rejected") {
-    card.append(el("p", {}, `✕ Not shown: ${it.error}`));
+    card.append(el("p", {}, sym("✕ "), `Not shown: ${it.error}`));
     if (it.detail) card.append(el("div", { class: "detail" }, it.detail));
     return node;
   }
@@ -1607,7 +1609,7 @@ function settle(s, it) {
 
 // `pending`: a neutral note, since the owner's approval may still arrive.
 function rejectedResult(reason, pending) {
-  return el("div", {}, pending ? el("p", { class: "note" }, reason) : el("p", { class: "note error" }, `✕ Result not accepted: ${reason}`));
+  return el("div", {}, pending ? el("p", { class: "note" }, reason) : el("p", { class: "note error" }, sym("✕ "), `Result not accepted: ${reason}`));
 }
 
 function logBlock(label, text, truncated) {
@@ -1643,7 +1645,7 @@ function renderOutFile(s, f) {
     return box;
   }
   if (!fi.ref || fi.ref.blob_sha256 !== f.item.blob_sha256) {
-    box.append(el("p", { class: "note error" }, `✕ ${f.name}: the file does not match the runner's result`));
+    box.append(el("p", { class: "note error" }, sym("✕ "), `${f.name}: the file does not match the runner's result`));
     return box;
   }
   appendFileView(box, fi);
@@ -1761,7 +1763,7 @@ function renderEvent(s, it, meta) {
   const ownerOnly = m.event !== "job_cancel";
   const suspect = ownerOnly && it.role !== "owner";
   return el("article", { class: `item evline${suspect ? " rejected" : ""}`, id: `item-${it.id}` },
-    el("div", { class: "pill" }, suspect ? `✕ ignored: ${text} (not from the owner)` : text, " · ", hhmm(it.created)));
+    el("div", { class: "pill" }, suspect ? [sym("✕ "), `ignored: ${text} (not from the owner)`] : text, " · ", hhmm(it.created)));
 }
 
 // ---------- runner console ----------
@@ -1875,7 +1877,7 @@ function renderRunners(s, list, note) {
     const failed = r.setup === "failed" && !r.rejected;
     const canApprove = owner && !r.rejected && !failed && (!r.approved || !!err);
     const warn = r.networkUnblocked && !r.rejected
-      ? el("span", { class: "chip warn", title: "This runner's sandbox cannot block network access" }, "⚠ network not blocked") : null;
+      ? el("span", { class: "chip warn", title: "This runner's sandbox cannot block network access" }, sym("⚠ "), "network not blocked") : null;
     const act = (name, label, cls, approve) => el("button", { type: "button", class: `small ${cls}`, "data-pub": r.pub, "data-act": name,
       disabled: !!s.closed, onclick: (ev) => decideRunner(s, r, approve, ev.currentTarget) }, label);
     return el("li", { class: `runner${r.rejected ? " is-rejected" : ""}` },
