@@ -12,7 +12,10 @@ const loadCore = () =>
   })());
 
 const MB = 1024 * 1024;
+// The size offered when the relay does not say what it allows, and the
+// largest default its answer can raise that to.
 const MAX_ITEM_MB = 25;
+const MAX_DEFAULT_ITEM_MB = 100;
 const FILE_TYPES = {
   ".py": ["py", "text/x-python"],
   ".md": ["md", "text/markdown"],
@@ -519,13 +522,26 @@ function newSession() {
     el("div", { class: "options" }, TYPE_LABELS.map(([v, label, ext]) =>
       el("label", { class: "option" }, el("input", { type: "checkbox", name: "type", value: v, checked: true }),
         label, el("span", { class: "ext" }, ext)))));
-  const size = el("input", { type: "number", id: "size", min: 1, max: MAX_ITEM_MB, step: 1, value: MAX_ITEM_MB });
-  const sizeField = el("div", { class: "stack" }, el("label", { for: "size" }, el("strong", {}, "Max file size")),
-    el("div", { class: "size" }, size, el("span", { class: "muted" }, "MB")));
+  const size = el("input", { type: "number", id: "size", min: 1, max: MAX_ITEM_MB, step: 1, value: MAX_ITEM_MB,
+    "aria-describedby": "size-hint" });
+  const sizeHint = el("span", { class: "muted hint-text", id: "size-hint", "aria-live": "polite" }, "Checking this relay's limit…");
+  // Offer files as large as this relay allows, up to 100 MB: the relay is not
+  // trusted to pick a larger default. Older relays do not say.
+  let sizeTouched = false;
+  size.addEventListener("input", () => (sizeTouched = true));
+  fetch("/v1/health").then((r) => r.json()).then((h) => {
+    const relayMb = Math.floor((typeof h.max_item_bytes === "number" ? h.max_item_bytes : 0) / MB);
+    if (relayMb < 1) throw new Error("no limit");
+    size.max = relayMb;
+    if (!sizeTouched) size.value = Math.min(relayMb, MAX_DEFAULT_ITEM_MB);
+    sizeHint.textContent = `1 to ${relayMb} MB on this relay`;
+  }).catch(() => (sizeHint.textContent = `1 to ${MAX_ITEM_MB} MB (could not read this relay's limit)`));
+  const sizeField = el("div", { class: "stack field" }, el("label", { for: "size" }, el("strong", {}, "Max file size")),
+    el("div", { class: "size" }, size, el("span", { class: "muted" }, "MB")), sizeHint);
   const lim = {
     runtime: el("input", { type: "text", id: "j-runtime", value: "python3.12", autocomplete: "off" }),
-    timeout: el("input", { type: "number", id: "j-timeout", min: 1, max: 86400, step: 1, value: 30 }),
-    memory: el("input", { type: "number", id: "j-memory", min: 32, max: 65536, step: 1, value: 512 }),
+    timeout: el("input", { type: "number", id: "j-timeout", min: 1, max: 86400, step: 1, value: 60 }),
+    memory: el("input", { type: "number", id: "j-memory", min: 32, max: 65536, step: 1, value: 2048 }),
     packages: el("input", { type: "text", id: "j-packages", placeholder: "numpy, pandas", autocomplete: "off" }),
     approve: el("input", { type: "checkbox", id: "j-approve", checked: true }),
   };
@@ -582,7 +598,8 @@ function newSession() {
       }
       job_limits = { runtime, timeout_s, memory_mb, network: false, packages, return_out: true, approve_runners: lim.approve.checked };
     }
-    if (!Number.isInteger(mb) || mb < 1 || mb > MAX_ITEM_MB) return (err.textContent = `Max file size must be 1 to ${MAX_ITEM_MB} MB.`);
+    const maxMb = Number(size.max);
+    if (!Number.isInteger(mb) || mb < 1 || mb > maxMb) return (err.textContent = `Max file size must be a whole number from 1 to ${maxMb} MB: this relay allows up to ${maxMb} MB.`);
     create.disabled = true;
     try {
       const params = { mode: execute ? "execute" : "relay", created_at_ms: Date.now(), ttl_ms: fd.get("ttl") === "never" ? null : Number(fd.get("ttl")), allowed_types: allowed,

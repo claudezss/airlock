@@ -20,6 +20,10 @@ containers), and is the one to use for code you don't trust.
   and stops with the missing names if not. It never installs anything into
   it. Without `--python` it builds a runtime with `uv`, as `--sandbox local`
   does.
+- **Where packages come from.** At startup the runner logs where each
+  allowlisted package resolves from. It warns when one is an editable install
+  (jobs import that checkout, not a wheel) or when `import` would load a copy
+  other than the installed one.
 - **One Job Object per job.** The job's memory (the session's limit, or less
   with `--memory`) is capped for its whole process tree, so `tara.exe` and
   anything it starts count together. Every process in it is killed when the
@@ -27,6 +31,12 @@ containers), and is the one to use for code you don't trust.
   nothing a job starts outlives it. Jobs get no clipboard, desktop or
   display-settings access, and a crash ends the job instead of opening a
   dialog.
+- **Memory is counted as commit.** That runs well above what Task Manager
+  shows: importing numpy and a compiled extension can take more than 512 MB.
+  At startup the runner imports the allowlisted packages once, in a Job
+  Object with the job's cap, and warns when that alone comes near the cap.
+  Sessions created from the CLI, the MCP server or the web UI default to
+  2048 MB.
 - **A fresh work folder per job**, under the system temp directory, deleted
   afterwards.
 - **A scrubbed environment.** A job sees only `PATH` (its interpreter and
@@ -83,7 +93,7 @@ a runner that should keep working (a service), create the session without an
 expiry, on a relay that allows that (the default; `--max-ttl`):
 
 ```powershell
-airlox session create --execute --ttl never --job-timeout 6h --max-item-mb 80 --package numpy
+airlox session create --profile host-runner --job-timeout 6h --package numpy
 ```
 
 A relay purges a session that sees no activity (joins, items, downloads) for
@@ -92,10 +102,15 @@ To move a runner to a new session, put the new runner invite in its invite
 file (for the service, `%ProgramData%\airlox\<service>\invite-runner.txt`,
 from an elevated prompt) and start it again (`sc.exe start <service>`).
 
-Items are capped per session when it is created: 25 MB unless you say
-otherwise (`--max-item-mb` above, or `max_item_bytes=` in the SDK's
-`Session.create`). Decks and simulation reports of tens of MB need more; the
-relay allows up to 100 MiB by default (`--max-item-bytes`).
+`--profile host-runner` stands for `--execute --ttl never --job-timeout 30m
+--job-memory 4096`, with items as large as the relay allows (up to 100 MB)
+and runner approval on. Any flag you give wins, and `create` prints the
+limits the session got.
+
+Items are capped per session when it is created: by default at the largest
+item the relay allows, up to 100 MB (25 MB for relays that do not say), or
+at what you pass (`--max-item-mb`, or `max_item_bytes=` in the SDK's
+`Session.create`). MB here means 1024 × 1024 bytes.
 
 ### Long jobs and dropped connections
 

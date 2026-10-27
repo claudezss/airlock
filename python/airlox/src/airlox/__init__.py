@@ -25,7 +25,7 @@ from .execute import (
     RunnerBusy,
     RunnerFailed,
 )
-from .session import Item, RelayError, Session
+from .session import Item, RelayError, Session, TransferCode, receive_code
 
 __all__ = [
     "AirloxError",
@@ -44,6 +44,8 @@ __all__ = [
     "RunnerFailed",
     "Session",
     "SignatureError",
+    "TransferCode",
     "ValidationError",
+    "receive_code",
 ]
 __version__ = "0.1.2"

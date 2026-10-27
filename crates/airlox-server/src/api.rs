@@ -139,8 +139,14 @@ pub(crate) async fn read_json_body(body: Body) -> ApiResult<String> {
     String::from_utf8(buf).map_err(|_| ApiError::bad_request("invalid", "body is not utf-8"))
 }
 
-pub async fn health() -> Json<Value> {
-    Json(json!({"ok": true, "protocol": airlox_core::PROTOCOL_VERSION}))
+/// `GET /v1/health`: liveness, and the largest `max_item_bytes` a manifest
+/// may set here, so clients can default to it.
+pub async fn health(State(st): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "ok": true,
+        "protocol": airlox_core::PROTOCOL_VERSION,
+        "max_item_bytes": st.store.cfg.max_item_bytes,
+    }))
 }
 
 /// `POST /v1/sessions` — body: canonical signed manifest.

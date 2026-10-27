@@ -22,6 +22,10 @@ from .cache import Cache, default_root
 from .execute import Job, NoRunnerAvailable, Runner, RunnerBusy, RunnerFailed, signed_approvals
 
 DEFAULT_TYPES = ("text", "py", "md", "zip", "image")
+# The item limit for a relay that does not say what it allows, and the
+# largest default a relay's answer can raise it to.
+DEFAULT_MAX_ITEM_BYTES = 25 * 1024 * 1024
+MAX_DEFAULT_ITEM_BYTES = 100 * 1024 * 1024
 FILE_TYPES = {
     ".py": ("py", "text/x-python"),
     ".md": ("md", "text/markdown"),
@@ -46,6 +50,17 @@ def _duration_ms(v: Union[int, float, str]) -> int:
         raise ValueError(f"bad duration {v!r}")
     mult = {"ms": 1, "s": 1000, None: 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}[m.group(2)]
     return int(m.group(1)) * mult
+
+
+def _relay_max_item_bytes(http: httpx.Client, base: str) -> Optional[int]:
+    """The largest item a session on this relay may allow, from
+    ``/v1/health``; ``None`` if the relay does not say."""
+    try:
+        v = _check(http.get(base + "/v1/health", timeout=5.0)).json().get("max_item_bytes")
+    except (httpx.HTTPError, RelayError, ValueError, AttributeError):
+        return None
+    # The relay is not trusted to pick a large limit: it caps the default only.
+    return min(v, MAX_DEFAULT_ITEM_BYTES) if type(v) is int and v > 0 else None
 
 
 def _canonical(obj) -> str:
@@ -173,8 +188,9 @@ class Session:
         mode: str = "relay",
         ttl: Union[int, float, str, None] = "1h",
         allowed_types: Iterable[str] = DEFAULT_TYPES,
-        max_item_bytes: int = 25 * 1024 * 1024,
+        max_item_bytes: Optional[int] = None,
         job_limits: Optional[dict] = None,
+        insecure_http_host: Optional[str] = None,
         display_name: str = "owner",
         description: Optional[str] = None,
         cache_dir: Optional[Union[str, Path]] = None,
@@ -182,20 +198,42 @@ class Session:
         """Create a session on ``relay`` and join it as the owner. ``ttl`` is
         seconds or a duration such as ``"30m"`` (at most 30 days); ``None``
         or ``"never"`` makes a session that lasts until it is closed, if the
-        relay allows it."""
-        params = {
-            "mode": mode,
-            "created_at_ms": _now_ms(),
-            "ttl_ms": None if ttl is None or ttl == "never" else _duration_ms(ttl),
-            "allowed_types": list(allowed_types),
-            "max_item_bytes": max_item_bytes,
-            "job_limits": job_limits,
-        }
-        owner_seed, signed = ac.create_session(json.dumps(params))
+        relay allows it.
+
+        ``max_item_bytes`` defaults to the largest item the relay allows, up
+        to 100 MB (25 MB if the relay does not say). Package names in ``job_limits`` are PEP 503
+        normalized (``"pyPowerGEM"`` becomes ``"pypowergem"``).
+
+        ``insecure_http_host`` lets participants reach the relay over plain
+        ``http://`` at that host, such as ``"airlox-relay.ns.svc"`` inside a
+        cluster; it is recorded in the signed manifest. Content stays
+        end-to-end encrypted, but bearer tokens cross that network in the
+        clear."""
         http = httpx.Client(timeout=httpx.Timeout(30.0, connect=10.0))
-        _check(http.post(relay.rstrip("/") + "/v1/sessions", content=signed))
-        url = ac.owner_invite(relay, owner_seed)
-        return cls.join(url, display_name=display_name, description=description, cache_dir=cache_dir, _http=http)
+        try:
+            base = relay.rstrip("/")
+            if max_item_bytes is None:
+                max_item_bytes = _relay_max_item_bytes(http, base) or DEFAULT_MAX_ITEM_BYTES
+            params = {
+                "mode": mode,
+                "created_at_ms": _now_ms(),
+                "ttl_ms": None if ttl is None or ttl == "never" else _duration_ms(ttl),
+                "allowed_types": list(allowed_types),
+                "max_item_bytes": max_item_bytes,
+                "job_limits": job_limits,
+            }
+            if insecure_http_host is not None:
+                params["insecure_http_host"] = insecure_http_host.strip().lower()
+            owner_seed, signed = ac.create_session(json.dumps(params))
+            url = ac.owner_invite(relay, owner_seed)
+            # Refuse a relay URL the session's own links could not use (plain
+            # http to a host it does not name) before the session exists.
+            ac.check_invite(url, signed)
+            _check(http.post(base + "/v1/sessions", content=signed))
+            return cls.join(url, display_name=display_name, description=description, cache_dir=cache_dir, _http=http)
+        except BaseException:
+            http.close()
+            raise
 
     @classmethod
     def join(
@@ -303,6 +341,34 @@ class Session:
         out = {r: ac.member_invite(self.relay, self._owner_seed, r) for r in roles}
         out["owner"] = ac.owner_invite(self.relay, self._owner_seed)
         return out
+
+    def transfer_code(self, role: str, *, allow_owner: bool = False) -> "TransferCode":
+        """Park ``role``'s invite on the relay under a one-time code such as
+        ``7-guitar-orbit`` (owner only), like the web UI's "Send to another
+        machine". Type it on the other machine with ``airlox runner join
+        --code`` or ``airlox receive``, or pass it to :func:`receive_code`.
+        The code works once and for a few minutes.
+
+        The relay holds the invite sealed under the code's two words, which
+        its operator could recover by trying all 65,536 pairs: a code trusts
+        the relay in a way the link itself does not. A code for the
+        ``owner`` invite hands over the session and needs ``allow_owner``."""
+        if role == "owner" and not allow_owner:
+            raise ValueError("a code for the owner invite hands over the session; pass allow_owner=True")
+        invites = self.invites
+        if role not in invites:
+            raise ValueError(f"this session has no {role} invite")
+        secret, claim_hash, sealed = ac.transfer_seal(invites[role])
+        r = _check(self._http.post(self.relay + "/v1/drops", json={"claim_hash": claim_hash, "box": sealed})).json()
+        return TransferCode(
+            code=f"{r['nameplate']}-{secret}",
+            role=role,
+            relay=self.relay,
+            expires_at_ms=r["expires_at_ms"],
+            _nameplate=r["nameplate"],
+            _token=r["token"],
+            _http=self._http,
+        )
 
     def close(self) -> None:
         """Close and purge the session on the relay (owner only)."""
@@ -887,6 +953,61 @@ class Session:
             if not item.mine:
                 self._ack(item_id)
         return item
+
+
+@dataclass
+class TransferCode:
+    """A one-time code carrying one invite, as its sender holds it."""
+
+    code: str
+    role: str
+    relay: str
+    expires_at_ms: int
+    _nameplate: int = field(repr=False)
+    _token: str = field(repr=False)
+    _http: httpx.Client = field(repr=False)
+
+    def _url(self) -> str:
+        return f"{self.relay}/v1/drops/{self._nameplate}"
+
+    def state(self) -> str:
+        """``waiting``, ``picked_up``, ``burned``, ``cancelled`` or ``expired``."""
+        r = self._http.get(self._url(), headers={"Authorization": f"Bearer {self._token}"})
+        return _check(r).json()["state"]
+
+    def wait(self, timeout: Optional[float] = None, poll: float = 2.0) -> str:
+        """Block until the code is no longer waiting; returns its state.
+        Returns ``"waiting"`` if ``timeout`` (seconds) runs out first."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            state = self.state()
+            if state != "waiting" or (deadline is not None and time.monotonic() >= deadline):
+                return state
+            time.sleep(poll if deadline is None else max(0.0, min(poll, deadline - time.monotonic())))
+
+    def cancel(self) -> None:
+        """Stop the code from working."""
+        _check(self._http.delete(self._url(), headers={"Authorization": f"Bearer {self._token}"}))
+
+
+def receive_code(code: str, relay: str = "https://airlox.app", *, allow_insecure_http: bool = False) -> str:
+    """Trade a one-time transfer code for the invite link it carries. The
+    code is used up; a wrong one spends one of its few tries.
+
+    Over plain ``http://`` to another machine the code and the invite cross
+    the network in the clear, so that needs ``allow_insecure_http``."""
+    if not allow_insecure_http:
+        try:
+            ac.check_transport(relay.rstrip("/"))
+        except ac.ValidationError:
+            raise ValueError(
+                f"{relay}: a code claimed over plain http:// crosses the network in the clear; use https, "
+                "or pass allow_insecure_http=True on a network you trust"
+            ) from None
+    nameplate, claim = ac.transfer_claim(code)
+    with httpx.Client(timeout=httpx.Timeout(30.0, connect=10.0)) as http:
+        r = _check(http.post(f"{relay.rstrip('/')}/v1/drops/{nameplate}/claim", json={"claim": claim}))
+    return ac.transfer_open(code, r.json()["box"])
 
 
 def _gone_reason(status: int) -> str:

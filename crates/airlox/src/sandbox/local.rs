@@ -51,6 +51,8 @@ pub struct Local {
     runtime_dirs: Vec<PathBuf>,
     shim: PathBuf,
     opts: LocalOpts,
+    /// The allowlisted packages as the operator's interpreter reported them.
+    packages: Option<Vec<PackageInfo>>,
 }
 
 /// What an interpreter reports about itself.
@@ -60,15 +62,164 @@ pub struct PythonInfo {
     pub version: String,
     /// Allowlisted packages it does not have.
     pub missing: Vec<String>,
+    /// `sys.executable`.
+    #[serde(default)]
+    pub executable: Option<String>,
+    /// Where each allowlisted package it has comes from.
+    #[serde(default)]
+    pub packages: Vec<PackageInfo>,
 }
 
-/// Lists the interpreter's version and which of the package names in argv
-/// (PEP 503 normalized) are not installed. Standard library only.
+/// An installed distribution, and where its top-level modules import from.
+#[derive(Debug, Deserialize)]
+pub struct PackageInfo {
+    pub name: String,
+    pub version: String,
+    /// The directory holding its `.dist-info`.
+    pub location: String,
+    /// Installed with `pip install -e`: jobs import a source checkout.
+    #[serde(default)]
+    pub editable: bool,
+    /// For an editable install, the checkout it points at (a `file://` URL).
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub imports: Vec<ModuleOrigin>,
+    /// The module names were guessed from the package name (Python 3.9 has
+    /// no `packages_distributions`, and the package no `top_level.txt`), and
+    /// may be wrong.
+    #[serde(default)]
+    pub inferred: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModuleOrigin {
+    pub module: String,
+    /// The file or directory `import module` would load, if found.
+    pub origin: Option<String>,
+}
+
+impl PackageInfo {
+    /// Modules that import from somewhere other than where the package is
+    /// installed: an editable checkout, or a copy earlier on `sys.path`.
+    pub fn elsewhere(&self) -> Vec<&ModuleOrigin> {
+        // Windows paths compare without case.
+        let fold = |p: &str| if cfg!(windows) { p.to_lowercase() } else { p.to_string() };
+        let home = fold(&self.location);
+        self.imports
+            .iter()
+            .filter(|m| m.origin.as_deref().is_some_and(|o| !Path::new(&fold(o)).starts_with(&home)))
+            .collect()
+    }
+}
+
+/// What importing the allowlisted packages took.
+#[derive(Debug)]
+pub struct Footprint {
+    /// Peak memory in MB, counted as jobs are capped: commit under a Windows
+    /// Job Object, virtual size on Linux, resident size on macOS.
+    pub peak_mb: u64,
+    /// Windows refused an allocation at the job's cap.
+    pub hit_cap: bool,
+    /// Modules that did not import, with the exception's name.
+    pub failed: Vec<String>,
+    /// Packages whose module names were guessed, so may not have been imported.
+    pub inferred: Vec<String>,
+}
+
+/// Reports the interpreter's version and which of the package names in argv
+/// (PEP 503 normalized) are not installed, and for those that are, where
+/// they come from: version, location, whether the install is editable, and
+/// the file each top-level module would load from (found, not imported).
+/// Standard library only.
 const PROBE_PY: &str = r#"
 import json, platform, re, sys
-from importlib import metadata
-have = {re.sub(r"[-_.]+", "-", d.metadata.get("Name") or "").lower() for d in metadata.distributions()}
-print(json.dumps({"version": platform.python_version(), "missing": [p for p in sys.argv[1:] if p not in have]}))
+from importlib import metadata, util
+def norm(n):
+    return re.sub(r"[-_.]+", "-", n or "").lower()
+want = sys.argv[1:]
+dists = {}
+mods = {}
+if want:
+    for d in metadata.distributions():
+        try:
+            dists.setdefault(norm(d.metadata.get("Name")), d)
+        except Exception:
+            pass
+    try:
+        top = metadata.packages_distributions()
+    except Exception:
+        top = {}
+    for m, names in top.items():
+        for n in names:
+            if not m.startswith("_"):
+                mods.setdefault(norm(n), set()).add(m)
+def origin(m):
+    try:
+        s = util.find_spec(m)
+    except Exception:
+        return None
+    if s is None:
+        return None
+    if s.origin and s.has_location:
+        return s.origin
+    locs = list(s.submodule_search_locations or [])
+    return locs[0] if locs else None
+pkgs = []
+for p in want:
+    d = dists.get(p)
+    if d is None:
+        continue
+    editable, source = False, None
+    try:
+        du = json.loads(d.read_text("direct_url.json") or "{}")
+        editable = bool(du.get("dir_info", {}).get("editable"))
+        source = du.get("url") if editable else None
+    except Exception:
+        pass
+    try:
+        location = str(d.locate_file(""))
+    except Exception:
+        location = ""
+    names = set(mods.get(p) or ())
+    if not names:
+        try:
+            names = {l.strip() for l in (d.read_text("top_level.txt") or "").splitlines()}
+            names = {n for n in names if n and not n.startswith("_")}
+        except Exception:
+            names = set()
+    names = sorted(names)[:5]
+    pkgs.append({"name": p, "version": d.version or "", "location": location, "editable": editable,
+                 "source": source, "inferred": not names,
+                 "imports": [{"module": m, "origin": origin(m)} for m in names or [p.replace("-", "_")]]})
+print(json.dumps({"version": platform.python_version(), "executable": sys.executable,
+                  "missing": [p for p in want if p not in dists], "packages": pkgs}))
+"#;
+
+/// Imports the given modules, then prints which failed and the process's
+/// peak memory in MB as jobs are capped there: virtual size on Linux
+/// (`RLIMIT_AS`), resident size on macOS. On Windows the runner reads the
+/// peak commit from the Job Object instead. Standard library only.
+const FOOTPRINT_PY: &str = r#"
+import importlib, json, sys
+failed = []
+for m in sys.argv[1:]:
+    try:
+        importlib.import_module(m)
+    except BaseException as e:
+        failed.append("%s (%s)" % (m, type(e).__name__))
+peak = None
+try:
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("VmPeak:"):
+                peak = int(line.split()[1]) // 1024
+except OSError:
+    if sys.platform != "win32":
+        import resource
+        r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        peak = r // (1 << 20) if sys.platform == "darwin" else r // 1024
+print(json.dumps({"peak_mb": peak, "failed": failed}))
 "#;
 
 /// Windows variables that describe the machine, not the user, and that
@@ -145,6 +296,33 @@ pub async fn probe_python(python: &Path, packages: &[String], pass_env: &[String
     }
     serde_json::from_slice(&out.stdout)
         .with_context(|| format!("unexpected answer from {}", python.display()))
+}
+
+/// Say where each allowlisted package imports from, and warn about the
+/// ones that do not import from the installed distribution.
+fn report_packages(packages: &[PackageInfo]) {
+    for p in packages {
+        tracing::info!(package = %p.name, version = %p.version, from = %p.location, "allowlisted package");
+        let elsewhere = p.elsewhere();
+        if p.editable {
+            tracing::warn!(
+                "{} is an editable install{}: jobs import that checkout as it is now, not a built wheel. If \
+                 that is not what you want, `pip install` the package normally into this interpreter",
+                p.name,
+                p.source.as_deref().map(|s| format!(" of {s}")).unwrap_or_default()
+            );
+        } else if let Some(m) = elsewhere.first() {
+            tracing::warn!(
+                "`import {}` loads {}, not the {} {} installed in {}: something earlier on sys.path shadows it. \
+                 Remove the other copy, or the PYTHONPATH or .pth entry that adds it",
+                m.module,
+                m.origin.as_deref().unwrap_or("?"),
+                p.name,
+                p.version,
+                p.location
+            );
+        }
+    }
 }
 
 /// Every symlink met while resolving `p` (e.g. uv's `cpython-3.12-…` link
@@ -227,6 +405,7 @@ impl Local {
             runtime_dirs: vec![],
             shim: state_dir.join("shim.py"),
             opts,
+            packages: None,
         }
     }
 
@@ -257,7 +436,11 @@ impl Local {
             }
         }
         let python = match self.opts.python.clone() {
-            Some(p) => self.check_python(&p, spec).await?,
+            Some(p) => {
+                let (python, packages) = self.check_python(&p, spec).await?;
+                self.packages = Some(packages);
+                python
+            }
             None => self.build_runtime(spec).await?,
         };
         // The venv's interpreter is a link into a Python installation that
@@ -275,7 +458,7 @@ impl Local {
 
     /// The operator's interpreter: it must run the session's Python and
     /// already have every allowlisted package. Nothing is installed.
-    async fn check_python(&self, python: &Path, spec: &RuntimeSpec) -> Result<PathBuf> {
+    async fn check_python(&self, python: &Path, spec: &RuntimeSpec) -> Result<(PathBuf, Vec<PackageInfo>)> {
         if !python.is_file() {
             bail!("--python {} is not a file", python.display());
         }
@@ -298,8 +481,93 @@ impl Local {
                 python.display()
             );
         }
-        tracing::info!(python = %python.display(), version = %info.version, "using the operator's interpreter");
-        Ok(python)
+        tracing::info!(
+            python = %info.executable.as_deref().unwrap_or(&python.display().to_string()),
+            version = %info.version,
+            "using the operator's interpreter"
+        );
+        report_packages(&info.packages);
+        Ok((python, info.packages))
+    }
+
+    /// How much memory importing the allowlisted packages takes, for
+    /// process mode, where jobs are plain processes anyway: a cap below it
+    /// fails every job that imports them. The import runs as a job would:
+    /// its own process group, or on Windows a Job Object with the job's cap,
+    /// killed whole after 120 s. `None` in other modes (importing here would
+    /// run package code outside the sandbox), or if it cannot tell.
+    pub async fn import_footprint(&self, spec: &RuntimeSpec, cap_mb: u32) -> Option<Footprint> {
+        if !self.opts.process || spec.packages.is_empty() {
+            return None;
+        }
+        let python = self.python.as_ref()?;
+        let probed;
+        let packages = match &self.packages {
+            Some(p) => p,
+            None => {
+                probed = probe_python(python, &spec.packages, &self.opts.pass_env).await.ok()?.packages;
+                &probed
+            }
+        };
+        let modules: Vec<&str> =
+            packages.iter().flat_map(|p| p.imports.iter().map(|m| m.module.as_str())).collect();
+        let inferred: Vec<String> = packages.iter().filter(|p| p.inferred).map(|p| p.name.clone()).collect();
+        tracing::info!("importing the allowlisted packages once to measure their memory, as a job would");
+        let mut cmd = Command::new(python);
+        base_env(&mut cmd, &self.opts.pass_env);
+        cmd.args(["-I", "-c", FOOTPRINT_PY])
+            .args(&modules)
+            .current_dir(&self.state_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
+        #[cfg(windows)]
+        let winjob = {
+            cmd.creation_flags(super::winjob::NO_WINDOW | super::winjob::SUSPENDED);
+            super::winjob::WinJob::new(cap_mb).ok()?
+        };
+        let _ = cap_mb;
+        let mut child = cmd.spawn().ok()?;
+        let pid = child.id();
+        #[cfg(windows)]
+        if winjob.adopt(child.raw_handle()? as _, pid?).is_err() {
+            let _ = child.start_kill();
+            return None;
+        }
+        let mut stdout = child.stdout.take()?;
+        let read = async {
+            use tokio::io::AsyncReadExt;
+            let mut out = String::new();
+            let _ = stdout.read_to_string(&mut out).await;
+            let _ = child.wait().await;
+            out
+        };
+        let out = tokio::time::timeout(std::time::Duration::from_secs(120), read).await;
+        #[cfg(unix)]
+        super::signal_group(pid, nix::sys::signal::Signal::SIGKILL);
+        #[cfg(windows)]
+        winjob.terminate();
+        let _ = pid;
+        let v: serde_json::Value = serde_json::from_str(out.ok()?.trim()).ok()?;
+        // A guessed module name that does not import says nothing about jobs.
+        let guessed: Vec<&str> = packages
+            .iter()
+            .filter(|p| p.inferred)
+            .flat_map(|p| p.imports.iter().map(|m| m.module.as_str()))
+            .collect();
+        let failed: Vec<String> = serde_json::from_value::<Vec<String>>(v["failed"].clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|f| !guessed.contains(&f.split(' ').next().unwrap_or("")))
+            .collect();
+        #[cfg(windows)]
+        let (peak_mb, hit_cap) = (winjob.peak_kb() / 1024, winjob.hit_memory_limit());
+        #[cfg(not(windows))]
+        let (peak_mb, hit_cap) = (v["peak_mb"].as_u64()?, false);
+        Some(Footprint { peak_mb, hit_cap, failed, inferred })
     }
 
     /// A uv venv with the allowlist, shared by runners using the same cache.
@@ -470,5 +738,59 @@ impl Local {
             peak_mem_kb,
             error,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_package_importing_from_outside_its_install_is_flagged() {
+        let info: PythonInfo = serde_json::from_str(
+            r#"{"version": "3.12.4", "missing": [], "executable": "/v/bin/python", "packages": [
+                {"name": "numpy", "version": "2.1.0", "location": "/v/lib/site-packages",
+                 "imports": [{"module": "numpy", "origin": "/v/lib/site-packages/numpy/__init__.py"}]},
+                {"name": "cugrid", "version": "0.3.0", "location": "/v/lib/site-packages", "editable": true,
+                 "source": "file:///src/cugrid",
+                 "imports": [{"module": "cugrid", "origin": "/src/cugrid/cugrid/__init__.py"},
+                             {"module": "gone", "origin": null}]}]}"#,
+        )
+        .unwrap();
+        assert!(info.packages[0].elsewhere().is_empty());
+        let out: Vec<_> = info.packages[1].elsewhere().iter().map(|m| m.module.as_str()).collect();
+        assert_eq!(out, ["cugrid"]);
+        // What older probes (and runners) report still parses.
+        let old: PythonInfo = serde_json::from_str(r#"{"version": "3.12.4", "missing": ["x"]}"#).unwrap();
+        assert!(old.packages.is_empty() && old.executable.is_none());
+    }
+
+    /// Some Python 3 on PATH to run the embedded scripts with, if any.
+    fn some_python() -> Option<PathBuf> {
+        which("python3").or_else(|| which("python"))
+    }
+
+    #[tokio::test]
+    async fn the_probe_runs_and_reports_what_is_missing() {
+        let Some(py) = some_python() else { return };
+        let none = probe_python(&py, &[], &[]).await.unwrap();
+        assert!(none.missing.is_empty() && none.packages.is_empty() && none.executable.is_some());
+        let info = probe_python(&py, &["airlox-no-such-package".into()], &[]).await.unwrap();
+        assert_eq!(info.missing, ["airlox-no-such-package"]);
+    }
+
+    #[tokio::test]
+    async fn the_footprint_script_measures_and_names_failed_imports() {
+        let Some(py) = some_python() else { return };
+        let mut cmd = Command::new(&py);
+        base_env(&mut cmd, &[]);
+        let out =
+            cmd.args(["-I", "-c", FOOTPRINT_PY, "json", "airlox_no_such_module"]).output().await.unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["failed"], serde_json::json!(["airlox_no_such_module (ModuleNotFoundError)"]));
+        if cfg!(unix) {
+            assert!(v["peak_mb"].as_u64().unwrap() > 0, "{v}");
+        }
     }
 }

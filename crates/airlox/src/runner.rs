@@ -69,11 +69,17 @@ pub struct JoinArgs {
     /// The relay to talk to: where --code is claimed (default: AIRLOX_RELAY,
     /// else https://airlox.app), and where the runner connects instead of
     /// the host in the invite, such as a port-forward
-    /// (http://127.0.0.1:8080): https, or http to this machine only. Only
-    /// this flag redirects the runner, never the environment. The session's
-    /// keys still come only from the invite.
+    /// (http://127.0.0.1:8080): https, http to this machine, or http to the
+    /// host the session allows (--insecure-http-host). Only this flag
+    /// redirects the runner, never the environment. The session's keys
+    /// still come only from the invite.
     #[arg(long)]
     pub relay: Option<String>,
+    /// Claim --code over plain http:// to a host other than this machine (a
+    /// relay inside a cluster). The code and the invite it carries then
+    /// cross that network in the clear: only for a network you trust.
+    #[arg(long, requires = "code")]
+    pub allow_insecure_http: bool,
     /// This runner's name, shown to senders: [a-z0-9][a-z0-9._-]{0,62}.
     #[arg(long)]
     pub name: String,
@@ -316,17 +322,6 @@ fn decode_text(bytes: &[u8]) -> Result<String> {
     }
 }
 
-/// A relay URL the runner may be pointed at: https anywhere, or plain http
-/// only to this machine (a port-forward), where nothing is sent in clear.
-fn relay_url_ok(url: &str) -> bool {
-    let Ok(u) = reqwest::Url::parse(url) else { return false };
-    match u.scheme() {
-        "https" => true,
-        "http" => matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")),
-        _ => false,
-    }
-}
-
 /// The invite link, from wherever the operator put it.
 pub(crate) async fn invite_link(
     http: &reqwest::Client,
@@ -351,7 +346,7 @@ pub(crate) async fn invite_link(
             }
             let env = std::env::var("AIRLOX_RELAY").ok().filter(|r| !r.is_empty());
             let relay = args.relay.clone().or(env).unwrap_or_else(|| DEFAULT_RELAY.into());
-            client::receive_code(http, &relay, code).await.map_err(|e| {
+            client::receive_code(http, &relay, code, args.allow_insecure_http).await.map_err(|e| {
                 anyhow::anyhow!(
                     "{e:#}\nA code works once. If this runner already used it, restart it with the invite it saved:\n  \
                      airlox runner join --invite-file '{}' --name {} ...",
@@ -398,8 +393,12 @@ pub async fn run(args: JoinArgs) -> Result<()> {
     let url = match args.relay.as_deref() {
         Some(r) if r.trim_end_matches('/') != base => {
             let r = r.trim_end_matches('/').to_string();
-            if !relay_url_ok(&r) {
-                bail!("--relay {r}: use https, or http to this machine (localhost, 127.0.0.1, [::1])");
+            // Plain http to another machine waits for the manifest, below:
+            // only fetching it (it names nothing secret) goes there first.
+            if let Err(e) = airlox_core::invite::check_transport(&r, None) {
+                if !r.starts_with("http://") {
+                    bail!("--relay {r}: {e}");
+                }
             }
             tracing::info!(relay = %r, invite_relay = %base, "connecting through the given relay URL");
             r
@@ -424,6 +423,10 @@ pub async fn run(args: JoinArgs) -> Result<()> {
     let signed = client::get_manifest(&http, &url, &sid).await?;
     let manifest = SignedManifest::from_json(&signed)?.manifest;
     invite.check_against(&manifest)?;
+    if url != base {
+        airlox_core::invite::check_transport(&url, manifest.insecure_http_host.as_deref())
+            .with_context(|| format!("--relay {url}"))?;
+    }
     if manifest.mode != Mode::Execute {
         bail!("session {sid} is in relay mode; it has no jobs to run");
     }
@@ -525,6 +528,42 @@ pub async fn run(args: JoinArgs) -> Result<()> {
     if let Err(e) = backend.prepare(&spec).await {
         let _ = relay.report("failed", Some(&failure_detail(&e)), None).await;
         return Err(e.context("preparing the sandbox"));
+    }
+    // A cap below what importing the allowlist takes fails every job that
+    // imports it, with only an out-of-memory notice to say why.
+    let cap_mb = limits.memory_mb.min(args.memory.unwrap_or(u32::MAX));
+    match backend.import_footprint(&spec, cap_mb).await {
+        Some(f) => {
+            tracing::info!(peak_mb = f.peak_mb, cap_mb, "memory used by importing the allowlisted packages");
+            for m in &f.failed {
+                tracing::warn!("`import {m}` failed in the job runtime; jobs that import it will fail too");
+            }
+            if !f.inferred.is_empty() {
+                tracing::info!(
+                    "the package metadata does not name the modules of {}; the measurement guessed them and \
+                     may be low",
+                    f.inferred.join(", ")
+                );
+            }
+            if f.hit_cap || f.peak_mb * 10 >= cap_mb as u64 * 8 {
+                let fix = if args.memory.is_some_and(|m| m < limits.memory_mb) {
+                    "raise this runner's --memory, or ask the owner for a new session with a larger --job-memory"
+                } else {
+                    "ask the owner for a new session with a larger --job-memory (the cap is fixed when a \
+                     session is created)"
+                };
+                tracing::warn!(
+                    "importing the allowlisted packages alone takes {} of the {cap_mb} MB jobs may use; jobs \
+                     that import them will likely run out of memory: {fix}",
+                    if f.hit_cap { "more than all".to_string() } else { format!("{} MB", f.peak_mb) }
+                );
+            }
+        }
+        None if !limits.packages.is_empty() && args.sandbox != SandboxArg::Process => tracing::info!(
+            "the job memory cap is {cap_mb} MB; the runner checks it against what importing the allowlist takes \
+             only with --sandbox process"
+        ),
+        None => {}
     }
     // Unsandboxed (the local backend off Linux, or process mode): jobs are
     // plain processes.

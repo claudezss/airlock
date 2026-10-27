@@ -299,3 +299,84 @@ def test_a_session_can_last_until_it_is_closed(relay, caches):
     agent = Session.join(owner.invites["sender"], cache_dir=caches("agent"))
     agent.send_text("no deadline")
     assert [i.text for i in owner.items()] == ["no deadline"]
+
+
+def test_a_transfer_code_carries_one_invite_once(relay, caches):
+    owner = Session.create(relay.url, cache_dir=caches("owner"))
+    code = owner.transfer_code("sender")
+    assert code.state() == "waiting"
+    assert airlox.receive_code(code.code, relay.url) == owner.invites["sender"]
+    assert code.wait(timeout=5) == "picked_up"
+    with pytest.raises(airlox.RelayError) as e:
+        airlox.receive_code(code.code, relay.url)
+    assert e.value.status == 410
+    # A cancelled code carries nothing; only the owner can make codes.
+    other = owner.transfer_code("observer")
+    other.cancel()
+    assert other.state() == "cancelled"
+    with pytest.raises(airlox.RelayError):
+        airlox.receive_code(other.code, relay.url)
+    agent = Session.join(owner.invites["sender"], cache_dir=caches("agent"))
+    with pytest.raises(PermissionError):
+        agent.transfer_code("sender")
+    with pytest.raises(ValueError):
+        owner.transfer_code("runner")  # a relay-mode session has no runners
+    with pytest.raises(ValueError, match="allow_owner"):
+        owner.transfer_code("owner")
+    # Not over plain http to another machine unless asked.
+    third = owner.transfer_code("sender")
+    other = relay.url.replace("127.0.0.1", "127.1")
+    with pytest.raises(ValueError, match="allow_insecure_http"):
+        airlox.receive_code(third.code, other)
+    assert airlox.receive_code(third.code, other, allow_insecure_http=True) == owner.invites["sender"]
+
+
+def test_package_names_are_normalized(relay, caches):
+    limits = {"runtime": "python3.12", "timeout_s": 20, "memory_mb": 512, "network": False,
+              "packages": ["pyPowerGEM", "NumPy", "numpy"], "return_out": True, "approve_runners": True}
+    owner = Session.create(relay.url, mode="execute", job_limits=limits, cache_dir=caches("owner"))
+    assert owner.manifest["job_limits"]["packages"] == ["pypowergem", "numpy"]
+
+
+def test_the_item_limit_defaults_to_the_relays(tmp_path, caches):
+    from conftest import Relay
+    r = Relay(tmp_path / "relay", max_item_bytes="40MiB").start()
+    try:
+        assert Session.create(r.url, cache_dir=caches("a")).manifest["max_item_bytes"] == 40 << 20
+        assert Session.create(r.url, max_item_bytes=1 << 20, cache_dir=caches("b")).manifest["max_item_bytes"] == 1 << 20
+    finally:
+        r.stop()
+    # A relay's answer raises the default to 100 MB at most.
+    r = Relay(tmp_path / "relay2", max_item_bytes="2GiB").start()
+    try:
+        assert Session.create(r.url, cache_dir=caches("c")).manifest["max_item_bytes"] == 100 << 20
+    finally:
+        r.stop()
+
+
+def test_plain_http_only_to_the_host_the_session_names(relay, caches, monkeypatch):
+    # A cluster service name, resolved to this machine in this process only.
+    import socket
+    real = socket.getaddrinfo
+
+    def resolve(host, *a, **kw):
+        return real("127.0.0.1" if host in ("airlox-relay.test", "other-relay.test") else host, *a, **kw)
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+    url = relay.url.replace("127.0.0.1", "airlox-relay.test")
+    with pytest.raises(airlox.ValidationError, match="insecure-http-host"):
+        Session.create(url, cache_dir=caches("refused"))
+    owner = Session.create(url, insecure_http_host="Airlox-Relay.test", cache_dir=caches("owner"))
+    assert owner.manifest["insecure_http_host"] == "airlox-relay.test"
+    link = owner.invites["sender"]
+    assert link.startswith("http://airlox-relay.test:")
+    agent = Session.join(link, cache_dir=caches("agent"))
+    agent.send_text("over plain http")
+    assert wait_for(lambda: any(i.text == "over plain http" for i in owner.sync()))
+    # The same session's keys with another plain-http host are refused.
+    moved = link.replace("airlox-relay.test", "other-relay.test")
+    with pytest.raises(airlox.ValidationError):
+        Session.join(moved, cache_dir=caches("moved"))
+    # Hosts URL parsers read as IPv4 must be plain dotted quads.
+    with pytest.raises(airlox.ValidationError, match="four decimal numbers"):
+        Session.create(url, insecure_http_host="2130706433", cache_dir=caches("numeric"))

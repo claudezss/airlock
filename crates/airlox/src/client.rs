@@ -145,6 +145,20 @@ pub async fn get_manifest(http: &reqwest::Client, base: &str, sid: &str) -> Resu
     v["signed_manifest"].as_str().map(str::to_string).context("relay sent no manifest")
 }
 
+/// The largest default a relay's answer can raise a new session's item
+/// limit to: the relay is not trusted to pick a large one, so a bigger
+/// limit takes an explicit `--max-item-mb`.
+pub const MAX_DEFAULT_ITEM_BYTES: u64 = 100 * 1024 * 1024;
+
+/// The item limit for a new session on `relay`: the largest the relay
+/// allows (`GET /v1/health`), at most [`MAX_DEFAULT_ITEM_BYTES`]; `None` if
+/// the relay does not say (older relays) or does not answer within 5 s.
+pub async fn relay_max_item_bytes(http: &reqwest::Client, relay: &str) -> Option<u64> {
+    let r = http.get(format!("{}/v1/health", relay.trim_end_matches('/'))).timeout(Duration::from_secs(5));
+    let v = read_json(check(r.send().await.ok()?).await.ok()?).await.ok()?;
+    v["max_item_bytes"].as_u64().filter(|n| *n > 0).map(|n| n.min(MAX_DEFAULT_ITEM_BYTES))
+}
+
 /// `POST /v1/sessions`: register a session from its signed manifest.
 pub async fn create_session(http: &reqwest::Client, base: &str, signed_manifest: String) -> Result<()> {
     let req = http.post(format!("{base}/v1/sessions")).timeout(REQUEST_TIMEOUT).body(signed_manifest);
@@ -155,9 +169,27 @@ pub async fn create_session(http: &reqwest::Client, base: &str, signed_manifest:
 /// `POST /v1/drops/{n}/claim`: trade a one-time transfer code for the
 /// invite link it carries. A right code is used up; a wrong one spends one
 /// of the few tries the code has.
-pub async fn receive_code(http: &reqwest::Client, relay: &str, code: &str) -> Result<String> {
+///
+/// Over plain `http://` to another machine the claim and the sealed invite
+/// cross the network in the clear, and the code's 16 bits of words would
+/// let anyone who saw them open it: that needs `allow_insecure_http`.
+pub async fn receive_code(
+    http: &reqwest::Client,
+    relay: &str,
+    code: &str,
+    allow_insecure_http: bool,
+) -> Result<String> {
     let code = airlox_core::transfer::Code::parse(code)?;
     let relay = relay.trim_end_matches('/');
+    if airlox_core::invite::check_transport(relay, None).is_err() && !allow_insecure_http {
+        let ok =
+            airlox_core::invite::check_transport(&relay.replacen("http://", "https://", 1), None).is_ok();
+        bail!(
+            "{}: a code claimed over plain http:// crosses the network in the clear, and anyone who sees it \
+             can open the invite. Use https, or pass --allow-insecure-http on a network you trust",
+            if ok { relay_text(relay) } else { format!("{} is not a relay URL", relay_text(relay)) }
+        );
+    }
     let req = http
         .post(format!("{relay}/v1/drops/{}/claim", code.nameplate))
         .timeout(REQUEST_TIMEOUT)
@@ -188,6 +220,60 @@ pub async fn receive_code(http: &reqwest::Client, relay: &str, code: &str) -> Re
     // Checks it is an invite link, so nothing else reaches the terminal.
     airlox_core::api::transfer_open(&code.to_code_string(), sealed)
         .context("the code's words do not open what the relay sent")
+}
+
+/// A one-time transfer code parked on a relay, as its sender holds it.
+pub struct SentCode {
+    pub relay: String,
+    /// `{nameplate}-{word}-{word}`, what the other machine types.
+    pub code: String,
+    pub nameplate: u32,
+    /// Lets the sender check on and cancel the code; not for the receiver.
+    pub token: String,
+    pub expires_at_ms: u64,
+}
+
+/// `POST /v1/drops`: park `invite` under a one-time code. The relay holds
+/// it sealed under the code's two words.
+pub async fn send_code(http: &reqwest::Client, relay: &str, invite: &str) -> Result<SentCode> {
+    let relay = relay.trim_end_matches('/');
+    let (secret, claim_hash, sealed) = airlox_core::api::transfer_seal(invite)?;
+    let req = http
+        .post(format!("{relay}/v1/drops"))
+        .timeout(REQUEST_TIMEOUT)
+        .json(&serde_json::json!({"claim_hash": claim_hash, "box": sealed}));
+    let v = read_json(check(req.send().await?).await?).await?;
+    let nameplate =
+        v["nameplate"].as_u64().and_then(|n| u32::try_from(n).ok()).context("relay sent no number")?;
+    Ok(SentCode {
+        relay: relay.to_string(),
+        code: format!("{nameplate}-{secret}"),
+        nameplate,
+        token: v["token"].as_str().context("relay sent no token")?.to_string(),
+        expires_at_ms: v["expires_at_ms"].as_u64().context("relay sent no expiry")?,
+    })
+}
+
+impl SentCode {
+    /// `GET /v1/drops/{n}`: `waiting`, `picked_up`, `burned`, `cancelled` or `expired`.
+    pub async fn state(&self, http: &reqwest::Client) -> Result<String> {
+        let req = http
+            .get(format!("{}/v1/drops/{}", self.relay, self.nameplate))
+            .bearer_auth(&self.token)
+            .timeout(REQUEST_TIMEOUT);
+        let v = read_json(check(req.send().await?).await?).await?;
+        Ok(v["state"].as_str().unwrap_or("unknown").to_string())
+    }
+
+    /// `DELETE /v1/drops/{n}`: the code stops working.
+    pub async fn cancel(&self, http: &reqwest::Client) -> Result<()> {
+        let req = http
+            .delete(format!("{}/v1/drops/{}", self.relay, self.nameplate))
+            .bearer_auth(&self.token)
+            .timeout(REQUEST_TIMEOUT);
+        check(req.send().await?).await?;
+        Ok(())
+    }
 }
 
 /// `POST /v1/sessions/{id}/participants`: returns the bearer token.

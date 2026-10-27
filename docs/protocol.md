@@ -63,7 +63,8 @@ links pin the manifest only through the session id, which is why it carries
       "runtime": "python3.12", "timeout_s": 30, "memory_mb": 512,
       "network": false, "packages": ["numpy", "pandas"],
       "return_out": true, "approve_runners": true
-    }
+    },
+    "insecure_http_host": "airlox-relay.ns.svc"
   },
   "sig": "<owner signature, context manifest, over canonical(manifest)>"
 }
@@ -83,7 +84,13 @@ Validity rules (all enforced by `Manifest::validate`):
 - `mode == relay` ⇔ `job_limits == null`. Execute mode requires `py` in
   `allowed_types`, `runtime` of the form `python3.<minor>`,
   `1 ≤ timeout_s ≤ 86400`, `32 ≤ memory_mb ≤ 65536`, and every package already
-  PEP 503-normalized.
+  PEP 503-normalized. Clients normalize what the owner typed (and drop
+  repeats) when they build the manifest, so `pyPowerGEM` is signed as
+  `pypowergem`.
+- `insecure_http_host` is optional and left out (not `null`) when unset, so
+  manifests without it are unchanged. When present it is a lowercase DNS name
+  or IPv4 address, without scheme, port or path, and not a loopback name: the
+  one relay host participants may reach over plain `http://` (§4).
 
 The manifest is plaintext policy. The server reads it to enforce expiry,
 sizes, kinds and roles. The session *name* is not in it; clients post it as
@@ -96,15 +103,33 @@ owner:  {base}/s/{session_id}#v=1&r=owner&ok={owner_seed}
 member: {base}/s/{session_id}#v=1&r={send|run|view}&k={K}&rk={role_seed}
 ```
 
-- `base` is `https://host[:port][/path]` without query, fragment, userinfo or
-  trailing `/`. `http://` is accepted only for `localhost`, `*.localhost`,
-  `127.0.0.1` and `[::1]`.
+- `base` is `https://host[:port][/path]` or `http://host[:port][/path]`,
+  without query, fragment, userinfo or trailing `/`. Parsers accept either
+  scheme; whether `http://` may be used is decided against the manifest
+  below, since the link alone cannot vouch for it.
 - The fragment never reaches the server.
 - Parsers reject: missing or non-`1` `v`, duplicate keys, an owner link
   carrying `k`/`rk`, a member link carrying `ok`, and an owner seed whose
   derived session id differs from the path. Unknown keys are ignored.
 - After fetching the manifest, a client checks that the role keypair derived
-  from the invite matches `manifest.roles[role]` (or `owner_pub`).
+  from the invite matches `manifest.roles[role]` (or `owner_pub`), and that
+  `base` is `https://`, or `http://` to `localhost`, `*.localhost`,
+  `127.0.0.1` or `[::1]`, or `http://` to exactly the host the signed
+  manifest names in `insecure_http_host`. Only then does it join or send a
+  token. Fetching the manifest itself reveals only the session id. Creators
+  run the same check on the owner link before registering a session.
+- Over plain `http://`, content stays end-to-end encrypted, but bearer tokens
+  and transfer codes (whose two words are 16 bits) cross the network in the
+  clear, and a token is the participant toward the relay: the owner's can
+  close the session, revoke roles and approve runners; a runner's can claim
+  jobs. `insecure_http_host` is for a network the owner trusts, such as a
+  cluster's service network. Clients refuse to claim a transfer code over
+  plain http to another machine unless told to.
+- `base` must be ASCII without `\` or `%`: HTTP clients read `\` as `/` and
+  decode escapes, so the host they connect to must be the host checked.
+  `insecure_http_host` is a lowercase DNS name or dotted-quad IPv4 address;
+  hosts URL parsers read as IPv4 (a numeric last label) must be four decimal
+  octets, not loopback, link-local, unspecified, broadcast or multicast.
 
 ### 4.1 Transfer codes
 
@@ -437,7 +462,7 @@ sends nothing for 30 seconds is answered with `408`.
 
 | Method and path | Auth | Body | Success |
 |---|---|---|---|
-| `GET /v1/health` | none | none | `200 {"ok": true, "protocol": 1}` |
+| `GET /v1/health` | none | none | `200 {"ok": true, "protocol": 1, "max_item_bytes": 104857600}`; clients default a new session's `max_item_bytes` to it |
 | `POST /v1/sessions` | none | signed manifest | `201 {"session_id", "expires_at_ms"}` |
 | `GET /v1/sessions/{id}` | none | none | `200 {"signed_manifest"}` |
 | `POST /v1/sessions/{id}/participants` | none | signed join request | `201 {"token", "participant_pub", "role", "seq"}` |

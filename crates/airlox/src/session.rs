@@ -492,6 +492,8 @@ pub struct NewSession {
     pub allowed_types: Vec<String>,
     pub max_item_bytes: u64,
     pub job_limits: Option<JobLimits>,
+    /// The relay host participants may reach over plain `http://`.
+    pub insecure_http_host: Option<String>,
 }
 
 pub struct Session {
@@ -545,10 +547,14 @@ impl Session {
                 .context("unknown content type")?,
             max_item_bytes: new.max_item_bytes,
             job_limits: new.job_limits,
+            insecure_http_host: new.insecure_http_host,
         };
         let (owner_seed, signed) = api::create_session(&serde_json::to_string(&params)?, None)?;
-        client::create_session(http, relay, signed).await?;
+        // Refuse a relay URL the session's own links could not use before
+        // the session exists (plain http to a host it does not name).
         let url = api::owner_invite(relay, &owner_seed)?;
+        api::check_invite(&url, &signed).with_context(|| format!("relay {relay}"))?;
+        client::create_session(http, relay, signed).await?;
         Session::join(http, &url, me, cache_root).await
     }
 

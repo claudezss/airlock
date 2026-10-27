@@ -288,6 +288,7 @@ mod tests {
                 allowed_types: vec![ContentType::Py],
                 max_item_bytes: 1024,
                 job_limits: Some(JobLimits::default()),
+                insecure_http_host: None,
             })
             .unwrap()
             .manifest;

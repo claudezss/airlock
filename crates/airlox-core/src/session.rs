@@ -121,7 +121,9 @@ impl Default for JobLimits {
         JobLimits {
             runtime: "python3.12".into(),
             timeout_s: 30,
-            memory_mb: 512,
+            // Enough for numpy-scale imports; a 512 MB cap (counted as commit
+            // under a Windows Job Object) does not fit them.
+            memory_mb: 2048,
             network: false,
             packages: vec![],
             return_out: true,
@@ -154,6 +156,11 @@ pub struct Manifest {
     pub allowed_types: Vec<ContentType>,
     pub max_item_bytes: u64,
     pub job_limits: Option<JobLimits>,
+    /// A relay host the owner lets participants reach over plain `http://`,
+    /// such as an in-cluster service name. Left out of the JSON when unset,
+    /// so manifests without it are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insecure_http_host: Option<String>,
 }
 
 /// An `Option` field that must be present, as `null` when it is `None`.
@@ -219,6 +226,9 @@ impl Manifest {
         if self.max_item_bytes == 0 || self.max_item_bytes > MAX_ITEM_BYTES_CEILING {
             return Err(Error::invalid("manifest", "max_item_bytes out of range"));
         }
+        if let Some(h) = &self.insecure_http_host {
+            crate::invite::check_insecure_http_host(h)?;
+        }
         let keys = [self.owner_pub, self.roles.sender, self.roles.runner, self.roles.observer];
         for (i, a) in keys.iter().enumerate() {
             if keys[i + 1..].contains(a) {
@@ -259,11 +269,26 @@ fn validate_job_limits(l: &JobLimits) -> Result<()> {
         return Err(Error::invalid("job_limits", "memory_mb must be 32..=65536"));
     }
     for p in &l.packages {
-        if crate::policy::normalize_package(p)? != *p {
-            return Err(Error::invalid("job_limits", format!("package {p:?} is not normalized")));
+        let n = crate::policy::normalize_package(p)?;
+        if n != *p {
+            return Err(Error::invalid("job_limits", format!("package {p:?} is not normalized; use {n:?}")));
         }
     }
     Ok(())
+}
+
+/// Packages as the manifest records them: PEP 503 normalized, each once, so
+/// `pyPowerGEM` and `PyPowerGem` both become `pypowergem`.
+fn normalize_limits(mut l: JobLimits) -> Result<JobLimits> {
+    let mut packages: Vec<String> = Vec::with_capacity(l.packages.len());
+    for p in &l.packages {
+        let n = crate::policy::normalize_package(p)?;
+        if !packages.contains(&n) {
+            packages.push(n);
+        }
+    }
+    l.packages = packages;
+    Ok(l)
 }
 
 /// A manifest plus the owner's signature over its canonical bytes.
@@ -320,6 +345,9 @@ pub struct SessionParams {
     pub max_item_bytes: u64,
     #[serde(default)]
     pub job_limits: Option<JobLimits>,
+    /// See [`Manifest::insecure_http_host`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insecure_http_host: Option<String>,
 }
 
 fn default_max_item_bytes() -> u64 {
@@ -405,7 +433,8 @@ impl SessionSecrets {
                 .transpose()?,
             allowed_types: p.allowed_types.clone(),
             max_item_bytes: p.max_item_bytes,
-            job_limits: p.job_limits.clone(),
+            job_limits: p.job_limits.clone().map(normalize_limits).transpose()?,
+            insecure_http_host: p.insecure_http_host.as_deref().map(str::to_ascii_lowercase),
         };
         manifest.validate()?;
         let sig = owner.sign(ctx::MANIFEST, &manifest.canonical_bytes()?);
@@ -445,6 +474,7 @@ mod tests {
             allowed_types: vec![ContentType::Text, ContentType::Py, ContentType::Md],
             max_item_bytes: DEFAULT_MAX_ITEM_BYTES,
             job_limits: (mode == Mode::Execute).then(JobLimits::default),
+            insecure_http_host: None,
         }
     }
 
@@ -495,6 +525,21 @@ mod tests {
         let mut p = params(Mode::Execute);
         p.allowed_types = vec![ContentType::Text];
         assert!(SessionSecrets::generate().manifest(&p).is_err());
+    }
+
+    #[test]
+    fn package_names_are_normalized_when_the_manifest_is_built() {
+        let mut p = params(Mode::Execute);
+        p.job_limits.as_mut().unwrap().packages =
+            vec!["pyPowerGEM".into(), "py_power.gem".into(), "numpy".into()];
+        let (_, m) = create_session(&p).unwrap();
+        assert_eq!(m.manifest.job_limits.as_ref().unwrap().packages, ["pypowergem", "py-power-gem", "numpy"]);
+        // A signed manifest must already carry the normalized form, and says which.
+        let l = JobLimits { packages: vec!["pyPowerGEM".into()], ..JobLimits::default() };
+        let e = validate_job_limits(&l).unwrap_err().to_string();
+        assert!(e.contains("\"pypowergem\""), "{e}");
+        p.job_limits.as_mut().unwrap().packages = vec!["not a name".into()];
+        assert!(create_session(&p).is_err());
     }
 
     #[test]

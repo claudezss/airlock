@@ -85,6 +85,7 @@ pub fn new_session_ttl(mode: Mode, ttl_ms: Option<u64>) -> Sess {
         allowed_types: vec![ContentType::Text, ContentType::Md, ContentType::Py],
         max_item_bytes: 1024 * 1024,
         job_limits: (mode == Mode::Execute).then(Default::default),
+        insecure_http_host: None,
     };
     let signed = secrets.manifest(&params).unwrap();
     Sess { id: signed.manifest.session_id.clone(), manifest_json: canon(&signed), secrets }
