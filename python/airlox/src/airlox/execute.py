@@ -127,6 +127,14 @@ class Result:
     out_files: List[OutFile] = field(default_factory=list)
     code_sha256: Optional[str] = None
     input_sha256: Optional[str] = None
+    #: Where the job ran, measured and signed by its runner (not written by
+    #: the job): ``python`` (the interpreter's version), ``packages`` (the
+    #: installed version of each allowlisted package, by normalized name),
+    #: ``airlox`` (the runner's version), ``sandbox`` and ``interpreter``
+    #: (``"uv-runtime"``, ``"--python"`` or ``"docker:<image>"``). It holds no
+    #: file system paths. ``None`` for unsigned results and for runners that
+    #: do not report it.
+    env: Optional[dict] = None
     #: The runner's key, and the name it joined with.
     runner: Optional[str] = None
     runner_name: Optional[str] = None
@@ -365,6 +373,7 @@ class Job:
                 out_files=outs,
                 code_sha256=m["code_sha256"],
                 input_sha256=m["input_sha256"],
+                env=m.get("env"),
                 runner=item.author,
                 runner_name=item.author_name,
             )
