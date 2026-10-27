@@ -283,7 +283,19 @@ select:focus { border-color: var(--accent); outline: none; }
   .readonly { margin: 0 16px 16px; }
   .composer-wrap { max-height: 60vh; max-height: 60dvh; }
   .composer textarea.code { min-height: 96px; max-height: 24vh; max-height: 24dvh; }
-  .title { display: none !important; }
+}
+/* Session pages keep who/what/when in one header row at every width. */
+@media (max-width: 820px) {
+  .top:has(#title:not([hidden])) { flex-wrap: nowrap; gap: 12px; }
+  .top:has(#title:not([hidden])) .brand span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .title { flex: 1 1 auto; padding-left: 12px; }
+  .title span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .top-right { flex: none; gap: 8px; }
+}
+@media (max-width: 600px) {
+  #badge-text, .exp-word { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .badge { padding: 6px; }
+  .expiry { border: 1px solid var(--line-2); border-radius: 999px; padding: 4px 10px; font-size: 12px; }
 }
 @media (max-width: 480px) {
   main { padding: 24px 16px; }

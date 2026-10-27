@@ -986,7 +986,8 @@ function buildSessionLayout(s) {
     const h = Math.floor(t / 3600);
     const mm = String(Math.floor((t % 3600) / 60)).padStart(2, "0");
     const ss = String(t % 60).padStart(2, "0");
-    expiry.textContent = `expires in ${h ? `${h}:` : ""}${mm}:${ss}`;
+    // On phones only the time shows; "expires in" stays for screen readers.
+    expiry.replaceChildren(el("span", { class: "exp-word" }, "expires in "), `${h ? `${h}:` : ""}${mm}:${ss}`);
     expiry.classList.toggle("soon", left < 5 * 60 * 1000);
   };
   const timer = setInterval(tick, 1000);
