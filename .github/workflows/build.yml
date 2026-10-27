@@ -3,10 +3,17 @@ name: build
 # Builds everything a release ships, without publishing anything: the
 # `airlox` binary per platform, the PyPI wheels (each with the binary) and
 # sdist, the npm packages and the MCPB bundle. Each is smoke-tested where the
-# runner can run it. Called by release.yml for a tag and by ci.yml when
-# packaging could have changed.
+# runner can run it. Called by release.yml for a tag with `all_platforms`, and
+# by ci.yml when packaging could have changed, where it builds only the Linux
+# x64 binary and wheel (and the sdist): the npm packages and the MCPB bundle
+# need every platform, so pull requests skip them.
 on:
   workflow_call:
+    inputs:
+      all_platforms:
+        description: Build every platform, as a release does; otherwise Linux x64 only
+        type: boolean
+        default: false
     outputs:
       version:
         description: The workspace version, which every package carries
@@ -24,10 +31,45 @@ jobs:
     timeout-minutes: 5
     outputs:
       version: ${{ steps.v.outputs.version }}
+      binaries: ${{ steps.matrix.outputs.binaries }}
+      wheels: ${{ steps.matrix.outputs.wheels }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - id: v
         run: python3 -c "import tomllib; print('version=' + tomllib.load(open('Cargo.toml', 'rb'))['workspace']['package']['version'])" >> "$GITHUB_OUTPUT"
+      # The platforms to build: all of them for a release, Linux x64 otherwise.
+      - id: matrix
+        env:
+          ALL: ${{ inputs.all_platforms }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          everything = os.environ["ALL"] == "true"
+          linux = {"name": "linux", "os": "ubuntu-latest", "build": "zigbuild", "run": "x86_64-unknown-linux-musl",
+                   "targets": "x86_64-unknown-linux-musl aarch64-unknown-linux-musl" if everything else "x86_64-unknown-linux-musl"}
+          binaries = [linux]
+          # maturin-action's default manylinux2014 images, pinned.
+          wheels = [{"os": "ubuntu-latest", "target": "x86_64", "bin": "x86_64-unknown-linux-musl", "native": True,
+                     "container": "quay.io/pypa/manylinux2014_x86_64@sha256:296069bc05d85275248f168f6e3b34ba8aa06181b67e40cd7447c64d56d3a851"}]
+          if everything:
+              binaries += [
+                  {"name": "macos", "os": "macos-latest", "targets": "aarch64-apple-darwin x86_64-apple-darwin",
+                   "build": "build", "run": "aarch64-apple-darwin universal-apple-darwin"},
+                  # Link the C runtime in, so the binary runs where the Visual
+                  # C++ redistributable is not installed.
+                  {"name": "windows", "os": "windows-latest", "targets": "x86_64-pc-windows-msvc", "build": "build",
+                   "run": "x86_64-pc-windows-msvc", "rustflags": "-C target-feature=+crt-static"},
+              ]
+              wheels += [
+                  {"os": "ubuntu-latest", "target": "aarch64", "bin": "aarch64-unknown-linux-musl", "native": False,
+                   "container": "ghcr.io/rust-cross/manylinux2014-cross@sha256:32c92568ebee8db53e0598c21bcd06a6dd1649d45d507646a8a49313c50325f8"},
+                  {"os": "macos-latest", "target": "x86_64", "bin": "x86_64-apple-darwin", "native": False},
+                  {"os": "macos-latest", "target": "aarch64", "bin": "aarch64-apple-darwin", "native": True},
+                  {"os": "windows-latest", "target": "x64", "bin": "x86_64-pc-windows-msvc", "native": True},
+              ]
+          print("binaries=" + json.dumps(binaries))
+          print("wheels=" + json.dumps(wheels))
+          EOF
 
   # Static musl binaries on Linux (one per architecture runs on any
   # distribution), both macOS architectures plus a universal binary for the
@@ -40,25 +82,7 @@ jobs:
       # Report every platform, not just the first to fail.
       fail-fast: false
       matrix:
-        include:
-          - name: linux
-            os: ubuntu-latest
-            targets: x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-            build: zigbuild
-            run: x86_64-unknown-linux-musl
-          - name: macos
-            os: macos-latest
-            targets: aarch64-apple-darwin x86_64-apple-darwin
-            build: build
-            run: aarch64-apple-darwin universal-apple-darwin
-          - name: windows
-            os: windows-latest
-            targets: x86_64-pc-windows-msvc
-            build: build
-            run: x86_64-pc-windows-msvc
-            # Link the C runtime in, so the binary runs where the Visual C++
-            # redistributable is not installed.
-            rustflags: -C target-feature=+crt-static
+        include: ${{ fromJSON(needs.version.outputs.binaries) }}
     defaults:
       run:
         shell: bash
@@ -135,21 +159,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # maturin-action's default manylinux2014 images, pinned.
-          - os: ubuntu-latest
-            target: x86_64
-            bin: x86_64-unknown-linux-musl
-            native: true
-            container: quay.io/pypa/manylinux2014_x86_64@sha256:296069bc05d85275248f168f6e3b34ba8aa06181b67e40cd7447c64d56d3a851
-          - os: ubuntu-latest
-            target: aarch64
-            bin: aarch64-unknown-linux-musl
-            native: false
-            container: ghcr.io/rust-cross/manylinux2014-cross@sha256:32c92568ebee8db53e0598c21bcd06a6dd1649d45d507646a8a49313c50325f8
-          - { os: macos-latest, target: x86_64, bin: x86_64-apple-darwin, native: false }
-          - { os: macos-latest, target: aarch64, bin: aarch64-apple-darwin, native: true }
-          - { os: windows-latest, target: x64, bin: x86_64-pc-windows-msvc, native: true }
+        include: ${{ fromJSON(needs.version.outputs.wheels) }}
     defaults:
       run:
         shell: bash
@@ -216,6 +226,7 @@ jobs:
   # and runs the binary through npx.
   npm:
     needs: [version, binaries]
+    if: inputs.all_platforms
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -256,6 +267,7 @@ jobs:
   # MCP registry entry that names it.
   mcpb:
     needs: [version, binaries]
+    if: inputs.all_platforms
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

@@ -132,6 +132,44 @@ pub async fn create_session(http: &reqwest::Client, base: &str, signed_manifest:
     Ok(())
 }
 
+/// `POST /v1/drops/{n}/claim`: trade a one-time transfer code for the
+/// invite link it carries. A right code is used up; a wrong one spends one
+/// of the few tries the code has.
+pub async fn receive_code(http: &reqwest::Client, relay: &str, code: &str) -> Result<String> {
+    let code = airlox_core::transfer::Code::parse(code)?;
+    let relay = relay.trim_end_matches('/');
+    let req = http
+        .post(format!("{relay}/v1/drops/{}/claim", code.nameplate))
+        .timeout(REQUEST_TIMEOUT)
+        .json(&serde_json::json!({"claim": code.claim()}));
+    let r = match check(req.send().await?).await {
+        Ok(r) => r,
+        Err(e) => match status_of(&e) {
+            Some(404) => {
+                bail!("no code {} on {}; it may have expired", code.to_code_string(), relay_text(relay))
+            }
+            Some(403) => bail!("wrong code: check the two words"),
+            Some(410) => {
+                let why = match e.downcast_ref::<RelayError>().map(|r| r.code.as_str()) {
+                    Some("used") => "was already used",
+                    Some("burned") => "was cancelled after too many wrong tries",
+                    Some("cancelled") => "was cancelled by the sender",
+                    Some("expired") => "expired",
+                    _ => "no longer works",
+                };
+                bail!("code {} {why}; ask for a new one", code.to_code_string())
+            }
+            Some(429) => bail!("too many wrong codes from this address; wait a few minutes"),
+            _ => return Err(e),
+        },
+    };
+    let v = read_json(r).await?;
+    let sealed = v["box"].as_str().context("relay sent no box")?;
+    // Checks it is an invite link, so nothing else reaches the terminal.
+    airlox_core::api::transfer_open(&code.to_code_string(), sealed)
+        .context("the code's words do not open what the relay sent")
+}
+
 /// `POST /v1/sessions/{id}/participants`: returns the bearer token.
 pub async fn join(http: &reqwest::Client, base: &str, sid: &str, signed_join: String) -> Result<String> {
     let req = http.post(format!("{base}/v1/sessions/{sid}/participants")).timeout(REQUEST_TIMEOUT);

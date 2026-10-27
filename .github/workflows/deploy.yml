@@ -2,13 +2,12 @@ name: deploy
 
 # A push to main that changes the relay (or how it is deployed) builds the
 # image, pushes it to ghcr.io/claudezss/airlox-server and deploys it to the
-# Droplet (see docs/deploy.md). Pull requests touching the same files, and
-# manual runs on other branches, only build the image. Run it by hand on main
-# to redeploy.
+# Droplet (see docs/deploy.md). Pull requests don't run it; manual runs on
+# other branches only build the image. Run it by hand on main to redeploy.
 on:
   push:
     branches: [main]
-    paths: &relay
+    paths:
       - Dockerfile
       - .dockerignore
       - Cargo.toml
@@ -20,13 +19,11 @@ on:
       - 'web/**'
       - 'deploy/**'
       - .github/workflows/deploy.yml
-  pull_request:
-    paths: *relay
   workflow_dispatch:
 
 concurrency:
-  group: deploy-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -44,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+      - if: github.ref == 'refs/heads/main'
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
@@ -54,7 +51,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
-          push: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+          push: ${{ github.ref == 'refs/heads/main' }}
           tags: |
             ${{ env.IMAGE }}:sha-${{ github.sha }}
             ${{ env.IMAGE }}:latest
@@ -62,7 +59,7 @@ jobs:
           cache-to: type=gha,mode=max
 
   deploy:
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main'
     needs: image
     runs-on: ubuntu-latest
     timeout-minutes: 15

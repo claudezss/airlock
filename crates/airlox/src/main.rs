@@ -43,6 +43,8 @@ enum Cmd {
     /// Runners: run jobs for a session, or list, approve and reject them.
     #[command(subcommand)]
     Runner(RunnerCmd),
+    /// Print the invite link a one-time transfer code carries.
+    Receive(cli::ReceiveArgs),
     /// Run an MCP server on stdio, for agents in chat apps and IDEs.
     Mcp(mcp::McpArgs),
 }
@@ -121,6 +123,7 @@ fn main() -> std::process::ExitCode {
             Cmd::Cancel(a) => cli::cancel(a).await.map(|()| 0),
             Cmd::Items(a) => cli::items(a).await.map(|()| 0),
             Cmd::Watch(a) => cli::watch(a).await.map(|()| 0),
+            Cmd::Receive(a) => cli::receive(a).await.map(|()| 0),
             Cmd::Runner(RunnerCmd::Join(args)) => runner::run(args).await.map(|()| 0),
             Cmd::Mcp(mcp::McpArgs { cmd: Some(mcp::McpCmd::Config(c)), .. }) => {
                 mcp::print_config(&c).map(|()| 0)

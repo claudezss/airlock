@@ -40,6 +40,10 @@ pub async fn new_page() -> Response {
     serve("index.html")
 }
 
+pub async fn receive_page() -> Response {
+    serve("index.html")
+}
+
 pub async fn session_page(Path(_id): Path<String>) -> Response {
     serve("index.html")
 }

@@ -30,15 +30,16 @@ Every push to `main` runs `.github/workflows/deploy.yml`:
    - if that fails, restores the previous image and files, and the workflow
      fails.
 
-Releases publish the same image separately, for linux/amd64 and linux/arm64,
-as `ghcr.io/claudezss/airlox-server:<version>` (see
+Releases publish the same image separately, for linux/amd64 only (other
+architectures build it from the `Dockerfile`), as `ghcr.io/claudezss/airlox-server:<version>` (see
 [releasing.md](releasing.md)); the Droplet keeps deploying `sha-<commit>` from
 `main`, and `:latest` always means the newest `main`, not the newest release.
 Anyone can run a release image with `docker run -p 8080:8080 -v airlox-data:/data
 ghcr.io/claudezss/airlox-server:<version>`; it listens on port 8080 and keeps
 sessions in `/data`.
 
-Pull requests, and manual runs on other branches, only build the image. To
+Pull requests don't build the image; manual runs on other branches only
+build it. To
 redeploy `main`, run the workflow by hand from the Actions tab. Deploys never
 overlap: the workflow serializes them and the script holds a lock.
 

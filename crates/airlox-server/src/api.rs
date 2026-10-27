@@ -55,6 +55,7 @@ static AUDITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
+    pub drops: Arc<crate::drops::Drops>,
     pub shutdown: watch::Receiver<bool>,
 }
 
@@ -89,7 +90,7 @@ pub(crate) fn auth(s: &Session, headers: &HeaderMap) -> ApiResult<(String, Role)
 /// The address bucket that per-address limits count: the peer, or with
 /// `--trust-proxy` the last `X-Forwarded-For` hop (the one the proxy added).
 /// IPv6 addresses are grouped by /64, since one host usually owns a /64.
-fn client_bucket(st: &AppState, headers: &HeaderMap, peer: SocketAddr) -> String {
+pub(crate) fn client_bucket(st: &AppState, headers: &HeaderMap, peer: SocketAddr) -> String {
     let mut ip = peer.ip();
     if st.store.cfg.trust_proxy {
         let last = headers

@@ -234,3 +234,22 @@ pub fn sanitize_image(data: &[u8]) -> R<JsValue> {
     let (mime, out) = api::sanitize_image(data).map_err(err)?;
     Ok(obj(&[("mime", mime.into()), ("data", bytes(&out))]))
 }
+
+/// Returns `{ secret, claimHash, box }`.
+#[wasm_bindgen(js_name = transferSeal)]
+pub fn transfer_seal(invite: &str) -> R<JsValue> {
+    let (secret, claim_hash, sealed) = api::transfer_seal(invite).map_err(err)?;
+    Ok(obj(&[("secret", secret.into()), ("claimHash", claim_hash.into()), ("box", sealed.into())]))
+}
+
+/// Returns `{ nameplate, claim }`.
+#[wasm_bindgen(js_name = transferClaim)]
+pub fn transfer_claim(code: &str) -> R<JsValue> {
+    let (nameplate, claim) = api::transfer_claim(code).map_err(err)?;
+    Ok(obj(&[("nameplate", nameplate.into()), ("claim", claim.into())]))
+}
+
+#[wasm_bindgen(js_name = transferOpen)]
+pub fn transfer_open(code: &str, sealed_box: &str) -> R<String> {
+    api::transfer_open(code, sealed_box).map_err(err)
+}

@@ -16,6 +16,7 @@ pub mod payload;
 pub mod policy;
 pub mod session;
 pub mod shim;
+pub mod transfer;
 pub mod validate;
 pub mod vectors;
 

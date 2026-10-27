@@ -6,6 +6,7 @@
 
 pub mod api;
 pub mod config;
+pub mod drops;
 pub mod error;
 pub mod exec;
 pub mod store;
@@ -51,8 +52,12 @@ pub fn router(state: api::AppState) -> Router {
         .route("/v1/sessions/{id}/runners/me/heartbeat", post(exec::heartbeat))
         .route("/v1/sessions/{id}/runners/{participant}/approve", post(exec::approve_runner))
         .route("/v1/sessions/{id}/runners/{participant}/reject", post(exec::reject_runner))
+        .route("/v1/drops", post(drops::create))
+        .route("/v1/drops/{n}", get(drops::status).delete(drops::cancel))
+        .route("/v1/drops/{n}/claim", post(drops::claim))
         .route("/", get(web::index))
         .route("/new", get(web::new_page))
+        .route("/receive", get(web::receive_page))
         .route("/s/{id}", get(web::session_page))
         .route("/assets/{*path}", get(web::asset))
         .layer(axum::middleware::map_response(no_store))
@@ -143,7 +148,7 @@ pub async fn start(cfg: Config) -> std::io::Result<Running> {
 
     let listener = tokio::net::TcpListener::bind(cfg.listen).await?;
     let addr = listener.local_addr()?;
-    let app = router(api::AppState { store: store.clone(), shutdown: rx.clone() });
+    let app = router(api::AppState { store: store.clone(), drops: Default::default(), shutdown: rx.clone() });
     let mut stop = rx;
     let server = tokio::spawn(async move {
         axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
