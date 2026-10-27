@@ -133,6 +133,21 @@ def run_agent(agent: str, invite: str, workdir: pathlib.Path, step=quiet):
     return code, "".join(tail)[-2000:] + stderr.read_text()[-2000:]
 
 
+def parse_answer(replies: list):
+    """The totals from the agent's last ANSWER message, by value: a model may
+    write 180, 180.0 or "180", and add words around the JSON."""
+    for text in reversed(replies):
+        m = re.search(r"ANSWER\s*(\{.*?\})", text, re.S)
+        if not m:
+            continue
+        try:
+            raw = json.loads(m.group(1))
+            return {str(k).strip().lower(): round(float(v), 6) for k, v in raw.items()}
+        except (ValueError, TypeError, AttributeError):
+            return None
+    return None
+
+
 def scenario(relay: str, start_runner, workdir: pathlib.Path, step=quiet) -> dict:
     workdir.mkdir(parents=True, exist_ok=True)
     cache = workdir.parent / "cache"
@@ -161,12 +176,11 @@ def scenario(relay: str, start_runner, workdir: pathlib.Path, step=quiet) -> dic
     jobs = [i for i in by_agent if i.kind == "job"]
     results = [i for i in items if i.kind == "result" and i.meta["job"]["id"] in {j.id for j in jobs}]
     replies = [i.text for i in by_agent if i.kind == "text"]
-    match = re.search(r"ANSWER\s*(\{.*\})", replies[-1] if replies else "", re.S)
+    answer = parse_answer(replies)
 
     expected = {}
     for _, region, amount in SALES:
         expected[region] = expected.get(region, 0) + amount
-    answer = json.loads(match.group(1)) if match else None
     step("data-team", "Checks the answer and the runner's signature", "answer == totals computed locally",
          out=f"{'match' if answer == expected else 'MISMATCH'} · {len(results)} signed result(s) from analysis-box")
     team.close()
@@ -178,7 +192,7 @@ def scenario(relay: str, start_runner, workdir: pathlib.Path, step=quiet) -> dic
         "reply": replies[-1] if replies else None,
         "answer": answer,
         "expected": expected,
-        "agent_output": agent_output if agent_exit or not match else "",
+        "agent_output": agent_output if agent_exit or answer != expected else "",
     }
 
 

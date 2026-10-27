@@ -244,11 +244,6 @@ It writes `web/demos/<name>.gif` and a still of the last frame
 (`<name>.webp`, shown to readers who prefer reduced motion). Re-record after
 a change to the web UI or the examples.
 
-## What we learned
-
-Building these surfaced bugs and rough edges, some fixed and some still
-open: [pain-points.md](pain-points.md).
-
 ## Writing your own
 
 [`examples/_local.py`](../examples/_local.py) has the plumbing: a local

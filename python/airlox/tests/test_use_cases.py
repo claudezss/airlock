@@ -6,6 +6,7 @@ The live agent case calls a real model and runs only with AIRLOX_LIVE_AGENT=1
 """
 
 import importlib.util
+import json
 import os
 import shutil
 
@@ -62,8 +63,15 @@ def test_live_agent(relay, start_runner, tmp_path):
     agent = os.environ.get("AIRLOX_AGENT", "claude")
     if not shutil.which(agent):
         pytest.skip(f"{agent} is not installed")
-    out = load("live-agent").scenario(relay.url, start_runner, tmp_path)
-    assert out["agent_exit"] == 0, out["agent_output"]
+    steps = []
+
+    def step(actor, text, code=None, *, out=None, observe=None):
+        steps.append("\n".join(filter(None, [f"[{actor}] {text}", code, out and f"= {out}"])))
+
+    out = load("live-agent").scenario(relay.url, start_runner, tmp_path, step)
+    # On failure, the whole run: every tool call the agent made and what it said.
+    transcript = "\n".join(steps) + "\n" + json.dumps(out, indent=1)
+    assert out["agent_exit"] == 0, transcript
     # The agent did the work on the runner, not in its head.
-    assert out["jobs_by_agent"] >= 1 and 0 in out["signed_results"], out
-    assert out["answer"] == out["expected"], out
+    assert out["jobs_by_agent"] >= 1 and 0 in out["signed_results"], transcript
+    assert out["answer"] == out["expected"], transcript
