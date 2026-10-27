@@ -195,13 +195,30 @@ pub struct CreateArgs {
 }
 
 /// Write an invite to a new private file; never over an existing one.
-fn write_private(path: &Path, link: &str) -> Result<()> {
+pub(crate) fn write_private(path: &Path, link: &str) -> Result<()> {
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
     let mut f = o.open(path).with_context(|| format!("creating {}", path.display()))?;
     std::io::Write::write_all(&mut f, format!("{link}\n").as_bytes())?;
+    Ok(())
+}
+
+#[derive(Args, Debug)]
+pub struct ReceiveArgs {
+    /// The one-time code shown on the other machine, like 7-guitar-orbit.
+    pub code: String,
+    /// The relay the code was made on.
+    #[arg(long, env = "AIRLOX_RELAY", default_value = "https://airlox.app")]
+    pub relay: String,
+}
+
+/// Print the invite link a transfer code carries.
+pub async fn receive(a: ReceiveArgs) -> Result<()> {
+    let invite = client::receive_code(&client::http()?, &a.relay, &a.code).await?;
+    println!("{invite}");
+    eprintln!("The code is used up. Pass this link as --invite or AIRLOX_INVITE, and keep it private.");
     Ok(())
 }
 

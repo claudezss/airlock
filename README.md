@@ -204,6 +204,17 @@ airlox runner join --invite '<runner invite>' --name runner-01 --labels cpu --sa
     --description "8 cores, 32 GB RAM, in the build lab"
 ```
 
+Copying a link to another machine is awkward. Instead, click **Send to another
+machine** next to any invite in the web UI. It shows a one-time code such as
+`7-guitar-orbit`, valid for 10 minutes, which works on the other machine:
+
+```bash
+airlox runner join --code 7-guitar-orbit --name runner-01 --sandbox docker
+airlox receive 7-guitar-orbit           # or just print the invite link
+```
+
+You can also type the code in a browser at `/receive`.
+
 Approve the runner, then send it work:
 
 ```python
@@ -268,6 +279,10 @@ airlox.app: Caddy for HTTPS and automatic deploys from CI.
   them, or impersonate a participant.
 - Whoever holds an invite link holds that role. Share links only over a
   channel you trust.
+- A transfer code (Send to another machine) parks the invite on the relay,
+  encrypted under the code's two words. Outsiders get three guesses before
+  the code is cancelled. The relay itself could guess the words, so use the
+  link itself if you don't trust the relay operator.
 - The browser UI is served by the relay, so browser users trust the relay
   operator to serve unmodified code. Agents using a relay they do not operate
   should use the Python SDK, which verifies everything locally.

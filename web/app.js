@@ -1,7 +1,7 @@
 // Airlox web client (M1 timeline). All cryptography runs in the
 // airlox-core WebAssembly module; the relay only sees ciphertext.
 // The WebAssembly core is loaded on demand so the landing page renders even if
-// it (or IndexedDB) is unavailable; only /new and /s/<id> need them.
+// it (or IndexedDB) is unavailable; only /new, /receive and /s/<id> need them.
 let ac;
 let corePromise;
 const loadCore = () =>
@@ -209,13 +209,175 @@ function inviteRow(name, url, hint, label = "Copy") {
   } }, label);
   box.append(btn);
   return el("div", { class: "invite-row", "data-role": name.toLowerCase() },
-    el("div", { class: "head" }, el("strong", {}, name), hint ? el("span", { class: "muted" }, hint) : null), box);
+    el("div", { class: "head" }, el("strong", {}, name), hint ? el("span", { class: "muted" }, hint) : null), box,
+    sendCode(name, url));
+}
+
+// ---------- one-time transfer codes ----------
+// "Send to another machine": park the invite on the relay, sealed under two
+// random words, and show `{nameplate}-{words}` to type in on the other
+// machine. The relay hands it out once; see crates/airlox-core/src/transfer.rs.
+const PUBLIC_RELAY = "https://airlox.app";
+const openDrops = new Map(); // nameplate → token, cancelled when the page goes
+addEventListener("pagehide", () => {
+  for (const [n, token] of openDrops) fetch(`/v1/drops/${n}`, { method: "DELETE", keepalive: true, headers: { Authorization: `Bearer ${token}` } }).catch(() => {});
+  openDrops.clear();
+});
+const relayFlag = () => (location.origin === PUBLIC_RELAY ? "" : ` --relay ${location.origin}`);
+const mmss = (ms) => { const s = Math.max(0, Math.ceil(ms / 1000)); return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`; };
+
+function sendCode(name, url) {
+  const wrap = el("div", { class: "send-code" });
+  const start = el("button", { class: "small", type: "button", onclick: () => open() }, "Send to another machine");
+  const idle = () => wrap.replaceChildren(el("div", { class: "row" }, start));
+  let drop = null; // { n, token, timer }
+  const stop = async ({ cancel }) => {
+    if (!drop) return;
+    clearInterval(drop.timer);
+    openDrops.delete(drop.n);
+    if (cancel) api("DELETE", `/v1/drops/${drop.n}`, { token: drop.token }).catch(() => {});
+    drop = null;
+  };
+  const panel = (...kids) => wrap.replaceChildren(el("div", { class: "send-panel stack", role: "group", "aria-label": `Send ${name.toLowerCase()} invite` }, ...kids));
+  const ended = (cls, text, again = true) => panel(
+    el("p", { class: `send-note ${cls}`, role: "status" }, text),
+    el("div", { class: "row" }, again ? el("button", { class: "small", type: "button", onclick: () => open() }, "New code") : null,
+      el("button", { class: "small", type: "button", onclick: idle }, "Done")));
+
+  async function open() {
+    await stop({ cancel: true });
+    panel(el("p", { class: "muted hint-text" }, "Making a code…"));
+    let code, n, token, expires;
+    try {
+      const s = ac.transferSeal(url);
+      const r = await (await api("POST", "/v1/drops", { body: JSON.stringify({ claim_hash: s.claimHash, box: s.box }), headers: { "Content-Type": "application/json" } })).json();
+      ({ nameplate: n, token, expires_at_ms: expires } = r);
+      code = `${n}-${s.secret}`;
+    } catch (e) {
+      return ended("bad", `Could not make a code: ${e.message || e}`);
+    }
+    const clock = el("span", { class: "mono send-clock", "aria-label": "Time left" }, mmss(expires - Date.now()));
+    const cli = name === "Runner"
+      ? `airlox runner join --code ${code} --name my-runner --sandbox docker${relayFlag()}`
+      : `airlox receive ${code}${relayFlag()}`;
+    const cmd = el("code", {}, cli);
+    panel(
+      el("div", { class: "send-head" }, el("strong", {}, `Send ${name.toLowerCase()} invite`), clock),
+      el("p", { class: "muted hint-text" }, "On the other machine, open ", el("span", { class: "mono" }, `${location.host}/receive`), " and type:"),
+      el("div", { class: "send-big", "aria-label": `Code ${code.split("-").join(" ")}` }, code),
+      el("p", { class: "muted hint-text" }, name === "Runner" ? "Or run this there:" : "Or print the link there with:"),
+      cmd,
+      el("div", { class: "row" }, copyButton("Copy command", () => cli, () => cmd, "Command with the code")),
+      el("p", { class: "muted hint-text send-wait" }, "Waiting for the other machine · works once"),
+      el("div", { class: "row" },
+        el("button", { class: "small", type: "button", onclick: () => open() }, "New code"),
+        el("button", { class: "small", type: "button", onclick: async () => { await stop({ cancel: true }); idle(); } }, "Cancel")));
+    announce(`Code ${code} ready`);
+    openDrops.set(n, token);
+    drop = { n, token, timer: null };
+    let polling = false;
+    const mine = drop;
+    drop.timer = setInterval(async () => {
+      if (drop !== mine) return;
+      clock.textContent = mmss(expires - Date.now());
+      if (Date.now() >= expires) {
+        await stop({ cancel: false });
+        return ended("", "The code expired before anyone used it.");
+      }
+      if (polling) return;
+      polling = true;
+      try {
+        const st = await (await api("GET", `/v1/drops/${n}`, { token })).json();
+        if (drop !== mine) return;
+        if (st.state === "picked_up") {
+          await stop({ cancel: false });
+          ended("good", `Picked up ${hhmm(st.picked_up_at_ms)} · the code is gone. If that wasn't you, revoke ${name}.`, false);
+          announce("Invite picked up");
+        } else if (st.state === "burned") {
+          await stop({ cancel: false });
+          ended("bad", "Someone typed wrong words too many times, so the code was cancelled. Make a new one.");
+        }
+      } catch (e) {
+        if (e.status === 404 && drop === mine) {
+          await stop({ cancel: false });
+          ended("", "The code is no longer on the relay (it expired, or the relay restarted).");
+        }
+      } finally {
+        polling = false;
+      }
+    }, 1000);
+  }
+  idle();
+  return wrap;
+}
+
+// ---------- receive (at /receive) ----------
+function receivePage() {
+  document.title = "Receive an invite · Airlox";
+  const input = el("input", { type: "text", id: "code", class: "mono receive-input", placeholder: "7-guitar-orbit", autocomplete: "off",
+    autocapitalize: "none", spellcheck: "false", enterkeyhint: "go", "aria-describedby": "code-err", required: true });
+  const err = el("p", { class: "error", id: "code-err", role: "alert" });
+  const go = el("button", { class: "primary", type: "submit" }, "Open session");
+  input.addEventListener("input", () => (err.textContent = ""));
+  const form = el("form", { class: "panel stack receive", onsubmit: async (ev) => {
+    ev.preventDefault();
+    const code = input.value.trim();
+    if (!code) return (err.textContent = "Enter the code first.");
+    let c;
+    try {
+      c = ac.transferClaim(code);
+    } catch (e) {
+      return (err.textContent = String(e.message || e).replace(/^\w+Error: (invalid code: )?/, "").replace(/^./, (m) => m.toUpperCase()) + ".");
+    }
+    go.disabled = true;
+    try {
+      const r = await (await api("POST", `/v1/drops/${c.nameplate}/claim`, { body: JSON.stringify({ claim: c.claim }), headers: { "Content-Type": "application/json" } })).json();
+      const link = ac.transferOpen(code, r.box);
+      // Runners join from the command line, not a browser: hand over the command.
+      if (ac.parseInvite(link).role === "runner") return showRunnerCommand(link);
+      const u = new URL(link);
+      // Same hand-off as the owner link: the key never enters the address bar here.
+      if (u.origin === location.origin) {
+        try {
+          sessionStorage.setItem(`invite:${u.pathname}`, u.hash.slice(1));
+          return location.assign(u.pathname);
+        } catch {}
+      }
+      location.assign(link);
+    } catch (e) {
+      go.disabled = false;
+      err.textContent = e.status === 404 ? `There is no code ${c.nameplate} on this relay. It may have expired; ask for a new one.`
+        : e.status === 403 ? "Wrong code. Check the two words; a few wrong tries cancel the code."
+        : e.status === 410 ? "This code was already used or cancelled. Ask for a new one."
+        : `Could not receive the invite: ${e.message || e}`;
+      input.focus();
+    }
+  } },
+    el("h1", {}, "Receive an invite"),
+    el("p", { class: "muted" }, "Enter the code shown on the other machine, under Send to another machine."),
+    el("label", { for: "code", class: "sr-only" }, "Code"),
+    input, err, go,
+    el("p", { class: "muted hint-text" }, "The link is decrypted in this browser. The relay stores it only encrypted, for a few minutes, and gives it out once."));
+  show(form);
+  input.focus();
+}
+
+function showRunnerCommand(link) {
+  const cmd = (l) => `airlox runner join --invite '${l}' --name my-runner --sandbox docker`;
+  const shown = el("code", {}, "airlox runner join --invite '", el("span", { class: "link" }, maskInvite(link)), "' --name my-runner --sandbox docker");
+  invitesShown = true;
+  show(el("div", { class: "panel stack receive runner-cmd" },
+    el("h1", {}, "Runner invite received"),
+    el("p", { class: "muted" }, "Runners join from the command line. Run this on this machine; the code is used up, so copy it now."),
+    shown,
+    el("div", { class: "row" }, copyButton("Copy command", () => cmd(link), () => shown, "Runner command", "primary")),
+    el("p", { class: "muted hint-text" }, "Install the airlox runner first: ", el("a", { href: INSTALL_URL, target: "_blank", rel: "noopener noreferrer" }, "see the install guide"), ".")));
 }
 
 // A revoked role's invite no longer works: drop its link and Copy buttons.
 function markRevoked(row) {
   if (!row || row.querySelector(".revoked-note")) return;
-  row.querySelectorAll(".invite, .runner-cmd").forEach((n) => n.remove());
+  row.querySelectorAll(".invite, .runner-cmd, .send-code").forEach((n) => n.remove());
   row.append(el("p", { class: "muted revoked-note" }, "Revoked for good · this link no longer works"));
 }
 
@@ -2055,6 +2217,14 @@ if (location.pathname.startsWith("/s/")) {
   try {
     await loadCore();
     newSession();
+  } catch (e) {
+    deadEnd("Airlox failed to start", String(e.message || e));
+  }
+} else if (location.pathname === "/receive") {
+  document.title = "Receive an invite · Airlox";
+  try {
+    await loadCore();
+    receivePage();
   } catch (e) {
     deadEnd("Airlox failed to start", String(e.message || e));
   }

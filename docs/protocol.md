@@ -106,6 +106,30 @@ member: {base}/s/{session_id}#v=1&r={send|run|view}&k={K}&rk={role_seed}
 - After fetching the manifest, a client checks that the role keypair derived
   from the invite matches `manifest.roles[role]` (or `owner_pub`).
 
+### 4.1 Transfer codes
+
+A one-time code such as `7-guitar-orbit` carries an invite link to another
+machine, so nobody has to copy the link across by hand.
+
+```text
+code   = {nameplate}-{w1}-{w2}            w1, w2 from transfer::WORDS (256 words)
+secret = "{w1}-{w2}"
+key    = HKDF-SHA256(ikm = secret, salt = none, info = "airlox transfer v1 key")
+claim  = HKDF-SHA256(ikm = secret, salt = none, info = "airlox transfer v1 claim")
+box    = nonce(12) || AES-256-GCM(key, nonce, invite_link, aad = "airlox transfer v1")
+```
+
+- The sender posts `{claim_hash: hex(sha256(claim)), box: b64url(box)}` to
+  `POST /v1/drops` (§12) and shows `{nameplate}-{secret}` with the nameplate
+  the relay assigns.
+- The receiver posts `{claim: b64url(claim)}` to `POST /v1/drops/{nameplate}/claim`
+  and opens the box. The relay hands it out once.
+- Codes are lowercased, and spaces or underscores read as `-`.
+- The secret has 16 bits. Against outsiders the relay's limits protect it:
+  three wrong claims burn a drop, and a drop lives for minutes. The relay
+  itself can try every secret against `claim_hash`, so a transfer code
+  trusts the relay with the invite in a way the link's fragment does not.
+
 ## 5. Role certificates and joining
 
 Each participant generates its own Ed25519 keypair and certifies it with the
@@ -537,6 +561,18 @@ purged with the session. The relay builds two exports at a time; more are
 individually and IPv6 addresses per /64. Behind a reverse proxy
 (`--trust-proxy`), the address is the last `X-Forwarded-For` entry, the one
 the proxy appended; earlier entries are client-controlled and ignored.
+
+### Transfer codes (§4.1)
+
+Held in memory only, for `--drop-ttl` (default 10 minutes); a restart forgets
+them. Nameplates are the lowest free positive integer.
+
+| Request | Body / auth | Answer |
+| --- | --- | --- |
+| `POST /v1/drops` | `{claim_hash, box}`; `box` at most 4096 bytes decoded | `201 {nameplate, token, expires_at_ms}`; `429` over `--max-drops` or `--max-drops-per-ip` |
+| `POST /v1/drops/{n}/claim` | `{claim}` | `200 {box}` once; `403` wrong claim; `410 used` after a claim; `410 burned` on the third wrong claim; `404` unknown or expired |
+| `GET /v1/drops/{n}` | `Authorization: Bearer {token}` | `{state: waiting \| picked_up \| burned, picked_up_at_ms, expires_at_ms}` |
+| `DELETE /v1/drops/{n}` | `Authorization: Bearer {token}` | `204`; the code stops working |
 
 ## 13. Execute HTTP binding
 

@@ -95,6 +95,21 @@ main.wide { max-width: none; padding: 0; }
 .revoked-note { margin: 0; font-size: 13px; }
 .hint-lines { gap: 2px; }
 .hint-lines p { margin: 0; }
+.send-panel { gap: 8px; border: 1px solid var(--accent-line); background: var(--accent-bg); border-radius: 8px; padding: 12px; }
+.send-panel p { margin: 0; }
+.send-panel > code { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 9px 10px; color: var(--soft); font-size: 12px; overflow-wrap: anywhere; }
+.send-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.send-clock { color: var(--accent); font-size: 13px; }
+.send-big { font-family: var(--mono); font-size: 22px; letter-spacing: 0.02em; text-align: center; padding: 12px 8px; border: 1px dashed var(--line-3); border-radius: 8px; background: var(--panel-2); color: var(--text); overflow-wrap: anywhere; user-select: all; }
+.send-note { margin: 0; font-size: 13px; }
+.send-note.good { color: var(--ok); }
+.send-note.bad { color: var(--bad); }
+.receive { max-width: 440px; margin: 48px auto; text-align: center; }
+.receive h1 { font-size: 28px; }
+.receive p { margin: 0; }
+.receive-input { text-align: center; font-size: 20px; min-height: 52px; }
+.receive.runner-cmd > code { text-align: left; }
+.receive .row { justify-content: center; }
 .invite code, .invite input { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 9px 10px; color: var(--soft); font-family: var(--mono); font-size: 12px; min-height: 40px; }
 
 /* live session */

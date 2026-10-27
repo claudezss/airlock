@@ -269,3 +269,25 @@ pub fn sanitize_image(bytes: &[u8]) -> Result<(String, Vec<u8>)> {
 pub fn shim_source() -> &'static str {
     crate::shim::SHIM_PY
 }
+
+/// Seal an invite for a transfer code. Returns `(secret, claim_hash, box)`:
+/// upload the last two, and show `{nameplate}-{secret}` once the relay
+/// assigns the nameplate.
+pub fn transfer_seal(invite: &str) -> Result<(String, String, String)> {
+    Invite::parse(invite)?;
+    let s = crate::transfer::seal(invite)?;
+    Ok((s.secret.clone(), s.claim_hash.clone(), s.sealed_box.clone()))
+}
+
+/// Parse a typed transfer code. Returns `(nameplate, claim)`.
+pub fn transfer_claim(code: &str) -> Result<(u32, String)> {
+    let c = crate::transfer::Code::parse(code)?;
+    Ok((c.nameplate, c.claim()))
+}
+
+/// Decrypt the box fetched with `code`; returns the invite link.
+pub fn transfer_open(code: &str, sealed_box: &str) -> Result<String> {
+    let invite = crate::transfer::Code::parse(code)?.open(sealed_box)?;
+    Invite::parse(&invite)?;
+    Ok(invite)
+}

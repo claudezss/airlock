@@ -35,10 +35,18 @@ pub enum SandboxArg {
 }
 
 #[derive(clap::Args, Debug)]
+#[command(group(clap::ArgGroup::new("source").args(["invite", "code"]).required(true).multiple(true)))]
 pub struct JoinArgs {
     /// The runner invite link (or set AIRLOX_INVITE).
     #[arg(long, env = "AIRLOX_INVITE", hide_env_values = true)]
-    pub invite: String,
+    pub invite: Option<String>,
+    /// A one-time transfer code for the runner invite, like 7-guitar-orbit,
+    /// instead of --invite. The invite is saved for restarts.
+    #[arg(long)]
+    pub code: Option<String>,
+    /// The relay the --code was made on.
+    #[arg(long, env = "AIRLOX_RELAY", default_value = "https://airlox.app")]
+    pub relay: String,
     /// This runner's name, shown to senders: [a-z0-9][a-z0-9._-]{0,62}.
     #[arg(long)]
     pub name: String,
@@ -169,7 +177,13 @@ pub async fn run(args: JoinArgs) -> Result<()> {
             bail!("{t:?} is not a valid runner name or label: use [a-z0-9][a-z0-9._-]{{0,62}}");
         }
     }
-    let invite = Invite::parse(&args.invite).context("not a valid invite link")?;
+    let http = client::http()?;
+    let link = match (&args.code, &args.invite) {
+        (Some(code), _) => client::receive_code(&http, &args.relay, code).await?,
+        (None, Some(link)) => link.clone(),
+        (None, None) => bail!("pass --invite or --code"),
+    };
+    let invite = Invite::parse(&link).context("not a valid invite link")?;
     if invite.role != Role::Runner {
         bail!("this is a {} invite; runners need the runner invite", invite.role.as_str());
     }
@@ -195,7 +209,6 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         ),
         _ => None,
     };
-    let http = client::http()?;
     let signed = client::get_manifest(&http, &invite.base_url, &sid).await?;
     let manifest = SignedManifest::from_json(&signed)?.manifest;
     invite.check_against(&manifest)?;
@@ -209,6 +222,19 @@ pub async fn run(args: JoinArgs) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    // A code works once: keep what it carried so the runner can restart.
+    if args.code.is_some() {
+        let saved = dir.join("invite-runner.txt");
+        if !saved.exists() {
+            crate::cli::write_private(&saved, &link)?;
+        }
+        eprintln!(
+            "Saved the runner invite to {}. To restart this runner later:\n  AIRLOX_INVITE=\"$(cat {})\" airlox runner join --name {} ...",
+            saved.display(),
+            saved.display(),
+            args.name
+        );
     }
     let state_dir = root.join("runner");
     let mut backend = match args.sandbox {

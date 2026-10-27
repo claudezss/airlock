@@ -78,6 +78,14 @@ pub struct Config {
     /// A runner without a heartbeat for this long is offline, and its job fails.
     #[arg(long = "runner-timeout", env = "AIRLOX_RUNNER_TIMEOUT", default_value = "30s", value_parser = parse_duration_ms)]
     pub runner_timeout_ms: u64,
+    /// How long a one-time transfer code stays claimable.
+    #[arg(long = "drop-ttl", env = "AIRLOX_DROP_TTL", default_value = "10m", value_parser = parse_duration_ms)]
+    pub drop_ttl_ms: u64,
+    /// Transfer codes open at once, relay-wide (they are held in memory).
+    #[arg(long, env = "AIRLOX_MAX_DROPS", default_value_t = 1000)]
+    pub max_drops: usize,
+    #[arg(long, env = "AIRLOX_MAX_DROPS_PER_IP", default_value_t = 10)]
+    pub max_drops_per_ip: usize,
     /// How often expiry, idle and eviction timers are checked.
     #[arg(long = "sweep-interval", env = "AIRLOX_SWEEP_INTERVAL", default_value = "1s", value_parser = parse_duration_ms)]
     pub sweep_interval_ms: u64,
