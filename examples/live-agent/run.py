@@ -28,7 +28,7 @@ import sys
 import zipfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-from _local import binary, main, quiet, wait_for_runner  # noqa: E402
+from _local import binary, main, quiet  # noqa: E402
 
 from airlox import Session  # noqa: E402
 
@@ -143,9 +143,9 @@ def scenario(relay: str, start_runner, workdir: pathlib.Path, step=quiet) -> dic
     step("analysis-box", "Joins as a runner; the data team approves it",
          '$ airlox runner join --name analysis-box\nteam.approve_runner("analysis-box")', observe=team.invites["observer"])
     start_runner(team.invites["runner"], "analysis-box", "--description", "Python 3.12, no network")
-    wait_for_runner(team, "analysis-box")
+    team.wait_for_runner("analysis-box")
     team.approve_runner("analysis-box")
-    wait_for_runner(team, "analysis-box", approved=True)
+    team.wait_for_runner("analysis-box", approved=True)
 
     step("data-team", "Posts the data and the question", 'data = send_file("sales.zip")\nsend_text("Total amount per region … run it on analysis-box")')
     data = team.send_file(sales_zip(), name="sales.zip")

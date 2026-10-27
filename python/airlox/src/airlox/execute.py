@@ -34,6 +34,16 @@ class JobTimeout(Exception):
     """``Job.wait`` gave up before a result arrived."""
 
 
+class RunnerFailed(Exception):
+    """A runner reported that its setup failed (``Runner.state == "failed"``),
+    so it will never take jobs. ``Session.wait_for_runner`` raises this at
+    once instead of waiting for it to time out."""
+
+    def __init__(self, runner: "Runner") -> None:
+        super().__init__(f"runner {runner.name} could not start: {runner.detail or 'no reason given'}")
+        self.runner = runner
+
+
 @dataclass
 class Runner:
     participant_pub: str

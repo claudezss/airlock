@@ -83,6 +83,19 @@ def test_history_survives_eviction(relay, caches):
     assert [(i.text, i.status) for i in reopened.items()] == [("keep me", "ok")]
 
 
+def test_items_know_which_are_mine(relay, caches):
+    owner = Session.create(relay.url, cache_dir=caches("owner"))
+    agent = Session.join(owner.invites["sender"], cache_dir=caches("agent"))
+    owner.send_text("from the owner")
+    agent.send_text("from the agent")
+    assert {i.text: i.mine for i in owner.items()} == {"from the owner": True, "from the agent": False}
+    assert {i.text: i.mine for i in agent.items()} == {"from the owner": False, "from the agent": True}
+
+    # Items loaded from the local cache are marked the same way.
+    reopened = Session.join(owner.invites["sender"], cache_dir=caches("agent"))
+    assert {i.text: i.mine for i in reopened.items()} == {"from the owner": False, "from the agent": True}
+
+
 def test_late_joiner_sees_evicted_items(relay, caches):
     owner = Session.create(relay.url, cache_dir=caches("owner"))
     agent = Session.join(owner.invites["sender"], cache_dir=caches("agent"))

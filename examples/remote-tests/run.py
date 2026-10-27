@@ -21,7 +21,7 @@ import sys
 import zipfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-from _local import binary, main, quiet, wait_for_runner  # noqa: E402
+from _local import binary, main, quiet  # noqa: E402
 
 from airlox import Session  # noqa: E402
 
@@ -69,10 +69,10 @@ def scenario(relay: str, start_runner, workdir: pathlib.Path, step=quiet) -> dic
          "$ airlox runner join --name ci-box --labels ci", observe=owner.invites["observer"])
     start_runner(owner.invites["runner"], "ci-box", "--labels", "ci",
                  "--description", "Shared CI box, Python 3.12, no network")
-    wait_for_runner(owner, "ci-box")
+    owner.wait_for_runner("ci-box")
     step("team-lead", "Approves the runner it expects", 'owner.approve_runner("ci-box")')
     owner.approve_runner("ci-box")
-    wait_for_runner(owner, "ci-box", approved=True)
+    owner.wait_for_runner("ci-box", approved=True)
 
     # The agent's checkout: a copy of the project it is about to change.
     shutil.copytree(HERE / "project", workdir / "project")

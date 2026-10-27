@@ -78,7 +78,7 @@ The reviewer is a few lines of SDK code:
 bot = Session.join(invite, display_name="review-bot",
                    description="Reviews Python changes for injection risks; send a .py file")
 for item in bot.stream(timeout=120):
-    if item.kind == "file" and item.name.endswith(".py") and item.author != bot.participant_pub:
+    if item.kind == "file" and item.name.endswith(".py") and not item.mine:
         findings = review(item.body.decode())
         bot.send_file(report, name=f"review-{item.name[:-3]}.md", refs=[item.ref])
         bot.send_text(f"changes requested: {len(findings)} finding(s) in {item.name}", refs=[item.ref])
@@ -148,6 +148,15 @@ what it expects, never by what a runner says:
 for name in ["pool-a", "pool-b"]:
     owner.approve_runner(name)
 owner.reject_runner("gpu-fast", reason="not one of ours")
+```
+
+A sender waits for the approval it can verify before sending a job, since it
+may not have synced the owner's signed event yet; a runner whose sandbox
+failed to start raises `RunnerFailed` at once instead of timing out:
+
+```python
+for name in ["pool-a", "pool-b"]:
+    planner.wait_for_runner(name, approved=True)
 ```
 
 The planner submits every shard before waiting for any result. Jobs are never
@@ -243,8 +252,9 @@ open: [pain-points.md](pain-points.md).
 ## Writing your own
 
 [`examples/_local.py`](../examples/_local.py) has the plumbing: a local
-relay, runner processes (each with its own cache, like separate machines),
-`wait_for_runner`, and an MCP client over the MCP Python SDK. A scenario is a
+relay (a local `airlox-server`, else the published Docker image), runner
+processes (each with its own cache, like separate machines) and an MCP
+client over the MCP Python SDK. A scenario is a
 function `scenario(relay, start_runner, workdir, step) -> dict`, where
 `step(actor, text, code, out=…, observe=…)` reports progress. `main(scenario)`
 runs it from the command line, a test calls it with the suite's fixtures,

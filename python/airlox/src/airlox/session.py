@@ -19,7 +19,7 @@ from . import _core as ac
 import httpx
 
 from .cache import Cache, default_root
-from .execute import Job, NoRunnerAvailable, Runner, signed_approvals
+from .execute import Job, NoRunnerAvailable, Runner, RunnerFailed, signed_approvals
 
 DEFAULT_TYPES = ("text", "py", "md", "zip", "image")
 FILE_TYPES = {
@@ -86,6 +86,8 @@ class Item:
     #: ``rejected`` (failed verification or policy, see ``error``).
     status: str = "ok"
     error: Optional[str] = None
+    #: This session's participant wrote it (``author`` is ``participant_pub``).
+    mine: bool = False
 
     @property
     def available(self) -> bool:
@@ -452,6 +454,44 @@ class Session:
             raise LookupError(f"{'no' if not matches else 'more than one'} runner matches {which!r}")
         return matches[0]
 
+    def wait_for_runner(
+        self, runner: Union[Runner, str], *, approved: bool = False, timeout: float = 120.0, poll: float = 0.25
+    ) -> Runner:
+        """Block until a runner (a ``Runner``, its name or key) is online and
+        return it. With ``approved=True`` also wait until *this* session sees
+        the owner's signed approval: a sender that calls ``run_python`` just
+        after the owner approved can still get ``PolicyError`` (no signed
+        approval yet) until its own sync has fetched the event.
+
+        Raises ``RunnerFailed`` at once if the runner reports that its setup
+        failed, ``LookupError`` if a name matches several runners, and
+        ``TimeoutError`` if it is not ready after ``timeout`` seconds."""
+        which = runner.participant_pub if isinstance(runner, Runner) else runner
+        deadline = time.monotonic() + timeout
+        seen: Optional[Runner] = None
+        while True:
+            # A key names exactly one runner; only then try names, as `_runner` does.
+            runners = self.runners()
+            matches = [r for r in runners if r.participant_pub == which] or [r for r in runners if r.name == which]
+            if len(matches) > 1:
+                raise LookupError(f"more than one runner matches {which!r}")
+            seen = matches[0] if matches else None
+            if seen is not None:
+                if seen.state == "failed":
+                    raise RunnerFailed(seen)
+                if seen.online and (seen.approved or not approved):
+                    return seen
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(poll)
+        if seen is None:
+            why = "has not joined"
+        elif not seen.online:
+            why = "is not online"
+        else:
+            why = "has no signed approval from the owner yet"
+        raise TimeoutError(f"runner {which} {why} after {timeout} s")
+
     def approve_runner(self, runner: Union[Runner, str]) -> Runner:
         """Let a runner take jobs (owner only): the relay's approval, then a
         signed ``runner_approve`` event for runners and senders to verify.
@@ -706,7 +746,7 @@ class Session:
             i
             for i in self._order
             if self._items[i].status == "evicted"
-            and self._items[i].author != self.participant_pub
+            and not self._items[i].mine
             and now - self._wanted.get(i, -REASK_S) >= REASK_S
         ]
         for item_id in sorted(due, key=lambda i: self._wanted.get(i, -REASK_S)):
@@ -781,6 +821,7 @@ class Session:
             kind=header["kind"],
             subkind=header["subkind"],
             author=header["author"],
+            mine=header["author"] == self.participant_pub,
             author_role=author["role"] if author else None,
             author_name=author["display_name"] if author else None,
             created_at_ms=header["created_at_ms"],
@@ -828,7 +869,7 @@ class Session:
         item.ref = json.loads(ac.item_ref(envelope, blob))
         if fresh:
             self._cache.write_blob(item_id, blob)
-            if header["author"] != self.participant_pub:
+            if not item.mine:
                 self._ack(item_id)
         return item
 
