@@ -782,6 +782,7 @@ function buildSessionLayout(s) {
   const submit = async () => {
     if (sendBtn.disabled) return;
     sendBtn.disabled = true;
+    sendBtn.dataset.busy = "1";
     status.textContent = "";
     try {
       if (jobUi?.active()) {
@@ -815,7 +816,8 @@ function buildSessionLayout(s) {
       }
       status.replaceChildren(...[e.final ? e.message : `Not sent: ${e.message || e}`, e.detail && el("span", { class: "detail" }, e.detail)].filter(Boolean));
     } finally {
-      sendBtn.disabled = !!s.closed;
+      delete sendBtn.dataset.busy;
+      sendBtn.disabled = !!s.closed || !!jobUi?.blocked();
     }
   };
   text.addEventListener("keydown", (ev) => {
@@ -1936,24 +1938,29 @@ function buildJobPanel(s, text, file) {
   const lim = s.manifest.job_limits;
   let on = false;
   let sendBtn;
-  let optsSig = null; // null: the options are not drawn yet (an empty list has an empty signature too)
+  let chipsSig = null; // null: the chips are not drawn yet
   let filesSig = null;
   let locked = false;
-  const target = el("select", { id: "job-target" });
+  // "any", "labels" or "runner:<pub>"; the relay picks the runner, this only says which.
+  let target = "any";
+  const chips = el("div", { class: "runchips", role: "group", "aria-labelledby": "job-target-label" });
   const labels = el("input", { type: "text", id: "job-labels", placeholder: "gpu, cpu", autocomplete: "off", "aria-label": "Runner labels" });
   const labelField = el("div", { class: "stack field", hidden: true }, el("label", { for: "job-labels" }, "Labels"), labels);
   const timeout = el("input", { type: "number", id: "job-timeout", min: 1, max: lim.timeout_s, step: 1, value: lim.timeout_s,
     title: `1 to ${lim.timeout_s} seconds` });
   const files = el("div", { class: "pickfiles" });
   const filesSummary = el("summary", {}, "Input files · none selected");
-  const status = el("p", { class: "muted hint-text" });
+  // Why a job sent now would fail, with what would fix it.
+  const readyText = el("span", { id: "job-ready" });
+  const readyAct = el("span", { class: "ready-act" });
+  const ready = el("div", { class: "job-ready", hidden: true }, el("span", { class: "ready-icon", "aria-hidden": "true" }, "!"), readyText, readyAct);
   const panel = el("div", { class: "jobpanel", hidden: true },
+    el("div", { class: "stack field" }, el("span", { class: "field-label", id: "job-target-label" }, "Run on"), chips),
     el("div", { class: "jobrow" },
-      el("div", { class: "stack field" }, el("label", { for: "job-target" }, "Target"), target),
-      el("div", { class: "stack field narrow" }, el("label", { for: "job-timeout" }, "Timeout (s)"), timeout),
-      labelField),
-    el("details", { class: "inputfiles" }, filesSummary, files),
-    status);
+      labelField,
+      el("div", { class: "stack field narrow" }, el("label", { for: "job-timeout" }, "Timeout (s)"), timeout)),
+    ready,
+    el("details", { class: "inputfiles" }, filesSummary, files));
   const countPicked = () => {
     const n = s.picked.size;
     filesSummary.textContent = `Input files · ${n ? `${n} selected` : "none selected"}`;
@@ -1963,33 +1970,110 @@ function buildJobPanel(s, text, file) {
     toggle.setAttribute("aria-pressed", String(on));
     toggle.classList.toggle("on", on);
     panel.hidden = !on;
-    optsSig = null;
+    chipsSig = null;
     filesSig = null;
     text.placeholder = on ? "Python code to run (or attach a .py file)…" : "Message the session…";
     text.classList.toggle("code", on);
     text.spellcheck = !on;
     text.rows = on ? 7 : 2;
     if (sendBtn) sendBtn.textContent = on ? "Send job" : "Send";
+    if (!on && sendBtn && !sendBtn.dataset.busy) {
+      sendBtn.disabled = !!s.closed;
+      sendBtn.removeAttribute("aria-describedby");
+    }
     refresh();
   };
   const toggle = el("button", { type: "button", class: "small", "aria-pressed": "false", onclick: () => setOn(!on) }, "Send as job");
-  target.addEventListener("change", () => (labelField.hidden = target.value !== "labels"));
+  labels.addEventListener("input", () => syncReady());
+
+  // The relay's rule: approved (signed by the owner here), online, idle, and
+  // matching the target. Anything else fails at once: there is no queue.
+  const usable = (r) => !r.rejected && r.approved && r.setup !== "failed" && r.online;
+  const runnerState = (r) => r.setup === "failed" ? "setup failed" : !r.approved ? "needs approval"
+    : !r.online ? (r.setup === "preparing" ? "preparing" : "offline") : r.job ? "busy" : "idle";
+  const wantedLabels = () => labels.value.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+  const matches = (r) => target === "any" ? true : target === "labels" ? wantedLabels().every((l) => r.labels?.includes(l)) : `runner:${r.pub}` === target;
+
+  // null when a job could go now; otherwise { text, act }.
+  function blocker() {
+    // Until the first poll, or while it fails, the list may be stale: let the relay decide.
+    if (!s.runnersLoaded || s.connBad?.has("poll")) return null;
+    if (target === "labels" && !wantedLabels().length) return null; // submit() explains
+    const live = s.runners.filter((r) => !r.rejected);
+    const fit = live.filter(matches);
+    if (fit.some((r) => usable(r) && !r.job)) return null;
+    const pending = fit.find((r) => !r.approved && r.setup !== "failed");
+    const one = target.startsWith("runner:") ? fit[0] : null;
+    let why;
+    if (one) why = `${one.name} ${{ "needs approval": "needs approval", "setup failed": "failed to set up", preparing: "is still preparing its sandbox" }[runnerState(one)] || `is ${runnerState(one)}`}`;
+    else if (fit.some(usable)) why = target === "labels" ? "Every runner with those labels is busy" : "Every runner is busy";
+    else if (target === "labels" && !fit.length) why = `No runner has the labels ${wantedLabels().join(", ")}`;
+    else if (!live.length) why = "No runner has joined yet";
+    else why = target === "labels" ? "No approved runner with those labels is online" : "No approved runner is online";
+    return { text: `${why}, so a job sent now would fail right away.`, pending: s.inv.role === "owner" ? pending : null, none: !live.length };
+  }
+
+  function syncReady() {
+    if (!on) return;
+    const b = locked ? null : blocker();
+    ready.hidden = !b;
+    // Not while a send is in flight: that would allow a second one.
+    if (sendBtn && !sendBtn.dataset.busy) {
+      sendBtn.disabled = !!s.closed || !!b;
+      if (b) sendBtn.setAttribute("aria-describedby", "job-ready");
+      else sendBtn.removeAttribute("aria-describedby");
+    }
+    if (!b) return;
+    readyText.textContent = b.text;
+    const sig = `${b.pending?.pub || ""}|${b.none}`;
+    if (readyAct.dataset.sig === sig) return;
+    readyAct.dataset.sig = sig;
+    const owner = s.inv.role === "owner";
+    if (b.pending) {
+      readyAct.replaceChildren(el("button", { type: "button", class: "small", onclick: () => {
+        const sec = document.getElementById("runner-console");
+        sec?.scrollIntoView({ block: "start" });
+        (sec?.querySelector(`button[data-act=approve][data-pub="${CSS.escape(b.pending.pub)}"]`) || sec)?.focus({ preventScroll: true });
+      } }, `Review ${b.pending.name}`));
+    } else if (b.none && owner && !s.revokedRoles.has("runner")) {
+      const cmd = `airlox runner join --invite '${ac.memberInvite(location.origin, s.inv.roleSeed, "runner")}' --name my-runner --sandbox docker`;
+      const btn = el("button", { type: "button", class: "small", onclick: async () => {
+        if (!(await copyText(btn, cmd, "Copy runner command"))) btn.textContent = "Copy it from Invites";
+      } }, "Copy runner command");
+      readyAct.replaceChildren(btn);
+    } else readyAct.replaceChildren(...(owner ? [] : [el("span", { class: "muted" }, "Ask the session owner to start and approve a runner.")]));
+  }
+
+  function drawChips() {
+    const live = s.runners.filter((r) => !r.rejected);
+    if (target.startsWith("runner:") && !live.some((r) => `runner:${r.pub}` === target)) target = "any";
+    labelField.hidden = target !== "labels";
+    const sig = JSON.stringify([target, locked, live.map((r) => [r.pub, r.name, r.labels, runnerState(r)])]);
+    if (sig === chipsSig) return;
+    chipsSig = sig;
+    const a = document.activeElement;
+    const keep = chips.contains(a) ? a.dataset.target : null;
+    const chip = (value, ...label) => el("button", { type: "button", class: "small runchip", "data-target": value, disabled: locked,
+      "aria-pressed": String(target === value), onclick: () => {
+        target = value;
+        refresh();
+        if (value === "labels") labels.focus();
+      } }, ...label);
+    chips.replaceChildren(
+      chip("any", "Any idle runner"),
+      ...live.map((r) => {
+        const st = runnerState(r);
+        return chip(`runner:${r.pub}`, el("span", { class: `dot ${st === "idle" ? "on" : st === "needs approval" ? "wait" : st === "busy" ? "busy" : ""}`, "aria-hidden": "true" }),
+          r.name, r.labels?.length ? el("span", { class: "muted" }, ` · ${r.labels.join(", ")}`) : null, el("span", { class: "state" }, st));
+      }),
+      chip("labels", "By label…"));
+    if (keep) chips.querySelector(`[data-target="${CSS.escape(keep)}"]`)?.focus({ preventScroll: true });
+  }
 
   function refresh() {
     if (!on) return;
-    const cur = target.value;
-    const opts = [el("option", { value: "any" }, "Any idle runner"), el("option", { value: "labels" }, "Labels…")];
-    for (const r of s.runners) {
-      if (r.rejected) continue;
-      opts.push(el("option", { value: `runner:${r.pub}` }, `${r.name}${r.online ? "" : " (offline)"}${r.setup === "failed" ? " (setup failed)" : r.approved ? "" : r.relayOnly ? " (not approved here)" : " (not approved)"}`));
-    }
-    const sig = s.runners.map((r) => `${r.pub}${r.name}${r.online}${r.approved}${r.relayOnly}${r.rejected}${r.setup}`).join("|");
-    if (sig !== optsSig) {
-      optsSig = sig;
-      target.replaceChildren(...opts);
-    }
-    target.value = [...target.options].some((o) => o.value === cur) ? cur : "any";
-    labelField.hidden = target.value !== "labels";
+    drawChips();
+    syncReady();
     const cands = [...s.items.values()].filter((i) => i.kind === "file" && i.status === "ok" && i.ref).sort((a, b) => a.seq - b.seq);
     countPicked();
     const fsig = cands.map((i) => i.id).join("|");
@@ -2023,16 +2107,16 @@ function buildJobPanel(s, text, file) {
     const t = Number(timeout.value);
     if (!Number.isInteger(t) || t < 1 || t > lim.timeout_s) throw new Error(`timeout must be 1 to ${lim.timeout_s} seconds`);
     let tgt;
-    if (!target.value || target.value === "any") tgt = { type: "any" };
-    else if (target.value === "labels") {
-      const ls = labels.value.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+    if (target === "any") tgt = { type: "any" };
+    else if (target === "labels") {
+      const ls = wantedLabels();
       if (!ls.length) throw new Error("enter at least one label, such as gpu");
       if (ls.length > 16) throw new Error("use at most 16 labels");
       const bad = ls.find((l) => !/^[a-z0-9][a-z0-9._-]{0,62}$/.test(l));
       if (bad) throw new Error(`"${bad.slice(0, 20)}" is not a valid label: use letters, digits, . _ - (up to 63, starting with a letter or digit)`);
       tgt = { type: "labels", labels: ls };
     } else {
-      const r = s.runners.find((x) => `runner:${x.pub}` === target.value);
+      const r = s.runners.find((x) => `runner:${x.pub}` === target);
       if (!r) throw new Error("that runner is gone");
       tgt = { type: "runner", participant_pub: r.pub, name: r.name };
     }
@@ -2056,9 +2140,10 @@ function buildJobPanel(s, text, file) {
     locked = true;
     setOn(false);
     toggle.disabled = true;
-    for (const c of panel.querySelectorAll("select, input, summary")) c.disabled = true;
+    for (const c of panel.querySelectorAll("button, input, summary")) c.disabled = true;
   };
-  return { panel, toggle, refresh, submit, lock, off: () => setOn(false), active: () => on, setSend: (b) => (sendBtn = b) };
+  return { panel, toggle, refresh, submit, lock, off: () => setOn(false), active: () => on, setSend: (b) => (sendBtn = b),
+    blocked: () => on && !locked && !!blocker() };
 }
 
 // ---------- sending ----------
