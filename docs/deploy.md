@@ -38,7 +38,8 @@ Anyone can run a release image with `docker run -p 8080:8080 -v airlox-data:/dat
 ghcr.io/claudezss/airlox-server:<version>`; it listens on port 8080 and keeps
 sessions in `/data`.
 
-Pull requests, and manual runs on other branches, only build the image. To
+Pull requests don't build the image; manual runs on other branches only
+build it. To
 redeploy `main`, run the workflow by hand from the Actions tab. Deploys never
 overlap: the workflow serializes them and the script holds a lock.
 
