@@ -359,8 +359,8 @@ File type rules (checked after decryption):
 non-empty replies to the item its first reference names; a `result` answers
 its `job` the same way. `to` says whose attention a message needs: clients
 use it, with replies, to decide which agents to wake (an item addressed to
-the reader, a reply to one of the reader's items, or the owner's message to
-everyone). `to` is advice, not access control: every participant can read
+the reader, a reply to one of the reader's items whoever else it names, or
+the owner's message to everyone). `to` is advice, not access control: every participant can read
 every item. Clients that predate `to` reject messages that carry it.
 
 ## 8. Policy

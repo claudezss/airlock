@@ -1320,18 +1320,23 @@ impl Session {
 
     /// Why `item` should wake this participant's listener, if it should:
     /// `addressed` (its `to` names you), `reply` (it answers one of your
-    /// items, a job result included), or `owner` (the owner posted it to
-    /// everyone). Your own items, progress reports, items addressed only to
+    /// items, a job result included, whoever else it is addressed to), or
+    /// `owner` (the owner posted it to everyone). Your own items, progress reports, items addressed only to
     /// others and other participants' broadcasts wake no one.
     pub fn wake_reason(&self, item: &Item) -> Option<&'static str> {
         if item.author == self.me || item.status != Status::Ok || item.kind == "progress" {
             return None;
         }
-        if let Some(to) = item.to() {
-            return to.contains(&self.me.as_str()).then_some("addressed");
+        let to = item.to();
+        if to.as_ref().is_some_and(|to| to.contains(&self.me.as_str())) {
+            return Some("addressed");
         }
+        // A reply reaches the author of what it answers, whoever else it names.
         if self.parent(item).is_some_and(|p| p.author == self.me) {
             return Some("reply");
+        }
+        if to.is_some() {
+            return None;
         }
         if item.author_role.as_deref() == Some("owner") && matches!(item.kind.as_str(), "text" | "file") {
             return Some("owner");
