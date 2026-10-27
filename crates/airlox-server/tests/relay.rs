@@ -744,3 +744,71 @@ async fn a_stalled_reseed_does_not_hold_off_other_holders() {
     assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "present".into()));
     assert_eq!(blob(&env, &s, &late, &id).await.bytes().await.unwrap().to_vec(), item.blob);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_reseeds_are_capped_and_losers_are_not_charged() {
+    let env = Env::with(|c| c.max_session_transfer = 20_000).await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let sender = join(&env, &s, Role::Sender, "sender").await;
+    let obs = join(&env, &s, Role::Observer, "obs").await;
+    let obs2 = join(&env, &s, Role::Observer, "obs2").await;
+    let item = seal_text(&s, &sender, &"x".repeat(4096));
+    let id = item.envelope.header.id.clone();
+    post(&env, &s, &sender, frame(&item)).await;
+    for m in [&owner, &obs, &obs2] {
+        ack(&env, &s, m, &id).await;
+    }
+    // Polling the blob would charge transfer: watch for the event instead.
+    assert!(
+        eventually(|| async { events(&env, &s, &owner).await.iter().any(|e| e["kind"] == "evicted") }).await
+    );
+    let late = join(&env, &s, Role::Observer, "late").await;
+    assert_eq!(want(&env, &s, &late, &id).await.status(), StatusCode::ACCEPTED);
+
+    // Three holders upload at once; a fourth is turned away.
+    let half = item.blob.len() / 2;
+    let mut ups = vec![];
+    for m in [&sender, &owner, &obs] {
+        let (tx, h) = stalled_put(&env, &s, m, &id);
+        tx.send(Ok(item.blob[..half].to_vec())).await.unwrap();
+        ups.push((tx, h));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let r = reseed(&env, &s, &obs2, &id, item.blob.clone()).await;
+    assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "uploading".into()));
+    let mut codes = vec![];
+    for (tx, h) in ups {
+        tx.send(Ok(item.blob[half..].to_vec())).await.unwrap();
+        drop(tx);
+        codes.push(h.await.unwrap().unwrap().status());
+    }
+    codes.sort();
+    assert_eq!(codes, [StatusCode::NO_CONTENT, StatusCode::CONFLICT, StatusCode::CONFLICT]);
+    // Only the winner counted against the transfer cap: the wanter can
+    // still download (one upload, one download, plus the first round trip).
+    assert_eq!(blob(&env, &s, &late, &id).await.status(), StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn asking_again_writes_nothing_and_needs_a_live_participant() {
+    let env = Env::new().await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let sender = join(&env, &s, Role::Sender, "sender").await;
+    let item = seal_text(&s, &sender, "x");
+    let id = item.envelope.header.id.clone();
+    post(&env, &s, &sender, frame(&item)).await;
+    ack(&env, &s, &owner, &id).await;
+    assert!(eventually(|| async { blob(&env, &s, &owner, &id).await.status() == StatusCode::GONE }).await);
+    let late = join(&env, &s, Role::Observer, "late").await;
+    for _ in 0..5 {
+        assert_eq!(want(&env, &s, &late, &id).await.status(), StatusCode::ACCEPTED);
+    }
+    let audit_wants = |text: String| text.lines().filter(|l| l.contains(r#""action":"want""#)).count();
+    assert_eq!(audit_wants(audit(&env, &s, &owner).await.text().await.unwrap()), 1);
+    let evs = events(&env, &s, &sender).await;
+    assert_eq!(evs.iter().filter(|e| e["kind"] == "want").count(), 1);
+}

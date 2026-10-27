@@ -258,3 +258,26 @@ pub async fn audit(env: &Env, s: &Sess, m: &Member) -> reqwest::Response {
         .await
         .unwrap()
 }
+
+/// A re-seed `PUT` whose body is sent in pieces through the returned
+/// channel; dropping the sender ends the body.
+#[allow(clippy::type_complexity)]
+pub fn stalled_put(
+    env: &Env,
+    s: &Sess,
+    m: &Member,
+    item: &str,
+) -> (
+    tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
+    tokio::task::JoinHandle<reqwest::Result<reqwest::Response>>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(1);
+    let stream = futures_util::stream::unfold(rx, |mut rx| async { rx.recv().await.map(|c| (c, rx)) });
+    let req = env
+        .http
+        .put(env.url(&format!("/v1/sessions/{}/items/{item}/blob", s.id)))
+        .bearer_auth(&m.token)
+        .body(reqwest::Body::wrap_stream(stream))
+        .send();
+    (tx, tokio::spawn(req))
+}

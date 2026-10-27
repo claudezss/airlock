@@ -7,7 +7,7 @@ use std::time::Duration;
 use airlox_core::cert::{issue_cert, sign_join, ClientKind, JoinRequest, RunnerInfo, SandboxKind};
 use airlox_core::item::{new_item_id, seal, ItemKind, ItemRef, NewItem, SealedItem};
 use airlox_core::keys::Keypair;
-use airlox_core::payload::{JobResult, JobSpec, JobStatus, Payload, Target};
+use airlox_core::payload::{Event, JobResult, JobSpec, JobStatus, Meta, Payload, Target};
 use airlox_core::session::{ContentType, Mode, Role};
 use airlox_server::Config;
 use bytes::Bytes;
@@ -582,4 +582,67 @@ async fn revoking_senders_fails_their_jobs_and_spares_rejected_runners() {
         .find(|l| l["action"] == "revoke" && l["role"] == "runner")
         .unwrap();
     assert_eq!(line["participants"], ev["data"]["participants"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn owner_approvals_stay_for_late_joiners_and_unapproved_runners_cannot_ask() {
+    let (env, s, owner, sender) = execute_env(|_| {}).await;
+    let runner = join_runner(&env, &s, "runner-01", &[]).await;
+    let waiting = join_runner(&env, &s, "runner-02", &[]).await;
+    approve(&env, &s, &owner, &runner).await;
+    let approval = seal_kind(
+        &s,
+        &owner,
+        ItemKind::Event,
+        None,
+        vec![],
+        Payload {
+            meta: Meta::Event(Event::RunnerApprove { participant_pub: runner.kp.public() }),
+            body: vec![],
+        },
+    );
+    let approval_id = approval.envelope.header.id.clone();
+    let note = seal_text(&s, &sender, "goes once delivered");
+    let note_id = note.envelope.header.id.clone();
+    assert_eq!(post(&env, &s, &owner, frame(&approval)).await.status(), StatusCode::CREATED);
+    assert_eq!(post(&env, &s, &sender, frame(&note)).await.status(), StatusCode::CREATED);
+    for m in [&sender, &runner] {
+        ack(&env, &s, m, &approval_id).await;
+    }
+    for m in [&owner, &runner] {
+        ack(&env, &s, m, &note_id).await;
+    }
+    assert!(
+        eventually(|| async { blob(&env, &s, &owner, &note_id).await.status() == StatusCode::GONE }).await
+    );
+    // The owner's signed approval is still there for whoever joins later.
+    let late = join(&env, &s, Role::Observer, "late").await;
+    assert_eq!(blob(&env, &s, &late, &approval_id).await.status(), StatusCode::OK);
+    // A runner the owner has not approved cannot pull evicted history.
+    assert_eq!(want(&env, &s, &waiting, &note_id).await.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_runners_event_stream_ends() {
+    let (env, s, owner, _sender) = execute_env(|_| {}).await;
+    let runner = join_runner(&env, &s, "runner-01", &[]).await;
+    let stream = env
+        .http
+        .get(env.url(&format!("/v1/sessions/{}/stream", s.id)))
+        .bearer_auth(&runner.token)
+        .send()
+        .await
+        .unwrap();
+    let r = call(
+        &env,
+        &owner,
+        reqwest::Method::POST,
+        format!("/v1/sessions/{}/runners/{}/reject", s.id, pk(&runner)),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    // The body ends after the rejection instead of staying open.
+    let body =
+        tokio::time::timeout(Duration::from_secs(5), stream.text()).await.expect("stream ended").unwrap();
+    assert!(body.contains("\"rejected\""));
 }

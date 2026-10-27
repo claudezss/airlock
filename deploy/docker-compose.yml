@@ -17,7 +17,9 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     mem_limit: 640m
-    pids_limit: 256
+    # Above tokio's 512 blocking threads, so a burst of disk work queues
+    # instead of failing to spawn.
+    pids_limit: 1024
     stop_grace_period: 20s
     # The relay needs no outbound access (not even the cloud metadata
     # service): it is only on a network without a route out.

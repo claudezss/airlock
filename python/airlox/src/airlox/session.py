@@ -7,6 +7,7 @@ module is HTTP plumbing, the local cache, and ergonomics.
 from __future__ import annotations
 
 import json
+import random
 import re
 import struct
 import time
@@ -679,6 +680,10 @@ class Session:
         if self.closed:
             return
         auth = {"Authorization": f"Bearer {self._token}"}
+        if self._asked:
+            # Every holder sees the same want: wait a moment at random, so
+            # the first upload usually lands before the others start.
+            time.sleep(random.uniform(0, 2))
         for item_id in list(self._asked):
             blob = self._cache.read_blob(item_id)
             if blob is not None:

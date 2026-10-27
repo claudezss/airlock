@@ -92,8 +92,9 @@ To use your own domain, add a DNS `A` record for it, re-run
 `setup-droplet.sh <domain> ...`, update the `AIRLOX_DOMAIN` variable, and
 redeploy.
 
-**Rolling back.** A relay that cannot read a session's log purges that
-session at startup. Logs only gain record types, so rolling back to a build
-older than the one that wrote a session (for example, one without re-seeding
-or revocation) purges every session that used the newer records. Roll
-forward with a fix instead, or accept that live sessions end.
+**Rolling back.** From this release on, a relay skips log records it does
+not know, so rolling back to it from a newer build keeps sessions (their
+newer features just stop applying). Builds before it purge a session whose
+log they cannot read, so rolling back past it, which `airlox-deploy` does by
+itself when a new build fails its health check, ends every session that used
+re-seeding or revocation. Roll forward with a fix instead where you can.

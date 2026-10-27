@@ -411,7 +411,7 @@ kills the sandbox and posts a `result` with `exit_code: null, cancelled: true`.
 - Jobs: routing (§6), status, heartbeats.
 - Streams: `GET /v1/sessions/:id/stream` (SSE) for the timeline, per-runner
   assignment streams.
-- Audit log: derived from the session log, one JSON line per record (`ts`,
+- Audit log: derived from the session log, one JSON line per record (`ts_ms`,
   `action`, the actor's key and the signed manifest, join or envelope with
   `blob_sha256`); exportable before purge ([protocol.md](protocol.md), "Audit export").
 - Purge: deleting the session directory at `expires_at` or on close. The

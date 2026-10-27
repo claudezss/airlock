@@ -450,7 +450,9 @@ pub async fn runner_stream(
                     {
                         return None
                     }
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Ok(_) => continue,
+                    // Lagged: it may have missed its own revocation; end, and
+                    // a reconnect re-checks its token.
                     Err(_) => return None,
                 },
                 _ = st.shutdown.changed() => return None,
