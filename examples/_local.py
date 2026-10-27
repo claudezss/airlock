@@ -2,7 +2,8 @@
 MCP client, so each example runs with one command and doubles as an
 end-to-end test (python/airlox/tests/test_use_cases.py).
 
-Binaries come from AIRLOX_BIN and AIRLOX_SERVER_BIN, else from PATH.
+Binaries come from AIRLOX_BIN and AIRLOX_SERVER_BIN, else from PATH. Without
+an `airlox-server`, the relay is the published Docker image, if Docker works.
 Runners use the local sandbox unless AIRLOX_SANDBOX says otherwise.
 """
 
@@ -18,8 +19,6 @@ import tempfile
 import time
 
 import httpx
-
-from airlox import Session
 
 
 def binary(env: str, name: str) -> str:
@@ -51,6 +50,49 @@ def local_relay(data: pathlib.Path):
     finally:
         proc.terminate()
         proc.wait(timeout=10)
+
+
+RELAY_IMAGE = "ghcr.io/claudezss/airlox-server:latest"
+
+
+def docker_works() -> bool:
+    """Whether a Docker daemon answers."""
+    if not shutil.which("docker"):
+        return False
+    try:
+        return subprocess.run(["docker", "info"], capture_output=True, timeout=20).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+
+
+@contextlib.contextmanager
+def docker_relay():
+    """The published relay image on a free local port, for as long as the
+    block runs; the container is removed afterwards. Nothing is kept
+    (`--ephemeral`). The image is linux/amd64, which Docker emulates elsewhere."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    run = subprocess.run(["docker", "run", "-d", "--rm", "--platform", "linux/amd64", "-p", f"127.0.0.1:{port}:8080",
+                          RELAY_IMAGE, "--ephemeral"], capture_output=True, text=True)
+    if run.returncode != 0:
+        raise RuntimeError(f"docker could not run {RELAY_IMAGE}: {run.stderr.strip()}")
+    container = run.stdout.strip()
+    url = f"http://127.0.0.1:{port}"
+    try:
+        for _ in range(200):
+            try:
+                if httpx.get(url + "/v1/health").status_code == 200:
+                    break
+            except httpx.TransportError:
+                pass
+            time.sleep(0.1)
+        else:
+            logs = subprocess.run(["docker", "logs", container], capture_output=True, text=True)
+            raise RuntimeError("relay container did not start: " + logs.stdout + logs.stderr)
+        yield url
+    finally:
+        subprocess.run(["docker", "rm", "-f", container], capture_output=True)
 
 
 class Runners:
@@ -87,20 +129,6 @@ class Runners:
                 p.wait(timeout=20)
             except subprocess.TimeoutExpired:
                 p.kill()
-
-
-def wait_for_runner(session: Session, name: str, approved: bool = False, timeout: float = 120.0):
-    """Wait until runner ``name`` is online (and approved, if asked). A
-    runner that reports its setup failed raises at once, with its reason."""
-    end = time.monotonic() + timeout
-    while time.monotonic() < end:
-        for r in session.runners():
-            if r.name == name and r.state == "failed":
-                raise RuntimeError(f"runner {name} could not start: {r.detail}")
-            if r.name == name and r.online and (r.approved or not approved):
-                return r
-        time.sleep(0.25)
-    raise TimeoutError(f"runner {name} did not come online")
 
 
 class McpTools:
@@ -145,17 +173,27 @@ def say(actor: str, text: str, code: str = None, *, out: str = None, observe: st
 
 def main(scenario) -> None:
     """Run ``scenario(relay, start_runner, workdir, step)`` against the relay named
-    on the command line, else a local `airlox-server` if there is one, else
-    https://airlox.app, and print what it returns."""
+    on the command line, else a local `airlox-server` if there is one, else the
+    published relay image in Docker, else https://airlox.app, and print what it
+    returns."""
     relay = sys.argv[1] if len(sys.argv) > 1 else None
-    if relay is None and not (os.environ.get("AIRLOX_SERVER_BIN") or shutil.which("airlox-server")):
-        relay = "https://airlox.app"
     with tempfile.TemporaryDirectory(prefix="airlox-example-") as tmp:
         tmp = pathlib.Path(tmp)
-        print("relay:", relay or "local", file=sys.stderr)
         with contextlib.ExitStack() as stack:
-            if relay is None:
+            if relay is not None:
+                print("relay:", relay, file=sys.stderr)
+            elif os.environ.get("AIRLOX_SERVER_BIN") or shutil.which("airlox-server"):
                 relay = stack.enter_context(local_relay(tmp / "relay"))
+                print("relay: local airlox-server", file=sys.stderr)
+            elif docker_works():
+                try:
+                    relay = stack.enter_context(docker_relay())
+                    print(f"relay: {RELAY_IMAGE} in Docker", file=sys.stderr)
+                except RuntimeError as e:
+                    print(e, file=sys.stderr)
+            if relay is None:
+                relay = "https://airlox.app"
+                print("relay:", relay, file=sys.stderr)
             runners = stack.enter_context(Runners(tmp / "runners"))
             result = scenario(relay, runners, tmp / "work", say)
         print(json.dumps(result, indent=2, default=str))

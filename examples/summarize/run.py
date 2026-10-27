@@ -9,7 +9,6 @@
 import io
 import pathlib
 import sys
-import time
 import zipfile
 
 from airlox import Session
@@ -32,9 +31,9 @@ def main(relay: str) -> None:
     print("runner invite:", owner.invites["runner"])
     agent = Session.join(owner.invites["sender"], display_name="planner-agent")
     print("waiting for runner-01 …")
-    while not any(r.name == "runner-01" and r.online for r in owner.runners()):
-        time.sleep(1)
+    owner.wait_for_runner("runner-01", timeout=600)
     owner.approve_runner("runner-01")
+    agent.wait_for_runner("runner-01", approved=True)
     data = agent.send_file(dataset(), name="dataset.zip")
     res = agent.run_file(HERE / "summarize.py", files=[data], runner="runner-01").wait(timeout=300)
     print(res.status, res.exit_code, f"{res.wall_ms} ms")

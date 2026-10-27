@@ -62,7 +62,7 @@ def review_bot(invite: str, cache: pathlib.Path, ready: threading.Event, step=qu
                        description="Reviews Python changes for injection risks; send a .py file")
     ready.set()
     for item in bot.stream(timeout=timeout):
-        if item.kind != "file" or not item.name.endswith(".py") or item.author == bot.participant_pub:
+        if item.kind != "file" or not item.name.endswith(".py") or item.mine:
             continue
         findings = review(item.body.decode())
         verdict = "changes requested" if findings else "approved"
