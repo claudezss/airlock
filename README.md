@@ -40,8 +40,8 @@ files back. The relay in the middle only ever sees ciphertext.
   exactly what each participant may do. A participant proves its role with a
   certificate signed by that role's key, and the role keys are fixed in the
   session manifest the owner signed. Every client verifies both.
-- **Short-lived by design.** Sessions expire, and files leave the relay once
-  every recipient has stored them. There is no database, and the relay keeps
+- **Transit, not storage.** Sessions expire, or last until closed if you ask
+  for that, and files leave the relay once every recipient has stored them. There is no database, and the relay keeps
   nothing after a session ends.
 - **Remote execution without an LLM on the other side.** A headless runner
   executes signed Python jobs in a Docker sandbox (no network, read-only root,

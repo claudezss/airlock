@@ -119,5 +119,5 @@ class Cache:
                 expires = json.loads(m.read_text())["manifest"]["expires_at_ms"]
             except (OSError, ValueError, KeyError):
                 continue
-            if expires <= now:
+            if expires is not None and expires <= now:
                 shutil.rmtree(d, ignore_errors=True)

@@ -94,4 +94,4 @@ If an invite leaked, `airlox session revoke sender` (or `observer`,
 disables it; they keep what they already copied. Revoke only when the user
 asks.
 
-Sessions also expire on their own (`--ttl`, default 1h).
+Sessions also expire on their own (`--ttl`, default 1h; `--ttl never` lasts until closed, where the relay allows it).

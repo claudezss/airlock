@@ -87,6 +87,17 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     n.checked_mul(unit_ms).map(Duration::from_millis).ok_or_else(|| format!("duration {s:?} is too long"))
 }
 
+/// A session lifetime: a duration, or `never` (`None`).
+#[derive(Clone, Copy, Debug)]
+pub struct Lifetime(pub Option<Duration>);
+
+pub fn parse_lifetime(s: &str) -> Result<Lifetime, String> {
+    if s.trim() == "never" {
+        return Ok(Lifetime(None));
+    }
+    parse_duration(s).map(|d| Lifetime(Some(d)))
+}
+
 // -------------------------------------------------------------- session --
 
 #[derive(Subcommand, Debug)]
@@ -135,9 +146,10 @@ pub struct CreateArgs {
     /// Allow running Python on runners.
     #[arg(long)]
     pub execute: bool,
-    /// Session lifetime, e.g. 30m, 1h, 1d.
-    #[arg(long, default_value = "1h", value_parser = parse_duration)]
-    pub ttl: Duration,
+    /// Session lifetime, e.g. 30m, 1h, 1d (at most 30d), or `never` for a
+    /// session that lasts until it is closed (if the relay allows it).
+    #[arg(long, default_value = "1h", value_parser = parse_lifetime)]
+    pub ttl: Lifetime,
     /// Content types allowed, comma-separated (text, py, md, zip, image).
     #[arg(long, value_delimiter = ',', default_values_t = DEFAULT_TYPES.iter().map(|s| s.to_string()))]
     pub types: Vec<String>,
@@ -207,7 +219,7 @@ pub async fn session(cmd: SessionCmd) -> Result<()> {
             });
             let new = NewSession {
                 mode: if a.execute { Mode::Execute } else { Mode::Relay },
-                ttl_ms: a.ttl.as_millis() as u64,
+                ttl_ms: a.ttl.0.map(|t| t.as_millis() as u64),
                 allowed_types: a.types.clone(),
                 max_item_bytes: a
                     .max_item_mb
@@ -254,7 +266,7 @@ pub async fn session(cmd: SessionCmd) -> Result<()> {
                 println!("session   {} on {}", s.session_id, s.base_url);
                 println!("you       {}", s.role.as_str());
                 println!("mode      {}", info["mode"].as_str().unwrap_or_default());
-                println!("expires   in {}", human_left(m.expires_at_ms));
+                println!("expires   {}", expiry(m.expires_at_ms));
                 println!(
                     "types     {}",
                     serde_json::from_value::<Vec<String>>(info["allowed_types"].clone())?.join(", ")
@@ -348,7 +360,7 @@ fn print_invites(s: &Session, json_out: bool, created: bool, owner_file: Option<
         return Ok(());
     }
     if created {
-        println!("created session {} (expires in {})", s.session_id, human_left(s.manifest.expires_at_ms));
+        println!("created session {} (expires {})", s.session_id, expiry(s.manifest.expires_at_ms));
         println!();
     }
     for role in ["owner", "sender", "observer", "runner"] {
@@ -363,6 +375,11 @@ fn print_invites(s: &Session, json_out: bool, created: bool, owner_file: Option<
     println!("Each link carries its role's keys: share it only over a channel you trust.");
     println!("Keep the owner link to manage the session (--invite or AIRLOX_INVITE).");
     Ok(())
+}
+
+/// "in 3 h 5 min", or "never".
+fn expiry(at_ms: Option<u64>) -> String {
+    at_ms.map_or_else(|| "never".into(), |t| format!("in {}", human_left(t)))
 }
 
 fn human_left(at_ms: u64) -> String {

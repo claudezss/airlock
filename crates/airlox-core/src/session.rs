@@ -146,10 +146,19 @@ pub struct Manifest {
     pub roles: RoleKeys,
     pub mode: Mode,
     pub created_at_ms: u64,
-    pub expires_at_ms: u64,
+    /// `None`: the session never expires; it ends when the owner closes it.
+    #[serde(deserialize_with = "required")]
+    pub expires_at_ms: Option<u64>,
     pub allowed_types: Vec<ContentType>,
     pub max_item_bytes: u64,
     pub job_limits: Option<JobLimits>,
+}
+
+/// An `Option` field that must be present, as `null` when it is `None`.
+fn required<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+) -> std::result::Result<Option<T>, D::Error> {
+    Option::deserialize(d)
 }
 
 impl Manifest {
@@ -167,7 +176,7 @@ impl Manifest {
     }
 
     pub fn is_expired(&self, now_ms: u64) -> bool {
-        now_ms >= self.expires_at_ms
+        self.expires_at_ms.is_some_and(|e| now_ms >= e)
     }
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
@@ -182,14 +191,19 @@ impl Manifest {
         if self.session_id != derive_session_id(&self.owner_pub) {
             return Err(Error::invalid("manifest", "session_id does not match owner_pub"));
         }
-        if self.expires_at_ms > MAX_SAFE_INTEGER {
-            return Err(Error::invalid("manifest", "timestamp out of range"));
-        }
-        if self.expires_at_ms <= self.created_at_ms {
-            return Err(Error::invalid("manifest", "expires_at_ms must be after created_at_ms"));
-        }
-        if self.expires_at_ms - self.created_at_ms > MAX_TTL_MS {
-            return Err(Error::invalid("manifest", "ttl exceeds 30 days"));
+        if let Some(expires) = self.expires_at_ms {
+            if expires > MAX_SAFE_INTEGER {
+                return Err(Error::invalid("manifest", "timestamp out of range"));
+            }
+            if expires <= self.created_at_ms {
+                return Err(Error::invalid("manifest", "expires_at_ms must be after created_at_ms"));
+            }
+            if expires - self.created_at_ms > MAX_TTL_MS {
+                return Err(Error::invalid(
+                    "manifest",
+                    "ttl exceeds 30 days; leave it out for a session that never expires",
+                ));
+            }
         }
         if self.allowed_types.is_empty() {
             return Err(Error::invalid("manifest", "allowed_types is empty"));
@@ -295,7 +309,10 @@ pub fn is_session_id(s: &str) -> bool {
 pub struct SessionParams {
     pub mode: Mode,
     pub created_at_ms: u64,
-    pub ttl_ms: u64,
+    /// `None` (`null`): the session never expires. Required, so leaving it
+    /// out by mistake does not make a session that never ends.
+    #[serde(deserialize_with = "required")]
+    pub ttl_ms: Option<u64>,
     pub allowed_types: Vec<ContentType>,
     #[serde(default = "default_max_item_bytes")]
     pub max_item_bytes: u64,
@@ -377,9 +394,13 @@ impl SessionSecrets {
             mode: p.mode,
             created_at_ms: p.created_at_ms,
             expires_at_ms: p
-                .created_at_ms
-                .checked_add(p.ttl_ms)
-                .ok_or_else(|| Error::invalid("session params", "ttl overflow"))?,
+                .ttl_ms
+                .map(|t| {
+                    p.created_at_ms
+                        .checked_add(t)
+                        .ok_or_else(|| Error::invalid("session params", "ttl overflow"))
+                })
+                .transpose()?,
             allowed_types: p.allowed_types.clone(),
             max_item_bytes: p.max_item_bytes,
             job_limits: p.job_limits.clone(),
@@ -418,7 +439,7 @@ mod tests {
         SessionParams {
             mode,
             created_at_ms: 1_700_000_000_000,
-            ttl_ms: 3_600_000,
+            ttl_ms: Some(3_600_000),
             allowed_types: vec![ContentType::Text, ContentType::Py, ContentType::Md],
             max_item_bytes: DEFAULT_MAX_ITEM_BYTES,
             job_limits: (mode == Mode::Execute).then(JobLimits::default),
@@ -434,6 +455,27 @@ mod tests {
         let json = String::from_utf8(canonical_json(&m).unwrap()).unwrap();
         SignedManifest::from_json(&json).unwrap();
         assert!(SignedManifest::from_json(&serde_json::to_string_pretty(&m).unwrap()).is_err());
+    }
+
+    #[test]
+    fn a_session_may_never_expire() {
+        let mut p = params(Mode::Relay);
+        p.ttl_ms = None;
+        let (_, m) = create_session(&p).unwrap();
+        let json = String::from_utf8(canonical_json(&m).unwrap()).unwrap();
+        assert!(json.contains("\"expires_at_ms\":null"));
+        let m = SignedManifest::from_json(&json).unwrap();
+        assert!(!m.manifest.is_expired(u64::MAX));
+        // The field must be there: leaving it out is not "never".
+        let without = json.replace("\"expires_at_ms\":null,", "");
+        assert!(SignedManifest::from_json(&without).is_err());
+        let params = r#"{"mode":"relay","created_at_ms":1,"allowed_types":["text"]}"#;
+        assert!(serde_json::from_str::<SessionParams>(params).is_err());
+        let params = r#"{"mode":"relay","created_at_ms":1,"ttl_ms":null,"allowed_types":["text"]}"#;
+        assert_eq!(serde_json::from_str::<SessionParams>(params).unwrap().ttl_ms, None);
+        // A finite lifetime still has its 30-day ceiling.
+        p.ttl_ms = Some(MAX_TTL_MS + 1);
+        assert!(create_session(&p).is_err());
     }
 
     #[test]

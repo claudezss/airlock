@@ -396,7 +396,8 @@ impl Profile {
 /// What a new session allows.
 pub struct NewSession {
     pub mode: Mode,
-    pub ttl_ms: u64,
+    /// `None`: the session never expires.
+    pub ttl_ms: Option<u64>,
     pub allowed_types: Vec<String>,
     pub max_item_bytes: u64,
     pub job_limits: Option<JobLimits>,
