@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, Implementation, InitializeRequestParams, InitializeResult,
+    CallToolResult, ContentBlock, DiscoverResult, Implementation, InitializeRequestParams, InitializeResult,
     ServerCapabilities, ServerConfig,
 };
 use rmcp::service::RequestContext;
@@ -489,6 +489,28 @@ impl Airlox {
         Ok(resolved)
     }
 
+    /// The client has spoken: take its name (unless `--as` gave one) and
+    /// join the `--invite` session, once. Called on initialize or discover,
+    /// and before any tool needs a session, so a client that skips both
+    /// still gets it.
+    async fn met(&self, client: Option<&str>) {
+        if !self.named {
+            if let Some(n) = client.and_then(client_name) {
+                *self.name.write().unwrap_or_else(|e| e.into_inner()) = n;
+            }
+        }
+        let mut startup = self.startup.lock().await;
+        let Some(inv) = startup.invite.take() else { return };
+        let joined = match Session::join(&self.http, &inv, &self.profile(None), &self.cache_root).await {
+            Ok(s) => self.add(s, true).await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = joined {
+            tracing::error!("joining the --invite session: {e:#}");
+            startup.error = Some(format!("{e:#}"));
+        }
+    }
+
     fn profile(&self, description: Option<String>) -> Profile {
         let d = description.or_else(|| self.description.clone());
         Profile::new(&self.name.read().unwrap_or_else(|e| e.into_inner()), d.as_deref())
@@ -497,6 +519,7 @@ impl Airlox {
     /// The session a tool call means: its `session` argument, or the
     /// default (the last one created, else the first joined).
     async fn slot(&self, session: &Option<String>) -> anyhow::Result<(String, SlotRef)> {
+        self.met(None).await;
         let st = self.state.lock().await;
         match session.as_ref().or(st.current.as_ref()) {
             Some(s) => match st.sessions.get(s) {
@@ -917,23 +940,15 @@ impl ServerHandler for Airlox {
         context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, ErrorData> {
         context.peer.set_peer_info(request.clone());
-        if !self.named {
-            if let Some(n) = client_name(&request.client_info.name) {
-                *self.name.write().unwrap_or_else(|e| e.into_inner()) = n;
-            }
-        }
-        let mut startup = self.startup.lock().await;
-        if let Some(inv) = startup.invite.take() {
-            let joined = match Session::join(&self.http, &inv, &self.profile(None), &self.cache_root).await {
-                Ok(s) => self.add(s, true).await.map(|_| ()),
-                Err(e) => Err(e),
-            };
-            if let Err(e) = joined {
-                tracing::error!("joining the --invite session: {e:#}");
-                startup.error = Some(format!("{e:#}"));
-            }
-        }
+        self.met(Some(&request.client_info.name)).await;
         self.negotiate_initialize(&request)
+    }
+
+    // Clients on the stateless protocol (2026-07-28) open with discover, not
+    // initialize, and name themselves in each request's _meta.
+    async fn discover(&self, context: RequestContext<RoleServer>) -> Result<DiscoverResult, ErrorData> {
+        self.met(context.client_info().as_ref().map(|c| c.name.as_str())).await;
+        Ok(DiscoverResult::from_server_info(self.supported_protocol_versions().into_owned(), self.get_info()))
     }
 
     fn get_info(&self) -> ServerConfig {

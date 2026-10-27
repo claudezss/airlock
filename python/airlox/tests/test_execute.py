@@ -9,7 +9,7 @@ import zipfile
 
 import pytest
 
-from airlox import NoRunnerAvailable, RunnerFailed, Session
+from airlox import NoRunnerAvailable, PolicyError, RunnerFailed, Session
 
 from conftest import REPO, RunnerProc
 
@@ -194,6 +194,8 @@ def test_refusals_timeouts_and_cancels(execute):
 def test_rejected_runner_stops(execute):
     owner, agent, runner = execute
     owner.reject_runner("runner-01")
+    with pytest.raises(PolicyError, match="rejected"):
+        agent.wait_for_runner("runner-01", timeout=10)
     runner.proc.wait(timeout=30)
     assert runner.proc.returncode != 0
     assert "rejected" in runner.output()

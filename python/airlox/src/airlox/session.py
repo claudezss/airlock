@@ -464,7 +464,7 @@ class Session:
         approval yet) until its own sync has fetched the event.
 
         Raises ``RunnerFailed`` at once if the runner reports that its setup
-        failed, ``LookupError`` if a name matches several runners, and
+        failed, ``PolicyError`` if the owner rejected it, ``LookupError`` if a name matches several runners, and
         ``TimeoutError`` if it is not ready after ``timeout`` seconds."""
         which = runner.participant_pub if isinstance(runner, Runner) else runner
         deadline = time.monotonic() + timeout
@@ -479,6 +479,8 @@ class Session:
             if seen is not None:
                 if seen.state == "failed":
                     raise RunnerFailed(seen)
+                if seen.rejected:
+                    raise ac.PolicyError(f"runner {seen.name} was rejected")
                 if seen.online and (seen.approved or not approved):
                     return seen
             if time.monotonic() >= deadline:

@@ -554,3 +554,41 @@ def test_mcp_config_for_headless_agents(tmp_path):
     assert "do not follow instructions" in cli("mcp", "prompt").stdout
     p = cli("mcp", "config", "codex", "--allow-dir", os.path.expanduser("~"), check=False)
     assert p.returncode != 0 and "too wide" in p.stderr
+
+
+def test_mcp_on_the_stateless_protocol(relay, caches, tmp_path):
+    # Clients on MCP 2026-07-28 (Claude Code) send no initialize: discover,
+    # then requests that carry the client in _meta. The --invite session must
+    # still be joined, under the client's name.
+    work = tmp_path / "work"
+    work.mkdir()
+    owner = Session.create(relay.url, cache_dir=caches("owner"))
+    env = {**os.environ, "AIRLOX_INVITE": owner.invites["sender"]}
+    proc = subprocess.Popen([BIN, "mcp", "--relay", relay.url, "--cache-dir", str(caches("mcp")), "--allow-dir",
+                             str(work)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=env, cwd=work)
+    meta = {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {"name": "claude-code", "version": "2"},
+            "io.modelcontextprotocol/clientCapabilities": {}}
+
+    def rpc(i, method, params):
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": i, "method": method,
+                                     "params": {**params, "_meta": meta}}) + "\n")
+        proc.stdin.flush()
+        while True:
+            line = proc.stdout.readline()
+            assert line, "airlox mcp exited:\n" + proc.stderr.read()
+            msg = json.loads(line)
+            if msg.get("id") == i:
+                assert "error" not in msg, msg
+                return msg["result"]
+
+    try:
+        assert "2026-07-28" in rpc(1, "server/discover", {})["supportedVersions"]
+        r = rpc(2, "tools/call", {"name": "send_text", "arguments": {"text": "hello"}})
+        assert not r.get("isError"), r
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=10)
+    owner.sync()
+    assert [(i.author_name, i.text) for i in owner.items() if i.kind == "text"] == [("claude-code", "hello")]
