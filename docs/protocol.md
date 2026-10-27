@@ -468,8 +468,9 @@ joiner, or a new device, which joins with a new key) posts `want`. The relay
 refuses it from a participant that acked the item and from a runner not yet
 approved (`403`), keeps it open for 10 minutes, allows 16 open wants and
 1024 distinct items per participant, and logs it and emits a `want` event.
-Asking again for an open want only refreshes it in memory: no log line, no
-event. At most 256 `want` log lines per participant and 2048 per session are
+Asking again for an open want only refreshes it in memory, with no log line
+or event, except once every 10 minutes, when it is logged and announced
+again for holders whose earlier upload was refused. At most 256 `want` log lines per participant and 2048 per session are
 kept; past that, `429`. A want stays open while a re-seed upload is in
 progress (the upload may fail); `409 present` means the blob is on the relay
 to download. Clients ask again, about every 5 minutes, for items still

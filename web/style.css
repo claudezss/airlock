@@ -33,6 +33,7 @@ code, pre, .mono { font-family: var(--mono); font-size: 13px; }
 .badge { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 12px; color: var(--ok); border: 1px solid var(--ok-line); border-radius: 999px; padding: 4px 10px; }
 .badge.off { color: var(--bad); border-color: var(--bad-line); }
 .expiry { color: var(--muted); }
+.conn { color: var(--accent); font-size: 12px; }
 .expiry.soon { color: var(--accent); }
 
 /* controls */
@@ -87,7 +88,9 @@ main.wide { max-width: none; padding: 0; }
 .invite { display: flex; gap: 8px; align-items: center; }
 .runner-cmd { gap: 8px; }
 .runner-cmd p { margin: 0; }
-.runner-cmd > code { overflow-wrap: anywhere; background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 9px 10px; color: var(--soft); font-size: 12px; }
+.runner-cmd > code { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 9px 10px; color: var(--soft); font-size: 12px; }
+.runner-cmd .link { overflow-wrap: anywhere; }
+.runner-cmd p code { word-break: normal; }
 .runner-cmd input { min-height: 40px; font-family: var(--mono); font-size: 12px; }
 .revoked-note { margin: 0; font-size: 13px; }
 .hint-lines { gap: 2px; }
@@ -152,7 +155,6 @@ details[open] > summary::before { transform: rotate(45deg); margin-bottom: 4px; 
 .item.evicted .card { border-style: dashed; border-color: var(--line-3); background: transparent; }
 .item.rejected .card { border-color: var(--bad-line); background: var(--bad-bg); }
 .item.rejected .card p { color: var(--bad); }
-.item.rejected .detail { padding: 0 16px 12px; font-family: var(--mono); font-size: 12px; color: var(--muted); word-break: break-word; }
 
 html { scroll-padding-bottom: var(--composer-h, 0px); }
 .item { scroll-margin-bottom: var(--composer-h, 0px); }
@@ -169,6 +171,8 @@ html { scroll-padding-bottom: var(--composer-h, 0px); }
 .toolbar .hint { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--muted); }
 .status { margin: 8px 4px 0; font-size: 13px; color: var(--bad); }
 .status:empty { display: none; }
+.status .detail { display: block; margin-top: 2px; font-family: var(--mono); font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.revoke-note:empty, .audit-done:empty { display: none; }
 .readonly { margin: 0 32px 20px; }
 
 /* execute mode */
@@ -208,21 +212,25 @@ select:focus { border-color: var(--accent); outline: none; }
 .outfile .file-head { padding: 8px 12px; }
 .outfile .small.link { margin: 8px 12px; align-self: flex-start; }
 .card .note.error, .item.rejected .card .note { color: var(--bad); }
-.card .note.unverified { color: var(--accent); border-top: 1px solid var(--line); }
+.card .detail { padding: 0 16px 12px; font-family: var(--mono); font-size: 12px; color: var(--muted); word-break: break-word; }
+.item:focus-visible { outline-offset: 4px; border-radius: 8px; }
 .note-actions { padding: 0 16px 12px; }
-.item.evline { display: block; }
-.item.evline .pill { display: block; align-self: auto; }
+.item.evline { display: flex; justify-content: center; }
+.item.evline .pill { max-width: 100%; }
 .item.evline.rejected .pill { color: var(--bad); border-color: var(--bad-line); }
 
 .runners { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 14px; }
 .runner { display: flex; flex-direction: column; gap: 6px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
 .runner.is-rejected { opacity: 0.6; }
 .rhead { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.rhead .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.rhead .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 6em; min-width: 0; }
 .rhead .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--line-3); flex: none; }
 .rhead .dot.on { background: var(--ok); }
 .rhead .dot.wait { background: var(--accent); }
 .runner .sub { font-size: 12px; color: var(--muted); word-break: break-word; }
+.runner .key { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.runner .confirm-note, .runner .net-note { margin: 0; }
+.runner .net-note { color: var(--accent); }
 .people .desc, .runner .desc { font-size: 12.5px; color: var(--text); margin-top: 2px; overflow-wrap: anywhere; unicode-bidi: isolate; }
 .desc .claim { color: var(--muted); font-style: italic; }
 .chip.good { color: var(--ok); border-color: var(--ok-line); }
@@ -239,6 +247,8 @@ select:focus { border-color: var(--accent); outline: none; }
   /* the timeline opens scrolled to the newest item: keep approvals in view */
   .banner.approval { position: sticky; top: 0; z-index: 10; padding: 8px 12px; }
   .readonly { margin: 0 16px 16px; }
+  .composer-wrap { max-height: 60vh; max-height: 60dvh; }
+  .composer textarea.code { min-height: 96px; max-height: 24vh; max-height: 24dvh; }
   .title { display: none !important; }
 }
 @media (max-width: 480px) {

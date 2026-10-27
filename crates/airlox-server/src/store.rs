@@ -298,6 +298,9 @@ pub struct Inner {
     pub wanted_items: HashMap<String, HashSet<String>>,
     /// `want` log lines per participant.
     pub want_lines: HashMap<String, u32>,
+    /// When each open want was last logged (and so announced to holders):
+    /// item → (participant → when).
+    pub want_announced: HashMap<String, HashMap<String, u64>>,
     /// Roles the owner revoked.
     pub revoked: HashSet<Role>,
     /// Held bytes per uploader address, shared by every session.
@@ -336,10 +339,11 @@ impl Inner {
     /// Stop counting `who` as a recipient and revoke its token.
     fn depart(&mut self, who: &str, ts: u64) {
         self.tokens.retain(|_, pk| pk != who);
-        for w in self.wants.values_mut() {
+        for w in self.wants.values_mut().chain(self.want_announced.values_mut()) {
             w.remove(who);
         }
         self.wants.retain(|_, w| !w.is_empty());
+        self.want_announced.retain(|_, w| !w.is_empty());
         // Stop waiting for this participant on blobs still held.
         let waiting: Vec<String> = self
             .items
@@ -503,6 +507,7 @@ impl Inner {
             }
             Rec::Want { item, by } => {
                 self.wants.entry(item.clone()).or_default().insert(by.clone(), ts);
+                self.want_announced.entry(item.clone()).or_default().insert(by.clone(), ts);
                 self.wanted_items.entry(by.clone()).or_default().insert(item.clone());
                 *self.want_lines.entry(by.clone()).or_default() += 1;
                 // Not activity: asking alone must not keep a session alive.
@@ -512,6 +517,7 @@ impl Inner {
                 // The wanters become the blob's recipients: it goes once they
                 // have all acked, or when its short hold ends. Expired wants
                 // are dropped here too, so a replay matches what happened live.
+                self.want_announced.remove(item);
                 let wanters: HashSet<String> = self
                     .wants
                     .remove(item)
@@ -685,6 +691,7 @@ impl Session {
             wants: HashMap::new(),
             wanted_items: HashMap::new(),
             want_lines: HashMap::new(),
+            want_announced: HashMap::new(),
             revoked: HashSet::new(),
             usage,
             hold_ms: cfg.blob_hold_ms,
