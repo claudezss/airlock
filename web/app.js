@@ -802,7 +802,7 @@ function buildSessionLayout(s) {
     },
     runners: () => {
       renderRunners(s, runnerList, runnerNote);
-      const n = s.runners.filter((r) => !r.approved && !r.rejected).length;
+      const n = s.runners.filter((r) => !r.approved && !r.rejected && r.setup !== "failed").length;
       approvalBanner.hidden = !(inv.role === "owner" && n && !s.closed);
       approvalText.textContent = `${n} runner${n === 1 ? "" : "s"} awaiting approval`;
       jobUi?.refresh();
@@ -1506,7 +1506,7 @@ async function pollRunners(s) {
     }
     const first = !s.runnersLoaded;
     for (const x of list) {
-      const label = x.rejected ? "rejected" : x.approved ? "approved" : "awaiting approval";
+      const label = x.rejected ? "rejected" : x.approved ? "approved" : x.setup === "failed" ? "failed to start" : "awaiting approval";
       if (!first && s.announce && s.runnerSeen.get(x.pub) !== label) announce(`Runner ${x.name}: ${label}`);
       s.runnerSeen.set(x.pub, label);
     }
@@ -1562,6 +1562,7 @@ function renderRunners(s, list, note) {
     const approval = r.rejected ? "rejected"
       : r.approved ? "approved"
       : r.relayOnly ? (owner ? "needs your confirmation" : "approval not received here")
+      : r.setup === "failed" ? "not approved"
       : "awaiting approval";
     const live = r.rejected ? "rejected" : r.setup === "failed" ? "setup failed"
       : r.setup === "preparing" && !r.online ? "preparing its sandbox"
@@ -1572,7 +1573,7 @@ function renderRunners(s, list, note) {
   // The poll runs every few seconds: leave the list (and keyboard focus) alone
   // unless something it shows has changed.
   const sig = JSON.stringify([!!s.closed, revoked, s.runners.map((r) => [r.pub, r.name, r.description, r.labels, r.host, r.sandbox, r.networkUnblocked,
-    r.rejected, r.approved, r.relayOnly, r.detail, text(r)])]);
+    r.rejected, r.approved, r.relayOnly, r.setup, r.detail, text(r)])]);
   if (list.dataset.sig === sig) return;
   list.dataset.sig = sig;
   const a = document.activeElement;
@@ -1587,7 +1588,9 @@ function renderRunners(s, list, note) {
     const dot = r.rejected ? "" : !r.approved ? "wait" : r.online ? "on" : "";
     // Kept after a failed approval: the relay may say approved while the
     // owner's approval never got posted, and the owner must be able to retry.
-    const canApprove = owner && !r.rejected && (!r.approved || !!err);
+    // A runner that failed to start has nothing to approve: show why instead.
+    const failed = r.setup === "failed" && !r.rejected;
+    const canApprove = owner && !r.rejected && !failed && (!r.approved || !!err);
     const warn = r.networkUnblocked && !r.rejected
       ? el("span", { class: "chip warn", title: "This runner's sandbox cannot block network access" }, "⚠ network not blocked") : null;
     const act = (name, label, cls, approve) => el("button", { type: "button", class: `small ${cls}`, "data-pub": r.pub, "data-act": name,
@@ -1608,11 +1611,10 @@ function renderRunners(s, list, note) {
         "The relay says this runner is approved, but this browser has no approval from you on record. Confirm only if you approved it. Its key: ",
         el("span", { class: "mono" }, ac.fingerprint(r.pub).slice(0, 16).replace(/(.{4})(?=.)/g, "$1 ")), ".") : null,
       owner && canApprove && warn ? el("p", { class: "sub net-note" }, "Jobs on this runner can reach the internet. Approve only if you trust the code senders submit.") : null,
+      failed ? el("p", { class: "sub setup-failed", title: "The runner's own report, not verified" }, r.detail || "The runner could not start.") : null,
       owner && !r.rejected ? el("div", { class: "row" },
         canApprove ? [warn, act("approve", r.relayOnly ? "Confirm approval" : "Approve", "primary", true)] : null,
         act("reject", "Reject", "danger", false)) : null,
-      r.setup === "failed" && r.detail && !r.rejected
-        ? el("p", { class: "sub setup-failed", title: "The runner's own report, not verified" }, r.detail) : null,
       err ? el("p", { class: "error", role: "alert" }, err) : null);
   }));
   if (focus) {
@@ -1699,9 +1701,9 @@ function buildJobPanel(s, text, file) {
     const opts = [el("option", { value: "any" }, "Any idle runner"), el("option", { value: "labels" }, "Labels…")];
     for (const r of s.runners) {
       if (r.rejected) continue;
-      opts.push(el("option", { value: `runner:${r.pub}` }, `${r.name}${r.online ? "" : " (offline)"}${r.approved ? "" : r.relayOnly ? " (not approved here)" : " (not approved)"}`));
+      opts.push(el("option", { value: `runner:${r.pub}` }, `${r.name}${r.online ? "" : " (offline)"}${r.setup === "failed" ? " (setup failed)" : r.approved ? "" : r.relayOnly ? " (not approved here)" : " (not approved)"}`));
     }
-    const sig = s.runners.map((r) => `${r.pub}${r.name}${r.online}${r.approved}${r.relayOnly}${r.rejected}`).join("|");
+    const sig = s.runners.map((r) => `${r.pub}${r.name}${r.online}${r.approved}${r.relayOnly}${r.rejected}${r.setup}`).join("|");
     if (sig !== optsSig) {
       optsSig = sig;
       target.replaceChildren(...opts);
