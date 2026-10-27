@@ -13,9 +13,10 @@ use crate::cert::{is_runner_token, SignedRoleCert};
 use crate::item::{ItemHeader, ItemKind, ItemRef};
 use crate::keys::PublicKey;
 use crate::payload::{
-    Event, JobProgress, JobResult, JobSpec, JobStatus, Meta, Payload, Target, MAX_OUT_FILES,
-    MAX_PROGRESS_TAIL_BYTES, MAX_REASON_CHARS, MAX_STDIO_BYTES,
+    Event, JobEnv, JobProgress, JobResult, JobSpec, JobStatus, Meta, Payload, Target, MAX_ENV_PACKAGES,
+    MAX_OUT_FILES, MAX_PROGRESS_TAIL_BYTES, MAX_REASON_CHARS, MAX_STDIO_BYTES,
 };
+use crate::pep440::SpecifierSet;
 use crate::session::{ContentType, Manifest, Mode, Role};
 use crate::validate::{check_name_component, sniff};
 use crate::{Error, Result};
@@ -244,6 +245,75 @@ pub fn normalize_package(name: &str) -> Result<String> {
     Ok(out)
 }
 
+/// Longest package allowlist entry (name and version specifier).
+pub const MAX_ALLOWLIST_ENTRY_LEN: usize = 256;
+
+/// A package allowlist entry: a name, and optionally the versions jobs may
+/// run against, such as `cugrid==0.1.0` or `numpy>=1.26,<3`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AllowedPackage {
+    /// PEP 503 normalized; what a job's `requirements` name.
+    pub name: String,
+    pub specifier: Option<SpecifierSet>,
+}
+
+impl AllowedPackage {
+    /// Parse an entry as a person writes it: `pyPowerGEM`, `cugrid == 0.1.0`,
+    /// `numpy>=1.26, <3`. Extras, markers and URLs are not accepted.
+    pub fn parse(entry: &str) -> Result<AllowedPackage> {
+        let bad = |why: &str| Err(Error::invalid("package", format!("{entry:?}: {why}")));
+        let entry = entry.trim();
+        if entry.len() > MAX_ALLOWLIST_ENTRY_LEN {
+            return bad("too long");
+        }
+        let (name, rest) = entry.split_at(allowlist_name(entry).len());
+        let Ok(name) = normalize_package(name) else { return bad("not a package name") };
+        let rest = rest.trim_start();
+        if rest.is_empty() {
+            return Ok(AllowedPackage { name, specifier: None });
+        }
+        match rest.as_bytes()[0] {
+            b'[' => return bad("extras are not supported; name the package alone"),
+            b';' => return bad("environment markers are not supported"),
+            b'@' => return bad("URLs are not supported; use a version specifier such as ==1.2.3"),
+            b'=' | b'!' | b'<' | b'>' | b'~' => {}
+            _ => return bad("a version specifier starts with an operator (==, >=, <, ...)"),
+        }
+        match SpecifierSet::parse(rest) {
+            Ok(specifier) => Ok(AllowedPackage { name, specifier: Some(specifier) }),
+            Err(why) => bad(&why),
+        }
+    }
+
+    /// The one spelling the manifest records: the normalized name, then the
+    /// clauses with no spaces. A name alone is just the normalized name.
+    pub fn canonical(&self) -> String {
+        match &self.specifier {
+            Some(s) => format!("{}{s}", self.name),
+            None => self.name.clone(),
+        }
+    }
+
+    /// Whether an installed `version` is one this entry allows.
+    pub fn allows_version(&self, version: &str) -> bool {
+        self.specifier.as_ref().is_none_or(|s| s.matches(version))
+    }
+}
+
+/// An allowlist entry in its canonical spelling (see [`AllowedPackage`]).
+pub fn canonical_allowlist_entry(entry: &str) -> Result<String> {
+    Ok(AllowedPackage::parse(entry)?.canonical())
+}
+
+/// The package name part of an allowlist entry, without any version
+/// specifier: `cugrid` for `cugrid==0.1.0`.
+pub fn allowlist_name(entry: &str) -> &str {
+    let end = entry
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+        .unwrap_or(entry.len());
+    &entry[..end]
+}
+
 /// Checks a runner must pass before running a job.
 pub fn check_job(m: &Manifest, job: &JobSpec) -> Result<()> {
     require_execute(m)?;
@@ -279,8 +349,12 @@ pub fn check_job(m: &Manifest, job: &JobSpec) -> Result<()> {
         check_progress_file(p)?;
     }
     for r in &job.requirements {
-        let n = normalize_package(r)?;
-        if !limits.packages.contains(&n) {
+        let n = normalize_package(r).map_err(|_| {
+            Error::policy(format!(
+                "requirement {r:?}: requirements name packages only; a version comes from the session's allowlist"
+            ))
+        })?;
+        if !limits.allows_package(&n) {
             return Err(Error::policy(format!("{r} not in allowlist")));
         }
     }
@@ -302,6 +376,31 @@ fn is_hex64(s: &str) -> bool {
 }
 
 /// Shape checks on a job result.
+/// Shape checks on the environment a result reports: short printable
+/// strings, and package names in normalized form.
+pub fn check_env(env: &JobEnv) -> Result<()> {
+    let short = |what: &str, s: &str, max: usize| {
+        if s.is_empty() || s.chars().count() > max || s.chars().any(char::is_control) {
+            Err(Error::policy(format!("env {what} must be 1 to {max} printable characters")))
+        } else {
+            Ok(())
+        }
+    };
+    short("python", &env.python, 32)?;
+    short("airlox", &env.airlox, 32)?;
+    short("interpreter", &env.interpreter, 128)?;
+    if env.packages.len() > MAX_ENV_PACKAGES {
+        return Err(Error::policy(format!("env lists at most {MAX_ENV_PACKAGES} packages")));
+    }
+    for (name, version) in &env.packages {
+        if normalize_package(name).ok().as_deref() != Some(name.as_str()) {
+            return Err(Error::policy(format!("env package {name:?} is not a normalized name")));
+        }
+        short("package version", version, 64)?;
+    }
+    Ok(())
+}
+
 pub fn check_result(r: &JobResult) -> Result<()> {
     r.job.validate()?;
     if r.stdout.len() > MAX_STDIO_BYTES || r.stderr.len() > MAX_STDIO_BYTES {
@@ -319,6 +418,9 @@ pub fn check_result(r: &JobResult) -> Result<()> {
     }
     if r.reason.as_ref().is_some_and(|s| s.chars().count() > MAX_REASON_CHARS) {
         return Err(Error::policy("reason too long"));
+    }
+    if let Some(env) = &r.env {
+        check_env(env)?;
     }
     let consistent = match r.status {
         JobStatus::Completed => r.exit_code.is_some(),
@@ -381,7 +483,7 @@ pub fn check_result_matches_job(
 mod tests {
     use super::*;
     use crate::cert::issue_cert;
-    use crate::encoding::b64e;
+    use crate::encoding::{b64e, canonical_json};
     use crate::item::{seal, NewItem};
     use crate::keys::Keypair;
     use crate::payload::OutFile;
@@ -440,6 +542,7 @@ mod tests {
             out_files: vec![OutFile { name: "chart.png".into(), size: 1, item: iref(4) }],
             code_sha256: "a".repeat(64),
             input_sha256: "b".repeat(64),
+            env: None,
         }
     }
 
@@ -531,6 +634,116 @@ mod tests {
         assert!(check_result(&r).is_err(), "refused with an exit code");
         r.exit_code = None;
         check_result(&r).unwrap();
+    }
+
+    #[test]
+    fn a_result_reports_its_environment_in_the_signed_meta_only_when_it_has_one() {
+        use crate::cert::SandboxKind;
+        use crate::payload::JobEnv;
+        // No env: the canonical form is what it was before the field existed.
+        let plain = result();
+        let json = String::from_utf8(canonical_json(&plain).unwrap()).unwrap();
+        assert!(!json.contains("\"env\""), "{json}");
+        let old: JobResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(old, plain);
+
+        let mut r = result();
+        r.env = Some(JobEnv {
+            python: "3.12.4".into(),
+            packages: [("cugrid".to_string(), "0.1.0".to_string()), ("numpy".into(), "2.1.0".into())].into(),
+            airlox: "0.1.2".into(),
+            sandbox: SandboxKind::Process,
+            interpreter: "--python".into(),
+        });
+        check_result(&r).unwrap();
+        let json = String::from_utf8(canonical_json(&r).unwrap()).unwrap();
+        assert!(
+            json.contains(r#""env":{"airlox":"0.1.2","interpreter":"--python","packages":{"cugrid":"0.1.0","numpy":"2.1.0"},"python":"3.12.4","sandbox":"process"}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<JobResult>(&json).unwrap(), r);
+        // The env is signed with the rest: an unknown field is refused.
+        let extra = json.replace(r#""python":"3.12.4""#, r#""python":"3.12.4","executable":"C:\\Users\\x""#);
+        assert!(serde_json::from_str::<JobResult>(&extra).is_err());
+
+        let mut bad = r.clone();
+        bad.env.as_mut().unwrap().python = String::new();
+        assert!(check_result(&bad).is_err());
+        let mut bad = r.clone();
+        bad.env.as_mut().unwrap().interpreter = "a\nb".into();
+        assert!(check_result(&bad).is_err());
+        let mut bad = r.clone();
+        bad.env.as_mut().unwrap().packages.insert("Not_Normal".into(), "1".into());
+        assert!(check_result(&bad).is_err());
+        let mut bad = r;
+        bad.env.as_mut().unwrap().packages =
+            (0..=MAX_ENV_PACKAGES).map(|i| (format!("p{i}"), "1".into())).collect();
+        assert!(check_result(&bad).is_err());
+    }
+
+    #[test]
+    fn allowlist_entries_have_one_canonical_spelling() {
+        let canon = |s: &str| canonical_allowlist_entry(s).unwrap();
+        // Names alone are as they always were.
+        assert_eq!(canon("pyPowerGEM"), "pypowergem");
+        assert_eq!(canon("Foo__Bar.baz"), "foo-bar-baz");
+        assert_eq!(canon("cugrid==0.1.0"), "cugrid==0.1.0");
+        assert_eq!(canon(" CuGrid >= 0.1.0.dev0 "), "cugrid>=0.1.0.dev0");
+        assert_eq!(canon("numpy>=1.26, <3"), "numpy>=1.26,<3");
+        assert_eq!(canon("py_power.gem~=2.1"), "py-power-gem~=2.1");
+        let p = AllowedPackage::parse("numpy>=1.26,<3").unwrap();
+        assert_eq!(p.name, "numpy");
+        assert!(p.allows_version("2.2.1") && !p.allows_version("3.0") && !p.allows_version("1.0"));
+        assert!(AllowedPackage::parse("numpy").unwrap().allows_version("anything"));
+        for bad in [
+            "numpy[extra]>=1",
+            "numpy; python_version<'3.13'",
+            "numpy @ https://example.com/numpy.whl",
+            "numpy 1.0",
+            "numpy>=",
+            "numpy=>1",
+            "numpy>=1.x",
+            ">=1.0",
+            "==1.0",
+            "numpy>=1,<",
+            "",
+        ] {
+            assert!(canonical_allowlist_entry(bad).is_err(), "{bad:?}");
+        }
+        assert!(canonical_allowlist_entry(&format!("numpy=={}", "1".repeat(300))).is_err());
+        assert_eq!(allowlist_name("cugrid==0.1.0"), "cugrid");
+        assert_eq!(allowlist_name("py-power.gem>=1,<2"), "py-power.gem");
+        assert_eq!(allowlist_name("numpy"), "numpy");
+    }
+
+    #[test]
+    fn requirements_name_allowlisted_packages_whatever_their_pins() {
+        let limits = JobLimits {
+            packages: vec!["cugrid==0.1.0".into(), "numpy>=1.26,<3".into(), "pandas".into()],
+            ..Default::default()
+        };
+        let m = secrets()
+            .manifest(&SessionParams {
+                mode: Mode::Execute,
+                created_at_ms: 1000,
+                ttl_ms: Some(1000),
+                allowed_types: vec![ContentType::Py],
+                max_item_bytes: 1024 * 1024,
+                job_limits: Some(limits),
+                insecure_http_host: None,
+            })
+            .unwrap()
+            .manifest;
+        let mut j = job();
+        j.requirements = vec!["CuGrid".into(), "numpy".into(), "pandas".into()];
+        check_job(&m, &j).unwrap();
+        // A name that merely starts with an allowlisted one is another package.
+        j.requirements = vec!["cugrid-extra".into()];
+        assert!(check_job(&m, &j).unwrap_err().to_string().contains("not in allowlist"));
+        // Versions belong to the allowlist, not to the job.
+        j.requirements = vec!["cugrid==0.1.0".into()];
+        let e = check_job(&m, &j).unwrap_err().to_string();
+        assert!(e.contains("requirements name packages only"), "{e}");
     }
 
     #[test]

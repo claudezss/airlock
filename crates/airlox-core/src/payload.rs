@@ -6,8 +6,11 @@
 //! body    = raw file bytes for "file"; empty for every other type
 //! ```
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
+use crate::cert::SandboxKind;
 use crate::encoding::canonical_json;
 use crate::item::{ItemKind, ItemRef};
 use crate::keys::PublicKey;
@@ -18,6 +21,8 @@ pub const MAX_META_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_STDIO_BYTES: usize = 1024 * 1024;
 pub const MAX_OUT_FILES: usize = 64;
 pub const MAX_REASON_CHARS: usize = 4096;
+/// Most packages a result's `env` lists.
+pub const MAX_ENV_PACKAGES: usize = 256;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -99,6 +104,29 @@ pub struct JobResult {
     /// Hex SHA-256 of the job code and of the concatenated input blobs.
     pub code_sha256: String,
     pub input_sha256: String,
+    /// Where the job ran. Absent from the canonical form when the runner
+    /// does not report it (older runners, or a job that never ran).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<JobEnv>,
+}
+
+/// The environment a job ran in, as its runner measured it once for the
+/// runtime. Signed with the result, so a sender can check where a job ran
+/// without trusting the job's own output. Holds no paths.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct JobEnv {
+    /// The interpreter's version, e.g. "3.12.4".
+    pub python: String,
+    /// Installed version of each allowlisted package, by normalized name.
+    pub packages: BTreeMap<String, String>,
+    /// The runner's airlox version.
+    pub airlox: String,
+    /// How the job was isolated.
+    pub sandbox: SandboxKind,
+    /// Where the interpreter came from: `uv-runtime` (built by the runner
+    /// from the allowlist), `--python` (the operator's), or `docker:<image>`.
+    pub interpreter: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
