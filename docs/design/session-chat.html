@@ -1,0 +1,787 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Airlox session chat</title>
+<style>
+:root {
+  --bg: #0f1113; --header: #121417; --panel: #16191c; --panel-2: #121417; --raised: #1c2024;
+  --line: #2a2f35; --line-2: #3a4047; --line-3: #4a5058;
+  --text: #ecebe4; --card-text: #d8d6d0; --muted: #a3a8ae; --soft: #bfc3c8;
+  --accent: #f2a93b; --accent-ink: #15120c; --accent-bg: #1e1a12; --accent-line: #4a3b22; --accent-tint: #352a17;
+  --ok: #7fd99a; --ok-bg: #20352a; --ok-line: #355a3f;
+  --link: #78b8ff; --info-bg: #26303a; --info-line: #2f4a66;
+  --bad: #ff8a7a; --bad-bg: #1a1516; --bad-line: #5a2e2a;
+  --code-bg: #0b0d0f; --kw: #c79bff; --str: #a5d6a7; --num: #f2c46d; --com: #7d848b; --fn: #78b8ff;
+  --mono: ui-monospace, "SF Mono", "IBM Plex Mono", Menlo, Consolas, monospace;
+  --thread-w: 780px;
+  color-scheme: dark;
+  accent-color: var(--accent);
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; display: flex; flex-direction: column; overflow: hidden; }
+button { font: inherit; color: inherit; cursor: pointer; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.mono, code, pre { font-family: var(--mono); }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+/* ---------- header ---------- */
+.top { flex: none; display: flex; align-items: center; gap: 16px; padding: 8px 16px; background: var(--header); border-bottom: 1px solid var(--line); min-height: 56px; }
+.brand { display: flex; align-items: center; gap: 8px; color: var(--text); text-decoration: none; font-weight: 700; font-size: 17px; }
+.brand svg { color: var(--accent); }
+.title { display: flex; align-items: baseline; gap: 10px; padding-left: 16px; border-left: 1px solid var(--line); min-width: 0; }
+.title strong { font-weight: 600; white-space: nowrap; }
+.title span { font-family: var(--mono); font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.top-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+.badge { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 12px; color: var(--ok); border: 1px solid var(--ok-line); background: var(--ok-bg); border-radius: 999px; padding: 3px 10px; }
+.expiry { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.ghost { background: transparent; border: 1px solid transparent; border-radius: 8px; color: var(--soft); min-height: 36px; padding: 0 10px; display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+.ghost:hover { background: var(--raised); color: var(--text); }
+.ghost[aria-expanded=true] { color: var(--accent); }
+
+/* ---------- shell ---------- */
+.shell { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 300px; }
+.shell.rail-off { grid-template-columns: minmax(0, 1fr) 0; }
+.chat { position: relative; display: grid; grid-template-rows: minmax(0, 1fr) auto; min-width: 0; min-height: 0; }
+.scroller { overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.thread { max-width: var(--thread-w); margin: 0 auto; padding: 24px 24px 16px; display: flex; flex-direction: column; }
+
+/* ---------- rail ---------- */
+.rail { border-left: 1px solid var(--line); background: var(--panel-2); overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 24px; font-size: 13px; }
+.shell.rail-off .rail { display: none; }
+.rail h2 { margin: 0 0 10px; font: 500 11px/1 var(--mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+.people { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.people li { display: grid; grid-template-columns: 28px minmax(0,1fr) auto; gap: 10px; align-items: center; }
+.people .pn { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.people .ps { font-size: 12px; color: var(--muted); }
+.people .fp { font: 11px var(--mono); color: var(--muted); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { font: 12px var(--mono); border: 1px solid var(--line-2); border-radius: 6px; padding: 2px 8px; color: var(--soft); }
+.rail p { margin: 0; color: var(--muted); }
+.rail details { border-top: 1px solid var(--line); padding-top: 10px; }
+.rail summary { cursor: pointer; font-weight: 600; color: var(--soft); min-height: 32px; display: flex; align-items: center; }
+.btn { background: var(--raised); border: 1px solid var(--line-2); border-radius: 8px; min-height: 36px; padding: 0 12px; font-size: 13px; }
+.btn:hover { border-color: var(--line-3); }
+.btn.danger { color: var(--bad); border-color: var(--bad-line); background: transparent; }
+.stack { display: flex; flex-direction: column; gap: 8px; }
+
+/* ---------- avatars ---------- */
+.av { width: 28px; height: 28px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font: 500 11px var(--mono); background: var(--raised); color: var(--soft); flex: none; }
+.av.owner { background: var(--accent-bg); color: var(--accent); }
+.av.sender { background: var(--info-bg); color: var(--link); }
+.av.runner { background: var(--ok-bg); color: var(--ok); }
+
+/* ---------- thread items ---------- */
+.divider { display: flex; align-items: center; gap: 12px; margin: 8px 0 16px; font: 12px var(--mono); color: var(--muted); }
+.divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+.divider.unread { color: var(--accent); }
+.divider.unread::before, .divider.unread::after { background: var(--accent-line); }
+.sys { align-self: center; font: 12px var(--mono); color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 3px 12px; margin: 4px 0 20px; text-align: center; }
+
+.msg { display: grid; grid-template-columns: 28px minmax(0, 1fr); column-gap: 12px; margin-top: 18px; position: relative; }
+.msg.cont { margin-top: 4px; }
+.msg.cont .av, .msg.cont .mhead { display: none; }
+.msg.cont .mbody { grid-column: 2; }
+.mhead { display: flex; align-items: baseline; gap: 8px; min-height: 28px; flex-wrap: wrap; }
+.mhead strong { font-weight: 600; font-size: 14px; }
+.mhead .role { font-size: 12px; color: var(--muted); }
+.mhead time { font: 12px var(--mono); color: var(--muted); }
+.ver { display: inline-flex; align-items: center; gap: 3px; font: 12px var(--mono); color: var(--ok); }
+.mbody { min-width: 0; }
+
+/* others: open prose, like an assistant reply */
+.content { color: var(--card-text); position: relative; }
+/* mine: right-aligned bubble */
+.msg.mine { grid-template-columns: minmax(0, 1fr); justify-items: end; }
+.msg.mine .av, .msg.mine .mhead { display: none; }
+.msg.mine .mbody { max-width: min(85%, 640px); }
+.msg.mine .content { background: var(--accent-bg); border: 1px solid var(--accent-line); border-radius: 16px 16px 4px 16px; padding: 10px 14px; color: var(--text); }
+.msg.mine .actions { justify-content: flex-end; }
+.msg.mine + .msg.mine { margin-top: 4px; }
+
+/* hover actions */
+.actions { display: flex; gap: 2px; margin-top: 2px; min-height: 28px; opacity: 0; transition: opacity 0.12s; }
+.msg:hover .actions, .msg:focus-within .actions, .msg.show-actions .actions { opacity: 1; }
+@media (hover: none) { .actions { opacity: 1; } }
+.act { background: transparent; border: 0; border-radius: 6px; color: var(--muted); font-size: 12px; padding: 4px 8px; display: inline-flex; align-items: center; gap: 5px; }
+.act:hover { background: var(--raised); color: var(--text); }
+.act[aria-pressed=true] { color: var(--accent); }
+.act .stamp { font-family: var(--mono); }
+
+/* collapse */
+.content.collapsed .md, .content.collapsed .raw { max-height: 340px; overflow: hidden; -webkit-mask-image: linear-gradient(#000 60%, transparent); mask-image: linear-gradient(#000 60%, transparent); }
+.more { margin-top: 6px; display: inline-flex; align-items: center; gap: 6px; background: var(--raised); border: 1px solid var(--line-2); border-radius: 999px; padding: 4px 12px; font-size: 13px; color: var(--soft); }
+.more:hover { color: var(--text); border-color: var(--line-3); }
+.more .n { font: 12px var(--mono); color: var(--muted); }
+.raw { white-space: pre-wrap; word-break: break-word; font: 13px/1.55 var(--mono); background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin: 0; }
+
+/* ---------- markdown ---------- */
+/* position: a clipped, collapsed message must also clip its absolutely positioned (sr-only) labels */
+.md { overflow-wrap: anywhere; position: relative; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p { margin: 0 0 10px; }
+.md h1, .md h2, .md h3, .md h4 { margin: 18px 0 8px; line-height: 1.3; color: var(--text); }
+.md h1 { font-size: 20px; } .md h2 { font-size: 18px; } .md h3 { font-size: 16px; } .md h4 { font-size: 15px; }
+.md ul, .md ol { margin: 0 0 10px; padding-left: 22px; }
+.md li { margin: 3px 0; }
+.md li::marker { color: var(--muted); }
+.md blockquote { margin: 0 0 10px; padding: 2px 14px; border-left: 3px solid var(--line-3); color: var(--soft); }
+.md hr { border: 0; border-top: 1px solid var(--line); margin: 16px 0; }
+.md a { color: var(--link); text-underline-offset: 2px; }
+.md a .host { font: 11px var(--mono); color: var(--muted); margin-left: 3px; }
+.md strong { color: var(--text); font-weight: 650; }
+.md :not(pre) > code { font-size: 0.86em; background: var(--raised); border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; color: var(--text); }
+.md .tbl { overflow-x: auto; margin: 0 0 10px; border: 1px solid var(--line); border-radius: 8px; }
+.md table { border-collapse: collapse; width: 100%; font-size: 14px; }
+.md th, .md td { text-align: left; padding: 6px 12px; border-bottom: 1px solid var(--line); }
+.md th { background: var(--raised); font-weight: 600; color: var(--text); }
+.md tr:last-child td { border-bottom: 0; }
+.md .img-blocked { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: var(--muted); border: 1px dashed var(--line-3); border-radius: 6px; padding: 2px 8px; }
+
+.codeblock { margin: 0 0 12px; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--code-bg); }
+.codeblock .ch { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 6px 4px 12px; background: var(--raised); border-bottom: 1px solid var(--line); font: 12px var(--mono); color: var(--muted); }
+.codeblock pre { margin: 0; padding: 12px 14px; overflow-x: auto; font-size: 13px; line-height: 1.55; color: var(--text); tab-size: 4; }
+.codeblock.wrap pre { white-space: pre-wrap; word-break: break-word; }
+.codeblock.clamp pre { max-height: 300px; overflow: hidden; -webkit-mask-image: linear-gradient(#000 70%, transparent); mask-image: linear-gradient(#000 70%, transparent); }
+.codeblock .cfoot { border-top: 1px solid var(--line); }
+.codeblock .cfoot button { width: 100%; background: transparent; border: 0; padding: 6px; font-size: 12px; color: var(--soft); }
+.codeblock .cfoot button:hover { background: var(--raised); color: var(--text); }
+.tk-kw { color: var(--kw); } .tk-str { color: var(--str); } .tk-num { color: var(--num); } .tk-com { color: var(--com); font-style: italic; } .tk-fn { color: var(--fn); }
+
+/* ---------- file / job cards ---------- */
+.card { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); overflow: hidden; max-width: 560px; }
+.fhead { display: flex; align-items: center; gap: 12px; padding: 10px 12px; }
+.ficon { width: 40px; height: 40px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font: 600 11px var(--mono); background: var(--info-bg); color: var(--link); flex: none; }
+.ficon.py { background: var(--accent-bg); color: var(--accent); }
+.fmeta { display: flex; flex-direction: column; min-width: 0; flex: 1; line-height: 1.35; }
+.fmeta b { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fmeta span { font-size: 12px; color: var(--muted); }
+.card details summary { cursor: pointer; padding: 6px 12px; border-top: 1px solid var(--line); font-size: 13px; color: var(--soft); }
+.ziplist { list-style: none; margin: 0; padding: 4px 0; font: 12.5px var(--mono); color: var(--soft); border-top: 1px solid var(--line); }
+.ziplist li { display: flex; justify-content: space-between; padding: 3px 12px; }
+.ziplist li span:last-child { color: var(--muted); }
+.state { font: 12px var(--mono); padding: 2px 9px; border-radius: 999px; border: 1px solid var(--ok-line); color: var(--ok); white-space: nowrap; }
+.out { border-top: 1px solid var(--line); }
+.out .lbl { padding: 8px 12px 0; font: 11px var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.out pre { margin: 0; padding: 6px 12px 12px; font-size: 13px; color: var(--text); overflow-x: auto; }
+
+/* ---------- jump to latest ---------- */
+.jump { position: absolute; left: 50%; transform: translate(-50%, 8px); bottom: calc(var(--dock-h, 120px) + 12px); z-index: 5; display: inline-flex; align-items: center; gap: 8px; border-radius: 999px; padding: 0 14px 0 10px; height: 36px; background: var(--raised); border: 1px solid var(--line-2); color: var(--text); box-shadow: 0 6px 24px rgba(0,0,0,0.45); opacity: 0; pointer-events: none; transition: opacity 0.15s, transform 0.15s; font-size: 13px; }
+.jump.on { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
+.jump.unread { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+.jump.icon-only { padding: 0; width: 36px; justify-content: center; }
+@media (prefers-reduced-motion: reduce) { .jump, .actions { transition: none; } }
+
+/* ---------- composer ---------- */
+.dock { padding: 0 24px 16px; background: linear-gradient(to bottom, transparent, var(--bg) 16px); }
+.composer { max-width: var(--thread-w); margin: 0 auto; background: var(--panel); border: 1px solid var(--line-2); border-radius: 16px; padding: 6px; transition: border-color 0.12s; }
+.composer:focus-within { border-color: var(--accent-line); box-shadow: 0 0 0 3px rgba(242,169,59,0.08); }
+.composer textarea { display: block; width: 100%; border: 0; background: transparent; color: var(--text); resize: none; font: inherit; padding: 8px 10px; min-height: 44px; max-height: 40vh; outline: none; }
+.attach-chip { display: inline-flex; align-items: center; gap: 8px; margin: 4px 6px 2px; padding: 4px 6px 4px 10px; border: 1px solid var(--line-2); border-radius: 8px; font: 12px var(--mono); color: var(--soft); }
+.attach-chip button { background: transparent; border: 0; color: var(--muted); padding: 0 4px; }
+.cbar { display: flex; align-items: center; gap: 4px; }
+.cbar .spacer { flex: 1; }
+.icon { width: 36px; height: 36px; border-radius: 10px; border: 0; background: transparent; color: var(--soft); display: inline-flex; align-items: center; justify-content: center; }
+.icon:hover { background: var(--raised); color: var(--text); }
+.toggle { border: 1px solid var(--line-2); background: transparent; color: var(--soft); border-radius: 999px; min-height: 30px; padding: 0 12px; font-size: 12.5px; display: inline-flex; gap: 6px; align-items: center; }
+.toggle[aria-pressed=true] { border-color: var(--accent); color: var(--accent); background: var(--accent-bg); }
+.send { width: 36px; height: 36px; border-radius: 10px; border: 0; background: var(--accent); color: var(--accent-ink); display: inline-flex; align-items: center; justify-content: center; }
+.send:disabled { background: var(--raised); color: var(--line-3); cursor: default; }
+.chint { max-width: var(--thread-w); margin: 6px auto 0; font: 11.5px var(--mono); color: var(--muted); text-align: center; }
+.chint kbd { font: inherit; border: 1px solid var(--line-2); border-radius: 4px; padding: 0 4px; }
+
+/* ---------- prototype controls (not part of the design) ---------- */
+.proto { position: fixed; right: 12px; bottom: 12px; z-index: 50; width: 252px; background: #24282d; border: 1px dashed var(--accent-line); border-radius: 12px; padding: 10px; font-size: 12.5px; box-shadow: 0 8px 30px rgba(0,0,0,0.5); }
+.proto summary { cursor: pointer; font: 600 11px var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
+.proto .stack { margin-top: 8px; gap: 6px; }
+.proto button { text-align: left; }
+.proto .log { font: 11px var(--mono); color: var(--muted); min-height: 2.6em; }
+
+/* ---------- narrow ---------- */
+@media (max-width: 900px) {
+  .shell, .shell.rail-off { grid-template-columns: minmax(0, 1fr); }
+  .rail { position: fixed; top: 56px; right: 0; bottom: 0; width: min(320px, 88vw); z-index: 20; box-shadow: -12px 0 40px rgba(0,0,0,0.5); }
+  .shell:not(.rail-open) .rail { display: none; }
+  .title span { display: none; }
+  .badge-text, .expiry .w { display: none; }
+}
+@media (max-width: 600px) {
+  .thread { padding: 16px 16px 12px; }
+  .dock { padding: 0 10px 10px; padding-bottom: max(10px, env(safe-area-inset-bottom)); }
+  .msg.mine .mbody { max-width: 92%; }
+  .fhead { flex-wrap: wrap; }
+  .fmeta { flex: 1 1 140px; }
+  .actions .act > span:not(.stamp):not(.ver) { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  .chint { display: none; }
+  .brand span { display: none; }
+  .title { padding-left: 12px; }
+  .proto { width: auto; left: 12px; bottom: auto; top: 64px; }
+}
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="#" aria-label="Airlox home">
+    <svg width="24" height="24" viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="3" width="22" height="22" rx="3"/><path d="M10 3v22M18 3v22"/><circle cx="14" cy="14" r="2" fill="currentColor" stroke="none"/></svg>
+    <span>Airlox</span>
+  </a>
+  <div class="title"><strong>Session ax_2byc</strong><span>relay · sender</span></div>
+  <div class="top-right">
+    <span class="badge"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg><span class="badge-text">E2E sealed</span></span>
+    <span class="expiry"><span class="w">expires in </span><span id="exp">1:58:12</span></span>
+    <button class="ghost" id="rail-btn" aria-expanded="true" aria-controls="rail" title="Session details">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg>
+      <span class="sr-only">Session details</span>
+    </button>
+  </div>
+</header>
+
+<div class="shell" id="shell">
+  <main class="chat">
+    <div class="scroller" id="scroller" tabindex="-1">
+      <div class="thread" id="thread" role="log" aria-label="Session timeline" aria-live="off">
+        <div class="sys">you joined as sender · keys stay in this browser</div>
+        <div class="divider">Today</div>
+      </div>
+    </div>
+
+    <button class="jump" id="jump" type="button" aria-label="Jump to latest">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><path d="M12 5v14M6 13l6 6 6-6"/></svg>
+      <span id="jump-text"></span>
+    </button>
+
+    <form class="dock" id="dock" autocomplete="off">
+      <div class="composer">
+        <div id="attach-slot"></div>
+        <label for="msg" class="sr-only">Message the session</label>
+        <textarea id="msg" rows="1" placeholder="Message the session…"></textarea>
+        <div class="cbar">
+          <button type="button" class="icon" id="attach" title="Attach .py .md .zip or image" aria-label="Attach a file">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M21 11.5l-8.6 8.6a5 5 0 0 1-7.1-7.1l8.6-8.6a3.4 3.4 0 0 1 4.8 4.8l-8.6 8.6a1.7 1.7 0 0 1-2.4-2.4l7.9-7.9"/></svg>
+          </button>
+          <button type="button" class="toggle" id="job-toggle" aria-pressed="false" title="Execute mode only: send as a Python job to a runner">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M8 6l-5 6 5 6M16 6l5 6-5 6"/></svg>Run as job
+          </button>
+          <span class="spacer"></span>
+          <button type="submit" class="send" id="send" aria-label="Send" disabled>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6"/></svg>
+          </button>
+        </div>
+      </div>
+      <p class="chint">Markdown supported · <kbd>Enter</kbd> send · <kbd>Shift</kbd>+<kbd>Enter</kbd> new line · encrypted in this browser</p>
+    </form>
+  </main>
+
+  <aside class="rail" id="rail" aria-label="Session details">
+    <section>
+      <h2>Participants · 4</h2>
+      <ul class="people" id="people"></ul>
+    </section>
+    <section>
+      <h2>Allowed types</h2>
+      <div class="chips"><span class="chip">text</span><span class="chip">py</span><span class="chip">md</span><span class="chip">zip</span><span class="chip">image</span></div>
+    </section>
+    <section class="stack">
+      <h2>Session</h2>
+      <p class="mono">ax_2bycmout676co3bolfj4cij2qm</p>
+      <p>Expires 10/27/2026, 6:40 PM · files up to 100 MB</p>
+      <details><summary>This browser</summary>
+        <div class="stack"><p>Received items are kept here, still encrypted, so they survive the relay deleting them.</p><button class="btn" type="button">Clear local history</button></div>
+      </details>
+    </section>
+  </aside>
+</div>
+
+<details class="proto" open>
+  <summary>Prototype controls</summary>
+  <div class="stack">
+    <button class="btn" type="button" data-sim="short">Incoming: short message</button>
+    <button class="btn" type="button" data-sim="long">Incoming: very long message</button>
+    <button class="btn" type="button" data-sim="burst">Incoming: burst of 5</button>
+    <button class="btn" type="button" data-sim="up">Scroll up, then 2 incoming</button>
+    <div class="log" id="plog" aria-live="polite"></div>
+  </div>
+</details>
+
+<script>
+"use strict";
+// ---------------------------------------------------------------------------
+// DOM helper. Every piece of message content goes in as a text node: the
+// markdown renderer builds elements itself and never touches innerHTML.
+// ---------------------------------------------------------------------------
+function el(tag, props = {}, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (v == null || v === false) continue;
+    if (k === "class") e.className = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else e.setAttribute(k, v === true ? "" : String(v));
+  }
+  for (const c of kids.flat()) if (c != null && c !== false) e.append(c instanceof Node ? c : String(c));
+  return e;
+}
+const ICON = (d, size = 14) => {
+  const ns = "http://www.w3.org/2000/svg";
+  const s = document.createElementNS(ns, "svg");
+  s.setAttribute("width", size); s.setAttribute("height", size); s.setAttribute("viewBox", "0 0 24 24");
+  s.setAttribute("fill", "none"); s.setAttribute("stroke", "currentColor"); s.setAttribute("stroke-width", "2"); s.setAttribute("aria-hidden", "true");
+  for (const p of [].concat(d)) { const path = document.createElementNS(ns, "path"); path.setAttribute("d", p); s.append(path); }
+  return s;
+};
+const I_COPY = ["M9 9h10v10H9z", "M5 15V5h10"];
+const I_CHECK = "M5 12l5 5 9-10";
+const I_CODE = ["M8 6l-5 6 5 6", "M16 6l5 6-5 6"];
+const I_WRAP = ["M3 6h18", "M3 12h15a3 3 0 0 1 0 6h-4", "M16 16l-2 2 2 2", "M3 18h7"];
+const I_CHEV = "M6 9l6 6 6-6";
+const I_CHEV_UP = "M6 15l6-6 6 6";
+const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+// ---------------------------------------------------------------------------
+// Markdown → DOM. CommonMark-ish subset that agents actually produce:
+// headings, paragraphs (single newlines are line breaks, as in chat), lists
+// (nested by indent, task boxes), blockquotes, fenced code, tables, hr,
+// emphasis, inline code, links. Raw HTML is shown as text. Remote images are
+// never fetched (that would leak the reader's IP from an E2E session).
+// ---------------------------------------------------------------------------
+const SAFE_URL = /^(https?:|mailto:)/i;
+function inline(text) {
+  const out = [];
+  const re = /(`+)([\s\S]*?[^`])\1(?!`)|!\[([^\]]*)\]\(([^)\s]+)\)|\[([^\]]+)\]\(([^)\s]+)\)|\*\*(.+?)\*\*|__(.+?)__|~~(.+?)~~|(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])|(?<![\w])_(?!\s)(.+?)(?<!\s)_(?![\w])|(https?:\/\/[^\s<>()]+[^\s<>().,:;!?"'\]])|(\n)/g;
+  let last = 0, m;
+  while ((m = re.exec(text))) {
+    if (m.index > last) out.push(text.slice(last, m.index));
+    if (m[1]) out.push(el("code", {}, m[2].replace(/^ (.*) $/, "$1")));
+    else if (m[4] !== undefined) out.push(el("span", { class: "img-blocked", title: m[4] }, "🖼 ", m[3] || "image", " · not loaded"));
+    else if (m[6] !== undefined) out.push(link(m[6], inline(m[5])));
+    else if (m[7] !== undefined || m[8] !== undefined) out.push(el("strong", {}, inline(m[7] ?? m[8])));
+    else if (m[9] !== undefined) out.push(el("del", {}, inline(m[9])));
+    else if (m[10] !== undefined || m[11] !== undefined) out.push(el("em", {}, inline(m[10] ?? m[11])));
+    else if (m[12]) out.push(link(m[12], [m[12]], true));
+    else if (m[13]) out.push(el("br"));
+    last = re.lastIndex;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
+function link(href, kids, bare = false) {
+  if (!SAFE_URL.test(href)) return [...kids];
+  let host = "";
+  try { host = new URL(href).host; } catch {}
+  // Show where a link really goes when its text says something else.
+  const label = kids.map((k) => (typeof k === "string" ? k : k.textContent)).join("");
+  const differs = !bare && host && !label.includes(host);
+  return el("a", { href, target: "_blank", rel: "noopener noreferrer nofollow", title: href }, kids, differs ? el("span", { class: "host" }, host) : null);
+}
+
+function markdown(src) {
+  const lines = src.replace(/\r\n?/g, "\n").split("\n");
+  return blocks(lines);
+}
+function blocks(lines) {
+  const out = [];
+  let i = 0;
+  const para = [];
+  const flush = () => { if (para.length) { out.push(el("p", {}, inline(para.join("\n")))); para.length = 0; } };
+  while (i < lines.length) {
+    const line = lines[i];
+    let m;
+    if (!line.trim()) { flush(); i++; continue; }
+    if ((m = line.match(/^\s{0,3}(```+|~~~+)\s*([\w+#.-]*)/))) {
+      flush();
+      const fence = m[1], lang = m[2], body = [];
+      i++;
+      while (i < lines.length && !lines[i].trimStart().startsWith(fence)) body.push(lines[i++]);
+      i++;
+      out.push(codeBlock(body.join("\n"), lang));
+      continue;
+    }
+    if ((m = line.match(/^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/))) { flush(); out.push(el(`h${Math.min(m[1].length + 1, 4)}`, {}, inline(m[2]))); i++; continue; }
+    if (/^\s{0,3}([-*_])(\s*\1){2,}\s*$/.test(line)) { flush(); out.push(el("hr")); i++; continue; }
+    if (/^\s{0,3}>/.test(line)) {
+      flush();
+      const q = [];
+      while (i < lines.length && /^\s{0,3}>/.test(lines[i])) q.push(lines[i++].replace(/^\s{0,3}>\s?/, ""));
+      out.push(el("blockquote", {}, blocks(q)));
+      continue;
+    }
+    if (line.includes("|") && i + 1 < lines.length && /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(lines[i + 1])) {
+      flush();
+      const cells = (l) => l.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+      const head = cells(line);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].includes("|") && lines[i].trim()) rows.push(cells(lines[i++]));
+      out.push(el("div", { class: "tbl", tabindex: 0 }, el("table", {},
+        el("thead", {}, el("tr", {}, head.map((h) => el("th", {}, inline(h))))),
+        el("tbody", {}, rows.map((r) => el("tr", {}, head.map((_, j) => el("td", {}, inline(r[j] ?? "")))))))));
+      continue;
+    }
+    if ((m = line.match(/^(\s*)([-*+]|\d{1,9}[.)])\s+/))) {
+      flush();
+      const [list, next] = listBlock(lines, i);
+      out.push(list);
+      i = next;
+      continue;
+    }
+    para.push(line.trim());
+    i++;
+  }
+  flush();
+  return out;
+}
+function listBlock(lines, i) {
+  const first = lines[i].match(/^(\s*)([-*+]|(\d{1,9})[.)])\s+/);
+  const indent = first[1].length;
+  const ordered = first[3] !== undefined;
+  const list = el(ordered ? "ol" : "ul", ordered && first[3] !== "1" ? { start: first[3] } : {});
+  while (i < lines.length) {
+    const m = lines[i].match(/^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/);
+    if (!m || m[1].length !== indent) break;
+    const body = [m[3]];
+    i++;
+    // Continuation: deeper-indented lines (nested lists, wrapped text).
+    while (i < lines.length && (lines[i].trim() === "" ? (lines[i + 1] ?? "").match(/^\s+/)?.[0].length > indent : lines[i].match(/^\s*/)[0].length > indent)) {
+      body.push(lines[i].slice(Math.min(indent + 2, lines[i].match(/^\s*/)[0].length)));
+      i++;
+    }
+    const task = body[0].match(/^\[([ xX])\]\s+(.*)$/);
+    if (task) body[0] = task[2];
+    const kids = body.length === 1 ? inline(body[0]) : blocks(body).flatMap((b) => (b.tagName === "P" ? [...b.childNodes] : [b]));
+    list.append(el("li", {}, task ? el("input", { type: "checkbox", disabled: true, checked: task[1] !== " ", "aria-label": task[1] !== " " ? "done" : "not done" }) : null, task ? " " : null, kids));
+  }
+  return [list, i];
+}
+
+// Light syntax colouring for the languages agents trade here (Python, JS, shell, JSON).
+const KW = {
+  python: "and as assert async await break class continue def del elif else except False finally for from global if import in is lambda None nonlocal not or pass raise return True try while with yield",
+  js: "async await break case catch class const continue default delete do else export extends false finally for function if import in instanceof let new null return super switch this throw true try typeof undefined var void while yield",
+  sh: "if then else fi for do done case esac in function export echo cd",
+};
+const LANG = { py: "python", python: "python", js: "js", javascript: "js", ts: "js", typescript: "js", json: "js", sh: "sh", bash: "sh", shell: "sh", console: "sh" };
+function highlight(code, lang) {
+  const kind = LANG[lang?.toLowerCase()];
+  if (!kind) return [code];
+  const kws = new Set(KW[kind].split(" "));
+  const com = kind === "js" ? "\\/\\/[^\\n]*|\\/\\*[\\s\\S]*?\\*\\/" : "#[^\\n]*";
+  const re = new RegExp(`(${com})|("""[\\s\\S]*?"""|'''[\\s\\S]*?'''|f?"(?:\\\\.|[^"\\\\\\n])*"|f?'(?:\\\\.|[^'\\\\\\n])*'|\`(?:\\\\.|[^\`\\\\])*\`)|\\b(\\d+(?:\\.\\d+)?)\\b|\\b([A-Za-z_]\\w*)(?=\\s*\\()|\\b([A-Za-z_]\\w*)\\b`, "g");
+  const out = [];
+  let last = 0, m;
+  while ((m = re.exec(code))) {
+    if (m.index > last) out.push(code.slice(last, m.index));
+    if (m[1]) out.push(el("span", { class: "tk-com" }, m[1]));
+    else if (m[2]) out.push(el("span", { class: "tk-str" }, m[2]));
+    else if (m[3]) out.push(el("span", { class: "tk-num" }, m[3]));
+    else if (m[4]) out.push(kws.has(m[4]) ? el("span", { class: "tk-kw" }, m[4]) : el("span", { class: "tk-fn" }, m[4]));
+    else out.push(kws.has(m[5]) ? el("span", { class: "tk-kw" }, m[5]) : m[5]);
+    last = re.lastIndex;
+  }
+  if (last < code.length) out.push(code.slice(last));
+  return out;
+}
+const CODE_CLAMP_LINES = 16;
+function codeBlock(code, lang) {
+  const n = code.split("\n").length;
+  const copy = copyBtn(() => code, "Copy");
+  const wrap = el("button", { class: "act", type: "button", "aria-pressed": "false", title: "Wrap long lines", onclick: (ev) => {
+    const on = box.classList.toggle("wrap");
+    ev.currentTarget.setAttribute("aria-pressed", on);
+  } }, ICON(I_WRAP), el("span", { class: "sr-only" }, "Wrap lines"));
+  const box = el("div", { class: "codeblock" },
+    el("div", { class: "ch" }, el("span", {}, lang || "text", el("span", { style: "opacity:.6" }, ` · ${n} line${n === 1 ? "" : "s"}`)), el("span", {}, wrap, copy)),
+    el("pre", { tabindex: 0 }, el("code", {}, highlight(code, lang))));
+  if (n > CODE_CLAMP_LINES) {
+    box.classList.add("clamp");
+    const b = el("button", { type: "button", "aria-expanded": "false", onclick: () => {
+      const open = box.classList.toggle("clamp");
+      b.setAttribute("aria-expanded", !open);
+      b.replaceChildren(open ? `Show all ${n} lines` : "Show fewer lines");
+    } }, `Show all ${n} lines`);
+    box.append(el("div", { class: "cfoot" }, b));
+  }
+  return box;
+}
+function copyBtn(get, label) {
+  const b = el("button", { class: "act", type: "button", title: label }, ICON(I_COPY), el("span", {}, label));
+  b.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(get()); } catch {}
+    b.replaceChildren(ICON(I_CHECK), el("span", {}, "Copied"));
+    setTimeout(() => b.replaceChildren(ICON(I_COPY), el("span", {}, label)), 1400);
+  });
+  return b;
+}
+
+// ---------------------------------------------------------------------------
+// Thread rendering
+// ---------------------------------------------------------------------------
+const PEOPLE = {
+  lead: { name: "lead", role: "owner", fp: "7f3e" },
+  planner: { name: "planner-agent", role: "sender", fp: "a91c", desc: "plans and reviews" },
+  coder: { name: "coder-agent", role: "sender", fp: "c204", desc: "writes the code" },
+  me: { name: "sender (web)", role: "sender", fp: "221d", me: true },
+  runner: { name: "runner-01", role: "runner", fp: "0be7" },
+};
+const initials = (n) => (n.split(/[^\p{L}\p{N}]+/u).filter(Boolean).slice(0, 2).map((w) => w[0]).join("") || "?").toUpperCase();
+const hhmm = (d) => d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+const GROUP_MS = 5 * 60 * 1000;
+const COLLAPSE_PX = 520;
+
+const thread = document.getElementById("thread");
+const scroller = document.getElementById("scroller");
+let lastAuthor = null, lastAt = 0;
+
+function head(p, at) {
+  return el("div", { class: "mhead" },
+    el("strong", {}, p.name),
+    el("span", { class: "role" }, p.role),
+    el("time", { datetime: at.toISOString() }, hhmm(at)),
+    el("span", { class: "ver", title: "Signature verified against this participant's key" }, ICON(I_CHECK, 12), el("span", { class: "sr-only" }, "verified")));
+}
+function shell(who, at, content, actions) {
+  const p = PEOPLE[who];
+  const cont = lastAuthor === who && at - lastAt < GROUP_MS;
+  lastAuthor = who; lastAt = at;
+  return el("article", { class: `msg${p.me ? " mine" : ""}${cont ? " cont" : ""}`, tabindex: -1, "aria-label": `${p.name}, ${hhmm(at)}` },
+    el("div", { class: `av ${p.role}`, "aria-hidden": "true" }, initials(p.name)),
+    el("div", { class: "mbody" }, head(p, at), content, actions));
+}
+
+function textMessage(who, text, at) {
+  const md = el("div", { class: "md" }, markdown(text));
+  const raw = el("pre", { class: "raw", hidden: true }, text);
+  const content = el("div", { class: "content" }, md, raw);
+  const srcBtn = el("button", { class: "act", type: "button", "aria-pressed": "false", title: "Show the exact text that was sent" }, ICON(I_CODE), el("span", {}, "Source"));
+  srcBtn.addEventListener("click", () => {
+    const on = raw.hidden;
+    raw.hidden = !on; md.hidden = on;
+    srcBtn.setAttribute("aria-pressed", on);
+  });
+  const p = PEOPLE[who];
+  const actions = el("div", { class: "actions" },
+    p.me ? el("span", { class: "act", style: "cursor:default" }, el("span", { class: "stamp" }, hhmm(at)), el("span", { class: "ver" }, ICON(I_CHECK, 12))) : null,
+    copyBtn(() => text, "Copy"), srcBtn);
+  const node = shell(who, at, content, actions);
+  node._content = content;
+  node._words = text.split(/\s+/).filter(Boolean).length;
+  return node;
+}
+
+// Collapse after layout, when the real height is known.
+function maybeCollapse(node) {
+  const c = node._content;
+  if (!c || c.scrollHeight <= COLLAPSE_PX) return;
+  c.classList.add("collapsed");
+  const words = node._words.toLocaleString();
+  const btn = el("button", { class: "more", type: "button", "aria-expanded": "false" });
+  const label = (open) => btn.replaceChildren(ICON(open ? I_CHEV_UP : I_CHEV), open ? "Show less" : "Show full message", open ? null : el("span", { class: "n" }, `${words} words`));
+  label(false);
+  btn.addEventListener("click", () => {
+    const open = c.classList.toggle("collapsed") === false;
+    btn.setAttribute("aria-expanded", open);
+    label(open);
+    // Collapsing from far below: bring the message's start back into view.
+    if (!open && node.getBoundingClientRect().top < scroller.getBoundingClientRect().top) node.scrollIntoView({ block: "start", behavior: reduced ? "auto" : "smooth" });
+  });
+  c.after(btn);
+}
+
+function fileCard(who, at, f) {
+  const list = el("details", {}, el("summary", {}, `${f.files.length} files · paths and sizes checked`),
+    el("ul", { class: "ziplist" }, f.files.map(([p, s]) => el("li", {}, el("span", {}, p), el("span", {}, s)))));
+  const card = el("div", { class: "card" },
+    el("div", { class: "fhead" }, el("div", { class: "ficon" }, "ZIP"),
+      el("div", { class: "fmeta" }, el("b", {}, f.name), el("span", {}, f.size)),
+      el("button", { class: "btn", type: "button" }, "Download")),
+    list);
+  return shell(who, at, card, el("div", { class: "actions" }));
+}
+function jobCard(who, at, j) {
+  const card = el("div", { class: "card" },
+    el("div", { class: "fhead" }, el("div", { class: "ficon py" }, "PY"),
+      el("div", { class: "fmeta" }, el("b", {}, j.file), el("span", {}, `job → ${j.runner} · timeout 30 s`)),
+      el("span", { class: "state" }, j.state)),
+    el("details", {}, el("summary", {}, "Code"), el("div", { style: "padding:8px 12px 0" }, codeBlock(j.code, "python"))),
+    el("div", { class: "out" }, el("div", { class: "lbl" }, `stdout · ${j.runner} · signed result ✓`), el("pre", { tabindex: 0 }, j.stdout)));
+  return shell(who, at, card, el("div", { class: "actions" }));
+}
+
+// ---------------------------------------------------------------------------
+// Scroll behaviour
+//  - At the bottom (within 80px): new items follow. A new item taller than
+//    the view is shown from its top, so you start reading at its beginning.
+//  - Scrolled up: nothing moves. A "N new messages" pill appears and a
+//    "New" divider marks where unread starts. Reaching the end clears both.
+//  - Your own sends always jump to the end.
+// ---------------------------------------------------------------------------
+const jump = document.getElementById("jump");
+const jumpText = document.getElementById("jump-text");
+const STICK_PX = 80;
+let unread = 0, unreadMark = null;
+const distance = () => scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+const atBottom = () => distance() < STICK_PX;
+const toBottom = (smooth = true) => scroller.scrollTo({ top: scroller.scrollHeight, behavior: smooth && !reduced ? "smooth" : "auto" });
+
+function add(node, { mine = false, initial = false } = {}) {
+  const follow = initial || mine || atBottom();
+  if (!follow && !unreadMark) {
+    unreadMark = el("div", { class: "divider unread", role: "separator" }, "New");
+    thread.append(unreadMark);
+  }
+  thread.append(node);
+  maybeCollapse(node);
+  if (initial) return;
+  appended = true; // this growth is handled here, not by the resize observer
+  if (follow) {
+    const tall = node.getBoundingClientRect().height > scroller.clientHeight * 0.75;
+    if (tall && !mine) stuck = false;
+    if (tall && !mine) scroller.scrollTo({ top: node.offsetTop - 16, behavior: reduced ? "auto" : "smooth" });
+    else toBottom();
+  } else {
+    unread++;
+  }
+  updateJump();
+}
+function updateJump() {
+  const far = distance() > 240;
+  if (unread && atBottom()) unread = 0;
+  jump.classList.toggle("on", far || unread > 0);
+  jump.classList.toggle("unread", unread > 0);
+  jump.classList.toggle("icon-only", !unread);
+  jumpText.textContent = unread ? `${unread} new message${unread === 1 ? "" : "s"}` : "";
+  jump.setAttribute("aria-label", unread ? `Jump to ${unread} new messages` : "Jump to latest");
+}
+scroller.addEventListener("scroll", () => {
+  if (atBottom() && unreadMark) {
+    // Keep the divider until the reader has seen it, then fade it out later.
+    const mark = unreadMark;
+    unreadMark = null;
+    setTimeout(() => mark.remove(), 4000);
+  }
+  updateJump();
+}, { passive: true });
+jump.addEventListener("click", () => {
+  // With unread items, land on the first one, not the very end.
+  if (unread && unreadMark) scroller.scrollTo({ top: unreadMark.offsetTop - 16, behavior: reduced ? "auto" : "smooth" });
+  else toBottom();
+});
+// Keep the pill above the composer, whatever its height.
+const dock = document.getElementById("dock");
+new ResizeObserver(() => document.documentElement.style.setProperty("--dock-h", `${dock.offsetHeight}px`)).observe(dock);
+// Images and late layout shouldn't knock a reader off the bottom.
+let stuck = true, appended = false;
+new ResizeObserver(() => {
+  if (appended) appended = false;
+  else if (stuck) toBottom(false);
+}).observe(thread);
+scroller.addEventListener("scroll", () => { stuck = atBottom(); }, { passive: true });
+
+// ---------------------------------------------------------------------------
+// Composer
+// ---------------------------------------------------------------------------
+const ta = document.getElementById("msg");
+const send = document.getElementById("send");
+const grow = () => { ta.style.height = "auto"; ta.style.height = `${Math.min(ta.scrollHeight, innerHeight * 0.4)}px`; send.disabled = !ta.value.trim(); };
+ta.addEventListener("input", grow);
+ta.addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); dock.requestSubmit(); }
+});
+dock.addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  const v = ta.value.trim();
+  if (!v) return;
+  add(textMessage("me", v, new Date()), { mine: true });
+  ta.value = ""; grow(); ta.focus();
+});
+document.getElementById("job-toggle").addEventListener("click", (ev) => {
+  const b = ev.currentTarget;
+  const on = b.getAttribute("aria-pressed") !== "true";
+  b.setAttribute("aria-pressed", on);
+  ta.placeholder = on ? "Python to run on a runner…" : "Message the session…";
+  ta.style.fontFamily = on ? "var(--mono)" : "";
+  ta.style.fontSize = on ? "13px" : "";
+});
+document.getElementById("attach").addEventListener("click", () => {
+  const slot = document.getElementById("attach-slot");
+  slot.replaceChildren(el("span", { class: "attach-chip" }, "📎 dataset.zip · 2.4 MB", el("button", { type: "button", "aria-label": "Remove attachment", onclick: () => slot.replaceChildren() }, "✕")));
+});
+
+// ---------------------------------------------------------------------------
+// Rail
+// ---------------------------------------------------------------------------
+const shellEl = document.getElementById("shell");
+const railBtn = document.getElementById("rail-btn");
+const narrow = matchMedia("(max-width: 900px)");
+const syncRail = () => railBtn.setAttribute("aria-expanded", narrow.matches ? shellEl.classList.contains("rail-open") : !shellEl.classList.contains("rail-off"));
+railBtn.addEventListener("click", () => { shellEl.classList.toggle(narrow.matches ? "rail-open" : "rail-off"); syncRail(); });
+narrow.addEventListener("change", syncRail);
+syncRail();
+document.getElementById("people").replaceChildren(...Object.values(PEOPLE).filter((p) => p.role !== "runner").map((p) =>
+  el("li", {}, el("div", { class: `av ${p.role}`, "aria-hidden": "true" }, initials(p.name)),
+    el("div", {}, el("div", { class: "pn" }, p.name, p.me ? el("span", { style: "color:var(--accent);font-size:11px;margin-left:6px" }, "you") : null),
+      el("div", { class: "ps" }, p.desc ? `${p.role} · ${p.desc}` : p.role)),
+    el("span", { class: "fp" }, p.fp))));
+
+// ---------------------------------------------------------------------------
+// Seed conversation (the same one used to test the current UI)
+// ---------------------------------------------------------------------------
+const STEPS = [
+  ["Remove `eval`", "The `apply_rule()` function evaluates rule strings with `eval(rule, {}, ctx)`. Any rule stored in the database becomes arbitrary code. Replace it with a tiny expression parser that accepts only comparisons, `and`/`or`, numbers and the names `subtotal`, `items` and `tier`."],
+  ["Drop `shell=True`", "`export_report()` calls `subprocess.run(f\"zip {path}\", shell=True)`. A path with a `;` runs a second command. Use `zipfile` from the standard library instead; it also removes the dependency on a `zip` binary in the container."],
+  ["Make rounding explicit", "Totals are floats today. Switch to `Decimal` with `ROUND_HALF_EVEN` at the edges only:\n\n```python\nfrom decimal import Decimal, ROUND_HALF_EVEN\n\ndef money(x) -> Decimal:\n    return Decimal(x).quantize(Decimal(\"0.01\"), rounding=ROUND_HALF_EVEN)\n```"],
+  ["Tests", "Add cases for:\n\n1. a rule that tries `__import__('os')` → rejected\n2. a path containing `; rm -rf ~` → zipped as a literal filename\n3. `0.1 + 0.2` style sums → exactly `0.30`\n4. tier boundaries at 100, 500 and 1000\n5. empty carts"],
+  ["Rollout", "Ship behind `DISCOUNTS_V2=1` for a week, compare totals in shadow mode, then flip the default. Anything that differs by more than one cent gets logged with the cart id.\n\n| Week | Flag | Action |\n|---|---|---|\n| 1 | off | shadow compare |\n| 2 | 10% | watch diffs |\n| 3 | 100% | remove old path |"],
+];
+const LONG = "## Refactor plan for `billing/discounts.py`\n\n" + [...STEPS, ...STEPS, ...STEPS].map(([t, b], i) => `### Step ${i + 1}: ${t}\n\n${b}`).join("\n\n");
+const PARSER = "Here is the parser core:\n\n```python\nimport ast\n\nALLOWED = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Compare,\n           ast.Gt, ast.GtE, ast.Lt, ast.LtE, ast.Eq, ast.NotEq,\n           ast.Name, ast.Load, ast.Constant, ast.Call)\nNAMES = {\"subtotal\", \"items\", \"tier\"}\nFUNCS = {\"min\": min, \"max\": max}\n\ndef check(rule: str) -> ast.Expression:\n    tree = ast.parse(rule, mode=\"eval\")\n    for node in ast.walk(tree):\n        if not isinstance(node, ALLOWED):\n            raise ValueError(f\"not allowed: {type(node).__name__}\")\n        if isinstance(node, ast.Name) and node.id not in NAMES | FUNCS.keys():\n            raise ValueError(f\"unknown name: {node.id}\")\n        if isinstance(node, ast.Call) and getattr(node.func, \"id\", None) not in FUNCS:\n            raise ValueError(\"only min() and max() may be called\")\n    return tree\n```\n\nAll 14 existing rules pass `check()`.";
+
+const t0 = Date.now() - 50 * 60 * 1000;
+const at = (min) => new Date(t0 + min * 60 * 1000);
+const SEED = [
+  () => textMessage("lead", "Morning both. Goal today: get `discounts.py` safe enough to ship. **planner**, can you draft the plan? **coder**, start on tests once it lands.", at(0)),
+  () => textMessage("planner", "On it. First pass at the risks:\n\n- `eval` on rule strings from the DB\n- `shell=True` in the export path\n- float money math\n\nFull plan coming in a minute.", at(1)),
+  () => textMessage("planner", LONG, at(2)),
+  () => textMessage("coder", "Read it. Two questions:\n\n1. Do we keep backwards compatibility for rules that use `max()`? A quick grep shows **14** rules using it.\n2. Is `Decimal` fine for the reporting job too, or does that stay float for pandas?\n\n> I'd lean towards allowing `min`/`max` as whitelisted calls.", at(9)),
+  () => textMessage("lead", "1. Yes, whitelist `min` and `max`.\n2. Reporting can convert at the boundary: `float(total)` is fine there.", at(11)),
+  () => textMessage("coder", PARSER, at(18)),
+  () => textMessage("planner", "Looks right. One nit: `ast.Constant` also admits strings and bytes; restrict it to `int | float`. Otherwise 👍", at(20)),
+  () => fileCard("coder", at(31), { name: "discounts-v2.zip", size: "48.2 KB · zip", files: [["discounts/__init__.py", "312 B"], ["discounts/rules.py", "4.1 KB"], ["tests/test_rules.py", "6.8 KB"]] }),
+  () => jobCard("coder", at(32), { file: "run_tests.py", runner: "runner-01", state: "exit 0 · 2.31 s", code: "import subprocess, sys\nsys.exit(subprocess.call([sys.executable, \"-m\", \"pytest\", \"-q\", \"tests\"]))", stdout: "........................                                  [100%]\n23 passed in 1.92s" }),
+  () => textMessage("coder", "Fixed, thanks. Tests: **23 passed**, 0 failed. Pushing to `fix/discounts-v2`.", at(33)),
+  () => textMessage("me", "Thanks both — I'll pull the branch and check the rollout table against the flag service. Is the [flag config](https://flags.example.com/billing/DISCOUNTS_V2) already created?", at(40)),
+  () => textMessage("lead", "Great work. I'll review the branch after lunch.", at(48)),
+];
+for (const make of SEED) add(make(), { initial: true });
+toBottom(false); // open at the newest item, before the first paint
+
+// ---------------------------------------------------------------------------
+// Prototype controls
+// ---------------------------------------------------------------------------
+const plog = document.getElementById("plog");
+const say = (who, text) => add(textMessage(who, text, new Date()));
+let n = 0;
+const SIM = {
+  short: () => say("planner", `Ping ${++n}: the CI job for \`fix/discounts-v2\` is green.`),
+  long: () => say("coder", "Second pass, with the full parser and the test table.\n\n" + PARSER + "\n\n" + LONG),
+  burst: () => ["Starting a shadow run.", "Loaded 12,408 carts.", "0 diffs above one cent.", "3 diffs of exactly one cent — all `ROUND_HALF_UP` vs `ROUND_HALF_EVEN` on `.005`.", "Done. Report: `shadow-2026-10-27.md`"]
+    .forEach((t, i) => setTimeout(() => say(i % 2 ? "coder" : "planner", t), i * 450)),
+  up: () => {
+    scroller.scrollTo({ top: 0 });
+    setTimeout(() => say("planner", "While you were reading up there: rollout week 1 starts Monday."), 600);
+    setTimeout(() => say("lead", "Approved. Ship it behind the flag."), 1300);
+  },
+};
+document.querySelectorAll("[data-sim]").forEach((b) => b.addEventListener("click", () => {
+  SIM[b.dataset.sim]();
+  plog.textContent = { short: "Arrived — followed if you were at the bottom.", long: "Long message: shown from its top, collapsed.", burst: "5 messages, grouped by sender.", up: "Scrolled up: watch the pill and the New divider." }[b.dataset.sim];
+}));
+
+// expiry tick
+let left = 2 * 3600 - 108;
+setInterval(() => { left--; const h = Math.floor(left / 3600), m = String(Math.floor(left % 3600 / 60)).padStart(2, "0"), s = String(left % 60).padStart(2, "0"); document.getElementById("exp").textContent = `${h}:${m}:${s}`; }, 1000);
+</script>
+</body>
+</html>

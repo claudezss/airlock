@@ -132,6 +132,250 @@ function explain(err) {
   return "It is malformed.";
 }
 
+// ---------- Markdown → DOM ----------
+// A CommonMark-ish subset of what agents actually send: headings, paragraphs
+// (single newlines are line breaks, as in chat), lists (nested by indent, task
+// boxes), blockquotes, fenced code, tables, rules, emphasis, inline code and
+// links. Everything is built with el() from text nodes, never innerHTML. Raw
+// HTML is shown as text. Only http(s) and mailto links are live, and remote
+// images are never fetched (that would tell a third party when and from where
+// this session is read).
+const reducedMotion = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
+const SAFE_URL = /^(https?:|mailto:)/i;
+// Past these sizes the renderer shows plain text instead: its regexes are
+// not meant for megabytes, and a sender should not be able to stall a reader.
+const MD_MAX_CHARS = 200000;
+const MD_MAX_INLINE = 10000;
+const MD_MAX_DEPTH = 6;
+const I_COPY = ["M9 9h10v10H9z", "M5 15V5h10"];
+const I_CHECK = ["M5 12l5 5 9-10"];
+const I_CODE = ["M8 6l-5 6 5 6", "M16 6l5 6-5 6"];
+const I_WRAP = ["M3 6h18", "M3 12h15a3 3 0 0 1 0 6h-4", "M16 16l-2 2 2 2", "M3 18h7"];
+const I_DOWN = ["M12 5v14", "M6 13l6 6 6-6"];
+const I_UP = ["M6 15l6-6 6 6"];
+const I_CHEV = ["M6 9l6 6 6-6"];
+
+const MD_INLINE = new RegExp([
+  "(`+)([\\s\\S]*?[^`])\\1(?!`)", // 1,2 code span
+  "!\\[([^\\]]*)\\]\\(([^)\\s]+)\\)", // 3,4 image
+  "\\[([^\\]]+)\\]\\(([^)\\s]+)\\)", // 5,6 link
+  "\\*\\*(.+?)\\*\\*|__(.+?)__", // 7,8 strong
+  "~~(.+?)~~", // 9 strikethrough
+  "(?<![\\w*])\\*(?!\\s)(.+?)(?<!\\s)\\*(?![\\w*])", // 10 emphasis
+  "(?<!\\w)_(?!\\s)(.+?)(?<!\\s)_(?!\\w)", // 11 emphasis
+  "(https?:\\/\\/[^\\s<>()]+[^\\s<>().,:;!?\"'\\]])", // 12 bare link
+  "(\\n)", // 13 line break
+].join("|"), "g");
+
+function mdInline(text, depth = 0) {
+  if (depth > MD_MAX_DEPTH || text.length > MD_MAX_INLINE) return [text];
+  const out = [];
+  const re = new RegExp(MD_INLINE);
+  let last = 0;
+  let m;
+  while ((m = re.exec(text))) {
+    if (m.index > last) out.push(text.slice(last, m.index));
+    if (m[1]) out.push(el("code", {}, m[2].replace(/^ (.*) $/, "$1")));
+    else if (m[4] !== undefined) out.push(el("span", { class: "img-blocked", title: m[4] }, "Image: ", m[3] || "no description", " · not loaded"));
+    else if (m[6] !== undefined) out.push(...mdLink(m[6], mdInline(m[5], depth + 1)));
+    else if (m[7] !== undefined || m[8] !== undefined) out.push(el("strong", {}, mdInline(m[7] ?? m[8], depth + 1)));
+    else if (m[9] !== undefined) out.push(el("del", {}, mdInline(m[9], depth + 1)));
+    else if (m[10] !== undefined || m[11] !== undefined) out.push(el("em", {}, mdInline(m[10] ?? m[11], depth + 1)));
+    else if (m[12]) out.push(...mdLink(m[12], [m[12]], true));
+    else if (m[13]) out.push(el("br"));
+    last = re.lastIndex;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
+
+const hostOf = (u) => {
+  try {
+    return new URL(u).host;
+  } catch {
+    return "";
+  }
+};
+// Returns an array of nodes: the link, or just its text when the scheme is not allowed.
+function mdLink(href, kids, bare = false) {
+  if (!SAFE_URL.test(href)) return kids;
+  const host = hostOf(href);
+  // Always say where a link really goes, unless its own text is a link to the same host.
+  const label = kids.map((k) => (typeof k === "string" ? k : k.textContent)).join("").trim();
+  const labelHost = /^https?:\/\//i.test(label) ? hostOf(label) : /^[\w-]+(\.[\w-]+)+(\/\S*)?$/.test(label) ? hostOf(`https://${label}`) : "";
+  const differs = !bare && host && labelHost !== host;
+  return [el("a", { href, target: "_blank", rel: "noopener noreferrer nofollow", title: href }, kids,
+    differs ? el("span", { class: "host" }, host) : null)];
+}
+
+function markdown(src) {
+  if (src.length > MD_MAX_CHARS) return [el("p", {}, src)];
+  try {
+    return mdBlocks(src.replace(/\r\n?/g, "\n").split("\n"), 0);
+  } catch {
+    return [el("p", {}, src)];
+  }
+}
+
+function mdBlocks(lines, depth) {
+  const out = [];
+  let i = 0;
+  const para = [];
+  const flush = () => {
+    if (para.length) out.push(el("p", {}, mdInline(para.join("\n"))));
+    para.length = 0;
+  };
+  while (i < lines.length) {
+    const line = lines[i];
+    let m;
+    if (!line.trim()) {
+      flush();
+      i++;
+    } else if ((m = line.match(/^\s{0,3}(```+|~~~+)\s*([\w+#.-]*)/))) {
+      flush();
+      const fence = m[1];
+      const body = [];
+      i++;
+      while (i < lines.length && !lines[i].trimStart().startsWith(fence)) body.push(lines[i++]);
+      i++;
+      out.push(codeBlock(body.join("\n"), m[2]));
+    } else if ((m = line.match(/^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/))) {
+      flush();
+      out.push(el(`h${Math.min(m[1].length + 1, 4)}`, {}, mdInline(m[2])));
+      i++;
+    } else if (/^\s{0,3}([-*_])(\s*\1){2,}\s*$/.test(line)) {
+      flush();
+      out.push(el("hr"));
+      i++;
+    } else if (/^\s{0,3}>/.test(line)) {
+      flush();
+      const q = [];
+      while (i < lines.length && /^\s{0,3}>/.test(lines[i])) q.push(lines[i++].replace(/^\s{0,3}>\s?/, ""));
+      out.push(el("blockquote", {}, depth < MD_MAX_DEPTH ? mdBlocks(q, depth + 1) : el("p", {}, q.join("\n"))));
+    } else if (line.includes("|") && i + 1 < lines.length && /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(lines[i + 1])) {
+      flush();
+      const cells = (l) => l.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+      const head = cells(line);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].includes("|") && lines[i].trim()) rows.push(cells(lines[i++]));
+      out.push(el("div", { class: "tbl", tabindex: 0, role: "region", "aria-label": "Table" }, el("table", {},
+        el("thead", {}, el("tr", {}, head.map((h) => el("th", {}, mdInline(h))))),
+        el("tbody", {}, rows.map((r) => el("tr", {}, head.map((_, j) => el("td", {}, mdInline(r[j] ?? "")))))))));
+    } else if (/^(\s*)([-*+]|\d{1,9}[.)])\s+/.test(line) && depth < MD_MAX_DEPTH) {
+      flush();
+      const [list, next] = mdList(lines, i, depth + 1);
+      out.push(list);
+      i = next;
+    } else {
+      para.push(line.trim());
+      i++;
+    }
+  }
+  flush();
+  return out;
+}
+
+function mdList(lines, i, depth) {
+  const first = lines[i].match(/^(\s*)([-*+]|(\d{1,9})[.)])\s+/);
+  const indent = first[1].length;
+  const ordered = first[3] !== undefined;
+  const list = el(ordered ? "ol" : "ul", ordered && first[3] !== "1" ? { start: first[3] } : {});
+  const pad = (l) => l.match(/^\s*/)[0].length;
+  while (i < lines.length) {
+    const m = lines[i].match(/^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/);
+    if (!m || m[1].length !== indent) break;
+    const body = [m[3]];
+    i++;
+    // Continuation: deeper-indented lines (nested lists, wrapped text).
+    while (i < lines.length && (lines[i].trim() === "" ? pad(lines[i + 1] ?? "") > indent : pad(lines[i]) > indent)) {
+      body.push(lines[i].slice(Math.min(indent + 2, pad(lines[i]))));
+      i++;
+    }
+    const task = body[0].match(/^\[([ xX])\]\s+(.*)$/);
+    if (task) body[0] = task[2];
+    const kids = body.length === 1 ? mdInline(body[0]) : mdBlocks(body, depth).flatMap((b) => (b.tagName === "P" ? [...b.childNodes] : [b]));
+    list.append(el("li", {}, task ? el("input", { type: "checkbox", disabled: true, checked: task[1] !== " ", "aria-label": task[1] !== " " ? "done" : "not done" }) : null,
+      task ? " " : null, kids));
+  }
+  return [list, i];
+}
+
+// Light colouring for what agents trade here: Python, JavaScript, shell, JSON.
+const KEYWORDS = {
+  python: "and as assert async await break class continue def del elif else except False finally for from global if import in is lambda None nonlocal not or pass raise return True try while with yield",
+  js: "async await break case catch class const continue default delete do else export extends false finally for function if import in instanceof let new null return super switch this throw true try typeof undefined var void while yield",
+  sh: "if then else fi for do done case esac in function export echo cd",
+};
+const LANGS = { py: "python", python: "python", js: "js", javascript: "js", ts: "js", typescript: "js", json: "js", sh: "sh", bash: "sh", shell: "sh", console: "sh" };
+const MD_MAX_HIGHLIGHT = 100000;
+function highlight(code, lang) {
+  const kind = LANGS[lang?.toLowerCase()];
+  if (!kind || code.length > MD_MAX_HIGHLIGHT) return [code];
+  const kws = new Set(KEYWORDS[kind].split(" "));
+  const comment = kind === "js" ? "\\/\\/[^\\n]*|\\/\\*[\\s\\S]*?\\*\\/" : "#[^\\n]*";
+  const re = new RegExp(`(${comment})|("""[\\s\\S]*?"""|'''[\\s\\S]*?'''|f?"(?:\\\\.|[^"\\\\\\n])*"|f?'(?:\\\\.|[^'\\\\\\n])*'|\`(?:\\\\.|[^\`\\\\])*\`)|\\b(\\d+(?:\\.\\d+)?)\\b|\\b([A-Za-z_]\\w*)(?=\\s*\\()|\\b([A-Za-z_]\\w*)\\b`, "g");
+  const out = [];
+  let last = 0;
+  let m;
+  while ((m = re.exec(code))) {
+    if (m.index > last) out.push(code.slice(last, m.index));
+    if (m[1]) out.push(el("span", { class: "tk-com" }, m[1]));
+    else if (m[2]) out.push(el("span", { class: "tk-str" }, m[2]));
+    else if (m[3]) out.push(el("span", { class: "tk-num" }, m[3]));
+    else if (m[4]) out.push(kws.has(m[4]) ? el("span", { class: "tk-kw" }, m[4]) : el("span", { class: "tk-fn" }, m[4]));
+    else out.push(kws.has(m[5]) ? el("span", { class: "tk-kw" }, m[5]) : m[5]);
+    last = re.lastIndex;
+  }
+  if (last < code.length) out.push(code.slice(last));
+  return out;
+}
+
+// A copy button that says so on itself and in the live region.
+function copyBtn(get, label = "Copy") {
+  const idle = () => [svg(I_COPY, 14), el("span", {}, label)];
+  const b = el("button", { class: "act", type: "button", title: label }, idle());
+  let t;
+  b.addEventListener("click", async () => {
+    let ok = true;
+    try {
+      await navigator.clipboard.writeText(get());
+    } catch {
+      ok = false;
+    }
+    b.replaceChildren(...(ok ? [svg(I_CHECK, 14), el("span", {}, "Copied")] : [el("span", {}, "Copy failed")]));
+    announce(ok ? "Copied" : "Could not copy");
+    clearTimeout(t);
+    t = setTimeout(() => b.replaceChildren(...idle()), 1400);
+  });
+  return b;
+}
+
+const CODE_CLAMP_LINES = 16;
+// `keep` = { set, key }: remembers "Show all" across re-renders of the card that holds the block.
+function codeBlock(code, lang, keep = null) {
+  const n = code.split("\n").length;
+  const wrap = el("button", { class: "act", type: "button", "aria-pressed": "false", title: "Wrap long lines", onclick: (ev) => {
+    ev.currentTarget.setAttribute("aria-pressed", String(box.classList.toggle("wrap")));
+  } }, svg(I_WRAP, 14), el("span", { class: "sr-only" }, "Wrap lines"));
+  const box = el("div", { class: "codeblock" },
+    el("div", { class: "ch" }, el("span", {}, lang || "text", el("span", { class: "dim" }, ` · ${n} line${n === 1 ? "" : "s"}`)), el("span", { class: "chtools" }, wrap, copyBtn(() => code))),
+    el("pre", { tabindex: 0 }, el("code", {}, highlight(code, lang))));
+  if (n > CODE_CLAMP_LINES) {
+    const open = !!keep?.set.has(keep.key);
+    box.classList.toggle("clamp", !open);
+    const b = el("button", { type: "button", "aria-expanded": String(open) }, open ? "Show fewer lines" : `Show all ${n} lines`);
+    b.addEventListener("click", () => {
+      const clamped = box.classList.toggle("clamp");
+      b.setAttribute("aria-expanded", String(!clamped));
+      b.replaceChildren(clamped ? `Show all ${n} lines` : "Show fewer lines");
+      if (keep) clamped ? keep.set.delete(keep.key) : keep.set.add(keep.key);
+    });
+    box.append(el("div", { class: "cfoot" }, b));
+  }
+  return box;
+}
+
 // ---------- IndexedDB: identity, events and ciphertext blobs ----------
 let dbPromise;
 const openDb = () =>
