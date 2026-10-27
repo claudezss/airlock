@@ -18,7 +18,9 @@ and publishes the result. Every package's version is
 The workflow refuses a tag whose commit is not on `main` or whose version does
 not match the workspace version. It builds the `airlox` binary for macOS
 (arm64, x64), Linux (arm64, x64; static musl) and Windows (x64), and from them
-(pull requests build only the Linux x64 binary and wheel):
+(pull requests build only the Linux x64 binary and wheel, unless they change
+`packaging/` or the build and release workflows; a manual CI run builds
+everything):
 
 | Where | What |
 |---|---|

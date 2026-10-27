@@ -171,6 +171,29 @@ async fn join(
     Ok((kp, token))
 }
 
+fn private_dir(dir: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Keep an invite received with a code at `<session dir>/invite-<role>.txt`
+/// (mode 0600), replacing an older one.
+fn save_invite(dir: &std::path::Path, invite: &Invite, link: &str) -> Result<PathBuf> {
+    private_dir(dir)?;
+    let path = dir.join(format!("invite-{}.txt", invite.role.as_str()));
+    if std::fs::read_to_string(&path).is_ok_and(|s| s.trim() == link) {
+        return Ok(path);
+    }
+    let _ = std::fs::remove_file(&path);
+    crate::cli::write_private(&path, link)?;
+    Ok(path)
+}
+
 pub async fn run(args: JoinArgs) -> Result<()> {
     for t in std::iter::once(&args.name).chain(&args.labels) {
         if !is_runner_token(t) {
@@ -178,18 +201,43 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         }
     }
     let http = client::http()?;
+    let root = args.cache_dir.clone().unwrap_or_else(default_cache_root);
     let link = match (&args.code, &args.invite) {
-        (Some(code), _) => client::receive_code(&http, &args.relay, code).await?,
+        (Some(code), invite) => {
+            if invite.is_some() {
+                eprintln!("note: using --code; ignoring the invite from --invite or AIRLOX_INVITE");
+            }
+            client::receive_code(&http, &args.relay, code).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "{e:#}\nA code works once. If this runner already used it, restart it with the invite it saved:\n  \
+                     AIRLOX_INVITE=\"$(cat '{}/<session>/invite-runner.txt')\" airlox runner join --name {} ...",
+                    root.display(),
+                    args.name
+                )
+            })?
+        }
         (None, Some(link)) => link.clone(),
         (None, None) => bail!("pass --invite or --code"),
     };
     let invite = Invite::parse(&link).context("not a valid invite link")?;
+    let sid = invite.session_id.clone();
+    let dir = root.join(&sid);
+    // A code works once: save what it carried before anything else can fail,
+    // so neither a failed start nor a restart needs a new code.
+    if args.code.is_some() {
+        let saved = save_invite(&dir, &invite, &link)?;
+        let quoted = format!("'{}'", saved.display().to_string().replace('\'', r"'\''"));
+        eprintln!("Saved the {} invite to {quoted}.", invite.role.as_str());
+        if invite.role == Role::Runner {
+            eprintln!(
+                "To restart this runner later:\n  AIRLOX_INVITE=\"$(cat {quoted})\" airlox runner join --name {} ...",
+                args.name
+            );
+        }
+    }
     if invite.role != Role::Runner {
         bail!("this is a {} invite; runners need the runner invite", invite.role.as_str());
     }
-    let sid = invite.session_id.clone();
-    let root = args.cache_dir.clone().unwrap_or_else(default_cache_root);
-    let dir = root.join(&sid);
     // Rejoin as the same participant if this cache has an identity for this name.
     let id_path = dir.join(format!("identity-runner-{}.json", args.name));
     let saved: Option<Identity> = std::fs::read(&id_path).ok().and_then(|b| serde_json::from_slice(&b).ok());
@@ -217,25 +265,7 @@ pub async fn run(args: JoinArgs) -> Result<()> {
     }
     let limits = manifest.job_limits.clone().context("execute session without job limits")?;
 
-    std::fs::create_dir_all(&dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    }
-    // A code works once: keep what it carried so the runner can restart.
-    if args.code.is_some() {
-        let saved = dir.join("invite-runner.txt");
-        if !saved.exists() {
-            crate::cli::write_private(&saved, &link)?;
-        }
-        eprintln!(
-            "Saved the runner invite to {}. To restart this runner later:\n  AIRLOX_INVITE=\"$(cat {})\" airlox runner join --name {} ...",
-            saved.display(),
-            saved.display(),
-            args.name
-        );
-    }
+    private_dir(&dir)?;
     let state_dir = root.join("runner");
     let mut backend = match args.sandbox {
         SandboxArg::Docker => Backend::Docker(Docker::new(

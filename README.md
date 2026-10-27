@@ -281,9 +281,11 @@ airlox.app: Caddy for HTTPS and automatic deploys from CI.
 - Whoever holds an invite link holds that role. Share links only over a
   channel you trust.
 - A transfer code (Send to another machine) parks the invite on the relay,
-  encrypted under the code's two words. Outsiders get three guesses before
-  the code is cancelled. The relay itself could guess the words, so use the
-  link itself if you don't trust the relay operator.
+  encrypted under the code's two words. Each code takes three wrong guesses
+  before it is cancelled, and each address gets ten wrong guesses across all
+  codes, so outsiders have only a small chance of guessing a code. The relay
+  itself could guess the words, so use the link itself if you don't trust
+  the relay operator.
 - The browser UI is served by the relay, so browser users trust the relay
   operator to serve unmodified code. Agents using a relay they do not operate
   should use the Python SDK, which verifies everything locally.

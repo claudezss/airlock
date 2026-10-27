@@ -229,49 +229,63 @@ const mmss = (ms) => { const s = Math.max(0, Math.ceil(ms / 1000)); return `${St
 function sendCode(name, url) {
   const wrap = el("div", { class: "send-code" });
   const start = el("button", { class: "small", type: "button", onclick: () => open() }, "Send to another machine");
-  const idle = () => wrap.replaceChildren(el("div", { class: "row" }, start));
+  const idle = ({ focus = false } = {}) => {
+    wrap.replaceChildren(el("div", { class: "row" }, start));
+    if (focus) start.focus();
+  };
   let drop = null; // { n, token, timer }
-  const stop = async ({ cancel }) => {
+  const stop = ({ cancel }) => {
     if (!drop) return;
     clearInterval(drop.timer);
     openDrops.delete(drop.n);
     if (cancel) api("DELETE", `/v1/drops/${drop.n}`, { token: drop.token }).catch(() => {});
     drop = null;
   };
+  // markRevoked() calls this before it removes the row's controls.
+  wrap.cancelCode = () => stop({ cancel: true });
   const panel = (...kids) => wrap.replaceChildren(el("div", { class: "send-panel stack", role: "group", "aria-label": `Send ${name.toLowerCase()} invite` }, ...kids));
-  const ended = (cls, text, again = true) => panel(
-    el("p", { class: `send-note ${cls}`, role: "status" }, text),
-    el("div", { class: "row" }, again ? el("button", { class: "small", type: "button", onclick: () => open() }, "New code") : null,
-      el("button", { class: "small", type: "button", onclick: idle }, "Done")));
+  const ended = (cls, text, { again = true } = {}) => {
+    stop({ cancel: false });
+    const next = again ? el("button", { class: "small", type: "button", onclick: () => open() }, "New code") : null;
+    const done = el("button", { class: "small", type: "button", onclick: () => idle({ focus: true }) }, "Done");
+    panel(el("p", { class: `send-note ${cls}` }, text), el("div", { class: "row" }, next, done));
+    announce(text);
+    (next || done).focus();
+  };
 
   async function open() {
-    await stop({ cancel: true });
+    stop({ cancel: true });
     panel(el("p", { class: "muted hint-text" }, "Making a code…"));
-    let code, n, token, expires;
+    let code, n, token, deadline;
     try {
       const s = ac.transferSeal(url);
       const r = await (await api("POST", "/v1/drops", { body: JSON.stringify({ claim_hash: s.claimHash, box: s.box }), headers: { "Content-Type": "application/json" } })).json();
-      ({ nameplate: n, token, expires_at_ms: expires } = r);
+      ({ nameplate: n, token } = r);
+      // Count down from now rather than trust this browser's clock against the relay's.
+      deadline = Date.now() + r.ttl_ms;
       code = `${n}-${s.secret}`;
     } catch (e) {
       return ended("bad", `Could not make a code: ${e.message || e}`);
     }
-    const clock = el("span", { class: "mono send-clock", "aria-label": "Time left" }, mmss(expires - Date.now()));
+    const left = el("span", {}, mmss(deadline - Date.now()));
     const cli = name === "Runner"
       ? `airlox runner join --code ${code} --name my-runner --sandbox docker${relayFlag()}`
       : `airlox receive ${code}${relayFlag()}`;
     const cmd = el("code", {}, cli);
+    const big = el("div", { class: "send-big", tabindex: -1 }, el("span", { class: "sr-only" }, "Code: "), code);
     panel(
-      el("div", { class: "send-head" }, el("strong", {}, `Send ${name.toLowerCase()} invite`), clock),
+      el("div", { class: "send-head" }, el("strong", {}, `Send ${name.toLowerCase()} invite`),
+        el("span", { class: "mono send-clock" }, el("span", { class: "sr-only" }, "Expires in "), left)),
       el("p", { class: "muted hint-text" }, "On the other machine, open ", el("span", { class: "mono" }, `${location.host}/receive`), " and type:"),
-      el("div", { class: "send-big", "aria-label": `Code ${code.split("-").join(" ")}` }, code),
+      big,
       el("p", { class: "muted hint-text" }, name === "Runner" ? "Or run this there:" : "Or print the link there with:"),
       cmd,
       el("div", { class: "row" }, copyButton("Copy command", () => cli, () => cmd, "Command with the code")),
-      el("p", { class: "muted hint-text send-wait" }, "Waiting for the other machine · works once"),
+      el("p", { class: "muted hint-text send-wait" }, "Waiting for the other machine · works once. Keep this page open: leaving it cancels the code."),
       el("div", { class: "row" },
         el("button", { class: "small", type: "button", onclick: () => open() }, "New code"),
-        el("button", { class: "small", type: "button", onclick: async () => { await stop({ cancel: true }); idle(); } }, "Cancel")));
+        el("button", { class: "small", type: "button", onclick: () => { stop({ cancel: true }); idle({ focus: true }); } }, "Cancel")));
+    big.focus();
     announce(`Code ${code} ready`);
     openDrops.set(n, token);
     drop = { n, token, timer: null };
@@ -279,29 +293,23 @@ function sendCode(name, url) {
     const mine = drop;
     drop.timer = setInterval(async () => {
       if (drop !== mine) return;
-      clock.textContent = mmss(expires - Date.now());
-      if (Date.now() >= expires) {
-        await stop({ cancel: false });
-        return ended("", "The code expired before anyone used it.");
-      }
+      left.textContent = mmss(deadline - Date.now());
       if (polling) return;
       polling = true;
       try {
         const st = await (await api("GET", `/v1/drops/${n}`, { token })).json();
         if (drop !== mine) return;
         if (st.state === "picked_up") {
-          await stop({ cancel: false });
-          ended("good", `Picked up ${hhmm(st.picked_up_at_ms)} · the code is gone. If that wasn't you, revoke ${name}.`, false);
-          announce("Invite picked up");
+          ended("good", `Picked up ${hhmm(st.picked_up_at_ms)} · the code is gone.${name === "Owner" ? "" : ` If that wasn't you, revoke ${name}.`}`, { again: false });
         } else if (st.state === "burned") {
-          await stop({ cancel: false });
           ended("bad", "Someone typed wrong words too many times, so the code was cancelled. Make a new one.");
+        } else if (st.state === "expired") {
+          ended("", "The code expired before anyone used it.");
+        } else if (st.state === "cancelled") {
+          ended("", "The code was cancelled when this page was left. Make a new one.");
         }
       } catch (e) {
-        if (e.status === 404 && drop === mine) {
-          await stop({ cancel: false });
-          ended("", "The code is no longer on the relay (it expired, or the relay restarted).");
-        }
+        if (e.status === 404 && drop === mine) ended("", "The code is no longer on the relay (it expired, or the relay restarted).");
       } finally {
         polling = false;
       }
@@ -312,22 +320,36 @@ function sendCode(name, url) {
 }
 
 // ---------- receive (at /receive) ----------
+const RECEIVE_ERRORS = {
+  used: "This code was already used. Ask for a new one.",
+  burned: "Too many wrong tries cancelled this code. Ask for a new one.",
+  cancelled: "The sender cancelled this code. Ask for a new one.",
+  expired: "This code expired. Ask for a new one.",
+};
+
 function receivePage() {
-  document.title = "Receive an invite · Airlox";
   const input = el("input", { type: "text", id: "code", class: "mono receive-input", placeholder: "7-guitar-orbit", autocomplete: "off",
-    autocapitalize: "none", spellcheck: "false", enterkeyhint: "go", "aria-describedby": "code-err", required: true });
+    autocapitalize: "none", spellcheck: "false", enterkeyhint: "go", "aria-describedby": "code-err" });
   const err = el("p", { class: "error", id: "code-err", role: "alert" });
   const go = el("button", { class: "primary", type: "submit" }, "Open session");
-  input.addEventListener("input", () => (err.textContent = ""));
+  const fail = (msg) => {
+    err.textContent = msg;
+    input.setAttribute("aria-invalid", "true");
+    input.focus();
+  };
+  input.addEventListener("input", () => {
+    err.textContent = "";
+    input.removeAttribute("aria-invalid");
+  });
   const form = el("form", { class: "panel stack receive", onsubmit: async (ev) => {
     ev.preventDefault();
     const code = input.value.trim();
-    if (!code) return (err.textContent = "Enter the code first.");
+    if (!code) return fail("Enter the code first.");
     let c;
     try {
       c = ac.transferClaim(code);
     } catch (e) {
-      return (err.textContent = String(e.message || e).replace(/^\w+Error: (invalid code: )?/, "").replace(/^./, (m) => m.toUpperCase()) + ".");
+      return fail(String(e.message || e).replace(/^\w+Error: (invalid code: )?/, "").replace(/^./, (m) => m.toUpperCase()) + ".");
     }
     go.disabled = true;
     try {
@@ -346,16 +368,16 @@ function receivePage() {
       location.assign(link);
     } catch (e) {
       go.disabled = false;
-      err.textContent = e.status === 404 ? `There is no code ${c.nameplate} on this relay. It may have expired; ask for a new one.`
+      fail(e.status === 404 ? `There is no code ${c.nameplate} on this relay. Check the number, or ask for a new code.`
         : e.status === 403 ? "Wrong code. Check the two words; a few wrong tries cancel the code."
-        : e.status === 410 ? "This code was already used or cancelled. Ask for a new one."
-        : `Could not receive the invite: ${e.message || e}`;
-      input.focus();
+        : e.status === 410 ? RECEIVE_ERRORS[e.code] || "This code no longer works. Ask for a new one."
+        : e.status === 429 ? "Too many wrong codes from this network. Wait a few minutes and try again."
+        : `Could not receive the invite: ${e.message || e}`);
     }
   } },
     el("h1", {}, "Receive an invite"),
     el("p", { class: "muted" }, "Enter the code shown on the other machine, under Send to another machine."),
-    el("label", { for: "code", class: "sr-only" }, "Code"),
+    el("label", { for: "code", class: "receive-label" }, "Code"),
     input, err, go,
     el("p", { class: "muted hint-text" }, "The link is decrypted in this browser. The relay stores it only encrypted, for a few minutes, and gives it out once."));
   show(form);
@@ -365,18 +387,23 @@ function receivePage() {
 function showRunnerCommand(link) {
   const cmd = (l) => `airlox runner join --invite '${l}' --name my-runner --sandbox docker`;
   const shown = el("code", {}, "airlox runner join --invite '", el("span", { class: "link" }, maskInvite(link)), "' --name my-runner --sandbox docker");
+  // Keep the link out of the back/forward cache, as on the create page.
   invitesShown = true;
+  invitesCreated = true;
+  const heading = el("h1", { tabindex: -1 }, "Runner invite received");
   show(el("div", { class: "panel stack receive runner-cmd" },
-    el("h1", {}, "Runner invite received"),
+    heading,
     el("p", { class: "muted" }, "Runners join from the command line. Run this on this machine; the code is used up, so copy it now."),
     shown,
     el("div", { class: "row" }, copyButton("Copy command", () => cmd(link), () => shown, "Runner command", "primary")),
     el("p", { class: "muted hint-text" }, "Install the airlox runner first: ", el("a", { href: INSTALL_URL, target: "_blank", rel: "noopener noreferrer" }, "see the install guide"), ".")));
+  heading.focus();
 }
 
 // A revoked role's invite no longer works: drop its link and Copy buttons.
 function markRevoked(row) {
   if (!row || row.querySelector(".revoked-note")) return;
+  row.querySelector(".send-code")?.cancelCode();
   row.querySelectorAll(".invite, .runner-cmd, .send-code").forEach((n) => n.remove());
   row.append(el("p", { class: "muted revoked-note" }, "Revoked for good · this link no longer works"));
 }

@@ -275,8 +275,8 @@ pub fn shim_source() -> &'static str {
 /// assigns the nameplate.
 pub fn transfer_seal(invite: &str) -> Result<(String, String, String)> {
     Invite::parse(invite)?;
-    let s = crate::transfer::seal(invite)?;
-    Ok((s.secret.clone(), s.claim_hash.clone(), s.sealed_box.clone()))
+    let crate::transfer::Sealed { secret, claim_hash, sealed_box } = crate::transfer::seal(invite)?;
+    Ok((secret, claim_hash, sealed_box))
 }
 
 /// Parse a typed transfer code. Returns `(nameplate, claim)`.

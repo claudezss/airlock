@@ -31,6 +31,8 @@ jobs:
       python: ${{ github.event_name != 'pull_request' || steps.filter.outputs.python == 'true' }}
       wasm: ${{ github.event_name != 'pull_request' || steps.filter.outputs.wasm == 'true' }}
       dist: ${{ github.event_name != 'pull_request' || steps.filter.outputs.dist == 'true' }}
+      # Build every platform for a manual run, or when packaging itself changed.
+      dist_all: ${{ github.event_name != 'pull_request' || steps.filter.outputs.packaging == 'true' }}
     steps:
       - if: github.event_name == 'pull_request'
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
@@ -72,6 +74,10 @@ jobs:
               - 'bindings/python/**'
               - python/airlox/pyproject.toml
               - python/airlox/README.md
+              - 'packaging/**'
+              - .github/workflows/build.yml
+              - .github/workflows/release.yml
+            packaging:
               - 'packaging/**'
               - .github/workflows/build.yml
               - .github/workflows/release.yml
@@ -129,11 +135,14 @@ jobs:
       - run: make test-wasm
 
   # Builds and smoke-tests the Linux x64 binary and wheel (build.yml), so a
-  # packaging breakage shows up before a tag. Only a tag builds every platform.
+  # packaging breakage shows up before a tag. A manual run, or a change to the
+  # packaging or the build and release workflows, builds every platform.
   dist:
     needs: changes
     if: needs.changes.outputs.dist == 'true'
     uses: ./.github/workflows/build.yml
+    with:
+      all_platforms: ${{ needs.changes.outputs.dist_all == 'true' }}
 
   # The single required check: green when every job that ran passed (skipped
   # jobs count as passing).

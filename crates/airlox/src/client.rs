@@ -133,8 +133,8 @@ pub async fn create_session(http: &reqwest::Client, base: &str, signed_manifest:
 }
 
 /// `POST /v1/drops/{n}/claim`: trade a one-time transfer code for the
-/// invite link it carries. The code is used up, right or wrong guesses alike
-/// count against it.
+/// invite link it carries. A right code is used up; a wrong one spends one
+/// of the few tries the code has.
 pub async fn receive_code(http: &reqwest::Client, relay: &str, code: &str) -> Result<String> {
     let code = airlox_core::transfer::Code::parse(code)?;
     let relay = relay.trim_end_matches('/');
@@ -149,13 +149,25 @@ pub async fn receive_code(http: &reqwest::Client, relay: &str, code: &str) -> Re
                 bail!("no code {} on {}; it may have expired", code.to_code_string(), relay_text(relay))
             }
             Some(403) => bail!("wrong code: check the two words"),
-            Some(410) => bail!("this code was already used, cancelled or burned; ask for a new one"),
+            Some(410) => {
+                let why = match e.downcast_ref::<RelayError>().map(|r| r.code.as_str()) {
+                    Some("used") => "was already used",
+                    Some("burned") => "was cancelled after too many wrong tries",
+                    Some("cancelled") => "was cancelled by the sender",
+                    Some("expired") => "expired",
+                    _ => "no longer works",
+                };
+                bail!("code {} {why}; ask for a new one", code.to_code_string())
+            }
+            Some(429) => bail!("too many wrong codes from this address; wait a few minutes"),
             _ => return Err(e),
         },
     };
     let v = read_json(r).await?;
     let sealed = v["box"].as_str().context("relay sent no box")?;
-    code.open(sealed).context("the code's words do not open what the relay sent")
+    // Checks it is an invite link, so nothing else reaches the terminal.
+    airlox_core::api::transfer_open(&code.to_code_string(), sealed)
+        .context("the code's words do not open what the relay sent")
 }
 
 /// `POST /v1/sessions/{id}/participants`: returns the bearer token.

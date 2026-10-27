@@ -126,9 +126,14 @@ box    = nonce(12) || AES-256-GCM(key, nonce, invite_link, aad = "airlox transfe
   and opens the box. The relay hands it out once.
 - Codes are lowercased, and spaces or underscores read as `-`.
 - The secret has 16 bits. Against outsiders the relay's limits protect it:
-  three wrong claims burn a drop, and a drop lives for minutes. The relay
-  itself can try every secret against `claim_hash`, so a transfer code
-  trusts the relay with the invite in a way the link's fragment does not.
+  three wrong claims burn a drop, a drop lives for minutes, and one address
+  gets ten wrong claims per TTL over all drops (unknown numbers included).
+  So an outsider gets a handful of guesses in 65,536 overall, not three per
+  open code, and can cancel only a few codes. Many addresses (say, IPv6
+  ranges) can still guess more and cancel more codes; a cancelled code tells
+  its sender to make a new one. The relay itself can try every secret
+  against `claim_hash`, so a transfer code trusts the relay with the invite
+  in a way the link's fragment does not.
 
 ## 5. Role certificates and joining
 
@@ -565,14 +570,17 @@ the proxy appended; earlier entries are client-controlled and ignored.
 ### Transfer codes (§4.1)
 
 Held in memory only, for `--drop-ttl` (default 10 minutes); a restart forgets
-them. Nameplates are the lowest free positive integer.
+them. Nameplates are drawn at random from `1..=max(100, 4 × drops held)`. A
+finished drop (claimed, burned, cancelled or expired) keeps its nameplate for
+another TTL, so a stale code gets `410` rather than reaching a newer drop.
+Only open drops count toward the limits.
 
 | Request | Body / auth | Answer |
 | --- | --- | --- |
-| `POST /v1/drops` | `{claim_hash, box}`; `box` at most 4096 bytes decoded | `201 {nameplate, token, expires_at_ms}`; `429` over `--max-drops` or `--max-drops-per-ip` |
-| `POST /v1/drops/{n}/claim` | `{claim}` | `200 {box}` once; `403` wrong claim; `410 used` after a claim; `410 burned` on the third wrong claim; `404` unknown or expired |
-| `GET /v1/drops/{n}` | `Authorization: Bearer {token}` | `{state: waiting \| picked_up \| burned, picked_up_at_ms, expires_at_ms}` |
-| `DELETE /v1/drops/{n}` | `Authorization: Bearer {token}` | `204`; the code stops working |
+| `POST /v1/drops` | `{claim_hash, box}`; `box` at most 4096 bytes decoded | `201 {nameplate, token, expires_at_ms, ttl_ms}`; `429` over `--max-drops` or `--max-drops-per-ip` open drops |
+| `POST /v1/drops/{n}/claim` | `{claim}` | `200 {box}` once; `403` wrong claim; `410` with `error` `used`, `burned` (third wrong claim), `cancelled` or `expired`; `404` unknown; `429` once the address has ten wrong claims this TTL |
+| `GET /v1/drops/{n}` | `Authorization: Bearer {token}` | `{state: waiting \| picked_up \| burned \| cancelled \| expired, picked_up_at_ms, expires_at_ms}` |
+| `DELETE /v1/drops/{n}` | `Authorization: Bearer {token}` | `204`; the code stops working (`410 cancelled`) |
 
 ## 13. Execute HTTP binding
 

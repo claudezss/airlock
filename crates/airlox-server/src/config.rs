@@ -84,6 +84,7 @@ pub struct Config {
     /// Transfer codes open at once, relay-wide (they are held in memory).
     #[arg(long, env = "AIRLOX_MAX_DROPS", default_value_t = 1000)]
     pub max_drops: usize,
+    /// Transfer codes one address may have open at once.
     #[arg(long, env = "AIRLOX_MAX_DROPS_PER_IP", default_value_t = 10)]
     pub max_drops_per_ip: usize,
     /// How often expiry, idle and eviction timers are checked.
