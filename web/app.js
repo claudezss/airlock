@@ -154,6 +154,8 @@ const I_WRAP = ["M3 6h18", "M3 12h15a3 3 0 0 1 0 6h-4", "M16 16l-2 2 2 2", "M3 1
 const I_DOWN = ["M12 5v14", "M6 13l6 6 6-6"];
 const I_UP = ["M6 15l6-6 6 6"];
 const I_CHEV = ["M6 9l6 6 6-6"];
+const I_SEND = ["M12 19V5", "M6 11l6-6 6 6"];
+const I_PANEL = ["M5 4h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z", "M15 4v16"];
 
 const MD_INLINE = new RegExp([
   "(`+)([\\s\\S]*?[^`])\\1(?!`)", // 1,2 code span
@@ -1026,35 +1028,55 @@ async function sessionView() {
 
 function buildSessionLayout(s) {
   const { sid, inv, manifest, identity } = s;
+  // The session page is an app shell: the header stays put and the timeline
+  // and the details rail scroll on their own. The landing page keeps its own flow.
+  document.body.classList.add("app-shell");
   app.classList.add("wide");
-  const timeline = el("div", { class: "timeline", role: "log", "aria-live": "off", "aria-label": "Session timeline", tabindex: -1 },
+  const timeline = el("div", { class: "timeline thread", role: "log", "aria-live": "off", "aria-label": "Session timeline", tabindex: -1 },
     el("div", { class: "pill" }, `${inv.role === "owner" ? "you opened the session" : `you joined as ${inv.role}`} · keys stay in this browser`),
     el("p", { class: "empty" }, "No messages yet. Items appear here as soon as someone sends one."));
+  const scroller = el("div", { class: "scroller", id: "scroller" }, timeline);
   const people = el("ul", { class: "people" });
   const banner = el("div", { class: "banner", tabindex: -1, hidden: true });
   const canSend = ["owner", "sender"].includes(inv.role);
 
   // composer
   const status = el("p", { class: "status", role: "alert" });
-  const text = el("textarea", { id: "msg", rows: 2, placeholder: "Message the session…" });
+  const text = el("textarea", { id: "msg", rows: 1, placeholder: "Message the session…" });
   // The attach button opens the picker; the input itself stays out of the tab order.
   const file = el("input", { type: "file", id: "file", class: "sr-only", tabindex: -1, "aria-hidden": "true", accept: Object.keys(FILE_TYPES).join(",") });
-  const pending = el("span", { class: "pending-file", hidden: true });
-  const sendBtn = el("button", { class: "primary", type: "submit" }, "Send");
+  const pending = el("span", { class: "attach-chip", hidden: true });
+  const sendBtn = el("button", { class: "send", type: "submit", title: "Send", "aria-label": "Send", disabled: true }, svg(I_SEND, 18));
   const execute = manifest.mode === "execute";
   const jobUi = canSend && execute ? buildJobPanel(s, text, file) : null;
-  const attach = el("button", { class: "icon-btn", type: "button", title: "Attach a file", "aria-label": "Attach a file", onclick: () => file.click() }, svg(ICON_CLIP));
+  const attach = el("button", { class: "icon", type: "button", title: "Attach a file", "aria-label": "Attach a file", onclick: () => file.click() }, svg(ICON_CLIP));
+  // The box grows with its text, up to 40% of the window.
+  const grow = () => {
+    text.style.height = "auto";
+    text.style.height = `${Math.min(text.scrollHeight, innerHeight * 0.4)}px`;
+  };
+  // Send is live only with something to send, and while nothing else blocks it.
+  const syncSend = () => {
+    sendBtn.disabled = !!s.closed || !!sendBtn.dataset.busy || !!jobUi?.blocked() || (!text.value.trim() && !file.files?.[0]);
+  };
+  const update = () => {
+    grow();
+    syncSend();
+  };
   const showPending = () => {
     const f = file.files?.[0];
     pending.hidden = !f;
     if (f) pending.replaceChildren(svg(ICON_CLIP, 14), el("span", {}, f.name),
-      el("button", { type: "button", class: "small", "aria-label": "Remove attachment", onclick: () => {
+      el("button", { type: "button", "aria-label": "Remove attachment", onclick: () => {
         file.value = "";
         showPending();
+        text.focus({ preventScroll: true });
       } }, "✕"));
+    syncSend();
   };
   file.addEventListener("change", showPending);
-  if (jobUi) jobUi.setSend(sendBtn);
+  text.addEventListener("input", update);
+  if (jobUi) jobUi.setSend(sendBtn, update);
   const submit = async () => {
     if (sendBtn.disabled) return;
     sendBtn.disabled = true;
@@ -1067,6 +1089,7 @@ function buildSessionLayout(s) {
           showPending();
           text.value = "";
           jobUi.off();
+          setHint();
           announce("Job submitted");
         }
         return;
@@ -1093,28 +1116,48 @@ function buildSessionLayout(s) {
       status.replaceChildren(...[e.final ? e.message : `Not sent: ${e.message || e}`, e.detail && el("span", { class: "detail" }, e.detail)].filter(Boolean));
     } finally {
       delete sendBtn.dataset.busy;
-      sendBtn.disabled = !!s.closed || !!jobUi?.blocked();
+      update();
       jobUi?.refresh(); // also links the reason to a blocked Send job
+      // The button just went disabled under the pointer: keep typing possible.
+      if (!s.closed && (!document.activeElement || document.activeElement === document.body)) text.focus({ preventScroll: true });
     }
   };
+  // Enter sends, Shift+Enter breaks the line. In job mode the box holds code,
+  // so Enter stays a line break and only Ctrl/Cmd+Enter sends; the same on
+  // touch screens, where there is no Shift and the Send button is right there.
   text.addEventListener("keydown", (ev) => {
-    if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey)) {
+    if (ev.key !== "Enter" || ev.isComposing || ev.keyCode === 229) return;
+    const mod = ev.metaKey || ev.ctrlKey;
+    if (mod || (!ev.shiftKey && !jobUi?.active() && !touchOnly())) {
       ev.preventDefault();
       submit();
     }
   });
+  const mac = navigator.platform.startsWith("Mac");
+  const hint = el("p", { class: "chint" });
+  const kbd = (...keys) => keys.flatMap((k, i) => [i ? "+" : null, el("kbd", {}, k)]).filter(Boolean);
+  const setHint = () => {
+    hint.replaceChildren(...(jobUi?.active() ? ["Python job · ", ...kbd(mac ? "⌘" : "Ctrl", "Enter"), " send · ", ...kbd("Enter"), " new line"]
+      : touchOnly() ? ["Markdown supported · encrypted in this browser"]
+      : ["Markdown supported · ", ...kbd("Enter"), " send · ", ...kbd("Shift", "Enter"), " new line · encrypted in this browser"]));
+  };
+  jobUi?.toggle.addEventListener("click", setHint);
+  setHint();
   const composer = canSend
-    ? el("form", { class: "composer-wrap", onsubmit: (ev) => {
+    ? el("form", { class: "dock", autocomplete: "off", onsubmit: (ev) => {
         ev.preventDefault();
         submit();
       } },
         el("div", { class: "composer" },
           jobUi?.panel,
+          el("div", { class: "attach-slot" }, pending),
           el("label", { for: "msg", class: "sr-only" }, "Message the session"), text,
-          el("div", { class: "toolbar" }, attach, file, pending, jobUi?.toggle,
-            touchOnly() ? null : el("span", { class: "hint" }, navigator.platform.startsWith("Mac") ? "⌘↵ to send" : "Ctrl+↵ to send"), sendBtn)),
-        status)
+          el("div", { class: "cbar" }, attach, file, jobUi?.toggle, el("span", { class: "spacer" }), sendBtn)),
+        status, hint)
     : el("div", { class: "panel readonly", tabindex: -1 }, `You joined as ${inv.role}. You can read this session but not post to it.`);
+  // The dock keeps its place under the timeline; the note that replaces the
+  // composer when the session ends goes into the same slot.
+  const dockSlot = el("div", { class: "dock-slot" }, composer);
 
   // rail
   const closeErr = el("p", { class: "error", role: "alert" });
@@ -1193,7 +1236,7 @@ function buildSessionLayout(s) {
     el("div", { class: "stack" }, el("p", { class: "muted hint-text" }, MASKED_NOTE), Object.values(inviteRows))) : null;
   const runnerList = el("ul", { class: "runners" });
   const runnerNote = el("p", { class: "muted" });
-  const rail = el("aside", { class: "rail" },
+  const rail = el("aside", { class: "rail", id: "rail", "aria-label": "Session details", tabindex: -1 },
     el("section", {}, el("h2", {}, "Participants"), people),
     execute ? el("section", { class: "stack", id: "runner-console", tabindex: -1, "aria-label": "Runner console" }, el("h2", {}, "Runners"), runnerList, runnerNote) : null,
     el("section", {}, el("h2", {}, "Allowed types"), el("div", { class: "chips" }, manifest.allowed_types.map((t) => el("span", { class: "chip" }, t)))),
@@ -1213,29 +1256,59 @@ function buildSessionLayout(s) {
         await clearSession(sid);
         location.reload();
       } }, "Clear local history")));
-  // Owners see pending runner approvals above the timeline; on narrow
-  // screens the rail (and the runner console) sits below it.
+  // The details rail sits at the right of the timeline; below 900px it is a
+  // drawer that the header button opens over it.
+  const narrow = matchMedia("(max-width: 900px)");
+  const railBtn = el("button", { class: "ghost", id: "rail-btn", type: "button", "aria-controls": "rail", title: "Session details" },
+    svg(I_PANEL, 18), el("span", { class: "sr-only" }, "Session details"));
+  const railOpen = () => (narrow.matches ? session.classList.contains("rail-open") : !session.classList.contains("rail-off"));
+  const syncRail = () => railBtn.setAttribute("aria-expanded", String(railOpen()));
+  const setRail = (open) => {
+    session.classList.toggle(narrow.matches ? "rail-open" : "rail-off", narrow.matches ? open : !open);
+    syncRail();
+  };
+  // Approvals and the runner console live in the rail: make sure it is showing.
+  s.openRail = () => {
+    if (!railOpen()) setRail(true);
+  };
+  railBtn.addEventListener("click", () => {
+    setRail(!railOpen());
+    if (narrow.matches && railOpen()) rail.focus({ preventScroll: true });
+  });
+  narrow.addEventListener("change", syncRail);
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Escape" || !narrow.matches || !railOpen()) return;
+    setRail(false);
+    railBtn.focus();
+  });
+
+  // Owners see pending runner approvals above the timeline.
   const approvalText = el("span", {});
   const approvalBanner = el("div", { class: "banner approval", hidden: true }, approvalText,
     el("button", { type: "button", class: "small primary", onclick: () => {
+      s.openRail();
       const sec = document.getElementById("runner-console");
       sec?.scrollIntoView({ block: "start" });
       (sec?.querySelector("button.primary") || sec)?.focus({ preventScroll: true });
     } }, "Review runners"));
-  show(el("div", { class: "session" }, el("h1", { class: "sr-only" }, `Session ${sid.slice(0, 7)}, ${manifest.mode} mode, ${inv.role}`),
-    el("div", { class: "main-col" }, approvalBanner, banner, timeline, composer), rail));
+  const jumpText = el("span", {});
+  const jump = el("button", { class: "jump", type: "button", "aria-label": "Jump to latest" }, svg(I_DOWN, 16), jumpText);
+  const session = el("div", { class: "session" }, el("h1", { class: "sr-only" }, `Session ${sid.slice(0, 7)}, ${manifest.mode} mode, ${inv.role}`),
+    el("div", { class: "main-col" }, approvalBanner, banner, scroller, jump, dockSlot), rail);
+  // Tapping the timeline closes the drawer.
+  session.querySelector(".main-col").addEventListener("pointerdown", () => narrow.matches && railOpen() && setRail(false));
+  show(session);
+  syncRail();
   // A #fragment would replace the stored invite on reload: move focus instead.
   const skip = (label, to) => el("a", { class: "skip", href: "#", onclick: (ev) => {
     ev.preventDefault();
-    to().focus();
+    to().focus({ preventScroll: true });
   } }, label);
   const skipMsg = canSend ? skip("Skip to message box", () => text) : null;
   document.body.prepend(...[skipMsg, skip("Skip to timeline", () => timeline)].filter(Boolean));
-  // The sticky composer must not cover the newest card when it scrolls into view.
-  if (canSend && typeof ResizeObserver !== "undefined") {
-    const wrap = document.querySelector(".composer-wrap");
-    new ResizeObserver(() => document.documentElement.style.setProperty("--composer-h", `${Math.ceil(wrap.getBoundingClientRect().height)}px`))
-      .observe(wrap);
+  // The jump button rides above the dock, whatever height it has.
+  if (typeof ResizeObserver !== "undefined") {
+    new ResizeObserver(() => session.style.setProperty("--dock-h", `${Math.ceil(dockSlot.getBoundingClientRect().height)}px`)).observe(dockSlot);
   }
 
   // header
@@ -1251,6 +1324,7 @@ function buildSessionLayout(s) {
   expiry.hidden = false;
   const conn = el("span", { class: "conn mono", role: "status", hidden: true });
   expiry.before(conn);
+  expiry.after(railBtn);
   const tick = () => {
     const left = manifest.expires_at_ms === null ? Infinity : manifest.expires_at_ms - Date.now();
     if (left === Infinity && !s.closed) return (expiry.textContent = "no expiry");
@@ -1271,30 +1345,118 @@ function buildSessionLayout(s) {
   tick();
 
   if (execute) runnerLoop(s);
-  // Follow new items when the reader is at the end of the timeline (not of the
-  // page: on narrow screens the sidebar follows it), or has not scrolled yet and
-  // sees the end. Scrolled up, or well into the sidebar below: leave them be.
-  const composerH = () => parseFloat(document.documentElement.style.getPropertyValue("--composer-h")) || 0;
-  const nearBottom = () => {
-    // The newest item, not the timeline box: that can stretch to fill the column.
-    const end = (timeline.lastElementChild || timeline).getBoundingClientRect().bottom;
-    const d = end - (window.innerHeight - composerH()); // > 0: end below the visible area
-    return (d >= -48 && d <= 160) || (window.scrollY === 0 && end <= window.innerHeight);
+
+  // ----- scrolling -----
+  //  - The timeline opens at its newest item.
+  //  - A reader within STICK_PX of the end follows: new items scroll into view,
+  //    and cards that grow in place (a file arrives, a job gets its result)
+  //    keep the end in view. A new item from someone else that is taller than
+  //    three quarters of the view is shown from its top instead.
+  //  - A reader who scrolled up is left alone: a "New" divider marks where the
+  //    unread items start and the pill counts them. Reaching the end clears both.
+  //  - The reader's own sends always go to the end.
+  const STICK_PX = 80;
+  const distance = () => scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+  const atBottom = () => distance() < STICK_PX;
+  const behavior = () => (reducedMotion() ? "auto" : "smooth");
+  const toBottom = (smooth = true) => scroller.scrollTo({ top: scroller.scrollHeight, behavior: smooth ? behavior() : "auto" });
+  const topOf = (node) => scroller.scrollTop + node.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+  const toNode = (node) => scroller.scrollTo({ top: Math.max(0, topOf(node) - 16), behavior: behavior() });
+  let stuck = true; // the reader is at the end (or on their way there)
+  let followUntil = 0; // a smooth scroll to the end is under way until then
+  let handledUntil = 0; // growth until then comes from an append that already moved the view
+  let unread = 0;
+  let unreadMark = null;
+  const following = () => stuck || performance.now() < followUntil;
+  const release = () => {
+    stuck = false;
+    followUntil = 0;
   };
-  // The last item ends just above the sticky composer.
-  const toEnd = () => {
-    const last = timeline.lastElementChild;
-    if (!last) return;
-    const delta = last.getBoundingClientRect().bottom - (window.innerHeight - composerH());
-    if (Math.abs(delta) >= 1) window.scrollBy(0, delta);
+  // Something the reader did (an expanded message) must not drag the view to the end.
+  s.ui = { scroller, release };
+  const updateJump = () => {
+    if (unread && atBottom()) unread = 0;
+    const far = distance() > 240;
+    jump.classList.toggle("on", far || unread > 0);
+    jump.classList.toggle("unread", unread > 0);
+    jump.classList.toggle("icon-only", !unread);
+    jumpText.textContent = unread ? `${unread} new message${unread === 1 ? "" : "s"}` : "";
+    jump.setAttribute("aria-label", unread ? `Jump to ${unread} new message${unread === 1 ? "" : "s"}` : "Jump to latest");
+  };
+  scroller.addEventListener("scroll", () => {
+    stuck = atBottom();
+    if (stuck && unreadMark) {
+      // Leave the divider a moment so the reader sees where the unread items began.
+      const mark = unreadMark;
+      unreadMark = null;
+      setTimeout(() => mark.remove(), 4000);
+    }
+    updateJump();
+  }, { passive: true });
+  // The reader takes over from any scroll we started.
+  for (const ev of ["wheel", "touchstart", "keydown"]) scroller.addEventListener(ev, () => (followUntil = 0), { passive: true });
+  jump.addEventListener("click", () => {
+    // With unread items, land on the first one, not the very end.
+    if (unread && unreadMark) {
+      release();
+      toNode(unreadMark);
+    } else {
+      stuck = true;
+      toBottom();
+    }
+  });
+  // A reader at the end stays there when the layout changes under them: a
+  // card grows, the composer gets taller, the window is resized. The appends
+  // handled below move the view themselves and are left out.
+  if (typeof ResizeObserver !== "undefined") {
+    const keepEnd = new ResizeObserver(() => {
+      if (performance.now() >= handledUntil && following()) toBottom(false);
+      updateJump();
+    });
+    keepEnd.observe(timeline);
+    keepEnd.observe(scroller);
+  }
+  // A node that arrived after the history was shown.
+  const arrived = (node, mine, wasFollowing) => {
+    handledUntil = performance.now() + 250;
+    if (mine || wasFollowing) {
+      const tall = !mine && node.getBoundingClientRect().height > scroller.clientHeight * 0.75;
+      if (tall) {
+        release();
+        toNode(node);
+      } else {
+        stuck = true;
+        followUntil = performance.now() + 700;
+        toBottom();
+      }
+    } else if (node.classList.contains("msg")) {
+      if (!unreadMark) {
+        unreadMark = el("div", { class: "divider unread", role: "separator" }, "New");
+        node.before(unreadMark);
+        regroup(node);
+      }
+      unread++;
+    }
+    updateJump();
+  };
+  // Messages from the same author within five minutes share one header.
+  const regroup = (node) => {
+    if (!node?.classList?.contains("msg")) return;
+    const prev = node.previousElementSibling;
+    node.classList.toggle("cont", !!prev?.classList.contains("msg") && prev.dataset.author === node.dataset.author
+      && Math.abs(node.dataset.at - prev.dataset.at) < GROUP_MS);
   };
   // Timeline entries are kept in event order.
   const place = (node, seq, old) => {
     node.dataset.seq = seq;
-    if (old) return old.replaceWith(node);
-    const next = [...timeline.children].find((n) => n.dataset?.seq !== undefined && Number(n.dataset.seq) > seq);
-    if (next) next.before(node);
-    else timeline.append(node);
+    if (old) old.replaceWith(node);
+    else {
+      const next = [...timeline.children].find((n) => n.dataset?.seq !== undefined && Number(n.dataset.seq) > seq);
+      if (next) next.before(node);
+      else timeline.append(node);
+    }
+    regroup(node);
+    regroup(node.nextElementSibling);
   };
   // The session is closed or this browser lost access: nothing can be posted
   // or decided any more. Focus on a control that goes away moves to the banner.
@@ -1306,7 +1468,6 @@ function buildSessionLayout(s) {
     approvalBanner.hidden = true;
     skipMsg?.remove();
     composer.replaceWith(el("div", { class: "panel readonly", id: "composer-note" }, why));
-    document.documentElement.style.removeProperty("--composer-h");
     s.render.runners();
     if (a && a !== document.body && (!a.isConnected || a.disabled)) banner.focus({ preventScroll: true });
   };
@@ -1319,14 +1480,15 @@ function buildSessionLayout(s) {
   s.render = {
     people: () => people.replaceChildren(...[...s.participants.values()].map((p) =>
       el("li", {},
-        el("span", { class: "dot", "aria-hidden": "true" }),
+        el("span", { class: `av ${p.role}`, "aria-hidden": "true" }, initials(p.display_name)),
         el("div", { class: "who" },
           el("div", { class: "name", title: p.display_name }, p.display_name, p.participant_pub === s.me ? el("span", { class: "you" }, "you") : null),
           el("div", { class: "sub" }, `${p.role} · ${p.kind}${p.revoked ? " · revoked" : p.left ? " · left" : ""}`),
           p.description ? el("div", { class: "desc", title: "Their own description, not verified" }, el("span", { class: "claim" }, "says "), p.description) : null),
         el("span", { class: "key", title: "Key fingerprint" }, ac.fingerprint(p.participant_pub).slice(0, 4))))),
     item: (it) => {
-      const stick = nearBottom();
+      // Was the reader at the end before this change? (Measured before anything moves.)
+      const was = atBottom() || following();
       // Files an accepted result lists live only inside that result.
       if (it.kind === "file" && it.status === "ok" && claimedBy(s, it)) {
         document.getElementById(`item-${it.id}`)?.remove();
@@ -1353,10 +1515,14 @@ function buildSessionLayout(s) {
       if (s.refocus === it.id) s.refocus = null;
       const node = renderItem(s, it);
       place(node, it.seq, old);
+      collapseLong(s, node);
       if (held) (held.keep && node.querySelector(`[data-keep="${held.keep}"]:not(:disabled)`) || node).focus({ preventScroll: true });
-      // A reader at the bottom stays there, also when a card grows in place
-      // (its file arrives, its job gets a result).
-      if (stick) toEnd();
+      // New items are handled by arrived(). During the first load the resize
+      // observer keeps the end in view. A card that grows in place (its file
+      // arrives, its job gets a result) keeps a reader at the end there.
+      if (old) {
+        if (was) toBottom(false);
+      } else if (s.announce) arrived(node, it.author === s.me, was);
       settle(s, it);
       if (it.kind === "job") announceJob(s, it);
       else if (!old && s.announce && it.status === "ok" && it.author !== s.me && (it.kind === "text" || it.kind === "file"))
@@ -1370,7 +1536,12 @@ function buildSessionLayout(s) {
       approvalText.textContent = `${n} runner${n === 1 ? "" : "s"} awaiting approval`;
       jobUi?.refresh();
     },
-    scroll: toEnd,
+    // History is in: open at the newest item, at once.
+    scroll: () => {
+      stuck = true;
+      toBottom(false);
+      updateJump();
+    },
     conn: (bad) => {
       conn.textContent = bad && !s.closed ? "Reconnecting…" : "";
       conn.hidden = !conn.textContent;
@@ -1388,7 +1559,10 @@ function buildSessionLayout(s) {
     note: (seq, text, at) => {
       const id = `note-${seq}`;
       if (document.getElementById(id)) return;
-      place(el("article", { class: "item evline", id }, el("div", { class: "pill" }, text, at ? ` · ${hhmm(at)}` : "")), seq);
+      const was = atBottom() || following();
+      const node = el("article", { class: "item evline", id }, el("div", { class: "pill" }, text, at ? ` · ${hhmm(at)}` : ""));
+      place(node, seq);
+      if (s.announce) arrived(node, false, was);
     },
     closed: (reason) => {
       s.closed ||= "closed";
@@ -1676,20 +1850,89 @@ async function receive(s, seq, envelope, fetchBlob, attempt = 0) {
   if (it.kind === "event" && it.role === "owner" && ["runner_approve", "runner_reject"].includes(it.meta?.event)) approvalsChanged(s);
 }
 
-function renderItem(s, it) {
+// ---------- timeline items ----------
+const GROUP_MS = 5 * 60 * 1000; // the same author within this long shares one header
+const COLLAPSE_PX = 520; // taller messages are folded (see .collapsed in the stylesheet)
+const isoOf = (ms) => (Number.isFinite(ms) ? new Date(ms).toISOString() : "");
+
+// The frame every message, file and job sits in: avatar, header (name, role,
+// time, verified mark), content, and a row of hover actions. Pieces that add
+// to a message later (a reply quote, delivery ticks, a freshness line) have a
+// place to go:
+//   head     .mhead    in the header row; `extras.head` nodes go after the ✓
+//   content  .mbody    the first child after the header is `content`
+//   actions  .actions  `actions` nodes go after Copy/Source, also kept in `node._slots`
+// The grouping fields (data-author, data-at) are read by regroup() in the layout.
+function messageShell(s, it, { content, actions = [], bubble = false, extras = {} }) {
   const mine = it.author === s.me;
-  const cls = ["item", mine && "mine", it.status !== "ok" && it.status].filter(Boolean).join(" ");
-  const av = ["owner", "sender", "runner"].includes(it.role) ? `av-${it.role}` : "";
-  const label = it.kind === "file" ? it.subkind : it.kind;
-  const meta = el("div", { class: "meta" },
+  const ok = it.status === "ok";
+  const at = Number.isFinite(it.created) ? it.created : 0;
+  const mark = (cls) => el("span", { class: cls, title: "Signature verified against this participant's key" }, svg(I_CHECK, 12), el("span", { class: "sr-only" }, "verified"));
+  const head = el("div", { class: "mhead" },
     el("strong", {}, it.authorName),
-    it.role ? el("span", { class: "muted" }, it.role) : null,
-    el("span", { class: "when" }, hhmm(it.created),
-      it.status === "ok" ? el("span", { class: "verified" }, " · ", sym("✓"), " verified") : null));
+    it.role ? el("span", { class: "role" }, it.role) : null,
+    el("time", { datetime: isoOf(at) }, hhmm(at)),
+    ok ? mark("ver") : null,
+    extras.head);
+  // Your own messages have no header; their time and ✓ sit with the actions.
+  const stamp = mine && ok ? el("span", { class: "act stampbox" }, el("span", { class: "stamp" }, hhmm(at)), mark("ver")) : null;
+  const all = [stamp, ...actions].filter(Boolean);
+  const bar = all.length ? el("div", { class: "actions" }, all) : null;
+  const av = ["owner", "sender", "runner"].includes(it.role) ? it.role : "";
+  const cls = ["item", "msg", mine && "mine", bubble ? "bubble" : "carded", !ok && it.status].filter(Boolean).join(" ");
+  const node = el("article", { class: cls, id: `item-${it.id}`, tabindex: -1, "aria-label": `${it.authorName}, ${hhmm(at)}`, "data-author": it.author, "data-at": at },
+    el("div", { class: `av ${av}`, "aria-hidden": "true" }, initials(it.authorName)),
+    el("div", { class: "mbody" }, head, content, bar));
+  node._slots = { head, content, actions: bar };
+  return node;
+}
+
+// A text that can be read rendered or as the exact characters that were sent.
+function sourceView(text, what = "message") {
+  const words = text.split(/\s+/).filter(Boolean).length;
+  const md = el("div", { class: "md" }, markdown(text));
+  const raw = el("pre", { class: "raw", hidden: true }, text);
+  const content = el("div", { class: "content", "data-words": words, "data-what": what }, md, raw);
+  const toggle = el("button", { class: "act", type: "button", "aria-pressed": "false", title: "Show the exact text that was sent" },
+    svg(I_CODE, 14), el("span", {}, "Source"));
+  toggle.addEventListener("click", () => {
+    const on = raw.hidden;
+    raw.hidden = !on;
+    md.hidden = on;
+    toggle.setAttribute("aria-pressed", String(on));
+  });
+  return { content, toggle };
+}
+
+// A long message is folded to a few screens once it is on the page and its
+// real height is known. "Show less" brings its start back into view.
+function collapseLong(s, node) {
+  for (const c of node.querySelectorAll(".content[data-words]")) {
+    if (c.scrollHeight <= COLLAPSE_PX) continue;
+    c.classList.add("collapsed");
+    const words = Number(c.dataset.words).toLocaleString();
+    const what = c.dataset.what || "message";
+    const btn = el("button", { class: "more", type: "button", "aria-expanded": "false" });
+    const label = (open) => btn.replaceChildren(svg(open ? I_UP : I_CHEV, 14), open ? "Show less" : `Show full ${what}`, open ? null : el("span", { class: "n" }, ` · ${words} words`));
+    label(false);
+    btn.addEventListener("click", () => {
+      const open = c.classList.toggle("collapsed") === false;
+      btn.setAttribute("aria-expanded", String(open));
+      label(open);
+      s.ui?.release(); // the reader chose this: do not drag them to the end
+      if (!open && s.ui && node.getBoundingClientRect().top < s.ui.scroller.getBoundingClientRect().top) {
+        node.scrollIntoView({ block: "start", behavior: "auto" }); // the content just shrank: jump, do not glide
+      }
+    });
+    c.after(btn);
+  }
+}
+
+function renderItem(s, it) {
+  const label = it.kind === "file" ? it.subkind : it.kind;
+  const mine = it.author === s.me;
   const card = el("div", { class: "card" });
-  const node = el("article", { class: cls, id: `item-${it.id}`, tabindex: -1 },
-    el("div", { class: `avatar ${av}`, "aria-hidden": "true" }, initials(it.authorName)),
-    el("div", { class: "body" }, meta, card));
+  const shell = (extra = {}) => messageShell(s, it, { content: card, ...extra });
   if (it.status === "evicted") {
     const noun = { text: "message", file: "file", job: "job", result: "result" }[it.kind] || "item";
     if (mine) card.append(el("p", { class: "note" }, `You sent this ${noun}, but this browser no longer has it and it is no longer on the relay.`));
@@ -1708,32 +1951,45 @@ function renderItem(s, it) {
           s.render.item(it);
         } }, "Ask again")));
     }
-    return node;
+    return shell();
   }
   if (it.status === "retry") {
     card.append(el("p", { class: "note" }, `Downloading this ${label} item failed. Retrying…`));
-    return node;
+    return shell();
   }
   if (it.status === "rejected") {
     card.append(el("p", {}, sym("✕ "), `Not shown: ${it.error}`));
     if (it.detail) card.append(el("div", { class: "detail" }, it.detail));
-    return node;
+    return shell();
   }
   const m = it.meta;
-  if (m.type === "event") return renderEvent(s, it, meta);
-  if (m.type === "text") card.append(el("p", {}, m.text));
-  else if (m.type === "file") {
+  if (m.type === "event") return renderEvent(s, it);
+  if (m.type === "text") {
+    // Others' texts read as open prose, your own as a bubble on the right.
+    const { content, toggle } = sourceView(String(m.text ?? ""));
+    const node = messageShell(s, it, { content, bubble: true, actions: [copyBtn(() => String(m.text ?? "")), toggle] });
+    if (it.note) content.after(el("p", { class: "note" }, it.note));
+    return node;
+  }
+  let node;
+  if (m.type === "file") {
     if (it.role === "runner") card.append(el("p", { class: "note" }, s.runners.find((x) => x.pub === it.author)?.relayOnly
       ? `Output file from runner ${it.authorName}. ${NOT_SHOWN_YET.replace("Not shown yet", "Not accepted yet")}`
       : `Output file from runner ${it.authorName}, not listed by an accepted result.`));
     appendFileView(card, it);
-  }
-  else if (m.type === "job") renderJob(s, it, card);
-  else if (m.type === "result") {
+    node = shell();
+  } else if (m.type === "job") {
+    renderJob(s, it, card);
+    node = shell();
+  } else if (m.type === "result") {
     const chk = resultCheck(s, it);
     card.append(chk.ok ? renderResult(s, it) : rejectedResult(chk.error, chk.pending));
+    node = shell();
     if (!chk.ok && !chk.pending) node.classList.add("rejected");
-  } else card.append(el("pre", { tabindex: 0 }, JSON.stringify(m, null, 2)));
+  } else {
+    card.append(el("pre", { tabindex: 0 }, JSON.stringify(m, null, 2)));
+    node = shell();
+  }
   if (it.note) card.append(el("p", { class: "note" }, it.note));
   return node;
 }
@@ -1741,13 +1997,17 @@ function renderItem(s, it) {
 function appendFileView(card, it) {
   const m = it.meta;
   const blobUrl = URL.createObjectURL(new Blob([it.body], { type: m.mime }));
-  card.append(el("div", { class: "file-head" },
+  const head = el("div", { class: "file-head" },
     el("span", { class: "chip type" }, it.subkind),
     el("span", { class: "fname", title: m.name }, m.name),
-    el("span", { class: "size" }, fmtBytes(it.body.length)),
-    el("a", { class: "button small", href: blobUrl, download: m.name }, "Download")));
-  if (it.subkind === "image") card.append(el("img", { src: blobUrl, alt: m.name }));
-  else if (it.subkind === "zip") {
+    el("span", { class: "size" }, fmtBytes(it.body.length)));
+  card.append(head);
+  const download = el("a", { class: "button small", href: blobUrl, download: m.name }, "Download");
+  if (it.subkind === "image") {
+    head.append(download);
+    card.append(el("img", { src: blobUrl, alt: m.name }));
+  } else if (it.subkind === "zip") {
+    head.append(download);
     try {
       const entries = JSON.parse(ac.inspectZip(it.body));
       const files = entries.filter((e) => !e.is_dir);
@@ -1757,7 +2017,18 @@ function appendFileView(card, it) {
     } catch (e) {
       card.append(el("p", { class: "error" }, "This file is not a valid ZIP."), el("div", { class: "detail" }, String(e.message || e)));
     }
-  } else card.append(el("pre", { tabindex: 0 }, new TextDecoder().decode(it.body)));
+  } else if (it.subkind === "md") {
+    // Markdown reads as formatted text; Source shows the file's exact characters.
+    const { content, toggle } = sourceView(new TextDecoder().decode(it.body), "file");
+    head.append(toggle, download);
+    card.append(el("div", { class: "filebody" }, content));
+  } else if (it.subkind === "py") {
+    head.append(download);
+    card.append(el("div", { class: "filebody" }, codeBlock(new TextDecoder().decode(it.body), "python")));
+  } else {
+    head.append(download);
+    card.append(el("pre", { tabindex: 0 }, new TextDecoder().decode(it.body)));
+  }
 }
 
 // ---------- execute mode: jobs, results, events ----------
@@ -2012,8 +2283,7 @@ function renderJob(s, it, card) {
   const m = it.meta;
   const { st, entries, accepted, text, tone, runner } = jobStatus(s, it);
   const rendered = entries.map((e) => (e.error ? rejectedResult(e.error, e.pending) : renderResult(s, e.r, e.dup ? "ignored: duplicate" : "")));
-  const lines = m.code.split("\n");
-  const code = el("pre", { tabindex: 0 }, m.code);
+  const code = codeBlock(m.code, "python", { set: s.open, key: `code:${it.id}` });
   const files = (m.files || []).map((ref) => s.items.get(ref.id)?.meta?.name || `item ${short(ref.id)}`);
   const active = !accepted && (st?.state === "assigned" || st?.state === "running");
   const canCancel = active && (s.inv.role === "owner" || it.author === s.me);
@@ -2057,9 +2327,7 @@ function renderJob(s, it, card) {
       el("dt", {}, "Limits"), el("dd", {}, `${m.runtime} · ${fmtDuration(m.timeout_s)}${m.memory_mb ? ` · ${m.memory_mb} MB` : ""}`),
       files.length ? el("dt", {}, "Inputs") : null, files.length ? el("dd", {}, files.join(", ")) : null),
     ...progress,
-    lines.length > 12
-      ? keepOpen(s, `code:${it.id}`, el("details", { class: "codebox" }, el("summary", {}, `Code · ${lines.length} lines`), code))
-      : code,
+    el("div", { class: "jobcode" }, code),
     details,
     ...rendered);
 }
@@ -2077,7 +2345,7 @@ async function cancelJob(s, it, btn) {
 }
 
 // Signed events render as one line.
-function renderEvent(s, it, meta) {
+function renderEvent(s, it) {
   const m = it.meta;
   const who = it.authorName;
   let text;
@@ -2277,6 +2545,7 @@ function buildJobPanel(s, text, file) {
   const lim = s.manifest.job_limits;
   let on = false;
   let sendBtn;
+  let sync = () => {}; // the composer's "is Send allowed" check
   let chipsSig = null; // null: the chips are not drawn yet
   let filesSig = null;
   let locked = false;
@@ -2314,15 +2583,19 @@ function buildJobPanel(s, text, file) {
     text.placeholder = on ? "Python code to run (or attach a .py file)…" : "Message the session…";
     text.classList.toggle("code", on);
     text.spellcheck = !on;
-    text.rows = on ? 7 : 2;
-    if (sendBtn) sendBtn.textContent = on ? "Send job" : "Send";
+    text.rows = on ? 7 : 1;
+    if (sendBtn) {
+      sendBtn.title = on ? "Send job" : "Send";
+      sendBtn.setAttribute("aria-label", sendBtn.title);
+    }
     if (!on && sendBtn && !sendBtn.dataset.busy) {
-      sendBtn.disabled = !!s.closed;
+      sync();
       sendBtn.removeAttribute("aria-describedby");
     }
     refresh();
   };
-  const toggle = el("button", { type: "button", class: "small", "aria-pressed": "false", onclick: () => setOn(!on) }, "Send as job");
+  const toggle = el("button", { type: "button", class: "toggle", "aria-pressed": "false", title: "Send Python to a runner to execute", onclick: () => setOn(!on) },
+    svg(I_CODE, 14), "Send as job");
   labels.addEventListener("input", () => syncReady());
 
   // The relay's rule: approved (signed by the owner here), online, idle, and
@@ -2367,7 +2640,7 @@ function buildJobPanel(s, text, file) {
     wasBlocked = !!b;
     // Not while a send is in flight: that would allow a second one.
     if (sendBtn && !sendBtn.dataset.busy) {
-      sendBtn.disabled = !!s.closed || !!b;
+      sync();
       if (b) sendBtn.setAttribute("aria-describedby", "job-ready");
       else sendBtn.removeAttribute("aria-describedby");
     }
@@ -2379,6 +2652,7 @@ function buildJobPanel(s, text, file) {
     const owner = s.inv.role === "owner";
     if (b.pending) {
       readyAct.replaceChildren(el("button", { type: "button", class: "small", onclick: () => {
+        s.openRail?.();
         const sec = document.getElementById("runner-console");
         sec?.scrollIntoView({ block: "start" });
         (sec?.querySelector(`button[data-act=approve][data-pub="${CSS.escape(b.pending.pub)}"]`) || sec)?.focus({ preventScroll: true });
@@ -2495,7 +2769,10 @@ function buildJobPanel(s, text, file) {
     toggle.disabled = true;
     for (const c of panel.querySelectorAll("button, input, summary")) c.disabled = true;
   };
-  return { panel, toggle, refresh, submit, lock, off: () => setOn(false), active: () => on, setSend: (b) => (sendBtn = b),
+  return { panel, toggle, refresh, submit, lock, off: () => setOn(false), active: () => on, setSend: (b, check) => {
+      sendBtn = b;
+      sync = check;
+    },
     blocked: () => on && !locked && !!blocker() };
 }
 
