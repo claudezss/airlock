@@ -41,6 +41,14 @@ SHIM_VERSION = 1
 IS_LINUX = sys.platform.startswith("linux")
 IS_WINDOWS = os.name == "nt"
 PR_SET_CHILD_SUBREAPER = 36
+# Windows variables that describe the machine, not the user, and that
+# programs expect (license managers, cmd, subprocess with shell=True).
+WINDOWS_SYSTEM_ENV = (
+    "WINDIR", "COMSPEC", "PATHEXT", "OS", "SystemDrive", "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER", "PROCESSOR_LEVEL", "PROCESSOR_REVISION",
+    "ProgramData", "ALLUSERSPROFILE", "PUBLIC", "ProgramFiles", "ProgramFiles(x86)",
+    "ProgramW6432", "CommonProgramFiles", "CommonProgramFiles(x86)", "CommonProgramW6432",
+)
 
 
 def become_subreaper():
@@ -222,6 +230,9 @@ def main(argv=None):
         )
         env["TEMP"] = env["TMP"] = tmpdir
         env["USERPROFILE"] = work
+        for name in WINDOWS_SYSTEM_ENV:
+            if name in os.environ:
+                env[name] = os.environ[name]
     # Variables the runner's operator chose to share, such as a license
     # server; PATH is extended, never replaced, so the job's Python stays first.
     for name in a.pass_env:

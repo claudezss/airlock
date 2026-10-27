@@ -71,6 +71,32 @@ have = {re.sub(r"[-_.]+", "-", d.metadata.get("Name") or "").lower() for d in me
 print(json.dumps({"version": platform.python_version(), "missing": [p for p in sys.argv[1:] if p not in have]}))
 "#;
 
+/// Windows variables that describe the machine, not the user, and that
+/// programs (license managers, `cmd`, Python's `shell=True`) expect. The
+/// shim's `WINDOWS_SYSTEM_ENV` passes the same names on to the job.
+#[cfg(windows)]
+const WINDOWS_SYSTEM_ENV: &[&str] = &[
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "OS",
+    "SystemDrive",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
+    "PROCESSOR_LEVEL",
+    "PROCESSOR_REVISION",
+    "ProgramData",
+    "ALLUSERSPROFILE",
+    "PUBLIC",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "CommonProgramFiles",
+    "CommonProgramFiles(x86)",
+    "CommonProgramW6432",
+];
+
 /// The environment every process the backend starts begins with: nothing
 /// of the runner's (its invite, its keys) but what the OS needs, then the
 /// operator's `--pass-env` variables.
@@ -83,6 +109,11 @@ fn base_env(cmd: &mut Command, pass_env: &[String]) {
         path.push("System32");
         let path = std::env::join_paths([path, PathBuf::from(&root)]).unwrap_or_default();
         cmd.env("SYSTEMROOT", &root).env("PATH", path);
+        for name in WINDOWS_SYSTEM_ENV {
+            if let Some(v) = std::env::var_os(name) {
+                cmd.env(name, v);
+            }
+        }
     }
     #[cfg(not(windows))]
     cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin");
@@ -336,7 +367,9 @@ impl Local {
             return Ok(c);
         }
         let mut c = Command::new(python);
-        c.arg(&self.shim)
+        // -I: the shim's own folder is not importable, nor PYTHON* honoured.
+        c.arg("-I")
+            .arg(&self.shim)
             .arg("--work")
             .arg(job.work_dir())
             .args(["--entry", &job.entry, "--timeout", &job.timeout_s.to_string()])
@@ -416,7 +449,7 @@ impl Local {
         #[cfg(windows)]
         if let Some(j) = winjob {
             peak_mem_kb = Some(j.peak_kb());
-            // An allocation the cap refused usually ends the job with an error.
+            // Windows refused an allocation at the cap, and the job then failed.
             oom_killed =
                 j.hit_memory_limit() && shim.as_ref().is_some_and(|s| s.exit_code.is_some_and(|c| c != 0));
             // Dropping the job kills anything the job left running.

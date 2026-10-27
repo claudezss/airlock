@@ -162,7 +162,8 @@ The join request is signed by the participant key the certificate names:
     "description": "A100 80 GB, CUDA 12; data team",   // optional
     "kind": "sdk|cli|web|runner",
     "runner": null | { "name": "runner-01", "labels": ["cpu"], "host": "build-box",
-                       "sandbox": "local|docker|kubernetes", "network_unblocked": false },
+                       "sandbox": "local|docker|kubernetes|process", "network_unblocked": false,
+                       "version": "0.1.1", "python": "3.12.4" },   // version, python optional
     "created_at_ms": 0
   },
   "sig": "<participant signature, context join, over canonical(join)>"
@@ -184,6 +185,13 @@ between visible characters (emoji sequences, Persian, Indic scripts);
 variation selectors (U+FE00–FE0F, Mongolian U+180B–180D) and the combining
 grapheme joiner only directly after a visible character, never in a run.
 Direction marks (LRM, RLM, ALM) are allowed.
+
+A runner's `version` (the airlox version it runs) and `python` (the
+interpreter version its jobs get) are optional, up to 32 characters of
+`[A-Za-z0-9.+-]`, and omitted rather than `null` when absent. Runners send
+`version` always. Relays and clients from before these fields (and before the
+`process` sandbox) reject such joins as malformed, so upgrade the relay
+before its runners.
 
 `description` is optional (the rules above apply): text in which the
 participant says what it is or does (a receiving agent's purpose, a runner's
@@ -582,10 +590,10 @@ purged with the session. The relay builds two exports at a time; more are
 | 403 | `forbidden`, `revoked` | role, author or content policy not allowed; a join with a revoked role's invite |
 | 404 | `not_found` | no such session or item |
 | 408 | `timeout` | request body stalled or upload too slow |
-| 409 | `conflict`, `duplicate`, `present`, `not_wanted`, `uploading` | duplicate session or participant key; a duplicate item id (`duplicate`); a want or re-seed for a blob the relay has; a re-seed nobody asked for; enough re-seeds of that blob already in flight |
+| 409 | `conflict`, `duplicate`, `present`, `not_wanted`, `uploading`, `runner_busy` | duplicate session or participant key; a duplicate item id (`duplicate`), or one still being uploaded (`uploading`: retry); a want or re-seed for a blob the relay has; a re-seed nobody asked for; enough re-seeds of that blob already in flight; a job whose matching runner is busy |
 | 410 | `closed`, `evicted` | session closed (or closed and not re-creatable), or blob already delivered |
-| 413 | `too_large` | body, envelope, item, session storage or session history limit (re-seeds included) |
-| 429 | `limit` | relay, address, participant, stream, item, transfer, want or re-seed limit; two audit exports already being built |
+| 413 | `too_large`, `storage_wait`, `session_full` | body, envelope or item limit; the session's storage is full until deliveries free some (`storage_wait`: retry); the session history limit (`session_full`) |
+| 429 | `limit`, `session_full` | relay, address, participant, stream, want or re-seed limit, or two audit exports already being built (`limit`: retry later); the session's item or transfer limit (`session_full`: it will not lift). `progress` items also get `session_full` once a session has used nine tenths of its item or history limit, which is kept for results |
 | 507 | `storage_full` | relay disk above its high watermark |
 
 **Address limits.** The per-address session limit counts IPv4 addresses

@@ -22,7 +22,9 @@ use airlox_core::payload::{JobResult, Payload, MAX_STDIO_BYTES};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use super::{record, Ctx, Poster, Sealed, RESULT_PATIENCE};
+use airlox_core::keys::Keypair;
+
+use super::{record_to, Poster, Sealed};
 use crate::client::is_transient;
 use crate::view::write_atomic;
 
@@ -76,7 +78,13 @@ pub(super) fn is_complete(dir: &Path) -> bool {
 /// counts as sent. Once the result is posted (or refused for good) the job
 /// is recorded as answered and the folder removed. While the relay stays
 /// unreachable the folder is kept, for the next try or the next start.
-pub(super) async fn deliver(ctx: &Ctx, poster: &Poster, dir: &Path) -> Result<()> {
+pub(super) async fn deliver(
+    kp: &Keypair,
+    done_file: &Path,
+    poster: &Poster,
+    dir: &Path,
+    patience: std::time::Duration,
+) -> Result<()> {
     let answer_path = dir.join("answer.json");
     let mut answer: Answer = serde_json::from_slice(&fs::read(&answer_path)?)
         .with_context(|| format!("reading {}", answer_path.display()))?;
@@ -90,7 +98,7 @@ pub(super) async fn deliver(ctx: &Ctx, poster: &Poster, dir: &Path) -> Result<()
         let blob_path = env_path.with_extension("blob");
         let env = fs::read_to_string(&env_path)?;
         let blob = fs::read(&blob_path)?;
-        if let Err(e) = poster.send(&env, &blob, RESULT_PATIENCE).await {
+        if let Err(e) = poster.send(&env, &blob, patience).await {
             if is_transient(&e) {
                 return Err(e.context("the relay is unreachable; the answer stays queued"));
             }
@@ -113,7 +121,7 @@ pub(super) async fn deliver(ctx: &Ctx, poster: &Poster, dir: &Path) -> Result<()
     let (result_env, result_blob) = (dir.join("result.env"), dir.join("result.blob"));
     if !result_env.is_file() {
         let sealed = poster.seal(
-            &ctx.keypair,
+            kp,
             ItemKind::Result,
             None,
             answer.refs.clone(),
@@ -122,13 +130,12 @@ pub(super) async fn deliver(ctx: &Ctx, poster: &Poster, dir: &Path) -> Result<()
         write_atomic(&result_blob, &sealed.blob, 0o600)?;
         write_atomic(&result_env, sealed.env.as_bytes(), 0o600)?;
     }
-    let sent =
-        poster.send(&fs::read_to_string(&result_env)?, &fs::read(&result_blob)?, RESULT_PATIENCE).await;
+    let sent = poster.send(&fs::read_to_string(&result_env)?, &fs::read(&result_blob)?, patience).await;
     match sent {
         Err(e) if is_transient(&e) => Err(e.context("the relay is unreachable; the result stays queued")),
         outcome => {
             // Delivered, or refused for good: either way, never again.
-            record(ctx, &format!("{job} posted"))?;
+            record_to(done_file, &format!("{job} posted"))?;
             let _ = fs::remove_dir_all(dir);
             outcome.context("the relay refused the result")
         }

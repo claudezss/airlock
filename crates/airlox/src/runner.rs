@@ -66,12 +66,13 @@ pub struct JoinArgs {
     /// instead of --invite. The invite is saved for restarts.
     #[arg(long)]
     pub code: Option<String>,
-    /// The relay to talk to: where --code is claimed (default
-    /// https://airlox.app), and, when given, where the runner connects
-    /// instead of the host in the invite, such as a port-forward
-    /// (http://127.0.0.1:8080). The session's keys still come only from the
-    /// invite, and the relay is never trusted with them.
-    #[arg(long, env = "AIRLOX_RELAY")]
+    /// The relay to talk to: where --code is claimed (default: AIRLOX_RELAY,
+    /// else https://airlox.app), and where the runner connects instead of
+    /// the host in the invite, such as a port-forward
+    /// (http://127.0.0.1:8080): https, or http to this machine only. Only
+    /// this flag redirects the runner, never the environment. The session's
+    /// keys still come only from the invite.
+    #[arg(long)]
     pub relay: Option<String>,
     /// This runner's name, shown to senders: [a-z0-9][a-z0-9._-]{0,62}.
     #[arg(long)]
@@ -294,6 +295,38 @@ fn check_args(args: &JoinArgs) -> Result<()> {
     Ok(())
 }
 
+/// Text from a file a Windows tool may have written: UTF-8 with or without
+/// a byte-order mark, or UTF-16 with one (PowerShell 5's `>`).
+fn decode_text(bytes: &[u8]) -> Result<String> {
+    let utf16 = |b: &[u8], le: bool| {
+        let units = b.chunks_exact(2).map(|c| {
+            if le {
+                u16::from_le_bytes([c[0], c[1]])
+            } else {
+                u16::from_be_bytes([c[0], c[1]])
+            }
+        });
+        String::from_utf16(&units.collect::<Vec<_>>()).map_err(anyhow::Error::from)
+    };
+    match bytes {
+        [0xFF, 0xFE, rest @ ..] => utf16(rest, true),
+        [0xFE, 0xFF, rest @ ..] => utf16(rest, false),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => Ok(String::from_utf8(rest.to_vec())?),
+        _ => Ok(String::from_utf8(bytes.to_vec())?),
+    }
+}
+
+/// A relay URL the runner may be pointed at: https anywhere, or plain http
+/// only to this machine (a port-forward), where nothing is sent in clear.
+fn relay_url_ok(url: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(url) else { return false };
+    match u.scheme() {
+        "https" => true,
+        "http" => matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")),
+        _ => false,
+    }
+}
+
 /// The invite link, from wherever the operator put it.
 pub(crate) async fn invite_link(
     http: &reqwest::Client,
@@ -304,17 +337,21 @@ pub(crate) async fn invite_link(
         if args.invite.is_some() {
             eprintln!("note: using --invite-file; ignoring the invite from --invite or AIRLOX_INVITE");
         }
-        let text = std::fs::read_to_string(path)
+        let bytes = std::fs::read(path)
             .with_context(|| format!("could not read the invite file {}", path.display()))?;
-        return Ok(text.trim().to_string());
+        return Ok(decode_text(&bytes)
+            .with_context(|| format!("the invite file {} is not text", path.display()))?
+            .trim()
+            .to_string());
     }
     match (&args.code, &args.invite) {
         (Some(code), invite) => {
             if invite.is_some() {
                 eprintln!("note: using --code; ignoring the invite from --invite or AIRLOX_INVITE");
             }
-            let relay = args.relay.as_deref().unwrap_or(DEFAULT_RELAY);
-            client::receive_code(http, relay, code).await.map_err(|e| {
+            let env = std::env::var("AIRLOX_RELAY").ok().filter(|r| !r.is_empty());
+            let relay = args.relay.clone().or(env).unwrap_or_else(|| DEFAULT_RELAY.into());
+            client::receive_code(http, &relay, code).await.map_err(|e| {
                 anyhow::anyhow!(
                     "{e:#}\nA code works once. If this runner already used it, restart it with the invite it saved:\n  \
                      airlox runner join --invite-file '{}' --name {} ...",
@@ -361,6 +398,9 @@ pub async fn run(args: JoinArgs) -> Result<()> {
     let url = match args.relay.as_deref() {
         Some(r) if r.trim_end_matches('/') != base => {
             let r = r.trim_end_matches('/').to_string();
+            if !relay_url_ok(&r) {
+                bail!("--relay {r}: use https, or http to this machine (localhost, 127.0.0.1, [::1])");
+            }
             tracing::info!(relay = %r, invite_relay = %base, "connecting through the given relay URL");
             r
         }
@@ -415,10 +455,11 @@ pub async fn run(args: JoinArgs) -> Result<()> {
     if nix::unistd::getuid().is_root() && args.sandbox != SandboxArg::Docker {
         bail!("refusing to run the local sandbox as root; run the runner as an unprivileged user, or use --sandbox docker");
     }
-    // Jobs run as the runner's own user: an administrator's or SYSTEM's
-    // rights would be theirs too.
+    // Process-sandbox jobs run as the runner's own user: an administrator's
+    // or SYSTEM's rights would be theirs too. (`local` off Linux is the
+    // development mode for trusted code, and says so when it starts.)
     #[cfg(windows)]
-    if args.sandbox != SandboxArg::Docker {
+    if args.sandbox == SandboxArg::Process {
         if let Some(who) = crate::sandbox::winjob::privileged() {
             bail!(
                 "refusing to run jobs as {who}: they would get the same rights. Run the runner as an ordinary \
@@ -464,6 +505,11 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         session = %sid, name = %args.name, participant = %kp.public().fingerprint(),
         sandbox = ?backend.kind(), "joined as a runner"
     );
+    let view = View::new(relay.clone(), signed, invite.session_key(), kp.public(), dir.clone())?;
+    let view = Arc::new(Mutex::new(view));
+    let outbox = dir.join(format!("outbox-{}", args.name));
+    job::deliver_saved(&kp, &done_file, &outbox, &view).await;
+
     let spec = RuntimeSpec { runtime: limits.runtime.clone(), packages: limits.packages.clone() };
     // A session that keeps jobs off the network cannot have that from the
     // process sandbox, unless the operator accepted the gap.
@@ -492,8 +538,6 @@ pub async fn run(args: JoinArgs) -> Result<()> {
     }
     relay.report("ready", None, owed).await?;
 
-    let view = View::new(relay.clone(), signed, invite.session_key(), kp.public(), dir.clone())?;
-    let view = Arc::new(Mutex::new(view));
     // Unsandboxed jobs see their real paths (in tracebacks, os.getcwd()):
     // under the system temp directory those do not name this user or where
     // the runner keeps its cache. Sandboxed jobs see /work.
@@ -515,7 +559,7 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         network: limits.network && !args.no_network,
         progress_interval: args.progress_interval,
         progress_tail: args.progress_tail as usize,
-        outbox: dir.join(format!("outbox-{}", args.name)),
+        outbox,
         exit_before_posting: args.exit_before_posting,
     });
     job::report_interrupted(&ctx, &view).await;

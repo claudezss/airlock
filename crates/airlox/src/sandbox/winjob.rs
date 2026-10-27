@@ -15,19 +15,21 @@
 use std::mem::{size_of, zeroed};
 
 use anyhow::{bail, Result};
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LUID};
 use windows_sys::Win32::Security::{
-    CheckTokenMembership, CreateWellKnownSid, GetTokenInformation, IsWellKnownSid, TokenElevation, TokenUser,
-    WinBuiltinAdministratorsSid, WinLocalSystemSid, SECURITY_MAX_SID_SIZE, TOKEN_ELEVATION, TOKEN_QUERY,
-    TOKEN_USER,
+    CheckTokenMembership, CreateWellKnownSid, GetTokenInformation, IsWellKnownSid, LookupPrivilegeValueW,
+    TokenElevation, TokenElevationType, TokenElevationTypeLimited, TokenPrivileges, TokenUser,
+    WinBuiltinAdministratorsSid, WinLocalSystemSid, SECURITY_MAX_SID_SIZE, TOKEN_ELEVATION,
+    TOKEN_ELEVATION_TYPE, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicUIRestrictions,
-    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
-    TerminateJobObject, JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectAssociateCompletionPortInformation,
+    JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+    SetInformationJobObject, TerminateJobObject, JOBOBJECT_ASSOCIATE_COMPLETION_PORT,
+    JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_JOB_MEMORY,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_UILIMIT_DESKTOP, JOB_OBJECT_UILIMIT_DISPLAYSETTINGS,
     JOB_OBJECT_UILIMIT_EXITWINDOWS, JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES,
@@ -37,6 +39,7 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, OpenProcessToken, OpenThread, ResumeThread, CREATE_NO_WINDOW, CREATE_SUSPENDED,
     THREAD_SUSPEND_RESUME,
 };
+use windows_sys::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED};
 
 /// Creation flags for a process that will join a job before it runs.
 pub const SUSPENDED: u32 = CREATE_SUSPENDED | CREATE_NO_WINDOW;
@@ -46,6 +49,11 @@ pub const NO_WINDOW: u32 = CREATE_NO_WINDOW;
 
 /// Exit code the job's processes get when the runner stops them.
 const STOPPED: u32 = 0xA1;
+
+/// Job notifications (winnt.h): a process, or the job as a whole, tried to
+/// commit more memory than its limit allows.
+const JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT: u32 = 9;
+const JOB_OBJECT_MSG_JOB_MEMORY_LIMIT: u32 = 10;
 
 fn last_error(what: &str) -> anyhow::Error {
     anyhow::anyhow!("{what}: {}", std::io::Error::last_os_error())
@@ -66,7 +74,8 @@ impl Drop for Handle {
 /// everything still in it.
 pub struct WinJob {
     handle: Handle,
-    memory_limit: usize,
+    /// Where Windows reports the job's events, such as hitting its memory cap.
+    port: Handle,
 }
 
 // SAFETY: a job handle may be used from any thread.
@@ -82,13 +91,24 @@ impl WinJob {
         if h.is_null() {
             return Err(last_error("CreateJobObjectW"));
         }
-        let job = WinJob { handle: Handle(h), memory_limit: memory_mb as usize * 1024 * 1024 };
+        let handle = Handle(h);
+        // SAFETY: a new completion port, not tied to any file.
+        let port = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1) };
+        if port.is_null() {
+            return Err(last_error("CreateIoCompletionPort"));
+        }
+        let job = WinJob { handle, port: Handle(port) };
+        let notify = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
+            CompletionKey: std::ptr::null_mut(),
+            CompletionPort: job.port.0,
+        };
+        job.set(JobObjectAssociateCompletionPortInformation, &notify, "job notifications")?;
         // SAFETY: plain-data struct, all zeroes is valid.
         let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
             | JOB_OBJECT_LIMIT_JOB_MEMORY
             | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
-        limits.JobMemoryLimit = job.memory_limit;
+        limits.JobMemoryLimit = memory_mb as usize * 1024 * 1024;
         job.set(JobObjectExtendedLimitInformation, &limits, "job limits")?;
         let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
             UIRestrictionsClass: JOB_OBJECT_UILIMIT_DESKTOP
@@ -149,10 +169,53 @@ impl WinJob {
         (info.PeakJobMemoryUsed / 1024) as u64
     }
 
-    /// The job came within 5% of its memory cap, so an allocation failure
-    /// (and the job's exit) was most likely the cap.
+    /// Windows refused one of the job's allocations because of its memory
+    /// cap, by the notifications queued so far.
     pub fn hit_memory_limit(&self) -> bool {
-        self.peak_kb() * 1024 >= (self.memory_limit as u64) / 100 * 95
+        let mut hit = false;
+        loop {
+            let (mut message, mut key, mut overlapped) = (0u32, 0usize, std::ptr::null_mut::<OVERLAPPED>());
+            // SAFETY: the port is open; all out-pointers are valid; a zero
+            // timeout returns at once when nothing is queued.
+            let got =
+                unsafe { GetQueuedCompletionStatus(self.port.0, &mut message, &mut key, &mut overlapped, 0) };
+            if got == 0 {
+                return hit;
+            }
+            hit |= matches!(message, JOB_OBJECT_MSG_JOB_MEMORY_LIMIT | JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT);
+        }
+    }
+}
+
+/// Where an open file really is (links and junctions resolved), as a
+/// `\\?\` path like [`std::fs::canonicalize`] returns.
+pub fn final_path(f: &std::fs::File) -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS,
+    };
+    let mut buf = vec![0u16; 1024];
+    loop {
+        // SAFETY: the handle is open for the life of `f`; the buffer's
+        // length is passed in u16 units.
+        let n = unsafe {
+            GetFinalPathNameByHandleW(
+                f.as_raw_handle() as HANDLE,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        } as usize;
+        if n == 0 {
+            return None;
+        }
+        // Too small: `n` is the size needed, including the terminator.
+        if n >= buf.len() {
+            buf.resize(n + 1, 0);
+            continue;
+        }
+        return Some(std::ffi::OsString::from_wide(&buf[..n]).into());
     }
 }
 
@@ -191,47 +254,68 @@ fn resume(pid: u32) -> Result<()> {
     Ok(())
 }
 
-/// Why this process must not run jobs, if it is privileged: elevated, a
-/// member of Administrators, or SYSTEM.
+/// Privileges that let a process take over the machine (impersonating a
+/// SYSTEM token, reading or replacing any file, debugging any process).
+/// Service accounts hold SeImpersonate by default.
+const DANGEROUS_PRIVILEGES: &[&str] = &[
+    "SeImpersonatePrivilege",
+    "SeAssignPrimaryTokenPrivilege",
+    "SeTcbPrivilege",
+    "SeCreateTokenPrivilege",
+    "SeDebugPrivilege",
+    "SeBackupPrivilege",
+    "SeRestorePrivilege",
+    "SeTakeOwnershipPrivilege",
+    "SeLoadDriverPrivilege",
+];
+
+/// `GetTokenInformation` into an 8-byte-aligned buffer; `None` if it fails.
+fn token_info(token: HANDLE, class: i32) -> Option<Vec<u64>> {
+    let mut len = 0u32;
+    // SAFETY: a size query (null buffer, zero length) only writes `len`.
+    unsafe { GetTokenInformation(token, class, std::ptr::null_mut(), 0, &mut len) };
+    if len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+    // SAFETY: the buffer holds `len` bytes, aligned for any token structure.
+    let ok = unsafe { GetTokenInformation(token, class, buf.as_mut_ptr().cast(), len, &mut len) };
+    (ok != 0).then_some(buf)
+}
+
+/// Why this process must not run jobs, if it is privileged: SYSTEM, an
+/// administrator (elevated or not), or an account holding a privilege that
+/// leads to SYSTEM. Fails closed: a token it cannot read counts.
 pub fn privileged() -> Option<&'static str> {
+    const UNCHECKED: &str = "a user whose token cannot be checked";
     let mut token: HANDLE = std::ptr::null_mut();
     // SAFETY: the pseudo handle of this process; the token is closed by `Handle`.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-        return Some("a user whose token cannot be checked");
+        return Some(UNCHECKED);
     }
     let token = Handle(token);
-    let mut user = [0u8; 256];
-    let mut len = 0u32;
-    // SAFETY: the buffer is large enough for TOKEN_USER plus a SID and its
-    // length is passed; the result is read only on success.
-    let ok = unsafe {
-        GetTokenInformation(token.0, TokenUser, user.as_mut_ptr().cast(), user.len() as u32, &mut len)
-    };
-    if ok != 0 {
-        // SAFETY: on success the buffer starts with a TOKEN_USER (read
-        // unaligned: the byte buffer has no alignment guarantee).
-        let tu: TOKEN_USER = unsafe { std::ptr::read_unaligned(user.as_ptr().cast()) };
-        // SAFETY: the SID points into `user`, which is still alive.
-        if unsafe { IsWellKnownSid(tu.User.Sid, WinLocalSystemSid) } != 0 {
-            return Some("SYSTEM");
-        }
+    let Some(user) = token_info(token.0, TokenUser) else { return Some(UNCHECKED) };
+    // SAFETY: the buffer starts with a TOKEN_USER whose SID points into it.
+    let sid = unsafe { (*(user.as_ptr() as *const TOKEN_USER)).User.Sid };
+    // SAFETY: the SID is valid while `user` lives.
+    if unsafe { IsWellKnownSid(sid, WinLocalSystemSid) } != 0 {
+        return Some("SYSTEM");
     }
-    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
-    // SAFETY: the buffer is a TOKEN_ELEVATION of the size given.
-    let ok = unsafe {
-        GetTokenInformation(
-            token.0,
-            TokenElevation,
-            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
-            size_of::<TOKEN_ELEVATION>() as u32,
-            &mut len,
-        )
-    };
-    if ok != 0 && elevation.TokenIsElevated != 0 {
+    let Some(elevation) = token_info(token.0, TokenElevation) else { return Some(UNCHECKED) };
+    // SAFETY: the buffer holds a TOKEN_ELEVATION.
+    if unsafe { (*(elevation.as_ptr() as *const TOKEN_ELEVATION)).TokenIsElevated } != 0 {
         return Some("an elevated administrator");
     }
-    let mut sid = [0u8; SECURITY_MAX_SID_SIZE as usize];
-    let mut sid_len = sid.len() as u32;
+    // An administrator's ordinary, unelevated token: Administrators is
+    // deny-only in it, so the membership check below misses it, but UAC is
+    // not a security boundary and a job could still elevate.
+    let Some(kind) = token_info(token.0, TokenElevationType) else { return Some(UNCHECKED) };
+    // SAFETY: the buffer holds a TOKEN_ELEVATION_TYPE.
+    if unsafe { *(kind.as_ptr() as *const TOKEN_ELEVATION_TYPE) } == TokenElevationTypeLimited {
+        return Some("an administrator (even unelevated: a job could elevate)");
+    }
+    let mut sid = [0u64; (SECURITY_MAX_SID_SIZE as usize).div_ceil(8)];
+    let mut sid_len = SECURITY_MAX_SID_SIZE;
     // SAFETY: the buffer holds any SID; its size is passed.
     let made = unsafe {
         CreateWellKnownSid(
@@ -243,11 +327,34 @@ pub fn privileged() -> Option<&'static str> {
     };
     let mut member = 0;
     // SAFETY: a null token checks the caller's effective token; the SID is valid.
-    if made != 0
-        && unsafe { CheckTokenMembership(std::ptr::null_mut(), sid.as_mut_ptr().cast(), &mut member) } != 0
-        && member != 0
+    if made == 0
+        || unsafe { CheckTokenMembership(std::ptr::null_mut(), sid.as_mut_ptr().cast(), &mut member) } == 0
     {
+        return Some(UNCHECKED);
+    }
+    if member != 0 {
         return Some("an administrator");
+    }
+    let Some(privs) = token_info(token.0, TokenPrivileges) else { return Some(UNCHECKED) };
+    // SAFETY: the buffer holds a TOKEN_PRIVILEGES with `PrivilegeCount`
+    // entries; a privilege the token lacks is not listed at all.
+    let held = unsafe {
+        let tp = privs.as_ptr() as *const TOKEN_PRIVILEGES;
+        std::slice::from_raw_parts((*tp).Privileges.as_ptr(), (*tp).PrivilegeCount as usize)
+    };
+    for name in DANGEROUS_PRIVILEGES {
+        let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        let mut luid = LUID { LowPart: 0, HighPart: 0 };
+        // SAFETY: a NUL-terminated name; `luid` is written on success.
+        if unsafe { LookupPrivilegeValueW(std::ptr::null(), wide.as_ptr(), &mut luid) } == 0 {
+            continue;
+        }
+        if held.iter().any(|p| p.Luid.LowPart == luid.LowPart && p.Luid.HighPart == luid.HighPart) {
+            return Some(match *name {
+                "SeImpersonatePrivilege" => "an account holding SeImpersonatePrivilege (it can reach SYSTEM)",
+                _ => "an account holding a privilege that can reach SYSTEM or any file",
+            });
+        }
     }
     None
 }
@@ -279,6 +386,20 @@ mod tests {
         assert!(child.try_wait().unwrap().is_none(), "resumed and running");
         job.terminate();
         assert_eq!(child.wait().unwrap().code(), Some(STOPPED as i32));
+        assert!(!job.hit_memory_limit(), "a small job never reaches its cap");
+    }
+
+    #[test]
+    fn an_allocation_over_the_cap_is_reported() {
+        let job = WinJob::new(256).unwrap();
+        let mut child = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", "$b = [byte[]]::new(1GB)"])
+            .creation_flags(SUSPENDED)
+            .spawn()
+            .unwrap();
+        job.adopt(child.as_raw_handle(), child.id()).unwrap();
+        assert!(!child.wait().unwrap().success(), "the allocation fails");
+        assert!(job.hit_memory_limit());
     }
 
     #[test]

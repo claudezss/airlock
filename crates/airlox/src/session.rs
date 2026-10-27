@@ -330,7 +330,15 @@ pub struct NoRunnerAvailable {
 
 impl std::fmt::Display for NoRunnerAvailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "no runner available: {:?}", client::relay_text(&self.message))
+        let message = client::relay_text(&self.message);
+        if self.reason == "runner_busy" {
+            write!(
+                f,
+                "runner busy: {message}; jobs are not queued. Retry when 'airlox runner list' shows it idle."
+            )
+        } else {
+            write!(f, "no runner available: {message:?}")
+        }
     }
 }
 
@@ -446,6 +454,13 @@ impl Outcome {
             runner_name,
             signed: false,
         }
+    }
+
+    /// The relay lost contact with the job's runner and no signed result
+    /// has come. Not final: the runner may still be running the job and
+    /// post its result when it is back, so check again later.
+    pub fn runner_lost(&self) -> bool {
+        !self.signed && self.reason.as_deref() == Some("runner_lost")
     }
 }
 
@@ -1068,7 +1083,9 @@ impl Session {
 
     /// Wait for a job's outcome. A job that failed on the relay (no runner,
     /// runner lost, cancelled before it started) gives an unsigned outcome
-    /// with the relay's reason. `None` if `timeout` passes first.
+    /// with the relay's reason. `None` if `timeout` passes first. A
+    /// `runner_lost` outcome ([`Outcome::runner_lost`]) is not final: a
+    /// late signed result still completes the job.
     pub async fn wait(&mut self, job: &str, timeout: Option<Duration>) -> Result<Option<Outcome>> {
         let deadline = timeout.map(|t| Instant::now() + t);
         loop {

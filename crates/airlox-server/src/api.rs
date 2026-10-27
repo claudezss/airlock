@@ -544,21 +544,40 @@ pub(crate) async fn receive_upload(
     }
     let mut reservation = {
         let mut g = s.lock();
-        if g.items.contains_key(&item_id) || g.pending.contains(&item_id) {
+        if g.items.contains_key(&item_id) {
             return Err(ApiError::conflict_code("duplicate", "an item with this id already exists"));
         }
+        // Not stored yet: the upload may still fail, so the sender retries.
+        if g.pending.contains(&item_id) {
+            return Err(ApiError::conflict_code("uploading", "this item is being uploaded; try again"));
+        }
         if g.items.len() + g.pending.len() >= cfg.max_items {
-            return Err(ApiError::limit("session is at its item limit"));
+            return Err(ApiError::session_full("session is at its item limit"));
         }
         if g.log_len() + env_json.len() as u64 + LOG_LINE_OVERHEAD > cfg.max_log_bytes {
-            return Err(ApiError::too_large("session history limit reached"));
+            return Err(ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "session_full",
+                "session history limit reached",
+            ));
+        }
+        // Progress is a nicety: the last tenth of a session's item and
+        // history budget is kept for what answers jobs.
+        let nearly_full = (g.items.len() + g.pending.len()) * 10 >= cfg.max_items * 9
+            || g.log_len() * 10 >= cfg.max_log_bytes * 9;
+        if h.kind == ItemKind::Progress && nearly_full {
+            return Err(ApiError::session_full("session is nearly full; progress reports are paused"));
         }
         if g.held_bytes + g.pending_bytes + blob_len > cfg.max_session_bytes {
-            return Err(ApiError::too_large("session would exceed its storage limit; wait for deliveries"));
+            return Err(ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "storage_wait",
+                "session would exceed its storage limit; wait for deliveries",
+            ));
         }
         // Pending uploads are already charged, so concurrent uploads cannot overshoot.
         if g.transfer_bytes + blob_len > cfg.max_session_transfer {
-            return Err(ApiError::limit("session transfer limit reached"));
+            return Err(ApiError::session_full("session transfer limit reached"));
         }
         charge_ip(&g, &ip_hash, blob_len, cfg.max_bytes_per_ip)?;
         g.pending.insert(item_id.clone());
@@ -794,7 +813,7 @@ pub async fn get_blob(
         }
         let len = r.blob_len;
         if g.transfer_bytes + len > st.store.cfg.max_session_transfer {
-            return Err(ApiError::limit("session transfer limit reached"));
+            return Err(ApiError::session_full("session transfer limit reached"));
         }
         g.transfer_bytes += len;
         g.last_activity_ms = now_ms();
@@ -974,7 +993,7 @@ pub async fn reseed(
             return Err(ApiError::too_large("session would exceed its storage limit; wait for deliveries"));
         }
         if g.transfer_bytes + blob_len > cfg.max_session_transfer {
-            return Err(ApiError::limit("session transfer limit reached"));
+            return Err(ApiError::session_full("session transfer limit reached"));
         }
         charge_ip(&g, &ip_hash, blob_len, cfg.max_bytes_per_ip)?;
         g.pending.insert(key.clone());

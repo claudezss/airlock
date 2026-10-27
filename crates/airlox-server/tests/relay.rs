@@ -429,7 +429,7 @@ async fn session_history_and_item_size_limits() {
         assert!(accepted < 50, "log cap never applied");
     };
     assert!(accepted > 0);
-    assert_eq!(error_code(last).await, (StatusCode::PAYLOAD_TOO_LARGE, "too_large".into()));
+    assert_eq!(error_code(last).await, (StatusCode::PAYLOAD_TOO_LARGE, "session_full".into()));
     let (_, body) = join_body(&s, Role::Observer, "late");
     assert_eq!(post_join(&env, &s, body).await.status(), StatusCode::PAYLOAD_TOO_LARGE);
 

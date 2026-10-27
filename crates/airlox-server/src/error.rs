@@ -42,6 +42,11 @@ impl ApiError {
     pub fn too_large(m: impl Into<String>) -> Self {
         Self::new(StatusCode::PAYLOAD_TOO_LARGE, "too_large", m)
     }
+    /// A session limit that will not lift (items, history, transfer):
+    /// retrying is pointless.
+    pub fn session_full(m: impl Into<String>) -> Self {
+        Self::new(StatusCode::TOO_MANY_REQUESTS, "session_full", m)
+    }
     pub fn limit(m: impl Into<String>) -> Self {
         Self::new(StatusCode::TOO_MANY_REQUESTS, "limit", m)
     }

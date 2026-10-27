@@ -84,6 +84,14 @@ const show = (...nodes) => app.replaceChildren(...nodes);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const fmtBytes = (n) => (n < 1024 ? `${n} B` : n < MB ? `${(n / 1024).toFixed(1)} KB` : `${(n / MB).toFixed(1)} MB`);
 const hhmm = (ms) => new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+// Whole seconds as "6 h", "2 h 5 min", "45 s" (zero parts left out).
+function fmtDuration(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const x = sec % 60;
+  return [h && `${h} h`, m && `${m} min`, x && `${x} s`].filter(Boolean).join(" ") || "0 s";
+}
 // Status symbols are decoration next to words: screen readers skip them.
 const sym = (c) => el("span", { "aria-hidden": "true" }, c);
 const initials = (name) => (name.split(/[^\p{L}\p{N}]+/u).filter(Boolean).slice(0, 2).map((w) => w[0]).join("") || "?").toUpperCase();
@@ -525,7 +533,7 @@ function newSession() {
     hint ? el("span", { class: "muted hint-text" }, hint) : null);
   const jobBox = el("fieldset", { class: "stack", hidden: true }, el("legend", {}, "Job limits"),
     el("div", { class: "limits" },
-      field("j-runtime", "Runtime", lim.runtime), field("j-timeout", "Timeout (seconds)", lim.timeout, "1 to 86400"),
+      field("j-runtime", "Runtime", lim.runtime), field("j-timeout", "Timeout (seconds)", lim.timeout, "1 to 86400 (24 h)"),
       field("j-memory", "Memory (MB)", lim.memory, "32 to 65536")),
     field("j-packages", "Packages", lim.packages, "Comma-separated. Only these can be requested by jobs."),
     el("label", { class: "option check" }, lim.approve, "Require owner approval for runners"),
@@ -721,7 +729,7 @@ async function sessionView() {
   const s = { sid, inv, manifest, signed, identity, me, participants: new Map(), items: new Map(), evicted: new Set(),
     wanted: new Map(), askOk: new Set(), askErrors: new Map(), asked: new Set(), uploads: new Set(), uploaded: new Map(), uploading: 0,
     revokedRoles: new Set(),
-    lastSeq: -1, closed: null, jobs: new Map(), results: new Map(), runners: [], picked: new Set(), decisions: null,
+    lastSeq: -1, closed: null, jobs: new Map(), results: new Map(), progress: new Map(), runners: [], picked: new Set(), decisions: null,
     said: new Map(), announce: false, jobErrors: new Map(), runnerErrors: new Map(), runnerSeen: new Map(), open: new Set() };
   buildSessionLayout(s);
 
@@ -1063,8 +1071,11 @@ function buildSessionLayout(s) {
         document.getElementById(`item-${it.id}`)?.remove();
         return;
       }
-      // A result with a known job lives inside the job's card.
+      // A result or progress report with a known job lives inside the job's
+      // card. Progress never stands alone: without its job (or verified,
+      // or still on the relay) it is not shown.
       const host = hostJob(s, it);
+      if (it.kind === "progress" && !host) return document.getElementById(`item-${it.id}`)?.remove();
       if (host) {
         document.getElementById(`item-${it.id}`)?.remove();
         it = host;
@@ -1169,7 +1180,7 @@ async function applyEvent(s, ev, { fetch, record, batch = false }) {
       s.render.item(it);
     }
     // Cached history (record false) never asks; the catch-up batch and the stream do.
-    if (fetch && record && it?.status === "evicted" && it.author !== s.me) wantBlob(s, it.id);
+    if (fetch && record && it?.status === "evicted" && it.author !== s.me && askable(it.kind)) wantBlob(s, it.id);
   } else if (ev.kind === "want") {
     // Not from cached history, and only for an item this browser verified: the
     // id could be anything the relay made up. A catch-up batch uploads once at
@@ -1223,6 +1234,8 @@ async function applyEvent(s, ev, { fetch, record, batch = false }) {
 // every REASK_MS for as long as the item is missing.
 const REASK_MS = 5 * 60 * 1000;
 const ASK_GRACE_MS = 30 * 1000;
+// A lost progress report is not worth asking for: a newer one or the result follows.
+const askable = (kind) => kind !== "progress";
 
 // "ok", "limit" (the relay has too many open wants: stop this round) or "error".
 async function wantBlob(s, id, { force = false } = {}) {
@@ -1345,7 +1358,7 @@ async function receive(s, seq, envelope, fetchBlob, attempt = 0) {
   if (!blob) {
     if (!fetchBlob || s.evicted.has(h.id)) {
       it.status = "evicted";
-      if (fetchBlob && h.author !== s.me) wantBlob(s, h.id);
+      if (fetchBlob && h.author !== s.me && askable(h.kind)) wantBlob(s, h.id);
       return s.render.item(it);
     }
     let r;
@@ -1357,7 +1370,7 @@ async function receive(s, seq, envelope, fetchBlob, attempt = 0) {
     }
     if (r?.status === 410 || r?.status === 404) {
       it.status = "evicted";
-      if (h.author !== s.me) wantBlob(s, h.id);
+      if (h.author !== s.me && askable(h.kind)) wantBlob(s, h.id);
       return s.render.item(it);
     }
     if (!r || !r.ok) {
@@ -1392,10 +1405,11 @@ async function receive(s, seq, envelope, fetchBlob, attempt = 0) {
     }
   }
   s.wanted.delete(h.id);
-  if (it.kind === "result" && it.meta?.job?.id) {
-    const list = s.results.get(it.meta.job.id) || [];
+  const byJob = it.kind === "result" ? s.results : it.kind === "progress" ? s.progress : null;
+  if (byJob && it.meta?.job?.id) {
+    const list = byJob.get(it.meta.job.id) || [];
     if (!list.some((r) => r.id === it.id)) list.push(it);
-    s.results.set(it.meta.job.id, list);
+    byJob.set(it.meta.job.id, list);
   }
   s.render.item(it);
   if (it.kind === "event" && it.role === "owner" && ["runner_approve", "runner_reject"].includes(it.meta?.event)) approvalsChanged(s);
@@ -1416,7 +1430,7 @@ function renderItem(s, it) {
     el("div", { class: `avatar ${av}`, "aria-hidden": "true" }, initials(it.authorName)),
     el("div", { class: "body" }, meta, card));
   if (it.status === "evicted") {
-    const noun = { text: "message", file: "file", job: "job", result: "result", progress: "progress report" }[it.kind] || "item";
+    const noun = { text: "message", file: "file", job: "job", result: "result" }[it.kind] || "item";
     if (mine) card.append(el("p", { class: "note" }, `You sent this ${noun}, but this browser no longer has it and it is no longer on the relay.`));
     else {
       const asked = s.wanted.get(it.id);
@@ -1458,11 +1472,6 @@ function renderItem(s, it) {
     const chk = resultCheck(s, it);
     card.append(chk.ok ? renderResult(s, it) : rejectedResult(chk.error, chk.pending));
     if (!chk.ok && !chk.pending) node.classList.add("rejected");
-  } else if (m.type === "progress") {
-    const t = Math.floor(m.elapsed_ms / 1000);
-    const took = t >= 3600 ? `${Math.floor(t / 3600)} h ${Math.floor((t % 3600) / 60)} min` : t >= 60 ? `${Math.floor(t / 60)} min` : `${t} s`;
-    card.append(el("p", { class: "note" }, `Job still running after ${took}.`));
-    if (m.tail) card.append(el("details", {}, el("summary", {}, m.tail_truncated ? "End of its log" : "Its log"), el("pre", { tabindex: 0 }, m.tail)));
   } else card.append(el("pre", { tabindex: 0 }, JSON.stringify(m, null, 2)));
   if (it.note) card.append(el("p", { class: "note" }, it.note));
   return node;
@@ -1517,12 +1526,18 @@ function notAvailableText(tgt) {
   return "failed · no runner available · not queued";
 }
 
+// The relay refused the job (409 runner_busy): a matching runner is online but busy.
+const busyText = (name) => `failed · ${name || "the runner"} is busy with another job · not queued`;
+
 function failureText(s, tgt, st) {
   if (st.reason === "not_available") return notAvailableText(tgt);
   if (st.reason === "cancelled") return "cancelled";
   if (st.reason === "author_revoked") return "cancelled · its sender's access was revoked";
   const name = (st.runner ? memberName(s, st.runner) : null) || (tgt?.type === "runner" ? tgt.name : null) || "the runner";
-  const tail = { runner_unresponsive: "did not claim it", runner_lost: "went offline", runner_left: "left", runner_rejected: "was rejected", runner_revoked: "was revoked" }[st.reason];
+  if (st.reason === "runner_busy") return busyText(name);
+  // Not final: the relay revives the job if the runner comes back, and a late signed result still counts.
+  if (st.reason === "runner_lost") return `lost contact with ${name} · it may still finish`;
+  const tail = { runner_unresponsive: "did not claim it", runner_left: "left", runner_rejected: "was rejected", runner_revoked: "was revoked" }[st.reason];
   return tail ? `failed · ${name} ${tail}` : `failed${st.reason ? ` · ${st.reason}` : ""}`;
 }
 
@@ -1553,15 +1568,37 @@ function approvalsChanged(s) {
   if (s.runnersLoaded) pollRunners(s); // runner cards depend on the signed approvals too
   for (const it of s.items.values()) if (it.kind === "result") delete it.check;
   for (const it of [...s.items.values()]) {
-    if (it.status === "ok" && (it.kind === "result" || (it.kind === "file" && it.role === "runner"))) s.render.item(it);
+    if (it.status === "ok" && (it.kind === "result" || (it.kind === "file" && it.role === "runner") || (it.kind === "job" && s.progress.has(it.id)))) s.render.item(it);
   }
 }
 
-// The job card that should show this result, when its job is in the timeline.
+// The job card that should show this result or progress report, when its job is in the timeline.
 function hostJob(s, it) {
-  if (it.kind !== "result" || it.status !== "ok") return null;
+  if ((it.kind !== "result" && it.kind !== "progress") || it.status !== "ok") return null;
   const job = s.items.get(it.meta?.job?.id);
   return job && job.status === "ok" && job.kind === "job" ? job : null;
+}
+
+// A progress report counts only from a runner (for a runner-targeted job,
+// that runner's key), approved when the session requires approval, and
+// about this exact job (pinned by blob hash).
+function progressOk(s, p, job) {
+  if (p.status !== "ok" || p.role !== "runner" || p.meta?.type !== "progress") return false;
+  if (!job.ref || p.meta.job?.id !== job.id || p.meta.job.blob_sha256 !== job.ref.blob_sha256) return false;
+  const t = job.meta.target;
+  if (t?.type === "runner" && t.participant_pub !== p.author) return false;
+  const approved = approvedRunners(s);
+  return !approved || approved.includes(p.author);
+}
+
+// The newest acceptable progress report for a job, if any.
+function lastProgress(s, job) {
+  let best = null;
+  for (const p of s.progress.get(job.id) || []) {
+    if (!progressOk(s, p, job)) continue;
+    if (!best || p.meta.elapsed_ms > best.meta.elapsed_ms || (p.meta.elapsed_ms === best.meta.elapsed_ms && p.seq > best.seq)) best = p;
+  }
+  return best;
 }
 
 const NOT_SHOWN_YET = "Not shown yet: this browser has not received the owner's approval of this runner.";
@@ -1694,7 +1731,7 @@ function jobStatus(s, it) {
   if (accepted) ({ text, bad } = outcome(accepted.meta));
   else if (st?.state === "failed") {
     text = failureText(s, it.meta.target, st);
-    bad = text !== "cancelled";
+    bad = text !== "cancelled" && st.reason !== "runner_lost";
   } else if (st?.state === "done") text = "done · waiting for the result";
   else text = st?.state || "submitted";
   const runner = st?.runner ? memberName(s, st.runner) : null;
@@ -1729,6 +1766,24 @@ function renderJob(s, it, card) {
       am?.code_sha256 ? el("dt", {}, "Result code") : null, am?.code_sha256 ? el("dd", { class: "mono" }, am.code_sha256) : null,
       am?.input_sha256 ? el("dt", {}, "Result inputs") : null, am?.input_sha256 ? el("dd", { class: "mono" }, am.input_sha256) : null)));
   const err = s.jobErrors.get(it.id);
+  // Until a result is accepted, the runner's newest progress report.
+  const p = accepted ? null : lastProgress(s, it);
+  const progress = [];
+  if (p) {
+    const t = Math.floor(p.meta.elapsed_ms / 1000);
+    const live = !st || st.state === "assigned" || st.state === "running" || st.reason === "runner_lost";
+    const took = fmtDuration(t >= 60 ? t - (t % 60) : t);
+    progress.push(el("p", { class: "note progress" }, live ? `Running · ${took} (last report ${hhmm(p.created)})`
+      : `Ran for at least ${took} (last report ${hhmm(p.created)})`));
+    if (typeof p.meta.tail === "string") {
+      const log = el("pre", { tabindex: 0 }, p.meta.tail || "(empty)");
+      const box = el("details", { class: "codebox progress-log" },
+        el("summary", {}, `Last lines of ${m.progress_file || "its log file"}`), log);
+      // Open at the end of the log, where the newest lines are.
+      box.addEventListener("toggle", () => box.open && requestAnimationFrame(() => (log.scrollTop = log.scrollHeight)));
+      progress.push(keepOpen(s, `progress:${it.id}`, box));
+    }
+  }
   card.append(
     el("div", { class: "file-head job-head" }, el("span", { class: "chip type" }, "job"), el("span", { class: "fname", title: m.filename }, m.filename),
       el("span", { class: "mono muted jobid", title: it.id }, `#${short(it.id)}`),
@@ -1738,8 +1793,9 @@ function renderJob(s, it, card) {
     el("dl", { class: "jobmeta" },
       el("dt", {}, "Target"), el("dd", {}, targetText(m.target)),
       runner ? el("dt", {}, "Runner") : null, runner ? el("dd", {}, runner) : null,
-      el("dt", {}, "Limits"), el("dd", {}, `${m.runtime} · ${m.timeout_s} s${m.memory_mb ? ` · ${m.memory_mb} MB` : ""}`),
+      el("dt", {}, "Limits"), el("dd", {}, `${m.runtime} · ${fmtDuration(m.timeout_s)}${m.memory_mb ? ` · ${m.memory_mb} MB` : ""}`),
       files.length ? el("dt", {}, "Inputs") : null, files.length ? el("dd", {}, files.join(", ")) : null),
+    ...progress,
     lines.length > 12
       ? keepOpen(s, `code:${it.id}`, el("details", { class: "codebox" }, el("summary", {}, `Code · ${lines.length} lines`), code))
       : code,
@@ -1793,7 +1849,9 @@ async function pollRunners(s) {
         if (j.cert.cert.participant_pub !== e.participant_pub || j.cert.cert.role !== "runner" || !j.runner) continue;
         list.push({ pub: e.participant_pub, name: j.runner.name, description: j.description, labels: j.runner.labels,
           host: j.runner.host, sandbox: j.runner.sandbox,
-          networkUnblocked: !!j.runner.network_unblocked, online: !!e.online, job: e.job,
+          version: typeof j.runner.version === "string" ? j.runner.version : null,
+          python: typeof j.runner.python === "string" ? j.runner.python : null,
+          networkUnblocked: !!j.runner.network_unblocked, online: !!e.online, job: e.job, busy: !!(e.busy ?? e.job),
           setup: e.state || null, detail: typeof e.detail === "string" ? (e.detail.length > 300 ? `${e.detail.slice(0, 300)}…` : e.detail) : null,
           ...runnerStatus(s, e) });
       } catch (err) {
@@ -1862,13 +1920,13 @@ function renderRunners(s, list, note) {
       : "awaiting approval";
     const live = r.rejected ? "rejected" : r.setup === "failed" ? "setup failed"
       : r.setup === "preparing" && !r.online ? "preparing its sandbox"
-      : !r.approved ? "awaiting approval" : r.online ? (r.job ? `busy · #${short(r.job)}` : "idle") : "offline";
+      : !r.approved ? "awaiting approval" : r.online ? (r.busy ? (r.job ? `busy · #${short(r.job)}` : "busy") : "idle") : "offline";
     return { approval, live, err: s.runnerErrors.get(r.pub) };
   };
   const revoked = s.revokedRoles.has("runner");
   // The poll runs every few seconds: leave the list (and keyboard focus) alone
   // unless something it shows has changed.
-  const sig = JSON.stringify([!!s.closed, revoked, s.runners.map((r) => [r.pub, r.name, r.description, r.labels, r.host, r.sandbox, r.networkUnblocked,
+  const sig = JSON.stringify([!!s.closed, revoked, s.runners.map((r) => [r.pub, r.name, r.description, r.labels, r.host, r.sandbox, r.version, r.python, r.networkUnblocked,
     r.rejected, r.approved, r.relayOnly, r.setup, r.detail, text(r)])]);
   if (list.dataset.sig === sig) return;
   list.dataset.sig = sig;
@@ -1889,6 +1947,9 @@ function renderRunners(s, list, note) {
     const canApprove = owner && !r.rejected && !failed && (!r.approved || !!err);
     const warn = r.networkUnblocked && !r.rejected
       ? el("span", { class: "chip warn", title: "This runner's sandbox cannot block network access" }, sym("⚠ "), "network not blocked") : null;
+    // No isolation at all: "process", and "local" where it cannot sandbox (macOS, Windows).
+    const plain = r.sandbox === "process" || (r.sandbox === "local" && r.networkUnblocked);
+    const versions = [r.version && `airlox ${r.version}`, r.python && `Python ${r.python}`].filter(Boolean).join(" · ");
     const act = (name, label, cls, approve) => el("button", { type: "button", class: `small ${cls}`, "data-pub": r.pub, "data-act": name,
       disabled: !!s.closed, onclick: (ev) => decideRunner(s, r, approve, ev.currentTarget) }, label);
     return el("li", { class: `runner${r.rejected ? " is-rejected" : ""}` },
@@ -1898,6 +1959,7 @@ function renderRunners(s, list, note) {
         el("span", { class: "sub" }, live),
         el("span", { class: "key", title: "Key fingerprint" }, ac.fingerprint(r.pub).slice(0, 4))),
       el("div", { class: "sub" }, `${r.sandbox} · ${r.host}`),
+      versions ? el("div", { class: "sub" }, versions) : null,
       r.description ? el("div", { class: "desc", title: "The runner's own description, not verified" }, el("span", { class: "claim" }, "says "), r.description) : null,
       r.labels.length ? el("div", { class: "chips" }, r.labels.map((l) => el("span", { class: "chip" }, l))) : null,
       el("div", { class: "chips" },
@@ -1906,7 +1968,9 @@ function renderRunners(s, list, note) {
       owner && r.relayOnly && !r.rejected ? el("p", { class: "sub confirm-note" },
         "The relay says this runner is approved, but this browser has no approval from you on record. Confirm only if you approved it. Its key: ",
         el("span", { class: "mono" }, ac.fingerprint(r.pub).slice(0, 16).replace(/(.{4})(?=.)/g, "$1 ")), ".") : null,
-      owner && canApprove && warn ? el("p", { class: "sub net-note" }, "Jobs on this runner can reach the internet. Approve only if you trust the code senders submit.") : null,
+      owner && canApprove && (warn || plain) ? el("p", { class: "sub net-note" }, plain
+        ? "Jobs on this runner run as plain processes: they can read this machine's files and reach the internet. Approve only if you trust the code senders submit."
+        : "Jobs on this runner can reach the internet. Approve only if you trust the code senders submit.") : null,
       failed ? el("p", { class: "sub setup-failed", title: "The runner's own report, not verified" }, r.detail || "The runner could not start.") : null,
       owner && !r.rejected ? el("div", { class: "row" },
         canApprove ? [warn, act("approve", r.relayOnly ? "Confirm approval" : "Approve", "primary", true)] : null,
@@ -2008,7 +2072,7 @@ function buildJobPanel(s, text, file) {
   const cleared = (r) => r.approved || r.relayOnly;
   const usable = (r) => !r.rejected && cleared(r) && r.setup !== "failed" && r.online;
   const runnerState = (r) => r.setup === "failed" ? "setup failed" : !cleared(r) ? "needs approval"
-    : !r.online ? (r.setup === "preparing" ? "preparing" : "offline") : r.job ? "busy" : "idle";
+    : !r.online ? (r.setup === "preparing" ? "preparing" : "offline") : r.busy ? "busy" : "idle";
   const approvalNote = (r) => r.relayOnly ? (s.inv.role === "owner" ? "needs your confirmation" : "approval not received here") : null;
   const wantedLabels = () => labels.value.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
   const matches = (r) => target === "any" ? true : target === "labels" ? wantedLabels().every((l) => r.labels?.includes(l)) : `runner:${r.pub}` === target;
@@ -2020,7 +2084,7 @@ function buildJobPanel(s, text, file) {
     if (target === "labels" && !wantedLabels().length) return null; // submit() explains
     const live = s.runners.filter((r) => !r.rejected);
     const fit = live.filter(matches);
-    if (fit.some((r) => usable(r) && !r.job)) return null;
+    if (fit.some((r) => usable(r) && !r.busy)) return null;
     const pending = fit.find((r) => !cleared(r) && r.setup !== "failed");
     const one = target.startsWith("runner:") ? fit[0] : null;
     let why;
@@ -2149,8 +2213,12 @@ function buildJobPanel(s, text, file) {
     try {
       await sendPayload(s, "job", "py", meta, new Uint8Array(), { path: "jobs", headers: { "Airlox-Target": JSON.stringify(tgt) } });
     } catch (e) {
-      if (e.code !== "no_runner_available") throw e;
-      const err = new Error(notAvailableText(tgt));
+      if (e.code !== "no_runner_available" && e.code !== "runner_busy") throw e;
+      // The relay kept the job as failed (it shows in the timeline): its inputs are used up.
+      s.picked.clear();
+      filesSig = null; // job mode stays on: redraw the checkboxes unticked
+      refresh();
+      const err = new Error(e.code === "runner_busy" ? busyText(tgt.type === "runner" ? tgt.name : null) : notAvailableText(tgt));
       err.final = true;
       throw err;
     }

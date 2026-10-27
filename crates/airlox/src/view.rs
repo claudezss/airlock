@@ -67,6 +67,11 @@ pub fn write_atomic(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     #[cfg(not(unix))]
     let _ = mode;
     tmp.persist(path)?;
+    // The rename itself must survive a power loss too.
+    #[cfg(unix)]
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
     Ok(())
 }
 

@@ -79,7 +79,7 @@ fn now_ms() -> u64 {
 /// `Some(false)` started it without posting a result (it restarted
 /// mid-job), `Some(true)` posted its result.
 fn run_record(ctx: &Ctx, id: &str) -> Option<bool> {
-    let text = fs::read_to_string(&ctx.done_file).unwrap_or_default();
+    let text = records(&ctx.done_file);
     let (mut started, mut posted) = (false, false);
     for line in text.lines() {
         match line.split_once(' ') {
@@ -91,41 +91,62 @@ fn run_record(ctx: &Ctx, id: &str) -> Option<bool> {
     (started || posted).then_some(posted)
 }
 
-/// Jobs this runner started but never answered: it stopped while they ran.
-fn interrupted(ctx: &Ctx) -> Vec<String> {
-    unanswered(&ctx.done_file)
+/// The complete lines of a run-record file: a line cut short by a power
+/// loss (no newline yet) never counts.
+fn records(done_file: &Path) -> String {
+    let mut text = fs::read_to_string(done_file).unwrap_or_default();
+    text.truncate(text.rfind('\n').map_or(0, |i| i + 1));
+    text
 }
 
 /// The jobs `done_file` records as started but not answered, oldest first.
 pub(crate) fn unanswered(done_file: &Path) -> Vec<String> {
-    let text = fs::read_to_string(done_file).unwrap_or_default();
+    let text = records(done_file);
     let mut started: Vec<&str> = text.lines().filter(|l| !l.contains(' ')).collect();
     started.retain(|id| !text.lines().any(|l| l.strip_suffix(" posted") == Some(*id)));
     started.dedup();
     started.into_iter().map(String::from).collect()
 }
 
-/// After a restart, finish what the runner left: post the saved answer of
-/// each job that finished before it stopped, and answer each job that was
-/// still running with a signed `failed` result (it is never run again), so
-/// its sender learns why instead of only that the relay lost the runner.
-pub async fn report_interrupted(ctx: &Arc<Ctx>, view: &Arc<Mutex<View>>) {
+/// How long a runner that just started keeps offering saved answers to a
+/// relay that will not take them before it gets on with its work (they stay
+/// saved for the next start).
+const STARTUP_PATIENCE: Duration = Duration::from_secs(10 * 60);
+
+/// After a restart, post the saved answer of each job that finished before
+/// the runner stopped. Needs no sandbox, so it runs before the sandbox is
+/// prepared: a runner whose setup now fails still delivers them.
+pub async fn deliver_saved(kp: &Keypair, done_file: &Path, outbox_root: &Path, view: &Arc<Mutex<View>>) {
     // Answers delivered just before a stop, whose folder outlived it.
-    for e in fs::read_dir(&ctx.outbox).into_iter().flatten().flatten() {
-        if e.file_name().to_str().is_some_and(|id| run_record(ctx, id) == Some(true)) {
+    let posted: Vec<String> =
+        records(done_file).lines().filter_map(|l| l.strip_suffix(" posted")).map(String::from).collect();
+    for e in fs::read_dir(outbox_root).into_iter().flatten().flatten() {
+        if e.file_name().to_str().is_some_and(|id| posted.iter().any(|p| p == id)) {
             let _ = fs::remove_dir_all(e.path());
         }
     }
-    for id in interrupted(ctx) {
-        let saved = ctx.outbox.join(&id);
-        if outbox::is_complete(&saved) {
-            let poster = Poster::of(&*view.lock().await);
-            match outbox::deliver(ctx, &poster, &saved).await {
-                Ok(()) => {
-                    tracing::info!(job = %id, "posted the saved result of a job that finished before a restart")
-                }
-                Err(e) => tracing::warn!(job = %id, "could not post a saved result: {e:#}"),
+    for id in unanswered(done_file) {
+        let saved = outbox_root.join(&id);
+        if !outbox::is_complete(&saved) {
+            continue;
+        }
+        let poster = Poster::of(&*view.lock().await);
+        match outbox::deliver(kp, done_file, &poster, &saved, STARTUP_PATIENCE).await {
+            Ok(()) => {
+                tracing::info!(job = %id, "posted the saved result of a job that finished before a restart")
             }
+            Err(e) => tracing::warn!(job = %id, "could not post a saved result yet: {e:#}"),
+        }
+    }
+}
+
+/// After a restart, answer each job that was still running when the runner
+/// stopped with a signed `failed` result (it is never run again), so its
+/// sender learns why instead of only that the relay lost the runner. Jobs
+/// with a saved answer are [`deliver_saved`]'s.
+pub async fn report_interrupted(ctx: &Arc<Ctx>, view: &Arc<Mutex<View>>) {
+    for id in unanswered(&ctx.done_file) {
+        if outbox::is_complete(&ctx.outbox.join(&id)) {
             continue;
         }
         let (_, never) = watch::channel(false);
@@ -138,7 +159,11 @@ pub async fn report_interrupted(ctx: &Arc<Ctx>, view: &Arc<Mutex<View>>) {
 }
 
 fn record(ctx: &Ctx, line: &str) -> Result<()> {
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(&ctx.done_file)?;
+    record_to(&ctx.done_file, line)
+}
+
+fn record_to(done_file: &Path, line: &str) -> Result<()> {
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(done_file)?;
     writeln!(f, "{line}")?;
     f.sync_data()?;
     Ok(())
@@ -242,8 +267,15 @@ fn create_new(path: &Path, data: &[u8]) -> Result<()> {
 /// inputs may claim the same name.
 fn stage_inputs(root: &Path, work: &Path, a: &Accepted) -> Result<()> {
     let limits = ZipLimits::default();
+    // One archive may expand to the limit, not every one of a job's inputs.
+    let mut budget = limits.max_total_bytes;
     for (i, (_, name, subkind, body)) in a.inputs.iter().enumerate() {
         if *subkind == ContentType::Zip {
+            let expands: u64 =
+                airlox_core::validate::zip::inspect_zip(body, &limits)?.iter().map(|e| e.size).sum();
+            budget = budget.checked_sub(expands).with_context(|| {
+                format!("the job's archives expand beyond {} MiB in total", limits.max_total_bytes >> 20)
+            })?;
             let staging = root.join(format!("unzip-{i}"));
             fs::create_dir(&staging)?;
             extract_zip(body, &staging, &limits)?;
@@ -524,16 +556,20 @@ impl Poster {
 /// exist (or is not a regular file inside `work`).
 fn read_tail(work: &Path, path: &Path, max: usize) -> (Option<String>, bool) {
     use std::io::{Read, Seek, SeekFrom};
-    let inside = |p: &Path| {
-        let (Ok(w), Ok(p)) = (fs::canonicalize(work), fs::canonicalize(p)) else { return None };
-        p.starts_with(&w).then_some(p)
-    };
-    let Some(real) = inside(path) else { return (None, false) };
     let mut o = fs::OpenOptions::new();
     o.read(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::custom_flags(&mut o, nix::fcntl::OFlag::O_NONBLOCK.bits());
-    let Ok(mut f) = o.open(&real) else { return (None, false) };
+    let Ok(mut f) = o.open(path) else { return (None, false) };
+    // The job can swap links while this runs: check where the file that is
+    // now open really is, not where its name pointed a moment ago.
+    let inside = match (fs::canonicalize(work), opened_path(&f)) {
+        (Ok(w), Some(real)) => real.starts_with(w),
+        _ => false,
+    };
+    if !inside {
+        return (None, false);
+    }
     let len = match f.metadata() {
         Ok(m) if m.is_file() => m.len(),
         _ => return (None, false),
@@ -554,32 +590,96 @@ fn read_tail(work: &Path, path: &Path, max: usize) -> (Option<String>, bool) {
             text.drain(..=nl);
         }
     }
+    // Each invalid byte became a 3-byte U+FFFD: keep within the limit.
+    let mut truncated = truncated;
+    if text.len() > MAX_PROGRESS_TAIL_BYTES {
+        let mut cut = text.len() - MAX_PROGRESS_TAIL_BYTES;
+        while !text.is_char_boundary(cut) {
+            cut += 1;
+        }
+        text.drain(..cut);
+        truncated = true;
+    }
     (Some(text), truncated)
 }
 
-/// Post the job's progress every `ctx.progress_interval` until aborted.
+/// Where an open file really is, from the OS; `None` where it cannot say.
+fn opened_path(f: &fs::File) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd())).ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut p = PathBuf::new();
+        nix::fcntl::fcntl(f.as_raw_fd(), nix::fcntl::FcntlArg::F_GETPATH(&mut p)).ok().map(|_| p)
+    }
+    #[cfg(windows)]
+    {
+        crate::sandbox::winjob::final_path(f)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = f;
+        None
+    }
+}
+
+/// After a job's first hour, progress goes out at most this often, so a
+/// day-long job stays well inside the relay's per-session item budget.
+const LONG_JOB_PROGRESS: Duration = Duration::from_secs(5 * 60);
+
+/// A task that is aborted when this is dropped, however its owner ends.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The tail of `file` (relative), found in the job's work dir or, failing
+/// that, its out dir (`$AIRLOX_OUT`, where a tool may write its log).
+fn read_progress_file(roots: &[PathBuf], file: &str, max: usize) -> (Option<String>, bool) {
+    roots
+        .iter()
+        .map(|root| read_tail(root, &root.join(file), max))
+        .find(|(t, _)| t.is_some())
+        .unwrap_or_default()
+}
+
+/// Post the job's progress every `ctx.progress_interval` while the
+/// returned guard lives.
 fn spawn_progress(
     ctx: &Arc<Ctx>,
     poster: &Poster,
     job_ref: &ItemRef,
-    work: PathBuf,
+    roots: Vec<PathBuf>,
     file: Option<String>,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Option<AbortOnDrop> {
     if ctx.progress_interval.is_zero() {
         return None;
     }
     let (ctx, poster, job_ref) = (ctx.clone(), poster.clone(), job_ref.clone());
-    Some(tokio::spawn(async move {
+    Some(AbortOnDrop(tokio::spawn(async move {
         let start = tokio::time::Instant::now();
         let mut tick = tokio::time::interval_at(start + ctx.progress_interval, ctx.progress_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last = start;
         loop {
             tick.tick().await;
-            let (work, path, max) = (work.clone(), file.as_ref().map(|f| work.join(f)), ctx.progress_tail);
-            let (tail, tail_truncated) = match path {
-                Some(p) => {
-                    tokio::task::spawn_blocking(move || read_tail(&work, &p, max)).await.unwrap_or_default()
-                }
+            let now = tokio::time::Instant::now();
+            if now - start > Duration::from_secs(3600) && now - last < LONG_JOB_PROGRESS {
+                continue;
+            }
+            last = now;
+            let (roots, max) = (roots.clone(), ctx.progress_tail);
+            let (tail, tail_truncated) = match file.clone() {
+                Some(f) => tokio::task::spawn_blocking(move || read_progress_file(&roots, &f, max))
+                    .await
+                    .unwrap_or_default(),
                 None => (None, false),
             };
             let p = JobProgress {
@@ -597,7 +697,7 @@ fn spawn_progress(
                 tracing::warn!(job = %job_ref.id, "could not post progress: {e:#}");
             }
         }
-    }))
+    })))
 }
 
 /// Handle one assigned (and already claimed) job to the end.
@@ -635,6 +735,14 @@ pub async fn handle(
     // the result cannot get the same signed job run again.
     if !matches!(verdict, Verdict::Interrupted) {
         record(&ctx, &job_id)?;
+    }
+    // Reassigned after a restart while its answer is still saved: send that
+    // answer, never replace it with a "restarted" one.
+    let saved = ctx.outbox.join(&job_id);
+    if matches!(verdict, Verdict::Interrupted) && outbox::is_complete(&saved) {
+        outbox::deliver(&ctx.keypair, &ctx.done_file, &poster, &saved, RESULT_PATIENCE).await?;
+        tracing::info!(job = %job_id, "posted the saved result");
+        return Ok(());
     }
     let mut outbox = outbox::Outbox::create(&ctx.outbox, &job_id)?;
     match verdict {
@@ -686,15 +794,18 @@ pub async fn handle(
                 result.reason = Some(format!("could not stage inputs: {e:#}"));
             } else {
                 tracing::info!(job = %job_id, entry = %job.entry, "running");
-                let progress =
-                    spawn_progress(&ctx, &poster, &job_ref, job.work_dir(), a.spec.progress_file.clone());
+                let progress = spawn_progress(
+                    &ctx,
+                    &poster,
+                    &job_ref,
+                    vec![job.work_dir(), job.out_dir()],
+                    a.spec.progress_file.clone(),
+                );
                 let raw = ctx.backend.run(&job, cancel).await.unwrap_or_else(|e| RawResult {
                     error: Some(format!("the sandbox could not run the job: {e:#}")),
                     ..Default::default()
                 });
-                if let Some(p) = progress {
-                    p.abort();
-                }
+                drop(progress);
                 let (status, exit_code, reason) = outcome(&raw, job.timeout_s, memory_mb);
                 result.status = status;
                 result.exit_code = exit_code;
@@ -751,7 +862,7 @@ pub async fn handle(
         tracing::warn!(job = %job_id, "--exit-before-posting: exiting with the answer saved");
         std::process::exit(3);
     }
-    outbox::deliver(&ctx, &poster, &saved).await?;
+    outbox::deliver(&ctx.keypair, &ctx.done_file, &poster, &saved, RESULT_PATIENCE).await?;
     tracing::info!(job = %job_id, ?status, "result posted");
     Ok(())
 }

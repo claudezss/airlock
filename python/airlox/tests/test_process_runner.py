@@ -2,7 +2,9 @@
 reports, one job at a time, and the network gap it cannot close."""
 
 import json
+import os
 import platform
+import subprocess
 import sys
 import time
 
@@ -11,6 +13,19 @@ import pytest
 from airlox import RunnerBusy, RunnerFailed, Session
 
 from test_execute import LIMITS, wait_runner
+
+
+def _windows_admin() -> bool:
+    """An administrator account, elevated or not: the runner refuses it."""
+    if os.name != "nt":
+        return False
+    groups = subprocess.run(["whoami", "/groups"], capture_output=True, text=True, errors="replace").stdout
+    return "S-1-5-32-544" in groups
+
+
+pytestmark = pytest.mark.skipif(
+    _windows_admin(), reason="the runner refuses administrator accounts; run as a standard user"
+)
 
 # The interpreter running these tests is the one the runner gets.
 PROCESS_LIMITS = dict(LIMITS, runtime=f"python3.{sys.version_info.minor}", timeout_s=60)

@@ -178,9 +178,16 @@ class Progress:
     tail: Optional[str]
     #: More of the file came before ``tail``.
     tail_truncated: bool
+    #: When the runner posted this report: milliseconds since the Unix
+    #: epoch by the runner's clock, from the item's signed header.
     created_at_ms: int
     runner: str
     runner_name: Optional[str] = None
+
+    @property
+    def elapsed(self) -> float:
+        """Time since the job started in seconds (``elapsed_ms / 1000``)."""
+        return self.elapsed_ms / 1000.0
 
 
 # Relay reasons for jobs that ended without a signed result.
@@ -265,6 +272,12 @@ class Job:
         """Block until the job has a result. Jobs that failed on the relay
         (no runner, runner lost, cancelled before it started) return an
         unsigned result with the relay's reason.
+
+        ``timeout`` is in seconds; past it this raises ``JobTimeout`` (the
+        job keeps running, so ``wait`` again or check ``result()`` later).
+        The default of 60 s suits short jobs: for long ones pass
+        ``timeout=None`` to wait as long as the job runs (its own time
+        limit still applies).
 
         ``on_progress`` is called with each new progress report while
         waiting. A runner that loses its connection keeps running the job

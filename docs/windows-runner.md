@@ -3,8 +3,11 @@
 A Windows machine can run jobs with `--sandbox process`: each job is a plain
 process using an interpreter you provide, contained in a Windows Job Object.
 It is meant for tools that need the machine itself, such as a licensed
-simulator, and for **senders you trust**: a job can read whatever the
-runner's account can read, and reach the network.
+simulator, and for **senders you trust as much as the runner's operator**.
+A job runs as the runner's own account. It can read whatever that account
+can read (including the runner's saved invite and identity, so it can act as
+the runner in the session), reach the network, and, using Windows facilities
+such as WMI, start processes outside its Job Object.
 
 `--sandbox docker` also works on Windows (Docker Desktop with Linux
 containers), and is the one to use for code you don't trust.
@@ -28,12 +31,21 @@ containers), and is the one to use for code you don't trust.
   afterwards.
 - **A scrubbed environment.** A job sees only `PATH` (its interpreter and
   the Windows system folders), `SYSTEMROOT`, `TEMP`/`TMP` inside its work
-  folder, `HOME` and `USERPROFILE` (the work folder), `LANG`,
-  `MPLBACKEND`, `AIRLOX_OUT`, and what you pass with `--pass-env`
-  (a license server, say). Never the runner's invite or keys, and never an
-  `AIRLOX_*` variable.
-- **Not as an administrator.** The runner refuses to start elevated, as a
-  member of Administrators, or as SYSTEM: jobs would get those rights.
+  folder, `HOME` and `USERPROFILE` (the work folder), `LANG`, `MPLBACKEND`,
+  `AIRLOX_OUT`, the machine's own variables (`WINDIR`, `COMSPEC`,
+  `PATHEXT`, `OS`, `SystemDrive`, `NUMBER_OF_PROCESSORS`,
+  `PROCESSOR_*`, `ProgramData`, `ALLUSERSPROFILE`, `PUBLIC`,
+  `ProgramFiles*`, `CommonProgramFiles*`), and what you pass with
+  `--pass-env`. Pass anything a tool needs beyond that, such as a license
+  server (`LM_LICENSE_FILE`) or `APPDATA`, by name. The runner's own
+  variables, its invite among them, never reach a job, and no `AIRLOX_*`
+  variable is ever passed.
+- **Not as an administrator.** The runner refuses to start as SYSTEM, as an
+  administrator (elevated or not: UAC is not a security boundary, so an
+  unelevated administrator's job could still elevate), or as an account that
+  holds a privilege leading to SYSTEM, such as `SeImpersonatePrivilege`.
+  Run it as a standard user, or as the Windows service below. The same holds
+  for running the tests of the process sandbox.
 - **No network isolation.** It cannot block the network, says so when it
   joins (`runner list` shows "cannot block network"), and refuses a session
   whose manifest says `network: false` unless you start it with
@@ -49,12 +61,41 @@ airlox runner join --invite-file C:\airlox\invite-runner.txt --name tara-01 `
 
 `--invite-file` keeps the invite out of the command line and the
 environment; `--code 7-guitar-orbit` works for the first start and saves the
-invite for later ones.
+invite for later ones. Write the file with
+
+```powershell
+Set-Content C:\airlox\invite-runner.txt -NoNewline -Encoding ascii -Value '<runner invite>'
+```
+
+and keep it readable only by the account the runner runs as.
 
 If the relay is reachable only through a tunnel or port-forward, add
 `--relay http://127.0.0.1:8080`: the runner connects there instead of the
-host in the invite. The session's keys still come only from the invite, and
-the relay never sees them.
+host in the invite. It takes https anywhere, or plain http to this machine
+only, and only this flag redirects the runner (`AIRLOX_RELAY` only chooses
+where `--code` is claimed). The session's keys still come only from the
+invite, and the relay never sees them.
+
+### Sessions for a long-lived runner
+
+A runner serves one session and stops, cleanly, when that session ends. For
+a runner that should keep working (a service), create the session without an
+expiry, on a relay that allows that (the default; `--max-ttl`):
+
+```powershell
+airlox session create --execute --ttl never --job-timeout 6h --max-item-mb 80 --package numpy
+```
+
+A relay purges a session that sees no activity (joins, items, downloads) for
+`--idle-ttl-unexpiring`, 30 days by default; jobs and their progress count.
+To move a runner to a new session, put the new runner invite in its invite
+file (for the service, `%ProgramData%\airlox\<service>\invite-runner.txt`,
+from an elevated prompt) and start it again (`sc.exe start <service>`).
+
+Items are capped per session when it is created: 25 MB unless you say
+otherwise (`--max-item-mb` above, or `max_item_bytes=` in the SDK's
+`Session.create`). Decks and simulation reports of tens of MB need more; the
+relay allows up to 100 MiB by default (`--max-item-bytes`).
 
 ### Long jobs and dropped connections
 
@@ -80,10 +121,14 @@ finished, and is not run again).
 
 A job can name a log file: `run_python(..., progress_file="logs/tara.log")`
 in the SDK, `airlox run --progress-file logs/tara.log` on the command line.
-While it runs, the runner posts a signed progress item every
-`--progress-interval` (60 s by default) with the elapsed time and the end of
-that file (`--progress-tail`, 4 KiB by default), so a sender can tell a long
-run from a hung one:
+The path is relative, and looked up in the job's work folder and then in its
+out folder (`$AIRLOX_OUT`, where a tool may write its log, such as TARA's
+`taralog.txt` in a run folder). While the job runs, the runner posts a signed
+progress item every `--progress-interval` (60 s by default; at most every
+5 minutes after the first hour) with the elapsed time and the end of that
+file (`--progress-tail`, 4 KiB by default), so a sender can tell a long run
+from a hung one. When a session is nearly full, the relay pauses progress so
+that results still fit:
 
 ```python
 job = agent.run_python(code, runner="tara-01", progress_file="logs/tara.log")
@@ -113,17 +158,28 @@ This:
   is restarted after a crash or failed start (after 10 s, 30 s, then every
   minute). A session that ends stops it cleanly;
 - runs it as its own virtual account, `NT SERVICE\airlox-runner-tara-01`,
-  which is neither an administrator nor SYSTEM;
+  which is neither an administrator nor SYSTEM, with only the privilege
+  every process needs (`sc.exe privs`: no `SeImpersonatePrivilege`);
 - keeps the invite, the runner's identity, its cache and its logs in
-  `%ProgramData%\airlox\airlox-runner-tara-01`, which only that account,
-  SYSTEM and administrators can open. The invite comes from `--code`,
+  `%ProgramData%\airlox\airlox-runner-tara-01`, which it makes owned by
+  Administrators and open only to that account, SYSTEM and administrators
+  (whatever was there before). The invite comes from `--code`,
   `--invite-file` or `--invite` and is written there; the service reads it
   from that file, never from its command line;
 - gives the account read access to the `--python` venv and the Python
   installation it is based on.
 
-Grant the service account read access to anything else jobs need (the
-simulator's folder, its license file), for example
+The service account is a member of Users and Authenticated Users, so its
+jobs can already read everything those groups can, which on default
+permissions is most folders on the machine. Deny it what jobs should not
+see, such as other projects' data and build caches:
+
+```powershell
+icacls D:\decks /deny "NT SERVICE\airlox-runner-tara-01:(OI)(CI)R"
+```
+
+and grant it read access to anything jobs need that it cannot read yet
+(the simulator's folder, its license file), for example
 `icacls C:\sim /grant "NT SERVICE\airlox-runner-tara-01:(OI)(CI)RX"`.
 
 Logs are in `...\cache\runner\logs\airlox-runner-tara-01.log`; they never

@@ -52,6 +52,7 @@ pub struct UninstallArgs {
     /// with the saved invite and the runner's identity.
     #[arg(long)]
     pub purge: bool,
+    /// The data folder, if install was given --data-dir.
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
 }
@@ -120,6 +121,51 @@ fn icacls(args: &[&std::ffi::OsStr]) -> Result<()> {
     Ok(())
 }
 
+/// Create `dir` (and `%ProgramData%\airlox` above a default one) owned by
+/// Administrators and open only to them and SYSTEM, whatever was there
+/// before: anyone may create folders in ProgramData, so one made in advance
+/// (or a junction elsewhere) must not keep its creator's access.
+fn lock_down(dir: &Path) -> Result<()> {
+    for d in dir.ancestors().take(2).collect::<Vec<_>>().into_iter().rev() {
+        if std::fs::symlink_metadata(d).is_ok_and(|m| m.file_type().is_symlink()) {
+            bail!("{} is a link or junction; remove it and install again", d.display());
+        }
+    }
+    std::fs::create_dir_all(dir)?;
+    let admins = "*S-1-5-32-544";
+    icacls(&[
+        dir.as_os_str(),
+        "/setowner".as_ref(),
+        admins.as_ref(),
+        "/T".as_ref(),
+        "/C".as_ref(),
+        "/Q".as_ref(),
+    ])?;
+    icacls(&[dir.as_os_str(), "/reset".as_ref(), "/T".as_ref(), "/C".as_ref(), "/Q".as_ref()])?;
+    icacls(&[
+        dir.as_os_str(),
+        "/inheritance:r".as_ref(),
+        "/grant:r".as_ref(),
+        "*S-1-5-32-544:(OI)(CI)F".as_ref(),
+        "*S-1-5-18:(OI)(CI)F".as_ref(),
+        "/Q".as_ref(),
+    ])?;
+    // The default parent: owned by Administrators, and no one else may add to it.
+    if let Some(parent) = dir.parent().filter(|p| p.file_name().is_some_and(|n| n == "airlox")) {
+        icacls(&[parent.as_os_str(), "/setowner".as_ref(), admins.as_ref(), "/Q".as_ref()])?;
+        icacls(&[
+            parent.as_os_str(),
+            "/inheritance:r".as_ref(),
+            "/grant:r".as_ref(),
+            "*S-1-5-32-544:(OI)(CI)F".as_ref(),
+            "*S-1-5-18:(OI)(CI)F".as_ref(),
+            "*S-1-5-32-545:RX".as_ref(),
+            "/Q".as_ref(),
+        ])?;
+    }
+    Ok(())
+}
+
 /// Let the service account read and run what `python` needs: its venv and,
 /// from `pyvenv.cfg`, the base installation (often under a user profile,
 /// which a service account cannot read by default).
@@ -171,15 +217,7 @@ pub async fn install(a: InstallArgs) -> Result<()> {
 
     // Keep it at once, where only SYSTEM and administrators can read it
     // until the service account exists and is let in.
-    std::fs::create_dir_all(&data)?;
-    icacls(&[
-        data.as_os_str(),
-        "/inheritance:r".as_ref(),
-        "/grant:r".as_ref(),
-        "*S-1-5-32-544:(OI)(CI)F".as_ref(),
-        "*S-1-5-18:(OI)(CI)F".as_ref(),
-        "/Q".as_ref(),
-    ])?;
+    lock_down(&data)?;
     let invite_file = data.join("invite-runner.txt");
     crate::view::write_atomic(&invite_file, link.as_bytes(), 0o600)?;
 
@@ -224,8 +262,8 @@ pub async fn install(a: InstallArgs) -> Result<()> {
         .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
         .with_context(|| {
             format!(
-                "could not create service {service} (does it already exist?); the invite is saved in {}, so \
-                 retry with --invite-file",
+                "could not create service {service} (does it already exist? remove it with `airlox runner \
+                 service uninstall {service}`); the invite is saved in {}, so retry with --invite-file",
                 invite_file.display()
             )
         })?;
@@ -242,6 +280,16 @@ pub async fn install(a: InstallArgs) -> Result<()> {
         actions: Some(vec![restart(10), restart(30), restart(60)]),
     })?;
     svc.set_failure_actions_on_non_crash_failures(true)?;
+    // Only the privilege every process needs. Service accounts otherwise hold
+    // SeImpersonatePrivilege, which a job could use to become SYSTEM (and
+    // which the runner refuses to start with).
+    let privs = std::process::Command::new("sc.exe")
+        .args([OsString::from("privs"), service.clone().into(), "SeChangeNotifyPrivilege".into()])
+        .output()
+        .context("could not run sc.exe")?;
+    if !privs.status.success() {
+        bail!("sc.exe privs {service} failed: {}", String::from_utf8_lossy(&privs.stdout).trim());
+    }
 
     // Now the account exists: let it into the data folder.
     let owner = OsString::from(format!("{account}:(OI)(CI)M"));
@@ -262,7 +310,9 @@ pub async fn install(a: InstallArgs) -> Result<()> {
     } else {
         let svc = manager.open_service(&service, ServiceAccess::START)?;
         svc.start::<&str>(&[]).with_context(|| format!("installed {service}, but it did not start"))?;
-        eprintln!("Started. Logs: {}", data.join("cache").join("runner").join("logs").display());
+        let log = data.join("cache").join("runner").join("logs").join(format!("{service}.log"));
+        eprintln!("Started. Log: {}", log.display());
+        eprintln!("Check that it joined with `airlox runner list`; the session owner must approve it.");
     }
     Ok(())
 }
@@ -336,7 +386,8 @@ fn service_main() {
     let name = args.windows_service.clone().unwrap_or_default();
     let handler = move |control| match control {
         ServiceControl::Stop | ServiceControl::Shutdown => {
-            let _ = crate::runner::SHUTDOWN.send(true);
+            // Kept even with nobody listening yet (a stop during startup).
+            crate::runner::SHUTDOWN.send_replace(true);
             ServiceControlHandlerResult::NoError
         }
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
