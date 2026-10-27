@@ -12,7 +12,6 @@
   and runs again, then tells the session the suite passes.
 """
 
-import io
 import json
 import os
 import pathlib
@@ -31,7 +30,7 @@ LIMITS = {"runtime": "python3.12", "timeout_s": 60, "memory_mb": 512, "network":
           "packages": [], "return_out": True, "approve_runners": True}
 FIX = ("    return s[mid]  # the bug the agent will find: wrong for even lengths\n",
        "    return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2\n")
-RUN = "$ airlox run --label ci --input project.zip --out-dir out run_tests.py"
+RUN = "$ airlox run --label ci --input project.zip --json run_tests.py"
 
 
 def zip_project(src: pathlib.Path, dest: pathlib.Path) -> None:
@@ -50,14 +49,13 @@ def agent_cli(*args, invite: str, cache: pathlib.Path) -> subprocess.CompletedPr
 def run_suite(workdir: pathlib.Path, invite: str, cache: pathlib.Path, attempt: int, step=quiet) -> dict:
     archive = workdir / "project.zip"
     zip_project(workdir / "project", archive)
-    out = workdir / f"out-{attempt}"
-    p = agent_cli("run", "--label", "ci", "--input", archive, "--out-dir", out, "--json", HERE / "run_tests.py",
+    p = agent_cli("run", "--label", "ci", "--input", archive, "--json", HERE / "run_tests.py",
                   invite=invite, cache=cache)
     res = json.loads(p.stdout)
-    with zipfile.ZipFile(io.BytesIO((out / "out.zip").read_bytes())) as z:
-        report = json.loads(z.read("report.json"))
+    # Small text files the job wrote come inline; --out-dir would save them all.
+    report = json.loads(next(f["text"] for f in res["out_text"] if f["name"] == "report.json"))
     failed = ", ".join(t.rsplit(".", 1)[-1] for t in report["failed"])
-    step("coding-agent", f"Gets the signed result: exit {p.returncode}", "out/out.zip → report.json",
+    step("coding-agent", f"Gets the signed result: exit {p.returncode}", 'out_text → "report.json"',
          out=f"{report['ran']} tests, failed: {failed}" if failed else f"{report['ran']} tests, all passed")
     return {"exit_code": p.returncode, "signed": res["signed"], "runner": res["runner_name"], "report": report}
 

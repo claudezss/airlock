@@ -8,8 +8,10 @@ runner's signed result, bound to the job by ``airlox._core``.
 
 from __future__ import annotations
 
+import io
 import json
 import time
+import zipfile
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
 
@@ -97,6 +99,31 @@ class Result:
             if f.name == name:
                 return f
         raise KeyError(name)
+
+    def read(self, name: str) -> bytes:
+        """A file the job wrote to ``$AIRLOX_OUT``, by its path there: a
+        top-level image, or anything else from inside ``out.zip`` (e.g.
+        ``"report.json"``). Raises ``KeyError`` if the job wrote no such
+        file, ``ValueError`` if it left the relay before it was fetched."""
+        try:
+            f = self.out_file(name)
+        except KeyError:
+            f = None
+        if f is None:
+            try:
+                f = self.out_file("out.zip")
+            except KeyError:
+                raise KeyError(name) from None
+        if f.data is None:
+            raise ValueError(f"{f.name} left the relay before it was fetched")
+        if f.name == name:
+            return f.data
+        # The same checks the runner applies to inputs, before opening it.
+        entries = json.loads(ac.inspect_zip(f.data))
+        if not any(e["path"] == name and not e["is_dir"] for e in entries):
+            raise KeyError(name)
+        with zipfile.ZipFile(io.BytesIO(f.data)) as z:
+            return z.read(name)
 
 
 # Relay reasons for jobs that ended without a signed result.

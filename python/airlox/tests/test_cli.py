@@ -182,9 +182,11 @@ def test_cli_runs_jobs(relay, caches, tmp_path, start_runner, runner_cache):
     p = cli("run", "--label", "cpu", "--input", data, "--out-dir", out, script, invite=sender, cache=caches("cli"))
     assert "2 orders, total 42" in p.stdout
     assert "signed by runner runner-01" in p.stderr
-    assert sorted(f.name for f in out.iterdir()) == ["chart.png", "out.zip"]
+    assert sorted(f.name for f in out.iterdir()) == ["chart.png", "out", "out.zip"]
     with zipfile.ZipFile(io.BytesIO((out / "out.zip").read_bytes())) as z:
         assert json.loads(z.read("summary.json")) == {"orders": 2, "total": 42}
+    # out.zip is also unpacked beside it.
+    assert json.loads((out / "out" / "summary.json").read_text()) == {"orders": 2, "total": 42}
 
     # The exit status is the job's; --no-wait plus `result` gets it later.
     failing = tmp_path / "fail.py"
@@ -385,8 +387,11 @@ def test_mcp_server(relay, caches, tmp_path, start_runner):
         res = mcp.call("run_python", code=SUMMARIZE, filename="summarize.py", files=[data_id], wait_s=120)["result"]
         assert res["signed"] and res["exit_code"] == 0 and "2 orders, total 42" in res["stdout"]
         assert res["runner_name"] == "runner-01"
+        # Small text files from out.zip come inline: no saving or unzipping.
+        assert res["out_text"] == [{"name": "summary.json", "text": '{"orders": 2, "total": 42}'}]
         saved = mcp.call("get_result", job=res["job"], save_dir="out")["saved"]
-        assert sorted(os.path.basename(p) for p in saved) == ["chart.png", "out.zip"]
+        assert {os.path.relpath(p, work / "out") for p in saved} == {
+            "chart.png", "out.zip", os.path.join("out", "summary.json")}
 
         # Joining another session does not redirect the default one.
         other = Session.create(relay.url, cache_dir=caches("other"))

@@ -334,6 +334,49 @@ pub struct OutFile {
     pub data: Option<Vec<u8>>,
 }
 
+/// A small text file from a job's `out.zip`, shown inline so it can be read
+/// without saving and unpacking the archive.
+#[derive(Clone, Debug, Serialize)]
+pub struct OutText {
+    pub name: String,
+    pub text: String,
+}
+
+/// Inline only files this small, at most this many bytes in all.
+const OUT_TEXT_MAX: u64 = 16 * 1024;
+const OUT_TEXT_TOTAL: u64 = 64 * 1024;
+
+/// The small UTF-8 text files in `out.zip`, by path. Anything else in the
+/// archive (binary, larger, or past the total) is left to `--out-dir`.
+pub fn out_text(outs: &[OutFile]) -> Vec<OutText> {
+    use airlox_core::validate::zip::{inspect_zip, ZipLimits};
+    use std::io::Read;
+    let Some(data) = outs.iter().find(|f| f.name == "out.zip").and_then(|f| f.data.as_deref()) else {
+        return vec![];
+    };
+    let Ok(entries) = inspect_zip(data, &ZipLimits::default()) else { return vec![] };
+    let Ok(mut ar) = zip::ZipArchive::new(std::io::Cursor::new(data)) else { return vec![] };
+    let mut out = Vec::new();
+    let mut budget = OUT_TEXT_TOTAL;
+    for e in &entries {
+        if e.is_dir || e.size > OUT_TEXT_MAX.min(budget) {
+            continue;
+        }
+        let Ok(f) = ar.by_name(&e.path) else { continue };
+        let mut buf = Vec::new();
+        if f.take(OUT_TEXT_MAX + 1).read_to_end(&mut buf).is_err() || buf.len() as u64 > OUT_TEXT_MAX {
+            continue;
+        }
+        let Ok(text) = String::from_utf8(buf) else { continue };
+        if text.contains('\0') {
+            continue;
+        }
+        budget -= text.len() as u64;
+        out.push(OutText { name: e.path.clone(), text });
+    }
+    out
+}
+
 /// A job's outcome. `signed` outcomes come from the runner; unsigned ones
 /// describe a job that never produced one (the relay's reason).
 #[derive(Clone, Debug, Serialize)]
@@ -349,6 +392,8 @@ pub struct Outcome {
     pub wall_ms: u64,
     pub peak_mem_mb: u64,
     pub out_files: Vec<OutFile>,
+    /// Small text files from `out.zip`, inline.
+    pub out_text: Vec<OutText>,
     /// The runner's key, and the name it joined with.
     pub runner: Option<String>,
     pub runner_name: Option<String>,
@@ -375,6 +420,7 @@ impl Outcome {
             wall_ms: 0,
             peak_mem_mb: 0,
             out_files: vec![],
+            out_text: vec![],
             runner,
             runner_name,
             signed: false,
@@ -976,6 +1022,7 @@ impl Session {
                 stderr_truncated: m["stderr_truncated"].as_bool().unwrap_or(false),
                 wall_ms: m["wall_ms"].as_u64().unwrap_or(0),
                 peak_mem_mb: m["peak_mem_mb"].as_u64().unwrap_or(0),
+                out_text: out_text(&outs),
                 out_files: outs,
                 runner: Some(item.author.clone()),
                 runner_name: item.author_name.clone(),
@@ -1514,5 +1561,51 @@ impl Session {
             }
         }
         Ok(Some(i))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    fn out_zip(files: &[(&str, &[u8])]) -> Vec<OutFile> {
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, data) in files {
+            w.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(data).unwrap();
+        }
+        let data = w.finish().unwrap().into_inner();
+        vec![OutFile {
+            name: "out.zip".into(),
+            size: data.len() as u64,
+            item_ref: json!({}),
+            data: Some(data),
+        }]
+    }
+
+    #[test]
+    fn out_text_inlines_only_small_text_files() {
+        let big = vec![b'a'; OUT_TEXT_MAX as usize + 1];
+        let outs = out_zip(&[
+            ("report.json", b"{\"ok\": true}"),
+            ("chart.bin", b"\x89PNG\x00\x01"),
+            ("big.log", &big),
+            ("dir/notes.md", b"# hi"),
+        ]);
+        let got: Vec<_> = out_text(&outs).into_iter().map(|t| (t.name, t.text)).collect();
+        assert_eq!(
+            got,
+            [("report.json".into(), "{\"ok\": true}".into()), ("dir/notes.md".into(), "# hi".into())]
+        );
+    }
+
+    #[test]
+    fn out_text_stops_at_the_total() {
+        let chunk = vec![b'a'; OUT_TEXT_MAX as usize];
+        let names: Vec<String> = (0..6).map(|i| format!("f{i}.txt")).collect();
+        let files: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), chunk.as_slice())).collect();
+        assert_eq!(out_text(&out_zip(&files)).len(), (OUT_TEXT_TOTAL / OUT_TEXT_MAX) as usize);
     }
 }

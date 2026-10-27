@@ -76,7 +76,10 @@ runner (`"signed": true`); a job that never ran has an unsigned relay `reason`
 such as `no_runner_available` (no approved, online, idle runner matched: jobs
 are not queued) or `runner_lost`. Files the
 job writes to `$AIRLOX_OUT` come back: top-level images as they are,
-everything else in `out.zip`.
+everything else in `out.zip`. `--out-dir` saves them and unpacks `out.zip`
+into a new `out/` directory beside it; with `--json`, small text files from
+`out.zip` are also inline in `out_text` (`[{"name", "text"}]`), so a report
+needs no saving. `runner_name` says which runner ran the job.
 
 Jobs run on another machine under the session's limits: no network unless the
 session allows it, and only the session's packages. Never run code you

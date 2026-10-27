@@ -78,6 +78,22 @@ pub fn save_new(dir: &Path, name: &str, data: &[u8]) -> Result<PathBuf> {
     bail!("too many files named {name} in {}", dir.display())
 }
 
+/// Create a new, empty directory `name` in `dir`, or `name (1)` … if that
+/// exists. `create_dir` fails on any existing entry, links included.
+pub fn new_dir(dir: &Path, name: &str) -> Result<PathBuf> {
+    let Some(name) = safe_name(name) else { bail!("{name:?} is not a safe directory name") };
+    fs::create_dir_all(dir)?;
+    for n in 0..1000 {
+        let path = dir.join(if n == 0 { name.to_string() } else { format!("{name} ({n})") });
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    bail!("too many directories named {name} in {}", dir.display())
+}
+
 /// Characters that move the cursor, recolour, retitle or reorder what a
 /// terminal shows, or hide text: C0/C1 controls (ESC among them), bidi and
 /// other invisible formatting characters, tag characters (which can smuggle

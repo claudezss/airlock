@@ -693,7 +693,8 @@ job writes to $AIRLOX_OUT come back as out files; use get_result with save_dir t
     }
 
     #[tool(description = "Get a job's signed result, optionally waiting for it and saving its out files \
-(images and out.zip, never over an existing file).")]
+(images, and out.zip unpacked beside it; never over an existing file). Small text files from out.zip \
+are in the result's out_text.")]
     async fn get_result(&self, Parameters(p): Parameters<ResultParams>) -> Result<CallToolResult, ErrorData> {
         let save_dir = match &p.save_dir {
             Some(d) => Some(tool_try!(self.allowed(d, false))),

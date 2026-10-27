@@ -113,15 +113,17 @@ The agent, each time it wants the suite run:
 
 ```bash
 zip -r project.zip project
-airlox run --label ci --input project.zip --out-dir out --json run_tests.py
+airlox run --label ci --input project.zip --json run_tests.py
 ```
 
 [`run_tests.py`](../examples/remote-tests/run_tests.py) runs `unittest` in
 the unpacked project, writes `report.json` to `$AIRLOX_OUT` and exits 1 on a
-failure, so `airlox run` exits the same way. The scenario plays the loop an
-agent goes through:
+failure, so `airlox run` exits the same way. Small text files a job writes
+come back inline in the JSON (`out_text`), so the agent reads the report
+without saving anything; `--out-dir` would save every file. The scenario
+plays the loop an agent goes through:
 
-1. The first run exits 1; `out/out.zip` holds a report naming
+1. The first run exits 1; the report in `out_text` names
    `test_median_even`.
 2. The agent fixes `median()` and runs again: exit 0, three tests passed.
 3. It tells the session: `airlox send text "stats: 3 tests pass on ci-box …"`.
@@ -160,8 +162,7 @@ for i, runner in enumerate(["pool-a", "pool-b"]):
 total = collections.Counter()
 for job in jobs:
     res = job.wait(timeout=300)
-    with zipfile.ZipFile(io.BytesIO(res.out_file("out.zip").data)) as z:
-        total.update(json.loads(z.read("counts.json")))
+    total.update(json.loads(res.read("counts.json")))   # a file the job wrote to $AIRLOX_OUT
 ```
 
 The test checks that the shards ran on `pool-a` and `pool-b`, that `gpu-fast`

@@ -88,6 +88,11 @@ def test_unapproved_runners_get_nothing_then_summarize_runs(execute):
     assert res.out_file("chart.png").data.startswith(b"\x89PNG")
     z = zipfile.ZipFile(io.BytesIO(res.out_file("out.zip").data))
     assert z.read("summary.json") == b'{"orders": 2, "total": 42}'
+    # read() finds files by their path in $AIRLOX_OUT, zipped or not.
+    assert res.read("summary.json") == b'{"orders": 2, "total": 42}'
+    assert res.read("chart.png").startswith(b"\x89PNG")
+    with pytest.raises(KeyError):
+        res.read("missing.txt")
     assert job.state()["state"] == "done"
     # The owner sees the same verified result.
     assert owner.items() and any(i.kind == "result" for i in owner.items())

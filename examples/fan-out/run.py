@@ -85,8 +85,7 @@ def scenario(relay: str, start_runner, workdir: pathlib.Path, step=quiet) -> dic
     for job in jobs:
         res = job.wait(timeout=300)
         assert res.ok and res.signed, (res.status, res.stderr)
-        with zipfile.ZipFile(io.BytesIO(res.out_file("out.zip").data)) as z:
-            total.update(json.loads(z.read("counts.json")))
+        total.update(json.loads(res.read("counts.json")))
         ran_on.append(res.runner_name)
 
     step("planner", "Merges the two signed results", "for job in jobs: total.update(counts(job.wait()))",

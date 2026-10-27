@@ -204,7 +204,8 @@ job = agent.run_python(open("summarize.py").read(), filename="summarize.py",
                        files=[data], runner="runner-01")
 res = job.wait()
 print(res.status, res.exit_code, res.stdout)
-chart = res.out_file("chart.png").data   # files the job wrote to $AIRLOX_OUT
+chart = res.read("chart.png")            # files the job wrote to $AIRLOX_OUT
+summary = res.read("summary.json")       # by path, whether or not it came zipped
 ```
 
 The runner builds its job image once (`python:3.12-slim` plus the session's

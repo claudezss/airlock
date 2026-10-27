@@ -11,12 +11,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use airlox_core::session::{JobLimits, Mode};
+use airlox_core::validate::zip::{extract_zip, ZipLimits};
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 
 use crate::client;
-use crate::files::{clean_line, clean_text, out_file_name, received_name, save_new};
+use crate::files::{clean_line, clean_text, new_dir, out_file_name, received_name, save_new};
 use crate::session::{
     default_cache_root, file_type, Item, JobSpec, NewSession, NoRunnerAvailable, Outcome, Profile, Session,
     Status, Target, DEFAULT_TYPES, FILE_TYPES_HELP,
@@ -619,7 +620,9 @@ fn exit_status(r: &Outcome) -> i32 {
 }
 
 /// Save a job's out files into `dir`, never over an existing file. Only
-/// the names runners produce (top-level images, `out.zip`) are saved.
+/// the names runners produce (top-level images, `out.zip`) are saved, and
+/// `out.zip` is also unpacked into a new directory beside it (`out`, or
+/// `out (1)` …) with the checks the runner applies to inputs.
 pub fn save_out_files(r: &Outcome, dir: &Path) -> Result<Vec<String>> {
     let mut saved = Vec::new();
     for f in &r.out_files {
@@ -629,6 +632,14 @@ pub fn save_out_files(r: &Outcome, dir: &Path) -> Result<Vec<String>> {
             continue;
         };
         saved.push(save_new(dir, name, data)?.display().to_string());
+        if name == "out.zip" {
+            let dest = new_dir(dir, "out")?;
+            let entries = extract_zip(data, &dest, &ZipLimits::default())
+                .with_context(|| format!("unpacking out.zip into {}", dest.display()))?;
+            saved.extend(
+                entries.iter().filter(|e| !e.is_dir).map(|e| dest.join(&e.path).display().to_string()),
+            );
+        }
     }
     Ok(saved)
 }
@@ -959,4 +970,72 @@ pub async fn runner_reject(conn: Conn, name: String, reason: Option<String>) -> 
         println!("rejected {}", clean_line(&r.name));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+    use crate::session::OutFile;
+
+    fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, data) in files {
+            w.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(data).unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    fn outcome(out_zip: Vec<u8>) -> Outcome {
+        Outcome {
+            job: "j".into(),
+            status: "completed".into(),
+            exit_code: Some(0),
+            reason: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            wall_ms: 0,
+            peak_mem_mb: 0,
+            out_files: vec![OutFile {
+                name: "out.zip".into(),
+                size: out_zip.len() as u64,
+                item_ref: json!({}),
+                data: Some(out_zip),
+            }],
+            out_text: vec![],
+            runner: None,
+            runner_name: None,
+            signed: true,
+        }
+    }
+
+    #[test]
+    fn out_zip_is_unpacked_beside_it_into_a_new_directory() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("out")).unwrap();
+        std::fs::write(d.path().join("out/report.json"), "mine").unwrap();
+        let r = outcome(zip_of(&[("report.json", b"{}"), ("logs/run.txt", b"ok")]));
+        let saved = save_out_files(&r, d.path()).unwrap();
+        let names: Vec<_> =
+            saved.iter().map(|p| Path::new(p).strip_prefix(d.path()).unwrap().to_owned()).collect();
+        assert_eq!(
+            names,
+            [Path::new("out.zip"), Path::new("out (1)/report.json"), Path::new("out (1)/logs/run.txt")]
+        );
+        assert_eq!(std::fs::read_to_string(d.path().join("out/report.json")).unwrap(), "mine");
+    }
+
+    #[test]
+    fn a_hostile_out_zip_writes_nothing_outside() {
+        let d = tempfile::tempdir().unwrap();
+        let inner = d.path().join("save");
+        let r = outcome(zip_of(&[("ok.txt", b"x"), ("../escaped.txt", b"x")]));
+        assert!(save_out_files(&r, &inner).is_err());
+        assert!(!d.path().join("escaped.txt").exists());
+        assert!(crate::session::out_text(&r.out_files).is_empty());
+    }
 }
