@@ -192,7 +192,7 @@ Create an execute session and start a runner with its runner invite:
 owner = Session.create(
     "https://airlox.app",
     mode="execute",
-    job_limits={"runtime": "python3.12", "timeout_s": 120, "memory_mb": 512,
+    job_limits={"runtime": "python3.12", "timeout_s": 120, "memory_mb": 2048,
                 "network": False, "packages": ["pandas", "matplotlib"],
                 "return_out": True, "approve_runners": True},
 )
@@ -204,9 +204,15 @@ airlox runner join --invite '<runner invite>' --name runner-01 --labels cpu --sa
     --description "8 cores, 32 GB RAM, in the build lab"
 ```
 
-Copying a link to another machine is awkward. Instead, click **Send to another
-machine** next to any invite in the web UI. It shows a one-time code such as
-`7-guitar-orbit`, valid for 10 minutes, which works on the other machine:
+Copying a link to another machine is awkward. Instead, make a one-time code
+such as `7-guitar-orbit`, valid for 10 minutes: click **Send to another
+machine** next to any invite in the web UI, or with the owner invite run
+
+```bash
+airlox session code runner             # prints the code; --wait waits until it is used
+```
+
+(`owner.transfer_code("runner").code` in Python). On the other machine:
 
 ```bash
 airlox runner join --code 7-guitar-orbit --name runner-01 --sandbox docker
@@ -214,6 +220,11 @@ airlox receive 7-guitar-orbit           # or just print the invite link
 ```
 
 You can also type the code in a browser at `/receive`.
+
+For a long-lived runner, `airlox session create --profile host-runner`
+starts from a session that never expires, with 30-minute jobs, 4096 MB of job
+memory, items as large as the relay allows and runner approval on. Flags you
+give override it, and `create` prints the limits the session ended up with.
 
 Approve the runner, then send it work:
 
@@ -281,6 +292,10 @@ see `airlox-server --help`. `--ephemeral` keeps nothing across restarts.
 Kubernetes liveness and readiness probes.
 [docs/deploy.md](docs/deploy.md) describes the production setup behind
 airlox.app: Caddy for HTTPS and automatic deploys from CI.
+[docs/kubernetes.md](docs/kubernetes.md) runs it in a cluster
+([`deploy/kubernetes/`](deploy/kubernetes/airlox-relay.yaml)), with plain
+http between pods when the session's owner allows it
+(`--insecure-http-host`).
 
 ## Security model
 

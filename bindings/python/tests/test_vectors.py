@@ -73,6 +73,13 @@ def test_bad_invites_rejected(case):
         ac.parse_invite(case["url"])
 
 
+@pytest.mark.parametrize("case", VEC["negative_invites_for_manifest"], ids=lambda c: c["name"])
+def test_invites_the_manifest_refuses(case):
+    ac.parse_invite(case["url"])
+    with pytest.raises(ac.ValidationError):
+        ac.check_invite(case["url"], MANIFEST)
+
+
 def test_certs_and_join():
     for c in VEC["certs"]:
         assert ac.verify_cert(c["signed_canonical"], MANIFEST) == c["role"]

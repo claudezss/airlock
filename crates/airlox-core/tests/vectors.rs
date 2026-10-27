@@ -91,6 +91,10 @@ fn invites_certs_join() {
     for n in v["negative_invites"].as_array().unwrap() {
         assert!(Invite::parse(st(&n["url"])).is_err(), "{}", n["name"]);
     }
+    for n in v["negative_invites_for_manifest"].as_array().unwrap() {
+        let i = Invite::parse(st(&n["url"])).unwrap();
+        assert!(i.check_against(&m.manifest).is_err(), "{}", n["name"]);
+    }
 }
 
 #[test]

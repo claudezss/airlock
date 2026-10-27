@@ -260,6 +260,24 @@ fn shim_source() -> &'static str {
     api::shim_source()
 }
 
+/// Seal an invite for a transfer code. Returns (secret, claim_hash, box).
+#[pyfunction]
+fn transfer_seal(invite: &str) -> PyResult<(String, String, String)> {
+    api::transfer_seal(invite).map_err(err)
+}
+
+/// Parse a typed transfer code. Returns (nameplate, claim).
+#[pyfunction]
+fn transfer_claim(code: &str) -> PyResult<(u32, String)> {
+    api::transfer_claim(code).map_err(err)
+}
+
+/// Open the box fetched with `code`; returns the invite link.
+#[pyfunction]
+fn transfer_open(code: &str, sealed_box: &str) -> PyResult<String> {
+    api::transfer_open(code, sealed_box).map_err(err)
+}
+
 #[pymodule]
 #[pyo3(name = "_core")]
 fn core_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -298,5 +316,8 @@ fn core_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_zip, m)?)?;
     m.add_function(wrap_pyfunction!(sanitize_image, m)?)?;
     m.add_function(wrap_pyfunction!(shim_source, m)?)?;
+    m.add_function(wrap_pyfunction!(transfer_seal, m)?)?;
+    m.add_function(wrap_pyfunction!(transfer_claim, m)?)?;
+    m.add_function(wrap_pyfunction!(transfer_open, m)?)?;
     Ok(())
 }

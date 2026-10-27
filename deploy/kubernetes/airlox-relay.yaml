@@ -1,0 +1,106 @@
+# An Airlox relay inside a cluster: one pod, a ClusterIP Service, and a
+# NetworkPolicy that lets in only this namespace's pods and lets nothing out.
+# Apply it to a namespace of your choice:
+#
+#   kubectl -n airlox apply -f deploy/kubernetes/airlox-relay.yaml
+#
+# Clients in the cluster reach it as http://airlox-relay.<namespace>.svc:8080.
+# Plain http is refused unless the session names that host, so create
+# sessions with the same host spelled the same way everywhere:
+#
+#   airlox session create --relay http://airlox-relay.airlox.svc:8080 \
+#     --insecure-http-host airlox-relay.airlox.svc --profile host-runner
+#
+# See docs/kubernetes.md.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airlox-relay
+  labels: {app.kubernetes.io/name: airlox-relay}
+spec:
+  # The relay keeps sessions in memory and on its own volume: one replica,
+  # replaced (not rolled) so two never share a session.
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app.kubernetes.io/name: airlox-relay}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: airlox-relay}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        # The image's own user; /data in the image belongs to it.
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: relay
+          # Pin the release you run; it is amd64 only.
+          image: ghcr.io/claudezss/airlox-server:0.1.2
+          ports:
+            - {name: http, containerPort: 8080}
+          env:
+            - {name: AIRLOX_LISTEN, value: "0.0.0.0:8080"}
+            - {name: AIRLOX_DATA, value: /data}
+            - {name: NO_COLOR, value: "1"}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+          startupProbe:
+            httpGet: {path: /v1/health, port: http}
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: {path: /v1/health, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /v1/health, port: http}
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {memory: 640Mi}
+      volumes:
+        # Ciphertext in transit, at most AIRLOX_MAX_SESSION_BYTES (1 GiB) per
+        # session. It outlives a container restart (the relay reloads its
+        # sessions) but not the pod; use a PersistentVolumeClaim to keep
+        # sessions across rescheduling.
+        - name: data
+          emptyDir: {sizeLimit: 4Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: airlox-relay
+  labels: {app.kubernetes.io/name: airlox-relay}
+spec:
+  selector: {app.kubernetes.io/name: airlox-relay}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+# Only pods in this namespace may connect, and the relay makes no outbound
+# connections at all. Enforced only where the cluster's network plugin
+# supports NetworkPolicy; widen the ingress rule for runners elsewhere.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: airlox-relay
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: airlox-relay}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - {port: http}
+  egress: []

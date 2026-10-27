@@ -526,6 +526,24 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         let _ = relay.report("failed", Some(&failure_detail(&e)), None).await;
         return Err(e.context("preparing the sandbox"));
     }
+    // A cap below what importing the allowlist takes fails every job that
+    // imports it, with only an out-of-memory notice to say why.
+    let cap_mb = limits.memory_mb.min(args.memory.unwrap_or(u32::MAX)) as u64;
+    if let Some(peak) = backend.import_footprint_mb(&spec).await {
+        tracing::info!(peak_mb = peak, cap_mb, "memory used by importing the allowlisted packages");
+        if peak * 10 >= cap_mb * 8 {
+            tracing::warn!(
+                "importing the allowlisted packages alone takes {peak} MB of the {cap_mb} MB jobs may use; jobs \
+                 that import them will likely run out of memory. Ask the owner for a session with a larger \
+                 --job-memory{}",
+                if args.memory.is_some_and(|m| (m as u64) < limits.memory_mb as u64) {
+                    ", or raise this runner's --memory"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
     // Unsandboxed (the local backend off Linux, or process mode): jobs are
     // plain processes.
     let unsandboxed = backend.network_unblocked();

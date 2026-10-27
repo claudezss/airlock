@@ -401,6 +401,7 @@ mod tests {
                 allowed_types: vec![ContentType::Text, ContentType::Py, ContentType::Md, ContentType::Zip],
                 max_item_bytes: 1024 * 1024,
                 job_limits: (mode == Mode::Execute).then_some(limits),
+                insecure_http_host: None,
             })
             .unwrap()
             .manifest

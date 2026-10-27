@@ -616,3 +616,56 @@ def test_mcp_on_the_stateless_protocol(relay, caches, tmp_path):
         proc.wait(timeout=10)
     owner.sync()
     assert [(i.author_name, i.text) for i in owner.items() if i.kind == "text"] == [("claude-code", "hello")]
+
+
+def test_cli_transfer_codes(relay, caches, tmp_path):
+    owner_file = tmp_path / "owner.txt"
+    created = json.loads(cli("session", "create", "--relay", relay.url, "--execute", "--json",
+                             "--owner-invite-file", owner_file, cache=caches("cli")).stdout)
+    owner = owner_file.read_text().strip()
+    made = json.loads(cli("session", "code", "runner", "--json", invite=owner, cache=caches("cli")).stdout)
+    assert made["role"] == "runner" and "--code " + made["code"] in made["command"]
+    got = cli("receive", made["code"], "--relay", relay.url)
+    assert got.stdout.strip() == created["invites"]["runner"]
+    # Without --json the code alone goes to stdout, the instructions to stderr.
+    plain = cli("session", "code", "sender", invite=owner, cache=caches("cli"))
+    assert re.fullmatch(r"\d+-[a-z]+-[a-z]+\n", plain.stdout)
+    assert "airlox receive" in plain.stderr
+    # --wait returns once the code is used.
+    env = dict(os.environ, AIRLOX_INVITE=owner, AIRLOX_CACHE_DIR=str(caches("cli")))
+    p = subprocess.Popen([BIN, "session", "code", "observer", "--wait"], env=env,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    code = p.stdout.readline().strip()
+    assert cli("receive", code, "--relay", relay.url).stdout.strip() == created["invites"]["observer"]
+    assert p.wait(timeout=30) == 0, p.stderr.read()
+    # Only the owner makes codes.
+    bad = cli("session", "code", "sender", invite=created["invites"]["sender"], cache=caches("s"), check=False)
+    assert bad.returncode != 0 and "owner" in bad.stderr
+
+
+def test_cli_create_profile_and_effective_limits(relay, caches):
+    out = cli("session", "create", "--relay", relay.url, "--profile", "host-runner", "--package", "pyPowerGEM",
+              "--job-memory", "8192", "--json", cache=caches("cli")).stdout
+    v = json.loads(out)
+    assert v["expires_at_ms"] is None
+    assert v["max_item_bytes"] == 100 << 20  # the relay's own limit
+    lim = v["job_limits"]
+    assert (lim["timeout_s"], lim["memory_mb"], lim["approve_runners"]) == (1800, 8192, True)
+    assert lim["packages"] == ["pypowergem"]
+    text = cli("session", "create", "--relay", relay.url, "--execute", "--max-item-mb", "5",
+               cache=caches("cli")).stdout
+    assert "items     up to 5 MiB" in text
+    assert re.search(r"jobs      python3\.12 · 60 s · 2048 MB · network off · packages \[\] · approval required", text)
+
+
+def test_cli_plain_http_needs_the_owner_to_name_the_host(relay, caches):
+    url = relay.url.replace("127.0.0.1", "127.1")
+    refused = cli("session", "create", "--relay", url, cache=caches("cli"), check=False)
+    assert refused.returncode != 0 and "--insecure-http-host" in refused.stderr
+    v = json.loads(cli("session", "create", "--relay", url, "--insecure-http-host", "127.1", "--json",
+                       cache=caches("cli")).stdout)
+    assert v["insecure_http_host"] == "127.1"
+    sender = v["invites"]["sender"]
+    cli("send", "text", "hello over http", invite=sender, cache=caches("s"))
+    info = json.loads(cli("session", "info", "--json", invite=sender, cache=caches("s")).stdout)
+    assert info["insecure_http_host"] == "127.1"

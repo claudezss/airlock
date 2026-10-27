@@ -60,15 +60,132 @@ pub struct PythonInfo {
     pub version: String,
     /// Allowlisted packages it does not have.
     pub missing: Vec<String>,
+    /// `sys.executable`.
+    #[serde(default)]
+    pub executable: Option<String>,
+    /// Where each allowlisted package it has comes from.
+    #[serde(default)]
+    pub packages: Vec<PackageInfo>,
 }
 
-/// Lists the interpreter's version and which of the package names in argv
-/// (PEP 503 normalized) are not installed. Standard library only.
+/// An installed distribution, and where its top-level modules import from.
+#[derive(Debug, Deserialize)]
+pub struct PackageInfo {
+    pub name: String,
+    pub version: String,
+    /// The directory holding its `.dist-info`.
+    pub location: String,
+    /// Installed with `pip install -e`: jobs import a source checkout.
+    #[serde(default)]
+    pub editable: bool,
+    /// For an editable install, the checkout it points at (a `file://` URL).
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub imports: Vec<ModuleOrigin>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModuleOrigin {
+    pub module: String,
+    /// The file or directory `import module` would load, if found.
+    pub origin: Option<String>,
+}
+
+impl PackageInfo {
+    /// Modules that import from somewhere other than where the package is
+    /// installed: an editable checkout, or a copy earlier on `sys.path`.
+    pub fn elsewhere(&self) -> Vec<&ModuleOrigin> {
+        // Windows paths compare without case.
+        let fold = |p: &str| if cfg!(windows) { p.to_lowercase() } else { p.to_string() };
+        let home = fold(&self.location);
+        self.imports
+            .iter()
+            .filter(|m| m.origin.as_deref().is_some_and(|o| !Path::new(&fold(o)).starts_with(&home)))
+            .collect()
+    }
+}
+
+/// Reports the interpreter's version and which of the package names in argv
+/// (PEP 503 normalized) are not installed, and for those that are, where
+/// they come from: version, location, whether the install is editable, and
+/// the file each top-level module would load from (found, not imported).
+/// Standard library only.
 const PROBE_PY: &str = r#"
 import json, platform, re, sys
-from importlib import metadata
-have = {re.sub(r"[-_.]+", "-", d.metadata.get("Name") or "").lower() for d in metadata.distributions()}
-print(json.dumps({"version": platform.python_version(), "missing": [p for p in sys.argv[1:] if p not in have]}))
+from importlib import metadata, util
+def norm(n):
+    return re.sub(r"[-_.]+", "-", n or "").lower()
+dists = {}
+for d in metadata.distributions():
+    dists.setdefault(norm(d.metadata.get("Name")), d)
+try:
+    top = metadata.packages_distributions()
+except AttributeError:
+    top = {}
+mods = {}
+for m, names in top.items():
+    for n in names:
+        if not m.startswith("_"):
+            mods.setdefault(norm(n), set()).add(m)
+def origin(m):
+    try:
+        s = util.find_spec(m)
+    except Exception:
+        return None
+    if s is None:
+        return None
+    if s.origin and s.has_location:
+        return s.origin
+    locs = list(s.submodule_search_locations or [])
+    return locs[0] if locs else None
+pkgs = []
+for p in sys.argv[1:]:
+    d = dists.get(p)
+    if d is None:
+        continue
+    editable, source = False, None
+    try:
+        du = json.loads(d.read_text("direct_url.json") or "{}")
+        editable = bool(du.get("dir_info", {}).get("editable"))
+        source = du.get("url") if editable else None
+    except Exception:
+        pass
+    names = sorted(mods.get(p) or {p.replace("-", "_")})[:5]
+    pkgs.append({"name": p, "version": d.version, "location": str(d.locate_file("")), "editable": editable,
+                 "source": source, "imports": [{"module": m, "origin": origin(m)} for m in names]})
+print(json.dumps({"version": platform.python_version(), "executable": sys.executable,
+                  "missing": [p for p in sys.argv[1:] if p not in dists], "packages": pkgs}))
+"#;
+
+/// Imports the given modules and prints the process's peak memory in MB:
+/// commit on Windows (what a Job Object caps), peak RSS elsewhere. Modules
+/// that fail to import are skipped. Standard library only.
+const FOOTPRINT_PY: &str = r#"
+import importlib, sys
+for m in sys.argv[1:]:
+    try:
+        importlib.import_module(m)
+    except BaseException:
+        pass
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+    class C(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+            (n, ctypes.c_size_t) for n in ("PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
+            "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage", "PagefileUsage",
+            "PeakPagefileUsage")]
+    c = C()
+    c.cb = ctypes.sizeof(C)
+    k = ctypes.WinDLL("kernel32")
+    k.GetCurrentProcess.restype = wintypes.HANDLE
+    ctypes.WinDLL("psapi").GetProcessMemoryInfo(k.GetCurrentProcess(), ctypes.byref(c), c.cb)
+    print(c.PeakPagefileUsage // (1 << 20))
+else:
+    import resource
+    r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    print(r // (1 << 20) if sys.platform == "darwin" else r // 1024)
 "#;
 
 /// Windows variables that describe the machine, not the user, and that
@@ -145,6 +262,31 @@ pub async fn probe_python(python: &Path, packages: &[String], pass_env: &[String
     }
     serde_json::from_slice(&out.stdout)
         .with_context(|| format!("unexpected answer from {}", python.display()))
+}
+
+/// Say where each allowlisted package imports from, and warn about the
+/// ones that do not import from the installed distribution.
+fn report_packages(packages: &[PackageInfo]) {
+    for p in packages {
+        tracing::info!(package = %p.name, version = %p.version, from = %p.location, "allowlisted package");
+        let elsewhere = p.elsewhere();
+        if p.editable {
+            tracing::warn!(
+                "{} is an editable install{}: jobs import that checkout as it is now, not a built wheel",
+                p.name,
+                p.source.as_deref().map(|s| format!(" of {s}")).unwrap_or_default()
+            );
+        } else if let Some(m) = elsewhere.first() {
+            tracing::warn!(
+                "`import {}` loads {}, not the {} {} installed in {}: something earlier on sys.path shadows it",
+                m.module,
+                m.origin.as_deref().unwrap_or("?"),
+                p.name,
+                p.version,
+                p.location
+            );
+        }
+    }
 }
 
 /// Every symlink met while resolving `p` (e.g. uv's `cpython-3.12-…` link
@@ -298,8 +440,35 @@ impl Local {
                 python.display()
             );
         }
-        tracing::info!(python = %python.display(), version = %info.version, "using the operator's interpreter");
+        tracing::info!(
+            python = %info.executable.as_deref().unwrap_or(&python.display().to_string()),
+            version = %info.version,
+            "using the operator's interpreter"
+        );
+        report_packages(&info.packages);
         Ok(python)
+    }
+
+    /// How much memory importing the allowlisted packages takes, in MB, for
+    /// process mode, where jobs are plain processes anyway: a cap below it
+    /// fails every job that imports them. `None` elsewhere (importing here
+    /// would run package code outside the sandbox), or if it cannot tell.
+    pub async fn import_footprint_mb(&self, spec: &RuntimeSpec) -> Option<u64> {
+        if !self.opts.process || spec.packages.is_empty() {
+            return None;
+        }
+        let python = self.python.as_ref()?;
+        let info = probe_python(python, &spec.packages, &self.opts.pass_env).await.ok()?;
+        let modules: Vec<&str> =
+            info.packages.iter().flat_map(|p| p.imports.iter().map(|m| m.module.as_str())).collect();
+        let mut cmd = Command::new(python);
+        base_env(&mut cmd, &self.opts.pass_env);
+        cmd.args(["-I", "-c", FOOTPRINT_PY]).args(&modules).stdin(Stdio::null()).kill_on_drop(true);
+        cmd.current_dir(&self.state_dir);
+        #[cfg(windows)]
+        cmd.creation_flags(super::winjob::NO_WINDOW);
+        let out = tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output()).await.ok()?.ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
     }
 
     /// A uv venv with the allowlist, shared by runners using the same cache.
@@ -470,5 +639,30 @@ impl Local {
             peak_mem_kb,
             error,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_package_importing_from_outside_its_install_is_flagged() {
+        let info: PythonInfo = serde_json::from_str(
+            r#"{"version": "3.12.4", "missing": [], "executable": "/v/bin/python", "packages": [
+                {"name": "numpy", "version": "2.1.0", "location": "/v/lib/site-packages",
+                 "imports": [{"module": "numpy", "origin": "/v/lib/site-packages/numpy/__init__.py"}]},
+                {"name": "cugrid", "version": "0.3.0", "location": "/v/lib/site-packages", "editable": true,
+                 "source": "file:///src/cugrid",
+                 "imports": [{"module": "cugrid", "origin": "/src/cugrid/cugrid/__init__.py"},
+                             {"module": "gone", "origin": null}]}]}"#,
+        )
+        .unwrap();
+        assert!(info.packages[0].elsewhere().is_empty());
+        let out: Vec<_> = info.packages[1].elsewhere().iter().map(|m| m.module.as_str()).collect();
+        assert_eq!(out, ["cugrid"]);
+        // What older probes (and runners) report still parses.
+        let old: PythonInfo = serde_json::from_str(r#"{"version": "3.12.4", "missing": ["x"]}"#).unwrap();
+        assert!(old.packages.is_empty() && old.executable.is_none());
     }
 }

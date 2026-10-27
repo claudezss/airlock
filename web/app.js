@@ -520,12 +520,20 @@ function newSession() {
       el("label", { class: "option" }, el("input", { type: "checkbox", name: "type", value: v, checked: true }),
         label, el("span", { class: "ext" }, ext)))));
   const size = el("input", { type: "number", id: "size", min: 1, max: MAX_ITEM_MB, step: 1, value: MAX_ITEM_MB });
+  // Offer files as large as this relay allows; older relays do not say.
+  fetch("/v1/health").then((r) => r.json()).then((h) => {
+    const relayMb = Math.floor((h.max_item_bytes || 0) / MB);
+    if (relayMb < 1) return;
+    const untouched = Number(size.value) === Number(size.max);
+    size.max = relayMb;
+    if (untouched) size.value = relayMb;
+  }, () => {});
   const sizeField = el("div", { class: "stack" }, el("label", { for: "size" }, el("strong", {}, "Max file size")),
     el("div", { class: "size" }, size, el("span", { class: "muted" }, "MB")));
   const lim = {
     runtime: el("input", { type: "text", id: "j-runtime", value: "python3.12", autocomplete: "off" }),
     timeout: el("input", { type: "number", id: "j-timeout", min: 1, max: 86400, step: 1, value: 30 }),
-    memory: el("input", { type: "number", id: "j-memory", min: 32, max: 65536, step: 1, value: 512 }),
+    memory: el("input", { type: "number", id: "j-memory", min: 32, max: 65536, step: 1, value: 2048 }),
     packages: el("input", { type: "text", id: "j-packages", placeholder: "numpy, pandas", autocomplete: "off" }),
     approve: el("input", { type: "checkbox", id: "j-approve", checked: true }),
   };
@@ -582,7 +590,8 @@ function newSession() {
       }
       job_limits = { runtime, timeout_s, memory_mb, network: false, packages, return_out: true, approve_runners: lim.approve.checked };
     }
-    if (!Number.isInteger(mb) || mb < 1 || mb > MAX_ITEM_MB) return (err.textContent = `Max file size must be 1 to ${MAX_ITEM_MB} MB.`);
+    const maxMb = Number(size.max);
+    if (!Number.isInteger(mb) || mb < 1 || mb > maxMb) return (err.textContent = `Max file size must be 1 to ${maxMb} MB.`);
     create.disabled = true;
     try {
       const params = { mode: execute ? "execute" : "relay", created_at_ms: Date.now(), ttl_ms: fd.get("ttl") === "never" ? null : Number(fd.get("ttl")), allowed_types: allowed,

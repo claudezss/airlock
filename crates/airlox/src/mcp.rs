@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use airlox_core::invite::Invite;
-use airlox_core::session::{JobLimits, Mode};
+use airlox_core::session::{JobLimits, Mode, DEFAULT_MAX_ITEM_BYTES};
 
 use crate::cli::{item_json, save_item, save_out_files};
 use crate::client::{self, is_transient};
@@ -323,7 +323,7 @@ pub struct CreateParams {
     pub network: bool,
     /// execute: job time limit in seconds (default 60).
     pub job_timeout_s: Option<u32>,
-    /// execute: job memory limit in MB (default 512).
+    /// execute: job memory limit in MB (default 2048).
     pub job_memory_mb: Option<u32>,
     /// execute: require the owner to approve each runner (default true).
     pub approve_runners: Option<bool>,
@@ -600,16 +600,19 @@ should have that role. The owner link is never returned.")]
             mode: if p.execute { Mode::Execute } else { Mode::Relay },
             ttl_ms,
             allowed_types: DEFAULT_TYPES.iter().map(|s| s.to_string()).collect(),
-            max_item_bytes: 25 * 1024 * 1024,
+            max_item_bytes: client::relay_max_item_bytes(&self.http, &self.relay)
+                .await
+                .unwrap_or(DEFAULT_MAX_ITEM_BYTES),
             job_limits: p.execute.then(|| JobLimits {
                 runtime: "python3.12".into(),
                 timeout_s: p.job_timeout_s.unwrap_or(60),
-                memory_mb: p.job_memory_mb.unwrap_or(512),
+                memory_mb: p.job_memory_mb.unwrap_or(crate::cli::DEFAULT_JOB_MEMORY_MB),
                 network: p.network,
                 packages: p.packages.clone(),
                 return_out: true,
                 approve_runners: p.approve_runners.unwrap_or(true),
             }),
+            insecure_http_host: None,
         };
         let me = self.profile(p.description.clone());
         let s = tool_try!(Session::create(&self.http, &self.relay, new, &me, &self.cache_root).await);

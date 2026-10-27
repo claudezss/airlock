@@ -21,6 +21,7 @@ use crate::session::{
     default_cache_root, file_type, Item, JobSpec, NewSession, NoRunnerAvailable, Outcome, Profile, Session,
     Status, Target, DEFAULT_TYPES, FILE_TYPES_HELP,
 };
+use airlox_core::session::DEFAULT_MAX_ITEM_BYTES;
 
 /// How a command reaches its session.
 #[derive(Args, Debug, Clone)]
@@ -106,6 +107,12 @@ pub enum SessionCmd {
     Create(CreateArgs),
     /// Print the invite links (owner invite only).
     Invites(Conn),
+    /// Make a one-time code that carries one role's invite to another
+    /// machine (owner invite only), like the web UI's "Send to another
+    /// machine": type it there with `airlox runner join --code` or
+    /// `airlox receive`. The link itself never leaves this machine in the
+    /// clear.
+    Code(CodeArgs),
     /// Show the session's settings and participants.
     Info(Conn),
     /// Close the session and purge it from the relay (owner invite only).
@@ -130,6 +137,19 @@ pub struct RevokeArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct CodeArgs {
+    #[command(flatten)]
+    pub conn: Conn,
+    /// The invite the code carries.
+    #[arg(value_parser = ["runner", "sender", "observer", "owner"])]
+    pub role: String,
+    /// Wait until the code is used, expires or is cancelled; Ctrl-C cancels
+    /// it. Exits 0 once it is used, 1 otherwise.
+    #[arg(long)]
+    pub wait: bool,
+}
+
+#[derive(Args, Debug)]
 pub struct AuditArgs {
     #[command(flatten)]
     pub conn: Conn,
@@ -138,37 +158,55 @@ pub struct AuditArgs {
     pub out: Option<PathBuf>,
 }
 
+/// A starting point for `session create`; any flag given explicitly wins.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateProfile {
+    /// A long-lived session for a runner on a host that takes real work:
+    /// --execute, --ttl never, --job-timeout 30m, --job-memory 4096, items
+    /// as large as the relay allows, runner approval on.
+    HostRunner,
+}
+
+/// Job memory when nothing else says: enough for numpy-scale imports, which
+/// a 512 MB cap (counted as commit under a Windows Job Object) does not fit.
+pub const DEFAULT_JOB_MEMORY_MB: u32 = 2048;
+
 #[derive(Args, Debug)]
 pub struct CreateArgs {
     /// Relay URL.
     #[arg(long, env = "AIRLOX_RELAY", default_value = "https://airlox.app")]
     pub relay: String,
+    /// Start from a preset; flags you give override it.
+    #[arg(long, value_enum)]
+    pub profile: Option<CreateProfile>,
     /// Allow running Python on runners.
     #[arg(long)]
     pub execute: bool,
     /// Session lifetime, e.g. 30m, 1h, 1d (at most 30d), or `never` for a
-    /// session that lasts until it is closed (if the relay allows it).
-    #[arg(long, default_value = "1h", value_parser = parse_lifetime)]
-    pub ttl: Lifetime,
+    /// session that lasts until it is closed (if the relay allows it)
+    /// [default: 1h].
+    #[arg(long, value_parser = parse_lifetime)]
+    pub ttl: Option<Lifetime>,
     /// Content types allowed, comma-separated (text, py, md, zip, image).
     #[arg(long, value_delimiter = ',', default_values_t = DEFAULT_TYPES.iter().map(|s| s.to_string()))]
     pub types: Vec<String>,
-    /// Largest item, in MB.
-    #[arg(long, default_value_t = 25)]
-    pub max_item_mb: u64,
+    /// Largest item, in MB [default: the largest the relay allows, or 25].
+    #[arg(long)]
+    pub max_item_mb: Option<u64>,
     /// execute: Python runtime.
     #[arg(long, default_value = "python3.12")]
     pub runtime: String,
-    /// execute: longest a job may run.
-    #[arg(long, default_value = "60s", value_parser = parse_duration)]
-    pub job_timeout: Duration,
-    /// execute: job memory limit (MB).
-    #[arg(long, default_value_t = 512)]
-    pub job_memory: u32,
+    /// execute: longest a job may run [default: 60s].
+    #[arg(long, value_parser = parse_duration)]
+    pub job_timeout: Option<Duration>,
+    /// execute: job memory limit (MB) [default: 2048].
+    #[arg(long)]
+    pub job_memory: Option<u32>,
     /// execute: let jobs reach the network.
     #[arg(long)]
     pub network: bool,
-    /// execute: a package jobs may use (repeat, or comma-separated).
+    /// execute: a package jobs may use (repeat, or comma-separated). Names
+    /// are PEP 503 normalized: pyPowerGEM becomes pypowergem.
     #[arg(long = "package", value_delimiter = ',')]
     pub packages: Vec<String>,
     /// execute: don't return files jobs write to $AIRLOX_OUT.
@@ -177,6 +215,13 @@ pub struct CreateArgs {
     /// execute: let runners take jobs without the owner's approval.
     #[arg(long)]
     pub no_approval: bool,
+    /// Let participants reach the relay over plain http:// at this host
+    /// (e.g. airlox-relay.ns.svc inside a cluster), as --relay names it.
+    /// Recorded in the signed manifest. The content stays end-to-end
+    /// encrypted, but bearer tokens and transfer codes cross the network in
+    /// the clear: only for a network you trust.
+    #[arg(long, value_name = "HOST")]
+    pub insecure_http_host: Option<String>,
     /// Your display name.
     #[arg(long = "as", env = "AIRLOX_NAME", default_value = "owner")]
     pub display_name: String,
@@ -192,6 +237,65 @@ pub struct CreateArgs {
     pub owner_invite_file: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
+}
+
+/// The session `create` asks for: explicit flags, then the profile, then
+/// the defaults. `relay_max` is the relay's largest item, if it said.
+fn new_session(a: &CreateArgs, relay_max: Option<u64>) -> Result<NewSession> {
+    let host = a.profile == Some(CreateProfile::HostRunner);
+    let execute = a.execute || host;
+    let ttl = a.ttl.unwrap_or(if host { Lifetime(None) } else { Lifetime(Some(Duration::from_secs(3600))) });
+    let job_timeout = a.job_timeout.unwrap_or(Duration::from_secs(if host { 30 * 60 } else { 60 }));
+    let job_memory = a.job_memory.unwrap_or(if host { 4096 } else { DEFAULT_JOB_MEMORY_MB });
+    let max_item_bytes = match a.max_item_mb {
+        Some(mb) => mb.checked_mul(1024 * 1024).context("--max-item-mb is too large")?,
+        None => relay_max.unwrap_or(DEFAULT_MAX_ITEM_BYTES),
+    };
+    let packages = a
+        .packages
+        .iter()
+        .map(|p| airlox_core::policy::normalize_package(p.trim()))
+        .collect::<Result<Vec<_>, _>>()
+        .context("--package")?;
+    Ok(NewSession {
+        mode: if execute { Mode::Execute } else { Mode::Relay },
+        ttl_ms: ttl.0.map(|t| t.as_millis() as u64),
+        allowed_types: a.types.clone(),
+        max_item_bytes,
+        job_limits: execute.then(|| JobLimits {
+            runtime: a.runtime.clone(),
+            timeout_s: job_timeout.as_secs().max(1) as u32,
+            memory_mb: job_memory,
+            network: a.network,
+            packages,
+            return_out: !a.no_out_files,
+            approve_runners: !a.no_approval,
+        }),
+        insecure_http_host: a.insecure_http_host.as_deref().map(|h| h.trim().to_ascii_lowercase()),
+    })
+}
+
+/// One line about what jobs may do.
+fn jobs_line(l: &JobLimits) -> String {
+    format!(
+        "{} · {} · {} MB · network {} · packages [{}] · approval {}",
+        l.runtime,
+        human_secs(l.timeout_s as u64),
+        l.memory_mb,
+        if l.network { "on" } else { "off" },
+        l.packages.join(", "),
+        if l.approve_runners { "required" } else { "off" }
+    )
+}
+
+/// "90 s", "30 min", "6 h", "1 h 30 min".
+fn human_secs(s: u64) -> String {
+    match s {
+        s if s < 120 || s % 60 != 0 => format!("{s} s"),
+        s if s < 3600 => format!("{} min", s / 60),
+        s if s % 3600 == 0 => format!("{} h", s / 3600),
+        s => format!("{} h {} min", s / 3600, (s % 3600) / 60),
+    }
 }
 
 /// Write an invite to a new private file; never over an existing one.
@@ -225,25 +329,12 @@ pub async fn receive(a: ReceiveArgs) -> Result<()> {
 pub async fn session(cmd: SessionCmd) -> Result<()> {
     match cmd {
         SessionCmd::Create(a) => {
-            let job_limits = a.execute.then(|| JobLimits {
-                runtime: a.runtime.clone(),
-                timeout_s: a.job_timeout.as_secs().max(1) as u32,
-                memory_mb: a.job_memory,
-                network: a.network,
-                packages: a.packages.clone(),
-                return_out: !a.no_out_files,
-                approve_runners: !a.no_approval,
-            });
-            let new = NewSession {
-                mode: if a.execute { Mode::Execute } else { Mode::Relay },
-                ttl_ms: a.ttl.0.map(|t| t.as_millis() as u64),
-                allowed_types: a.types.clone(),
-                max_item_bytes: a
-                    .max_item_mb
-                    .checked_mul(1024 * 1024)
-                    .context("--max-item-mb is too large")?,
-                job_limits,
+            let http = client::http()?;
+            let relay_max = match a.max_item_mb {
+                Some(_) => None,
+                None => client::relay_max_item_bytes(&http, &a.relay).await,
             };
+            let new = new_session(&a, relay_max)?;
             // Check the owner-invite file can be written before the session
             // exists, so a bad path cannot leave a session nobody can use.
             if let Some(f) = &a.owner_invite_file {
@@ -257,10 +348,11 @@ pub async fn session(cmd: SessionCmd) -> Result<()> {
             }
             let root = a.cache_dir.clone().unwrap_or_else(default_cache_root);
             let me = Profile::new(&a.display_name, a.description.as_deref());
-            let s = Session::create(&client::http()?, &a.relay, new, &me, &root).await?;
+            let s = Session::create(&http, &a.relay, new, &me, &root).await?;
             print_invites(&s, a.json, true, a.owner_invite_file.as_deref())
         }
         SessionCmd::Invites(c) => print_invites(&c.join().await?, c.json, false, None),
+        SessionCmd::Code(a) => session_code(a).await,
         SessionCmd::Info(c) => {
             let mut s = c.join().await?;
             s.sync().await?;
@@ -274,6 +366,7 @@ pub async fn session(cmd: SessionCmd) -> Result<()> {
                 "allowed_types": m.allowed_types,
                 "max_item_bytes": m.max_item_bytes,
                 "job_limits": m.job_limits,
+                "insecure_http_host": m.insecure_http_host,
                 "participants": s.participants(),
                 "closed": s.closed,
             });
@@ -288,16 +381,12 @@ pub async fn session(cmd: SessionCmd) -> Result<()> {
                     "types     {}",
                     serde_json::from_value::<Vec<String>>(info["allowed_types"].clone())?.join(", ")
                 );
+                println!("items     up to {}", human_bytes(m.max_item_bytes));
                 if let Some(l) = &m.job_limits {
-                    println!(
-                        "jobs      {} · {} s · {} MB · network {} · packages [{}] · approval {}",
-                        l.runtime,
-                        l.timeout_s,
-                        l.memory_mb,
-                        if l.network { "on" } else { "off" },
-                        l.packages.join(", "),
-                        if l.approve_runners { "required" } else { "off" }
-                    );
+                    println!("jobs      {}", jobs_line(l));
+                }
+                if let Some(h) = &m.insecure_http_host {
+                    println!("http      plain http:// allowed to {h}");
                 }
                 println!("participants:");
                 for p in s.participants() {
@@ -357,6 +446,74 @@ pub async fn session(cmd: SessionCmd) -> Result<()> {
     }
 }
 
+async fn session_code(a: CodeArgs) -> Result<()> {
+    let s = a.conn.join().await?;
+    let invites = s.invites().map_err(|_| anyhow::anyhow!("only the owner invite can make codes"))?;
+    let Some(link) = invites.get(&a.role) else {
+        bail!("this session has no {} invite: it is in relay mode", a.role);
+    };
+    let http = client::http()?;
+    let code = client::send_code(&http, &s.base_url, link).await?;
+    let relay = match s.base_url.as_str() {
+        crate::runner::DEFAULT_RELAY => String::new(),
+        r => format!(" --relay {r}"),
+    };
+    let to_type = match a.role.as_str() {
+        "runner" => format!("airlox runner join --code {}{relay} --name NAME ...", code.code),
+        _ => format!("airlox receive {}{relay}", code.code),
+    };
+    if a.conn.json {
+        print_json(&json!({
+            "code": code.code,
+            "role": a.role,
+            "relay": s.base_url,
+            "expires_at_ms": code.expires_at_ms,
+            "command": to_type,
+        }));
+    } else {
+        println!("{}", code.code);
+        eprintln!(
+            "One-time code for the {} invite, valid {} or until used. On the other machine:\n  {to_type}",
+            a.role,
+            expiry(Some(code.expires_at_ms)).replacen("in ", "for ", 1)
+        );
+        if a.role == "owner" {
+            eprintln!("It carries the owner link: whoever types it first controls the session.");
+        }
+    }
+    if !a.wait {
+        return Ok(());
+    }
+    let wait = async {
+        loop {
+            match code.state(&http).await?.as_str() {
+                "waiting" => tokio::time::sleep(Duration::from_secs(2)).await,
+                state => return Ok::<_, anyhow::Error>(state.to_string()),
+            }
+        }
+    };
+    let state = tokio::select! {
+        r = wait => r?,
+        _ = tokio::signal::ctrl_c() => {
+            code.cancel(&http).await?;
+            "cancelled".to_string()
+        }
+    };
+    if a.conn.json {
+        print_json(&json!({"code": code.code, "state": state}));
+    }
+    match state.as_str() {
+        "picked_up" => {
+            eprintln!("The code was used.");
+            Ok(())
+        }
+        "expired" => bail!("the code expired unused"),
+        "burned" => bail!("too many wrong tries cancelled the code"),
+        "cancelled" => bail!("the code was cancelled"),
+        s => bail!("the code no longer works ({})", clean_line(s)),
+    }
+}
+
 fn print_invites(s: &Session, json_out: bool, created: bool, owner_file: Option<&Path>) -> Result<()> {
     let mut inv = s.invites()?;
     if let Some(path) = owner_file {
@@ -368,8 +525,13 @@ fn print_invites(s: &Session, json_out: bool, created: bool, owner_file: Option<
         }
     }
     if json_out {
-        let mut v =
-            json!({"session_id": s.session_id, "expires_at_ms": s.manifest.expires_at_ms, "invites": inv});
+        let m = &s.manifest;
+        let mut v = json!({"session_id": s.session_id, "expires_at_ms": m.expires_at_ms, "invites": inv});
+        if created {
+            v["max_item_bytes"] = json!(m.max_item_bytes);
+            v["job_limits"] = json!(m.job_limits);
+            v["insecure_http_host"] = json!(m.insecure_http_host);
+        }
         if let Some(path) = owner_file {
             v["owner_invite_file"] = json!(path);
         }
@@ -377,7 +539,17 @@ fn print_invites(s: &Session, json_out: bool, created: bool, owner_file: Option<
         return Ok(());
     }
     if created {
-        println!("created session {} (expires {})", s.session_id, expiry(s.manifest.expires_at_ms));
+        let m = &s.manifest;
+        println!("created session {} (expires {})", s.session_id, expiry(m.expires_at_ms));
+        println!("items     up to {}", human_bytes(m.max_item_bytes));
+        if let Some(l) = &m.job_limits {
+            println!("jobs      {}", jobs_line(l));
+        }
+        if let Some(h) = &m.insecure_http_host {
+            println!(
+                "http      plain http:// allowed to {h}: tokens and codes cross that network in the clear"
+            );
+        }
         println!();
     }
     for role in ["owner", "sender", "observer", "runner"] {
@@ -392,6 +564,18 @@ fn print_invites(s: &Session, json_out: bool, created: bool, owner_file: Option<
     println!("Each link carries its role's keys: share it only over a channel you trust.");
     println!("Keep the owner link to manage the session (--invite or AIRLOX_INVITE).");
     Ok(())
+}
+
+/// "25 MiB", "100 MiB", "1.5 GiB".
+fn human_bytes(n: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    match n {
+        n if n >= 1024 * MIB && n % (1024 * MIB) == 0 => format!("{} GiB", n / (1024 * MIB)),
+        n if n >= 1024 * MIB => format!("{:.1} GiB", n as f64 / (1024 * MIB) as f64),
+        n if n % MIB == 0 => format!("{} MiB", n / MIB),
+        n if n >= MIB => format!("{:.1} MiB", n as f64 / MIB as f64),
+        n => format!("{n} bytes"),
+    }
 }
 
 /// "in 3 h 5 min", or "never".

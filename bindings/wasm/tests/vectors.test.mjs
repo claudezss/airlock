@@ -46,6 +46,10 @@ test("invites", () => {
   for (const n of VEC.negative_invites) {
     assert.equal(errClass(() => ac.parseInvite(n.url)), "ValidationError", n.name);
   }
+  for (const n of VEC.negative_invites_for_manifest) {
+    ac.parseInvite(n.url);
+    assert.equal(errClass(() => ac.checkInvite(n.url, MANIFEST)), "ValidationError", n.name);
+  }
 });
 
 test("certs and join", () => {

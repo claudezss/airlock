@@ -40,7 +40,6 @@ fn negative_invites(secrets: &SessionSecrets) -> Result<Value> {
         {"name": "wrong_version", "url": good.replace("v=1", "v=2")},
         {"name": "duplicate_role", "url": format!("{good}&r=view")},
         {"name": "query_instead_of_fragment", "url": good.replace('#', "?")},
-        {"name": "plain_http", "url": good.replace("https://", "http://")},
         {"name": "owner_link_with_member_key", "url": format!("{owner}&k=AAAA")},
         {"name": "owner_seed_for_other_session", "url": forged_owner},
         {"name": "short_session_id", "url": good.replace(&secrets.session_id(), "ax_aaaaaaaaaaaa")},
@@ -66,6 +65,7 @@ pub fn generate() -> Result<Value> {
             packages: vec!["matplotlib".into(), "numpy".into(), "pandas".into()],
             ..JobLimits::default()
         }),
+        insecure_http_host: None,
     };
     let signed = secrets.manifest(&params)?;
     let sid = signed.manifest.session_id.clone();
@@ -294,6 +294,11 @@ pub fn generate() -> Result<Value> {
              "blob": b64e(&base.blob), "expect": "invalid"},
         ],
         "negative_invites": negative_invites(&secrets)?,
+        // Links that parse but that the manifest above refuses: it names no
+        // host for plain http.
+        "negative_invites_for_manifest": [
+            {"name": "plain_http", "url": Invite::member(BASE_URL, &secrets, Role::Sender)?.to_url().replace("https://", "http://")},
+        ],
         "negative_payloads": [
             {"name": "truncated", "payload": b64e(&[0, 0, 0])},
             {"name": "meta_length_past_end", "payload": b64e(&[0, 0, 0, 9, b'{', b'}'])},

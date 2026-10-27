@@ -385,10 +385,6 @@
       "url": "https://airlox.example/s/ax_kzdvvj2umnduyauf35o36k6kw4?v=1&r=send&k=0YrX4q2BkPnQ6vZ5sZXRq2PRJG7N129BxusSI62qth4&rk=MsEsdKjy2XKt5OGhcN6sctyVfRgmYRh6gzZOC-Tv634"
     },
     {
-      "name": "plain_http",
-      "url": "http://airlox.example/s/ax_kzdvvj2umnduyauf35o36k6kw4#v=1&r=send&k=0YrX4q2BkPnQ6vZ5sZXRq2PRJG7N129BxusSI62qth4&rk=MsEsdKjy2XKt5OGhcN6sctyVfRgmYRh6gzZOC-Tv634"
-    },
-    {
       "name": "owner_link_with_member_key",
       "url": "https://airlox.example/s/ax_kzdvvj2umnduyauf35o36k6kw4#v=1&r=owner&ok=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&k=AAAA"
     },
@@ -399,6 +395,12 @@
     {
       "name": "short_session_id",
       "url": "https://airlox.example/s/ax_aaaaaaaaaaaa#v=1&r=send&k=0YrX4q2BkPnQ6vZ5sZXRq2PRJG7N129BxusSI62qth4&rk=MsEsdKjy2XKt5OGhcN6sctyVfRgmYRh6gzZOC-Tv634"
+    }
+  ],
+  "negative_invites_for_manifest": [
+    {
+      "name": "plain_http",
+      "url": "http://airlox.example/s/ax_kzdvvj2umnduyauf35o36k6kw4#v=1&r=send&k=0YrX4q2BkPnQ6vZ5sZXRq2PRJG7N129BxusSI62qth4&rk=MsEsdKjy2XKt5OGhcN6sctyVfRgmYRh6gzZOC-Tv634"
     }
   ],
   "negative_items": [

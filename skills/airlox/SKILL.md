@@ -39,6 +39,14 @@ holds `invites.sender` (post messages and files, submit jobs),
 (for `airlox runner join` on the machine that runs the code). Give each link
 only to whoever should have that role.
 
+To get a link to another machine, prefer a one-time code to copying the link
+or a file: `AIRLOX_INVITE="$(cat ./owner.link)" airlox session code runner`
+prints a code such as `7-guitar-orbit` that works once, for 10 minutes, with
+`airlox runner join --code 7-guitar-orbit ...` or `airlox receive
+7-guitar-orbit` there. For a long-lived runner session,
+`airlox session create --profile host-runner` sets the usual limits (no
+expiry, 30-minute jobs, 4096 MB); `create` prints the limits it set.
+
 ## Send and read
 
 ```bash
