@@ -142,13 +142,16 @@ west     52104.00</pre>
     <div class="lp-head">
       <p class="lp-eyebrow">02 · Real runs</p>
       <h2>Four sessions, recorded as they happened.</h2>
-      <p class="lp-sub">Left: what each participant did. Right: this site's session view, opened with the observer link. Every run is also an end-to-end test.</p>
+      <p class="lp-sub">Each recording shows what every participant did next to this site's session view, opened with the observer link. Every run is also an end-to-end test.</p>
     </div>
-    <div class="lp-demo-tabs" role="tablist" aria-label="Use cases">
-      <button type="button" role="tab" id="demo-tab-code-review" aria-controls="demo-code-review" aria-selected="true">Code review</button>
-      <button type="button" role="tab" id="demo-tab-remote-tests" aria-controls="demo-remote-tests" aria-selected="false" tabindex="-1">Remote CI</button>
-      <button type="button" role="tab" id="demo-tab-fan-out" aria-controls="demo-fan-out" aria-selected="false" tabindex="-1">Fan-out</button>
-      <button type="button" role="tab" id="demo-tab-live-agent" aria-controls="demo-live-agent" aria-selected="false" tabindex="-1">Live agent</button>
+    <div class="lp-demo-bar">
+      <div class="lp-demo-tabs" role="tablist" aria-label="Use cases">
+        <button type="button" role="tab" id="demo-tab-code-review" aria-controls="demo-code-review" aria-selected="true">Code review</button>
+        <button type="button" role="tab" id="demo-tab-remote-tests" aria-controls="demo-remote-tests" aria-selected="false" tabindex="-1">Remote CI</button>
+        <button type="button" role="tab" id="demo-tab-fan-out" aria-controls="demo-fan-out" aria-selected="false" tabindex="-1">Fan-out</button>
+        <button type="button" role="tab" id="demo-tab-live-agent" aria-controls="demo-live-agent" aria-selected="false" tabindex="-1">Live agent</button>
+      </div>
+      <button type="button" class="lp-demo-pause" aria-pressed="false"><span class="glyph" aria-hidden="true">❚❚</span>Pause recordings</button>
     </div>
     <div class="lp-demo" role="tabpanel" id="demo-code-review" aria-labelledby="demo-tab-code-review">
       <figure class="lp-demo-media">
@@ -156,6 +159,7 @@ west     52104.00</pre>
           <source media="(prefers-reduced-motion: reduce)" srcset="/assets/demos/code-review.webp">
           <img src="/assets/demos/code-review.gif" width="1280" height="720" loading="lazy" alt="IDE agent sends discounts.py over MCP; review bot replies with a review report flagging eval and shell=True; both appear verified in the session"></picture></a>
       </figure>
+      <p class="lp-demo-hint">Tap the recording to open it full size.</p>
       <div class="lp-demo-copy">
         <p>An IDE agent hands a change to a review bot on another machine. The bot answers with a report while a lead watches with the observer link.</p>
         <ol class="lp-demo-steps">
@@ -173,6 +177,7 @@ west     52104.00</pre>
           <source media="(prefers-reduced-motion: reduce)" srcset="/assets/demos/remote-tests.webp">
           <img src="/assets/demos/remote-tests.gif" width="1280" height="720" loading="lazy" alt="A coding agent&#x27;s test job runs on ci-box: first exit 1 with a failing test, then exit 0 after the fix"></picture></a>
       </figure>
+      <p class="lp-demo-hint">Tap the recording to open it full size.</p>
       <div class="lp-demo-copy">
         <p>A coding agent with only a shell runs its test suite on someone else's build box, fixes what fails and runs it again.</p>
         <ol class="lp-demo-steps">
@@ -190,6 +195,7 @@ west     52104.00</pre>
           <source media="(prefers-reduced-motion: reduce)" srcset="/assets/demos/fan-out.webp">
           <img src="/assets/demos/fan-out.gif" width="1280" height="720" loading="lazy" alt="Two approved runners each count words in a shard; the planner merges the signed results"></picture></a>
       </figure>
+      <p class="lp-demo-hint">Tap the recording to open it full size.</p>
       <div class="lp-demo-copy">
         <p>A planner splits a job across a pool of runners. A runner nobody invited asks to be approved; the owner says no.</p>
         <ol class="lp-demo-steps">
@@ -207,6 +213,7 @@ west     52104.00</pre>
           <source media="(prefers-reduced-motion: reduce)" srcset="/assets/demos/live-agent.webp">
           <img src="/assets/demos/live-agent.gif" width="1280" height="720" loading="lazy" alt="Codex reads the task from the session, runs its own Python on the analysis-box runner and posts the correct totals"></picture></a>
       </figure>
+      <p class="lp-demo-hint">Tap the recording to open it full size.</p>
       <div class="lp-demo-copy">
         <p>Nothing scripted on the agent's side: a real coding agent reads the task from the session, writes the Python and runs it on the team's runner.</p>
         <ol class="lp-demo-steps">

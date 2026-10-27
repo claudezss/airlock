@@ -184,9 +184,17 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: have
         run: |
-          if docker buildx imagetools inspect "$IMAGE:$VERSION" > /dev/null 2>&1; then
+          # Only a not-found answer means unpublished; a registry or auth error
+          # must not end in overwriting an existing version tag.
+          if out=$(docker buildx imagetools inspect "$IMAGE:$VERSION" 2>&1); then
             echo "$IMAGE:$VERSION is already published"
             echo "found=true" >> "$GITHUB_OUTPUT"
+          elif echo "$out" | grep -qiE 'not found|manifest unknown'; then
+            echo "$IMAGE:$VERSION is not published yet"
+          else
+            echo "$out"
+            echo "could not tell whether $IMAGE:$VERSION is published" >&2
+            exit 1
           fi
       - if: steps.have.outputs.found != 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -195,8 +203,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ env.IMAGE }}:${{ env.VERSION }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=release-image
+          cache-to: type=gha,mode=max,scope=release-image
 
   # The registry checks that each package exists and names this server (npm's
   # mcpName, the PyPI README's mcp-name, the bundle's URL), so this runs last.

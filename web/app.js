@@ -725,9 +725,23 @@ function buildSessionLayout(s) {
   tick();
 
   if (execute) runnerLoop(s);
-  // At the end of the timeline, not of the page: on narrow screens the
-  // sidebar follows the timeline.
-  const nearBottom = () => timeline.getBoundingClientRect().bottom <= window.innerHeight + 160;
+  // Follow new items when the reader is at the end of the timeline (not of the
+  // page: on narrow screens the sidebar follows it), or has not scrolled yet and
+  // sees the end. Scrolled up, or well into the sidebar below: leave them be.
+  const composerH = () => parseFloat(document.documentElement.style.getPropertyValue("--composer-h")) || 0;
+  const nearBottom = () => {
+    // The newest item, not the timeline box: that can stretch to fill the column.
+    const end = (timeline.lastElementChild || timeline).getBoundingClientRect().bottom;
+    const d = end - (window.innerHeight - composerH()); // > 0: end below the visible area
+    return (d >= -48 && d <= 160) || (window.scrollY === 0 && end <= window.innerHeight);
+  };
+  // The last item ends just above the sticky composer.
+  const toEnd = () => {
+    const last = timeline.lastElementChild;
+    if (!last) return;
+    const delta = last.getBoundingClientRect().bottom - (window.innerHeight - composerH());
+    if (Math.abs(delta) >= 1) window.scrollBy(0, delta);
+  };
   // Timeline entries are kept in event order.
   const place = (node, seq, old) => {
     node.dataset.seq = seq;
@@ -793,7 +807,7 @@ function buildSessionLayout(s) {
       if (held) (held.keep && node.querySelector(`[data-keep="${held.keep}"]:not(:disabled)`) || node).focus({ preventScroll: true });
       // A reader at the bottom stays there, also when a card grows in place
       // (its file arrives, its job gets a result).
-      if (stick) timeline.lastElementChild?.scrollIntoView({ block: "end" });
+      if (stick) toEnd();
       settle(s, it);
       if (it.kind === "job") announceJob(s, it);
       else if (!old && s.announce && it.status === "ok" && it.author !== s.me && (it.kind === "text" || it.kind === "file"))
@@ -807,7 +821,7 @@ function buildSessionLayout(s) {
       approvalText.textContent = `${n} runner${n === 1 ? "" : "s"} awaiting approval`;
       jobUi?.refresh();
     },
-    scroll: () => timeline.lastElementChild?.scrollIntoView({ block: "end" }),
+    scroll: toEnd,
     conn: (bad) => {
       conn.textContent = bad && !s.closed ? "Reconnecting…" : "";
       conn.hidden = !conn.textContent;
@@ -1498,7 +1512,7 @@ async function pollRunners(s) {
         list.push({ pub: e.participant_pub, name: j.runner.name, description: j.description, labels: j.runner.labels,
           host: j.runner.host, sandbox: j.runner.sandbox,
           networkUnblocked: !!j.runner.network_unblocked, online: !!e.online, job: e.job,
-          setup: e.state || null, detail: typeof e.detail === "string" ? e.detail : null,
+          setup: e.state || null, detail: typeof e.detail === "string" ? (e.detail.length > 300 ? `${e.detail.slice(0, 300)}…` : e.detail) : null,
           ...runnerStatus(s, e) });
       } catch (err) {
         console.warn("ignoring unverifiable runner", err);
@@ -1936,6 +1950,7 @@ function showHome() {
   document.title = "Airlox · Secure sessions for code and LLM agents";
   show(document.getElementById("home-tpl").content.cloneNode(true));
   demoTabs(document.querySelector(".lp-demo-tabs"));
+  demoPause(document.querySelector(".lp-demo-pause"));
   let target = null;
   try {
     target = location.hash.length > 1 ? document.getElementById(decodeURIComponent(location.hash.slice(1))) : null;
@@ -1967,6 +1982,23 @@ function demoTabs(list) {
     select(next);
     next.focus();
   });
+}
+
+// The recordings loop forever (WCAG 2.2.2): one toggle swaps every GIF for its
+// still. Reduced motion starts paused (the <picture> source already shows the still).
+function demoPause(btn) {
+  const imgs = [...document.querySelectorAll(".lp-demo-media img")];
+  const set = (paused) => {
+    for (const img of imgs) {
+      // The <source> would win over src under reduced motion: switch it off and drive src alone.
+      img.previousElementSibling?.setAttribute("media", "not all");
+      img.src = img.getAttribute("src").replace(/\.(gif|webp)$/, paused ? ".webp" : ".gif");
+    }
+    btn.setAttribute("aria-pressed", String(paused));
+    btn.querySelector(".glyph").textContent = paused ? "▶" : "❚❚";
+  };
+  btn.addEventListener("click", () => set(btn.getAttribute("aria-pressed") !== "true"));
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) set(true);
 }
 
 // ---------- boot ----------
