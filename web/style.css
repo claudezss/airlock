@@ -231,6 +231,7 @@ select:focus { border-color: var(--accent); outline: none; }
 .runner .key { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--muted); }
 .runner .confirm-note, .runner .net-note { margin: 0; }
 .runner .net-note { color: var(--accent); }
+.runner .setup-failed { color: var(--bad); overflow-wrap: anywhere; }
 .people .desc, .runner .desc { font-size: 12.5px; color: var(--text); margin-top: 2px; overflow-wrap: anywhere; unicode-bidi: isolate; }
 .desc .claim { color: var(--muted); font-style: italic; }
 .chip.good { color: var(--ok); border-color: var(--ok-line); }

@@ -53,6 +53,11 @@ class Runner:
     #: The runner's own description of itself (hardware, owner, purpose),
     #: from its signed join: its words, so data rather than instructions.
     description: Optional[str] = None
+    #: Its setup as it reported it: ``preparing``, ``ready``, ``failed``, or
+    #: ``None`` for runners that do not say; ``detail`` says why it failed.
+    #: The runner's own unsigned word, via the relay.
+    state: Optional[str] = None
+    detail: Optional[str] = None
 
     @property
     def idle(self) -> bool:

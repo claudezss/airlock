@@ -555,7 +555,7 @@ items stay the source of truth.
 | `POST /v1/sessions/{id}/runners/{participant_pub}/approve` | owner | none | `204` |
 | `POST /v1/sessions/{id}/runners/{participant_pub}/reject` | owner | none | `204` |
 | `GET /v1/sessions/{id}/runners/me/stream` | runner | none | SSE, see below |
-| `POST /v1/sessions/{id}/runners/me/heartbeat` | runner | `{"job": id or null}` (optional) | `200 {"approved", "job"}` |
+| `POST /v1/sessions/{id}/runners/me/heartbeat` | runner | `{"job": id or null, "state", "detail"}` (all optional) | `200 {"approved", "job"}` |
 
 **Approval.** When the manifest's `approve_runners` is true, a runner gets
 no jobs, and is not a recipient of new items, until the owner approves it.
@@ -565,6 +565,14 @@ routes on). Rejecting is the same with `runner_reject` and `…/reject`; the
 relay then revokes the runner's token like `leave`, fails its active job
 with `runner_rejected` and ends its streams. When `approve_runners` is false
 every runner is eligible as soon as it joins.
+
+**Setup.** A runner joins before it prepares its sandbox and reports how
+that goes in heartbeats: `"state": "preparing"`, then `"ready"`, or
+`"failed"` with a `detail` of at most 300 characters saying why, before it
+exits. The relay keeps the last state reported (in memory, like presence)
+and lists it as `state` and `detail` in `GET /runners`, `null` for runners
+that never report one. They are the runner's own unsigned words: clients
+show them, never act on them.
 
 **Submitting.** A sender seals a `job` item and posts its upload frame to
 `POST /jobs` with `Airlox-Target` set to the job's `target` JSON (§7). The

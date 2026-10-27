@@ -245,6 +245,8 @@ pub async fn runners(
                 "rejected": p.rejected,
                 "online": g.runner_online(pk, now, timeout_ms),
                 "job": p.job,
+                "state": g.presence.get(pk).and_then(|x| x.state.clone()),
+                "detail": g.presence.get(pk).and_then(|x| x.detail.clone()),
                 "signed_join": p.public["signed_join"],
             })
         })
@@ -321,11 +323,21 @@ struct Heartbeat {
     /// The job the runner is working on, if any.
     #[serde(default)]
     job: Option<String>,
+    /// The runner's setup: `preparing`, `ready` or `failed`. Kept until the
+    /// next heartbeat that carries one.
+    #[serde(default)]
+    state: Option<String>,
+    /// Why, for `failed`; at most `MAX_DETAIL_CHARS`.
+    #[serde(default)]
+    detail: Option<String>,
 }
 
-/// `POST /v1/sessions/:id/runners/me/heartbeat` — body `{"job": id|null}`
-/// (optional). A runner that reports idle while the relay has it running a
-/// job has lost that job, which then fails.
+pub const MAX_DETAIL_CHARS: usize = 300;
+
+/// `POST /v1/sessions/:id/runners/me/heartbeat` — body `{"job": id|null,
+/// "state": "preparing"|"ready"|"failed", "detail": text}` (all optional). A
+/// runner that reports idle while the relay has it running a job has lost
+/// that job, which then fails.
 pub async fn heartbeat(
     State(st): State<AppState>,
     Path(id): Path<String>,
@@ -343,9 +355,23 @@ pub async fn heartbeat(
     } else {
         serde_json::from_str(&raw).map_err(|e| ApiError::bad_request("invalid", e.to_string()))?
     };
+    if hb.state.as_deref().is_some_and(|st| !matches!(st, "preparing" | "ready" | "failed")) {
+        return Err(ApiError::bad_request("invalid", "state must be preparing, ready or failed"));
+    }
+    if hb.detail.as_ref().is_some_and(|d| d.chars().count() > MAX_DETAIL_CHARS) {
+        return Err(ApiError::bad_request(
+            "invalid",
+            format!("detail is over {MAX_DETAIL_CHARS} characters"),
+        ));
+    }
     blocking(move || {
         let mut g = s.lock();
-        g.presence.entry(who.clone()).or_default().last_seen_ms = now_ms();
+        let presence = g.presence.entry(who.clone()).or_default();
+        presence.last_seen_ms = now_ms();
+        if hb.state.is_some() {
+            presence.state = hb.state;
+            presence.detail = hb.detail;
+        }
         let current = g.participants.get(&who).and_then(|p| p.job.clone());
         if let Some(job) = current {
             let running = g.jobs.get(&job).is_some_and(|j| j.state == JobState::Running);

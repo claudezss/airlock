@@ -72,7 +72,7 @@ def execute(relay, caches, start_runner):
 def test_unapproved_runners_get_nothing_then_summarize_runs(execute):
     owner, agent, runner = execute
     [r] = agent.runners()
-    assert (r.name, r.labels, r.approved, r.online) == ("runner-01", ["cpu"], False, True)
+    assert (r.name, r.labels, r.approved, r.online, r.state) == ("runner-01", ["cpu"], False, True, "ready")
     with pytest.raises(NoRunnerAvailable):
         agent.run_python("print(1)")
 

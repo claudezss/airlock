@@ -1498,6 +1498,7 @@ async function pollRunners(s) {
         list.push({ pub: e.participant_pub, name: j.runner.name, description: j.description, labels: j.runner.labels,
           host: j.runner.host, sandbox: j.runner.sandbox,
           networkUnblocked: !!j.runner.network_unblocked, online: !!e.online, job: e.job,
+          setup: e.state || null, detail: typeof e.detail === "string" ? e.detail : null,
           ...runnerStatus(s, e) });
       } catch (err) {
         console.warn("ignoring unverifiable runner", err);
@@ -1562,14 +1563,16 @@ function renderRunners(s, list, note) {
       : r.approved ? "approved"
       : r.relayOnly ? (owner ? "needs your confirmation" : "approval not received here")
       : "awaiting approval";
-    const live = r.rejected ? "rejected" : !r.approved ? "awaiting approval" : r.online ? (r.job ? `busy · #${short(r.job)}` : "idle") : "offline";
+    const live = r.rejected ? "rejected" : r.setup === "failed" ? "setup failed"
+      : r.setup === "preparing" && !r.online ? "preparing its sandbox"
+      : !r.approved ? "awaiting approval" : r.online ? (r.job ? `busy · #${short(r.job)}` : "idle") : "offline";
     return { approval, live, err: s.runnerErrors.get(r.pub) };
   };
   const revoked = s.revokedRoles.has("runner");
   // The poll runs every few seconds: leave the list (and keyboard focus) alone
   // unless something it shows has changed.
   const sig = JSON.stringify([!!s.closed, revoked, s.runners.map((r) => [r.pub, r.name, r.description, r.labels, r.host, r.sandbox, r.networkUnblocked,
-    r.rejected, r.approved, r.relayOnly, text(r)])]);
+    r.rejected, r.approved, r.relayOnly, r.detail, text(r)])]);
   if (list.dataset.sig === sig) return;
   list.dataset.sig = sig;
   const a = document.activeElement;
@@ -1608,6 +1611,8 @@ function renderRunners(s, list, note) {
       owner && !r.rejected ? el("div", { class: "row" },
         canApprove ? [warn, act("approve", r.relayOnly ? "Confirm approval" : "Approve", "primary", true)] : null,
         act("reject", "Reject", "danger", false)) : null,
+      r.setup === "failed" && r.detail && !r.rejected
+        ? el("p", { class: "sub setup-failed", title: "The runner's own report, not verified" }, r.detail) : null,
       err ? el("p", { class: "error", role: "alert" }, err) : null);
   }));
   if (focus) {

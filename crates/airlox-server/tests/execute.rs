@@ -646,3 +646,36 @@ async fn a_rejected_runners_event_stream_ends() {
         tokio::time::timeout(Duration::from_secs(5), stream.text()).await.expect("stream ended").unwrap();
     assert!(body.contains("\"rejected\""));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runners_report_their_setup() {
+    let (env, s, owner, _sender) = execute_env(|_| {}).await;
+    let runner = join_runner(&env, &s, "runner-01", &[]).await;
+    let report = |body: Value| {
+        env.http
+            .post(env.url(&format!("/v1/sessions/{}/runners/me/heartbeat", s.id)))
+            .bearer_auth(&runner.token)
+            .body(body.to_string())
+            .send()
+    };
+    let setup = || async {
+        let [r] = runners(&env, &s, &owner).await.try_into().unwrap();
+        (r["state"].clone(), r["detail"].clone())
+    };
+    // Runners that never say have no state.
+    assert_eq!(setup().await, (Value::Null, Value::Null));
+    let ok = report(serde_json::json!({"state": "failed", "detail": "no docker"})).await.unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+    assert_eq!(setup().await, (serde_json::json!("failed"), serde_json::json!("no docker")));
+    // A plain heartbeat keeps the last report; a new one replaces it.
+    assert_eq!(heartbeat(&env, &s, &runner, None).await.status(), StatusCode::OK);
+    assert_eq!(setup().await.0, serde_json::json!("failed"));
+    report(serde_json::json!({"state": "ready"})).await.unwrap();
+    assert_eq!(setup().await, (serde_json::json!("ready"), Value::Null));
+    for bad in [
+        serde_json::json!({"state": "busy"}),
+        serde_json::json!({"state": "failed", "detail": "x".repeat(301)}),
+    ] {
+        assert_eq!(report(bad).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    }
+}

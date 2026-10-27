@@ -90,10 +90,13 @@ class Runners:
 
 
 def wait_for_runner(session: Session, name: str, approved: bool = False, timeout: float = 120.0):
-    """Wait until runner ``name`` is online (and approved, if asked)."""
+    """Wait until runner ``name`` is online (and approved, if asked). A
+    runner that reports its setup failed raises at once, with its reason."""
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         for r in session.runners():
+            if r.name == name and r.state == "failed":
+                raise RuntimeError(f"runner {name} could not start: {r.detail}")
             if r.name == name and r.online and (r.approved or not approved):
                 return r
         time.sleep(0.25)

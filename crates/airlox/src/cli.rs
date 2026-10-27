@@ -923,8 +923,13 @@ pub async fn runner_list(conn: Conn) -> Result<()> {
         println!("no runners have joined");
     }
     for r in rs {
+        let failed = r.detail.as_deref().map(|d| format!("failed: {}", clean_line(d)));
         let state = if r.rejected {
             "rejected"
+        } else if r.state.as_deref() == Some("failed") {
+            "setup failed"
+        } else if r.state.as_deref() == Some("preparing") && !r.online {
+            "preparing"
         } else if !r.approved {
             "awaiting approval"
         } else if !r.online {
@@ -945,6 +950,9 @@ pub async fn runner_list(conn: Conn) -> Result<()> {
         );
         if let Some(d) = &r.description {
             println!("{:<20} {}", "", clean_line(d));
+        }
+        if let Some(f) = failed.filter(|_| r.state.as_deref() == Some("failed")) {
+            println!("{:<20} {f}", "");
         }
     }
     Ok(())

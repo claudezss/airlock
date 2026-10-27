@@ -287,6 +287,11 @@ pub struct Runner {
     pub online: bool,
     /// The job it is running, per the relay.
     pub job: Option<String>,
+    /// Its setup as it reported it (`preparing`, `ready`, `failed`, or
+    /// `None` for runners that do not say), and why it failed: the runner's
+    /// own unsigned word, via the relay.
+    pub state: Option<String>,
+    pub detail: Option<String>,
 }
 
 /// Which runner a job goes to.
@@ -840,6 +845,8 @@ impl Session {
                 rejected: rejected_relay || approvals.get(&public) == Some(&false),
                 online: r["online"].as_bool().unwrap_or(false),
                 job: r["job"].as_str().map(String::from),
+                state: r["state"].as_str().map(String::from),
+                detail: r["detail"].as_str().map(String::from),
                 participant_pub: public,
             });
         }

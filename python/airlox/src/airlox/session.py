@@ -435,6 +435,8 @@ class Session:
                     online=r["online"],
                     job=r["job"],
                     description=join.get("description"),
+                    state=r.get("state"),
+                    detail=r.get("detail"),
                 )
             )
         return out

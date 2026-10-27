@@ -61,13 +61,18 @@ change code or contact anyone, check with the user first.
 ## Run Python on a runner (execute sessions)
 
 ```bash
-AIRLOX_INVITE="$(cat ./owner.link)" airlox runner list --json        # who has joined, approved, online, busy
+AIRLOX_INVITE="$(cat ./owner.link)" airlox runner list --json        # who has joined, approved, online, busy, failed
 AIRLOX_INVITE="$(cat ./owner.link)" airlox runner approve runner-01  # owner only; approve only runners the user expects
 airlox run --input data.zip --out-dir ./out analysis.py
 airlox run --label gpu --no-wait --json analysis.py      # returns {"job": …}
 airlox result --wait 5m --out-dir ./out --json -- <job>   # `--`: job ids may start with "-"
 airlox cancel -- <job>
 ```
+
+A runner reports its setup: `"state": "preparing"`, `"ready"`, or
+`"failed"` with a `detail` saying why (no Docker, a package that would not
+install). A failed runner will not come online; tell the user its `detail`
+rather than waiting for it.
 
 `airlox run` prints the job's stdout and stderr and exits with the job's exit
 code; 1 if the job produced none, 75 if `--wait` ran out (check `status` in

@@ -227,26 +227,20 @@ pub async fn run(args: JoinArgs) -> Result<()> {
     if nix::unistd::getuid().is_root() && matches!(args.sandbox, SandboxArg::Local) {
         bail!("refusing to run the local sandbox as root; run the runner as an unprivileged user, or use --sandbox docker");
     }
-    let spec = RuntimeSpec { runtime: limits.runtime.clone(), packages: limits.packages.clone() };
-    backend.prepare(&spec).await.context("preparing the sandbox")?;
-    if backend.network_unblocked() && !limits.network {
-        tracing::warn!(
-            "the local backend cannot block network access here, but this session says network: false; \
-             only run code you trust, or use --sandbox docker"
-        );
-    }
-
+    // Join before preparing the sandbox, and say how that goes: a runner
+    // that cannot start then shows as failed, with why, rather than missing.
     let (kp, token) = match saved {
         Some(i) => (Keypair::from_seed(&seed_from_hex(&i.participant_seed)?), i.token),
         None => join(&http, &invite, &args, &backend).await?,
     };
     let mut relay = Relay::new(http.clone(), &invite.base_url, &sid, &token);
-    let (kp, relay) = match relay.heartbeat(None).await {
+    let (kp, relay) = match relay.report("preparing", None).await {
         Err(e) if status_of(&e) == Some(401) => {
             tracing::info!("saved identity is no longer valid; joining again");
             let (kp, token) = join(&http, &invite, &args, &backend).await?;
             relay = Relay::new(http.clone(), &invite.base_url, &sid, &token);
             save_identity(&id_path, &kp, &token, &base)?;
+            relay.report("preparing", None).await?;
             (kp, relay)
         }
         Err(e) => return Err(e),
@@ -259,6 +253,18 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         session = %sid, name = %args.name, participant = %kp.public().fingerprint(),
         sandbox = ?backend.kind(), "joined as a runner"
     );
+    let spec = RuntimeSpec { runtime: limits.runtime.clone(), packages: limits.packages.clone() };
+    if let Err(e) = backend.prepare(&spec).await {
+        let _ = relay.report("failed", Some(&failure_detail(&e))).await;
+        return Err(e.context("preparing the sandbox"));
+    }
+    if backend.network_unblocked() && !limits.network {
+        tracing::warn!(
+            "the local backend cannot block network access here, but this session says network: false; \
+             only run code you trust, or use --sandbox docker"
+        );
+    }
+    relay.report("ready", None).await?;
 
     let view = View::new(relay.clone(), signed, invite.session_key(), kp.public(), dir.clone())?;
     let view = Arc::new(Mutex::new(view));
@@ -281,6 +287,18 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         let _ = std::fs::remove_dir_all(&dir);
     }
     outcome
+}
+
+/// A setup error as one short line for the session: the first lines of its
+/// chain, whitespace collapsed, within the relay's limit.
+fn failure_detail(e: &anyhow::Error) -> String {
+    let text = format!("preparing the sandbox: {e:#}");
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: String = line.chars().take(299).collect();
+    if out.len() < line.len() {
+        out.push('…');
+    }
+    out
 }
 
 fn save_identity(path: &std::path::Path, kp: &Keypair, token: &str, base_url: &str) -> Result<()> {

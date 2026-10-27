@@ -193,6 +193,11 @@ pub struct JobRec {
 pub struct Presence {
     pub streams: usize,
     pub last_seen_ms: u64,
+    /// What the runner last said about its setup (`preparing`, `ready`,
+    /// `failed`) and why: its own unsigned word, shown so a runner that
+    /// cannot start is not just missing.
+    pub state: Option<String>,
+    pub detail: Option<String>,
 }
 
 /// A message on one runner's private stream.

@@ -472,3 +472,27 @@ def test_cli_creates_a_session_that_never_expires(relay, caches):
     assert created["expires_at_ms"] is None
     out = cli("session", "info", invite=created["invites"]["observer"], cache=caches("cli")).stdout
     assert "expires   never" in out
+
+
+def test_a_runner_that_cannot_start_says_why(relay, caches, tmp_path):
+    # It joins before preparing its sandbox, so the session sees it fail
+    # (here: no usable Docker) instead of a runner that never turns up.
+    owner = Session.create(relay.url, mode="execute", job_limits=LIMITS, cache_dir=caches("owner"))
+    env = dict(os.environ, AIRLOX_INVITE=owner.invites["runner"], AIRLOX_DOCKER="false")
+    p = subprocess.run([BIN, "runner", "join", "--name", "broken", "--sandbox", "docker", "--cache-dir",
+                        str(tmp_path / "runner")], env=env, capture_output=True, text=True, timeout=60)
+    assert p.returncode != 0 and "preparing the sandbox" in p.stderr, p.stderr
+
+    [r] = owner.runners()
+    assert (r.name, r.state, r.online) == ("broken", "failed", False)
+    assert r.detail.startswith("preparing the sandbox:") and "docker" in r.detail.lower(), r.detail
+    listing = cli("runner", "list", invite=owner.invites["owner"], cache=caches("owner-cli")).stdout
+    assert "setup failed" in listing and "failed: preparing the sandbox" in listing, listing
+    work = tmp_path / "work"
+    work.mkdir()
+    mcp = Mcp(relay.url, caches("mcp"), work, invite=owner.invites["sender"])
+    try:
+        [m] = mcp.call("list_runners")["runners"]
+        assert (m["state"], m["detail"]) == ("failed", r.detail)
+    finally:
+        mcp.close()
