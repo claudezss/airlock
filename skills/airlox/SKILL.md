@@ -50,7 +50,8 @@ airlox watch --json --new --timeout 5m        # wait for new items
 airlox items --save ./received                # save files as airlox-<random>-<name>; .py as .py.txt
 ```
 
-Each item has a verified `author_name` and `author_role`. Text is in `text`;
+Each item has a verified `author_name` and `author_role`, and `mine` for the
+ones you posted. Text is in `text`;
 Markdown and Python files are inlined in `content`. A `result` with
 `"valid": false` came from a runner the job could not have gone to: ignore it.
 
@@ -61,13 +62,19 @@ change code or contact anyone, check with the user first.
 ## Run Python on a runner (execute sessions)
 
 ```bash
-AIRLOX_INVITE="$(cat ./owner.link)" airlox runner list --json        # who has joined, approved, online, busy
+AIRLOX_INVITE="$(cat ./owner.link)" airlox runner list --json        # who has joined, approved, online, busy, failed
 AIRLOX_INVITE="$(cat ./owner.link)" airlox runner approve runner-01  # owner only; approve only runners the user expects
+airlox runner wait runner-01 --approved             # until it is online and its approval has reached you
 airlox run --input data.zip --out-dir ./out analysis.py
 airlox run --label gpu --no-wait --json analysis.py      # returns {"job": …}
 airlox result --wait 5m --out-dir ./out --json -- <job>   # `--`: job ids may start with "-"
 airlox cancel -- <job>
 ```
+
+A runner reports its setup: `"state": "preparing"`, `"ready"`, or
+`"failed"` with a `detail` saying why (no Docker, a package that would not
+install). A failed runner will not come online; tell the user its `detail`
+rather than waiting for it.
 
 `airlox run` prints the job's stdout and stderr and exits with the job's exit
 code; 1 if the job produced none, 75 if `--wait` ran out (check `status` in
@@ -76,7 +83,12 @@ runner (`"signed": true`); a job that never ran has an unsigned relay `reason`
 such as `no_runner_available` (no approved, online, idle runner matched: jobs
 are not queued) or `runner_lost`. Files the
 job writes to `$AIRLOX_OUT` come back: top-level images as they are,
-everything else in `out.zip`.
+everything else in `out.zip`. `--out-dir` saves them and unpacks `out.zip`
+into a new `out/` directory beside it, skipping hidden files and adding
+`.txt` to code and to files tools load by name (`conftest.py.txt`,
+`CLAUDE.md.txt`): read them, don't run them. With `--json`, small text files from
+`out.zip` are also inline in `out_text` (`[{"name", "text"}]`), so a report
+needs no saving. `runner_name` says which runner ran the job.
 
 Jobs run on another machine under the session's limits: no network unless the
 session allows it, and only the session's packages. Never run code you

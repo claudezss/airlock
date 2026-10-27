@@ -222,25 +222,66 @@ function markRevoked(row) {
 const INSTALL_URL = "https://github.com/claudezss/airlox#install";
 const MASKED_NOTE = "Links are partly hidden here. Copy puts the full link on the clipboard.";
 
+// A button that copies `text()`; when the clipboard is denied, `shown()` is
+// swapped for a selected field holding the same text.
+function copyButton(label, text, shown, name, cls = "small") {
+  const btn = el("button", { class: cls, type: "button", onclick: async () => {
+    if (await copyText(btn, text(), label)) return;
+    const input = el("input", { type: "text", readonly: true, value: text(), "aria-label": name });
+    shown().replaceWith(input);
+    input.select();
+    btn.textContent = pressCopy();
+  } }, label);
+  return btn;
+}
+
 // Runner invites come with the command that uses them. The shown command
 // carries the masked link; Copy command always copies the full one.
 function runnerInviteRow(url) {
   const cmd = (link) => `airlox runner join --invite '${link}' --name my-runner --sandbox docker`;
   // Only the link part may break mid-word; the rest wraps at spaces.
   const shown = el("code", {}, "airlox runner join --invite '", el("span", { class: "link" }, maskInvite(url)), "' --name my-runner --sandbox docker");
-  const btn = el("button", { class: "small primary", type: "button", onclick: async () => {
-    if (await copyText(btn, cmd(url), "Copy command")) return;
-    const input = el("input", { type: "text", readonly: true, value: cmd(url), "aria-label": "Runner command" });
-    shown.replaceWith(input);
-    input.select();
-    btn.textContent = pressCopy();
-  } }, "Copy command");
+  const btn = copyButton("Copy command", () => cmd(url), () => shown, "Runner command", "small primary");
   const row = inviteRow("Runner", url, "a machine that runs jobs", "Copy link");
   row.append(el("div", { class: "runner-cmd stack" },
     el("p", { class: "muted hint-text" },
       "Install the airlox runner first: ", el("a", { href: INSTALL_URL, target: "_blank", rel: "noopener noreferrer" }, "see the install guide"), "."),
     el("p", { class: "muted hint-text" }, "Then run this on the runner host. Change ", el("code", {}, "my-runner"), " to a name senders will recognise."),
     shown, el("div", { class: "row" }, btn)));
+  return row;
+}
+
+// Sender invites come with how to hand them to a coding agent: add the
+// airlox MCP server once, then ask the agent to join with the link.
+const AGENTS = {
+  "Claude Code": "claude mcp add airlox -- npx -y airlox mcp",
+  Codex: "codex mcp add airlox -- npx -y airlox mcp",
+};
+const MCP_DOCS_URL = "https://github.com/claudezss/airlox#from-an-ai-agent";
+
+function senderInviteRow(url) {
+  const row = inviteRow("Sender", url, "can post messages, files and jobs, e.g. your code agent", "Copy link");
+  let agent = "Claude Code";
+  const setup = () => row.querySelector("[data-part=setup]");
+  const prompt = el("code", {}, "Join the Airlox session ", el("span", { class: "link" }, maskInvite(url)));
+  const picks = Object.keys(AGENTS).map((name) => el("button", {
+    type: "button", class: "small", "aria-pressed": String(name === agent), onclick: () => {
+      agent = name;
+      picks.forEach((b) => b.setAttribute("aria-pressed", String(b.textContent === name)));
+      // Also undoes a denied clipboard's swap to an input field.
+      setup().replaceWith(el("code", { "data-part": "setup" }, AGENTS[name]));
+    } }, name));
+  row.append(el("div", { class: "runner-cmd stack" },
+    el("p", { class: "muted hint-text" }, "Connect Codex or Claude Code:"),
+    el("div", { class: "row agent-pick", role: "group", "aria-label": "Coding agent" }, picks),
+    el("p", { class: "muted hint-text" }, "1. In the folder the agent works in, add the airlox MCP server once. The agent can send and save files only inside that folder."),
+    el("code", { "data-part": "setup" }, AGENTS[agent]),
+    el("div", { class: "row" }, copyButton("Copy command", () => AGENTS[agent], setup, "Setup command")),
+    el("p", { class: "muted hint-text" }, "2. Start the agent there and ask it to join. It asks you before each step; to run it unattended, see ",
+      el("a", { href: MCP_DOCS_URL, target: "_blank", rel: "noopener noreferrer" }, "airlox mcp config"), "."),
+    prompt,
+    el("div", { class: "row" }, copyButton("Copy prompt", () => `Join the Airlox session ${url}`, () => prompt, "Prompt for the agent", "small primary")),
+    el("p", { class: "muted hint-text" }, "Two agents on one machine that use this link act as one participant, under the first one's name.")));
   return row;
 }
 
@@ -356,7 +397,7 @@ function newSession() {
         el("p", { class: "muted" }, "Copy the owner link now: it cannot be shown again. Sender, observer and runner links stay available under Invites in the session."),
         el("p", { class: "muted hint-text" }, MASKED_NOTE),
         inviteRow("Owner", owner, "you · keep it private"),
-        inviteRow("Sender", ac.memberInvite(base, s.ownerSeed, "sender"), "can post messages, files and jobs, e.g. your code agent"),
+        senderInviteRow(ac.memberInvite(base, s.ownerSeed, "sender")),
         inviteRow("Observer", ac.memberInvite(base, s.ownerSeed, "observer"), "can read everything and export the audit log"),
         ...(execute ? [runnerInviteRow(ac.memberInvite(base, s.ownerSeed, "runner"))] : []),
         el("div", { class: "row" },
@@ -640,7 +681,7 @@ function buildSessionLayout(s) {
     el("p", { class: "muted hint-text" }, "JSON Lines with the session's records, for checking with airlox tools."),
     el("p", { class: "muted hint-text" }, inv.role === "owner" ? "Download before you close: closing deletes it." : "Download before the owner closes the session: closing deletes it.")) : null;
   const inviteRows = inv.role === "owner" ? {
-    sender: inviteRow("Sender", ac.memberInvite(location.origin, inv.roleSeed, "sender"), "can post messages, files and jobs, e.g. your code agent"),
+    sender: senderInviteRow(ac.memberInvite(location.origin, inv.roleSeed, "sender")),
     observer: inviteRow("Observer", ac.memberInvite(location.origin, inv.roleSeed, "observer"), "can read everything and export the audit log"),
     runner: execute ? runnerInviteRow(ac.memberInvite(location.origin, inv.roleSeed, "runner")) : null } : {};
   const invites = inv.role === "owner" ? el("details", {},
@@ -725,7 +766,23 @@ function buildSessionLayout(s) {
   tick();
 
   if (execute) runnerLoop(s);
-  const nearBottom = () => window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 160;
+  // Follow new items when the reader is at the end of the timeline (not of the
+  // page: on narrow screens the sidebar follows it), or has not scrolled yet and
+  // sees the end. Scrolled up, or well into the sidebar below: leave them be.
+  const composerH = () => parseFloat(document.documentElement.style.getPropertyValue("--composer-h")) || 0;
+  const nearBottom = () => {
+    // The newest item, not the timeline box: that can stretch to fill the column.
+    const end = (timeline.lastElementChild || timeline).getBoundingClientRect().bottom;
+    const d = end - (window.innerHeight - composerH()); // > 0: end below the visible area
+    return (d >= -48 && d <= 160) || (window.scrollY === 0 && end <= window.innerHeight);
+  };
+  // The last item ends just above the sticky composer.
+  const toEnd = () => {
+    const last = timeline.lastElementChild;
+    if (!last) return;
+    const delta = last.getBoundingClientRect().bottom - (window.innerHeight - composerH());
+    if (Math.abs(delta) >= 1) window.scrollBy(0, delta);
+  };
   // Timeline entries are kept in event order.
   const place = (node, seq, old) => {
     node.dataset.seq = seq;
@@ -789,7 +846,9 @@ function buildSessionLayout(s) {
       const node = renderItem(s, it);
       place(node, it.seq, old);
       if (held) (held.keep && node.querySelector(`[data-keep="${held.keep}"]:not(:disabled)`) || node).focus({ preventScroll: true });
-      if (stick && !old) node.scrollIntoView({ block: "end" });
+      // A reader at the bottom stays there, also when a card grows in place
+      // (its file arrives, its job gets a result).
+      if (stick) toEnd();
       settle(s, it);
       if (it.kind === "job") announceJob(s, it);
       else if (!old && s.announce && it.status === "ok" && it.author !== s.me && (it.kind === "text" || it.kind === "file"))
@@ -798,12 +857,12 @@ function buildSessionLayout(s) {
     },
     runners: () => {
       renderRunners(s, runnerList, runnerNote);
-      const n = s.runners.filter((r) => !r.approved && !r.rejected).length;
+      const n = s.runners.filter((r) => !r.approved && !r.rejected && r.setup !== "failed").length;
       approvalBanner.hidden = !(inv.role === "owner" && n && !s.closed);
       approvalText.textContent = `${n} runner${n === 1 ? "" : "s"} awaiting approval`;
       jobUi?.refresh();
     },
-    scroll: () => timeline.lastElementChild?.scrollIntoView({ block: "end" }),
+    scroll: toEnd,
     conn: (bad) => {
       conn.textContent = bad && !s.closed ? "Reconnecting…" : "";
       conn.hidden = !conn.textContent;
@@ -1494,6 +1553,7 @@ async function pollRunners(s) {
         list.push({ pub: e.participant_pub, name: j.runner.name, description: j.description, labels: j.runner.labels,
           host: j.runner.host, sandbox: j.runner.sandbox,
           networkUnblocked: !!j.runner.network_unblocked, online: !!e.online, job: e.job,
+          setup: e.state || null, detail: typeof e.detail === "string" ? (e.detail.length > 300 ? `${e.detail.slice(0, 300)}…` : e.detail) : null,
           ...runnerStatus(s, e) });
       } catch (err) {
         console.warn("ignoring unverifiable runner", err);
@@ -1501,7 +1561,7 @@ async function pollRunners(s) {
     }
     const first = !s.runnersLoaded;
     for (const x of list) {
-      const label = x.rejected ? "rejected" : x.approved ? "approved" : "awaiting approval";
+      const label = x.rejected ? "rejected" : x.approved ? "approved" : x.setup === "failed" ? "failed to start" : "awaiting approval";
       if (!first && s.announce && s.runnerSeen.get(x.pub) !== label) announce(`Runner ${x.name}: ${label}`);
       s.runnerSeen.set(x.pub, label);
     }
@@ -1557,15 +1617,18 @@ function renderRunners(s, list, note) {
     const approval = r.rejected ? "rejected"
       : r.approved ? "approved"
       : r.relayOnly ? (owner ? "needs your confirmation" : "approval not received here")
+      : r.setup === "failed" ? "not approved"
       : "awaiting approval";
-    const live = r.rejected ? "rejected" : !r.approved ? "awaiting approval" : r.online ? (r.job ? `busy · #${short(r.job)}` : "idle") : "offline";
+    const live = r.rejected ? "rejected" : r.setup === "failed" ? "setup failed"
+      : r.setup === "preparing" && !r.online ? "preparing its sandbox"
+      : !r.approved ? "awaiting approval" : r.online ? (r.job ? `busy · #${short(r.job)}` : "idle") : "offline";
     return { approval, live, err: s.runnerErrors.get(r.pub) };
   };
   const revoked = s.revokedRoles.has("runner");
   // The poll runs every few seconds: leave the list (and keyboard focus) alone
   // unless something it shows has changed.
   const sig = JSON.stringify([!!s.closed, revoked, s.runners.map((r) => [r.pub, r.name, r.description, r.labels, r.host, r.sandbox, r.networkUnblocked,
-    r.rejected, r.approved, r.relayOnly, text(r)])]);
+    r.rejected, r.approved, r.relayOnly, r.setup, r.detail, text(r)])]);
   if (list.dataset.sig === sig) return;
   list.dataset.sig = sig;
   const a = document.activeElement;
@@ -1580,7 +1643,9 @@ function renderRunners(s, list, note) {
     const dot = r.rejected ? "" : !r.approved ? "wait" : r.online ? "on" : "";
     // Kept after a failed approval: the relay may say approved while the
     // owner's approval never got posted, and the owner must be able to retry.
-    const canApprove = owner && !r.rejected && (!r.approved || !!err);
+    // A runner that failed to start has nothing to approve: show why instead.
+    const failed = r.setup === "failed" && !r.rejected;
+    const canApprove = owner && !r.rejected && !failed && (!r.approved || !!err);
     const warn = r.networkUnblocked && !r.rejected
       ? el("span", { class: "chip warn", title: "This runner's sandbox cannot block network access" }, "⚠ network not blocked") : null;
     const act = (name, label, cls, approve) => el("button", { type: "button", class: `small ${cls}`, "data-pub": r.pub, "data-act": name,
@@ -1601,6 +1666,7 @@ function renderRunners(s, list, note) {
         "The relay says this runner is approved, but this browser has no approval from you on record. Confirm only if you approved it. Its key: ",
         el("span", { class: "mono" }, ac.fingerprint(r.pub).slice(0, 16).replace(/(.{4})(?=.)/g, "$1 ")), ".") : null,
       owner && canApprove && warn ? el("p", { class: "sub net-note" }, "Jobs on this runner can reach the internet. Approve only if you trust the code senders submit.") : null,
+      failed ? el("p", { class: "sub setup-failed", title: "The runner's own report, not verified" }, r.detail || "The runner could not start.") : null,
       owner && !r.rejected ? el("div", { class: "row" },
         canApprove ? [warn, act("approve", r.relayOnly ? "Confirm approval" : "Approve", "primary", true)] : null,
         act("reject", "Reject", "danger", false)) : null,
@@ -1690,9 +1756,9 @@ function buildJobPanel(s, text, file) {
     const opts = [el("option", { value: "any" }, "Any idle runner"), el("option", { value: "labels" }, "Labels…")];
     for (const r of s.runners) {
       if (r.rejected) continue;
-      opts.push(el("option", { value: `runner:${r.pub}` }, `${r.name}${r.online ? "" : " (offline)"}${r.approved ? "" : r.relayOnly ? " (not approved here)" : " (not approved)"}`));
+      opts.push(el("option", { value: `runner:${r.pub}` }, `${r.name}${r.online ? "" : " (offline)"}${r.setup === "failed" ? " (setup failed)" : r.approved ? "" : r.relayOnly ? " (not approved here)" : " (not approved)"}`));
     }
-    const sig = s.runners.map((r) => `${r.pub}${r.name}${r.online}${r.approved}${r.relayOnly}${r.rejected}`).join("|");
+    const sig = s.runners.map((r) => `${r.pub}${r.name}${r.online}${r.approved}${r.relayOnly}${r.rejected}${r.setup}`).join("|");
     if (sig !== optsSig) {
       optsSig = sig;
       target.replaceChildren(...opts);
@@ -1924,11 +1990,56 @@ function showHome() {
   app.classList.add("wide");
   document.title = "Airlox · Secure sessions for code and LLM agents";
   show(document.getElementById("home-tpl").content.cloneNode(true));
+  demoTabs(document.querySelector(".lp-demo-tabs"));
+  demoPause(document.querySelector(".lp-demo-pause"));
   let target = null;
   try {
     target = location.hash.length > 1 ? document.getElementById(decodeURIComponent(location.hash.slice(1))) : null;
   } catch {}
   if (target) target.scrollIntoView();
+}
+
+// The use case tabs: one panel shown at a time, arrow keys move between tabs.
+function demoTabs(list) {
+  const tabs = [...list.querySelectorAll("[role=tab]")];
+  const select = (tab) => {
+    for (const t of tabs) {
+      const on = t === tab;
+      t.setAttribute("aria-selected", String(on));
+      t.tabIndex = on ? 0 : -1;
+      document.getElementById(t.getAttribute("aria-controls")).hidden = !on;
+    }
+  };
+  list.addEventListener("click", (e) => {
+    const tab = e.target.closest("[role=tab]");
+    if (tab) select(tab);
+  });
+  list.addEventListener("keydown", (e) => {
+    const i = tabs.indexOf(document.activeElement);
+    const step = { ArrowRight: 1, ArrowLeft: -1, Home: -i, End: tabs.length - 1 - i }[e.key];
+    if (i < 0 || step === undefined) return;
+    e.preventDefault();
+    const next = tabs[(i + step + tabs.length) % tabs.length];
+    select(next);
+    next.focus();
+  });
+}
+
+// The recordings loop forever (WCAG 2.2.2): one toggle swaps every GIF for its
+// still. Reduced motion starts paused (the <picture> source already shows the still).
+function demoPause(btn) {
+  const imgs = [...document.querySelectorAll(".lp-demo-media img")];
+  const set = (paused) => {
+    for (const img of imgs) {
+      // The <source> would win over src under reduced motion: switch it off and drive src alone.
+      img.previousElementSibling?.setAttribute("media", "not all");
+      img.src = img.getAttribute("src").replace(/\.(gif|webp)$/, paused ? ".webp" : ".gif");
+    }
+    btn.setAttribute("aria-pressed", String(paused));
+    btn.querySelector(".glyph").textContent = paused ? "▶" : "❚❚";
+  };
+  btn.addEventListener("click", () => set(btn.getAttribute("aria-pressed") !== "true"));
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) set(true);
 }
 
 // ---------- boot ----------

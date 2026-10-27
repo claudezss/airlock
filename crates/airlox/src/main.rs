@@ -53,6 +53,9 @@ enum RunnerCmd {
     Join(runner::JoinArgs),
     /// List the session's runners.
     List(cli::Conn),
+    /// Wait until a runner is online (and approved, with --approved); exits
+    /// 1 if it reports that it could not start, 75 if the wait runs out.
+    Wait(cli::WaitArgs),
     /// Let a runner take jobs (owner invite only).
     Approve {
         #[command(flatten)]
@@ -119,8 +122,16 @@ fn main() -> std::process::ExitCode {
             Cmd::Items(a) => cli::items(a).await.map(|()| 0),
             Cmd::Watch(a) => cli::watch(a).await.map(|()| 0),
             Cmd::Runner(RunnerCmd::Join(args)) => runner::run(args).await.map(|()| 0),
+            Cmd::Mcp(mcp::McpArgs { cmd: Some(mcp::McpCmd::Config(c)), .. }) => {
+                mcp::print_config(&c).map(|()| 0)
+            }
+            Cmd::Mcp(mcp::McpArgs { cmd: Some(mcp::McpCmd::Prompt), .. }) => {
+                println!("{}", mcp::WORKER_PROMPT);
+                Ok(0)
+            }
             Cmd::Mcp(a) => mcp::serve(a).await.map(|()| 0),
             Cmd::Runner(RunnerCmd::List(c)) => cli::runner_list(c).await.map(|()| 0),
+            Cmd::Runner(RunnerCmd::Wait(a)) => cli::runner_wait(a).await,
             Cmd::Runner(RunnerCmd::Approve { conn, runner }) => {
                 cli::runner_approve(conn, runner).await.map(|()| 0)
             }

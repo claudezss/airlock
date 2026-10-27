@@ -2,13 +2,16 @@
 
 import io
 import os
+import subprocess
 import sys
 import time
 import zipfile
 
 import pytest
 
-from airlox import NoRunnerAvailable, Session
+from airlox import NoRunnerAvailable, PolicyError, RunnerFailed, Session
+
+from conftest import REPO, RunnerProc
 
 LIMITS = {
     "runtime": "python3.12",
@@ -70,24 +73,65 @@ def execute(relay, caches, start_runner):
 def test_unapproved_runners_get_nothing_then_summarize_runs(execute):
     owner, agent, runner = execute
     [r] = agent.runners()
-    assert (r.name, r.labels, r.approved, r.online) == ("runner-01", ["cpu"], False, True)
+    assert (r.name, r.labels, r.approved, r.online, r.state) == ("runner-01", ["cpu"], False, True, "ready")
     with pytest.raises(NoRunnerAvailable):
         agent.run_python("print(1)")
 
     owner.approve_runner("runner-01")
-    assert wait_runner(agent, "runner-01", lambda r: r.approved)
+    assert agent.wait_for_runner("runner-01", approved=True)
     data = agent.send_file(dataset(), name="dataset.zip")
     job = agent.run_python(SUMMARIZE, filename="summarize.py", files=[data], runner="runner-01")
     res = job.wait(timeout=60)
     assert res.signed and res.status == "completed", (res, runner.output())
     assert res.ok and res.stdout.strip() == "2 orders, total 42"
+    assert (res.runner, res.runner_name) == (r.participant_pub, "runner-01")
     assert {f.name for f in res.out_files} == {"chart.png", "out.zip"}
     assert res.out_file("chart.png").data.startswith(b"\x89PNG")
     z = zipfile.ZipFile(io.BytesIO(res.out_file("out.zip").data))
     assert z.read("summary.json") == b'{"orders": 2, "total": 42}'
+    # read() finds files by their path in $AIRLOX_OUT, zipped or not.
+    assert res.read("summary.json") == b'{"orders": 2, "total": 42}'
+    assert res.read("chart.png").startswith(b"\x89PNG")
+    with pytest.raises(KeyError):
+        res.read("missing.txt")
     assert job.state()["state"] == "done"
     # The owner sees the same verified result.
     assert owner.items() and any(i.kind == "result" for i in owner.items())
+
+
+def test_wait_for_runner_waits_for_the_senders_view_of_the_approval(execute):
+    owner, agent, runner = execute
+    r = agent.wait_for_runner("runner-01")  # online, but nobody approved it yet
+    assert (r.name, r.online, r.approved) == ("runner-01", True, False)
+    assert agent.wait_for_runner(r.participant_pub).participant_pub == r.participant_pub  # by key, too
+    with pytest.raises(TimeoutError, match="no signed approval"):
+        agent.wait_for_runner("runner-01", approved=True, timeout=1.0)
+    with pytest.raises(TimeoutError, match="has not joined"):
+        agent.wait_for_runner("nobody", timeout=0.5)
+
+    # Straight after the owner approves, the sender may not have the signed
+    # event yet; waiting for it is what makes the next call safe.
+    owner.approve_runner("runner-01")
+    assert agent.wait_for_runner("runner-01", approved=True).approved
+    res = agent.run_python("print('ok')", runner="runner-01").wait(timeout=60)
+    assert res.ok and res.stdout.strip() == "ok", (res, runner.output())
+
+
+def test_wait_for_runner_raises_at_once_for_a_runner_that_failed(relay, caches, tmp_path):
+    owner = Session.create(relay.url, mode="execute", job_limits=LIMITS, cache_dir=caches("owner"))
+    binary = os.environ.get("AIRLOX_BIN", str(REPO / "target/debug/airlox"))
+    env = dict(os.environ, AIRLOX_INVITE=owner.invites["runner"], AIRLOX_DOCKER="false")
+    p = subprocess.run([binary, "runner", "join", "--name", "broken", "--sandbox", "docker", "--cache-dir",
+                        str(tmp_path / "runner")], env=env, capture_output=True, text=True, timeout=60)
+    assert p.returncode != 0, p.stderr
+
+    start = time.monotonic()
+    with pytest.raises(RunnerFailed, match=r"broken.*preparing the sandbox") as e:
+        owner.wait_for_runner("broken", timeout=30)
+    assert time.monotonic() - start < 10
+    assert e.value.runner.state == "failed"
+    with pytest.raises(RunnerFailed):
+        owner.wait_for_runner("broken", approved=True, timeout=30)
 
 
 def test_idle_runner_still_sees_its_approval(execute):
@@ -97,7 +141,7 @@ def test_idle_runner_still_sees_its_approval(execute):
     # idle runner's next sync, and every job would be refused.
     owner, agent, runner = execute
     owner.approve_runner("runner-01")
-    wait_runner(agent, "runner-01", lambda r: r.approved)
+    agent.wait_for_runner("runner-01", approved=True)
     time.sleep(1.5)
     res = agent.run_python("print('ok')", runner="runner-01").wait(timeout=60)
     assert res.ok and res.stdout.strip() == "ok", (res, runner.output())
@@ -121,7 +165,7 @@ def test_job_arriving_just_before_the_signed_approval_runs(execute):
 def test_refusals_timeouts_and_cancels(execute):
     owner, agent, runner = execute
     owner.approve_runner("runner-01")
-    wait_runner(agent, "runner-01", lambda r: r.approved)
+    agent.wait_for_runner("runner-01", approved=True)
 
     # Not in the allowlist: the runner refuses without running anything.
     res = agent.run_python("import scipy", requirements=["scipy"]).wait(timeout=30)
@@ -150,9 +194,25 @@ def test_refusals_timeouts_and_cancels(execute):
 def test_rejected_runner_stops(execute):
     owner, agent, runner = execute
     owner.reject_runner("runner-01")
+    with pytest.raises(PolicyError, match="rejected"):
+        agent.wait_for_runner("runner-01", timeout=10)
     runner.proc.wait(timeout=30)
     assert runner.proc.returncode != 0
     assert "rejected" in runner.output()
+
+
+def test_runners_sharing_a_cache_start_together(relay, caches, tmp_path):
+    # Runners on one machine share ~/.cache/airlox by default. Started at
+    # once on a fresh cache, one builds the job runtime and the others wait
+    # for it, rather than deleting the venv another is building.
+    owner = Session.create(relay.url, mode="execute", job_limits=LIMITS, cache_dir=caches("owner"))
+    procs = [RunnerProc(owner.invites["runner"], f"runner-{n}", tmp_path / "shared") for n in range(8)]
+    try:
+        for n, p in enumerate(procs):
+            wait_runner(owner, f"runner-{n}", lambda r: r.online, proc=p)
+    finally:
+        for p in procs:
+            p.stop()
 
 
 PROBE = """
@@ -180,7 +240,7 @@ print("cwd", os.getcwd())
 def test_sandbox_confines_the_job(execute):
     owner, agent, runner = execute
     owner.approve_runner("runner-01")
-    wait_runner(agent, "runner-01", lambda r: r.approved)
+    agent.wait_for_runner("runner-01", approved=True)
     res = agent.run_python(PROBE).wait(timeout=60)
     assert res.ok, (res, runner.output())
     lines = dict(line.split(" ", 1) for line in res.stdout.strip().splitlines())

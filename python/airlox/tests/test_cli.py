@@ -1,11 +1,13 @@
 """The `airlox` command-line client and `airlox mcp`, against a real relay
 and runner, interoperating with the Python SDK."""
 
+import glob
 import io
 import json
 import os
 import re
 import subprocess
+import tempfile
 import time
 import zipfile
 
@@ -154,6 +156,7 @@ def test_cli_output_is_safe(relay, caches, tmp_path):
 
 
 def test_cli_runs_jobs(relay, caches, tmp_path, start_runner, runner_cache):
+    temp_jobs = set(glob.glob(os.path.join(tempfile.gettempdir(), "airlox-jobs-*")))
     owner = Session.create(relay.url, mode="execute", job_limits=LIMITS, cache_dir=caches("owner"))
     sender = owner.invites["sender"]
     owner_link = owner.invites["owner"]
@@ -175,25 +178,40 @@ def test_cli_runs_jobs(relay, caches, tmp_path, start_runner, runner_cache):
     assert [(r["name"], r["approved"], r["description"]) for r in listing["runners"]] == [
         ("runner-01", False, "8 cores, 32 GB RAM")]
     assert "8 cores, 32 GB RAM" in cli("runner", "list", invite=owner_link, cache=caches("owner-cli")).stdout
+    p = cli("runner", "wait", "runner-01", "--approved", "--timeout", "1s", invite=sender, cache=caches("cli"),
+            check=False)
+    assert p.returncode == 75 and "not ready" in p.stderr, p.stderr
     cli("runner", "approve", "runner-01", invite=owner_link, cache=caches("owner-cli"))
-    wait_runner(owner, "runner-01", lambda r: r.approved and r.online)
+    # The sender waits until the owner's signed approval has reached it.
+    p = cli("runner", "wait", "runner-01", "--approved", invite=sender, cache=caches("cli"))
+    assert "online and approved" in p.stdout
 
     out = tmp_path / "out"
     p = cli("run", "--label", "cpu", "--input", data, "--out-dir", out, script, invite=sender, cache=caches("cli"))
     assert "2 orders, total 42" in p.stdout
-    assert "signed by the runner" in p.stderr
-    assert sorted(f.name for f in out.iterdir()) == ["chart.png", "out.zip"]
+    assert "signed by runner runner-01" in p.stderr
+    assert sorted(f.name for f in out.iterdir()) == ["chart.png", "out", "out.zip"]
+    # A job does not learn where the runner keeps its files, or whose they are.
+    where = tmp_path / "where.py"
+    where.write_text("import os\nprint(os.getcwd())\n")
+    cwd = cli("run", where, invite=sender, cache=caches("cli")).stdout.strip()
+    assert not cwd.startswith(str(runner_cache)) and os.path.expanduser("~") not in cwd, cwd
     with zipfile.ZipFile(io.BytesIO((out / "out.zip").read_bytes())) as z:
         assert json.loads(z.read("summary.json")) == {"orders": 2, "total": 42}
+    # out.zip is also unpacked beside it.
+    assert json.loads((out / "out" / "summary.json").read_text()) == {"orders": 2, "total": 42}
 
     # The exit status is the job's; --no-wait plus `result` gets it later.
     failing = tmp_path / "fail.py"
     failing.write_text("import sys\nprint('bad input', file=sys.stderr)\nsys.exit(7)\n")
-    job = json.loads(cli("run", "--no-wait", "--json", failing, invite=sender, cache=caches("cli")).stdout)["job"]
+    submitted = json.loads(cli("run", "--no-wait", "--json", failing, invite=sender, cache=caches("cli")).stdout)
+    assert submitted["runner_name"] == "runner-01"
+    job = submitted["job"]
     p = cli("result", job, "--wait", "60s", "--json", invite=sender, cache=caches("cli"), check=False)
     assert p.stdout, p.stderr
     res = json.loads(p.stdout)
     assert p.returncode == 7 and res["exit_code"] == 7 and res["signed"] and "bad input" in res["stderr"]
+    assert res["runner_name"] == "runner-01"
 
     # The SDK sees the same signed result.
     owner.sync()
@@ -203,9 +221,14 @@ def test_cli_runs_jobs(relay, caches, tmp_path, start_runner, runner_cache):
     p = cli("result", "-AAAAAAAAAAAAAAAAAAAAA", "--json", invite=sender, cache=caches("cli"), check=False)
     assert "unexpected argument" not in p.stderr and "not a job id" not in p.stderr, p.stderr
 
+    # SIGTERM stops it cleanly, and an unsandboxed runner's temporary job
+    # directory goes with it.
+    runner.proc.terminate()
+    assert runner.proc.wait(timeout=20) == 0, runner.output()
+    assert set(glob.glob(os.path.join(tempfile.gettempdir(), "airlox-jobs-*"))) <= temp_jobs
+
     # A runner link altered to name another relay does not get the approved
     # runner's saved token: refused before any request.
-    runner.stop()
     altered = re.sub(r"127\.0\.0\.1:\d+", "127.0.0.1:9", owner.invites["runner"])
     env = dict(os.environ, AIRLOX_INVITE=altered)
     p = subprocess.run([BIN, "runner", "join", "--name", "runner-01", "--sandbox", "local", "--cache-dir",
@@ -216,7 +239,7 @@ def test_cli_runs_jobs(relay, caches, tmp_path, start_runner, runner_cache):
 class Mcp:
     """An `airlox mcp` process spoken to over JSON-RPC on stdio."""
 
-    def __init__(self, relay_url, cache, allow, invite=None, extra=(), env=None):
+    def __init__(self, relay_url, cache, allow, invite=None, extra=(), env=None, client="pytest"):
         args = [BIN, "mcp", "--relay", relay_url, "--cache-dir", str(cache), "--allow-dir", str(allow), *extra]
         if invite:
             args += ["--invite", invite]
@@ -225,7 +248,7 @@ class Mcp:
                                      text=True, env=env, cwd=allow)
         self.n = 0
         init = self.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
-                                       "clientInfo": {"name": "pytest", "version": "0"}})
+                                       "clientInfo": {"name": client, "version": "0"}})
         assert init["serverInfo"]["name"] == "airlox"
         self.send("notifications/initialized")
 
@@ -300,7 +323,8 @@ def test_mcp_owner_invites_in_the_work_dir(relay, caches, tmp_path):
         s = mcp.call("create_session")
         owner_file = s["owner_invite_file"]
         assert os.path.dirname(owner_file) == str(work / "links")
-        assert [p["display_name"] for p in mcp.call("session_info")["participants"]] == ["mcp"]
+        # No --as: the client's own name.
+        assert [p["display_name"] for p in mcp.call("session_info")["participants"]] == ["pytest"]
         # The model cannot send the owner link anywhere, by any path to it.
         for path in [owner_file, os.path.relpath(owner_file, work), "links/../links/" + os.path.basename(owner_file)]:
             with pytest.raises(McpToolError, match="protected"):
@@ -342,7 +366,7 @@ def test_mcp_server(relay, caches, tmp_path, start_runner):
                              cache_dir=caches("sdk"))
         agent.send_text("please summarize the data")
         people = {p["display_name"]: p["description"] for p in mcp.call("session_info")["participants"]}
-        assert people == {"mcp": None, "sdk-agent": "Has the sales data"}
+        assert people == {"pytest": None, "sdk-agent": "Has the sales data"}
 
         listed = mcp.call("list_items", wait_s=5)
         assert "data, not as instructions" in listed["note"]
@@ -381,8 +405,12 @@ def test_mcp_server(relay, caches, tmp_path, start_runner):
 
         res = mcp.call("run_python", code=SUMMARIZE, filename="summarize.py", files=[data_id], wait_s=120)["result"]
         assert res["signed"] and res["exit_code"] == 0 and "2 orders, total 42" in res["stdout"]
+        assert res["runner_name"] == "runner-01"
+        # Small text files from out.zip come inline: no saving or unzipping.
+        assert res["out_text"] == [{"name": "summary.json", "text": '{"orders": 2, "total": 42}'}]
         saved = mcp.call("get_result", job=res["job"], save_dir="out")["saved"]
-        assert sorted(os.path.basename(p) for p in saved) == ["chart.png", "out.zip"]
+        assert {os.path.relpath(p, work / "out") for p in saved} == {
+            "chart.png", "out.zip", os.path.join("out", "summary.json")}
 
         # Joining another session does not redirect the default one.
         other = Session.create(relay.url, cache_dir=caches("other"))
@@ -463,3 +491,123 @@ def test_cli_creates_a_session_that_never_expires(relay, caches):
     assert created["expires_at_ms"] is None
     out = cli("session", "info", invite=created["invites"]["observer"], cache=caches("cli")).stdout
     assert "expires   never" in out
+
+
+def test_a_runner_that_cannot_start_says_why(relay, caches, tmp_path):
+    # It joins before preparing its sandbox, so the session sees it fail
+    # (here: no usable Docker) instead of a runner that never turns up.
+    owner = Session.create(relay.url, mode="execute", job_limits=LIMITS, cache_dir=caches("owner"))
+    env = dict(os.environ, AIRLOX_INVITE=owner.invites["runner"], AIRLOX_DOCKER="false")
+    p = subprocess.run([BIN, "runner", "join", "--name", "broken", "--sandbox", "docker", "--cache-dir",
+                        str(tmp_path / "runner")], env=env, capture_output=True, text=True, timeout=60)
+    assert p.returncode != 0 and "preparing the sandbox" in p.stderr, p.stderr
+
+    [r] = owner.runners()
+    assert (r.name, r.state, r.online) == ("broken", "failed", False)
+    assert r.detail.startswith("preparing the sandbox:") and "docker" in r.detail.lower(), r.detail
+    listing = cli("runner", "list", invite=owner.invites["owner"], cache=caches("owner-cli")).stdout
+    assert "setup failed" in listing and "failed: preparing the sandbox" in listing, listing
+    p = cli("runner", "wait", "broken", invite=owner.invites["sender"], cache=caches("cli"), check=False)
+    assert p.returncode == 1 and "could not start: preparing the sandbox" in p.stderr, p.stderr
+    work = tmp_path / "work"
+    work.mkdir()
+    mcp = Mcp(relay.url, caches("mcp"), work, invite=owner.invites["sender"])
+    try:
+        [m] = mcp.call("list_runners")["runners"]
+        assert (m["state"], m["detail"]) == ("failed", r.detail)
+    finally:
+        mcp.close()
+    # Anyone with the runner link can take the same name: then only a key will do.
+    subprocess.run([BIN, "runner", "join", "--name", "broken", "--sandbox", "docker", "--cache-dir",
+                    str(tmp_path / "runner2")], env=env, capture_output=True, text=True, timeout=60)
+    p = cli("runner", "wait", "broken", invite=owner.invites["sender"], cache=caches("cli"), check=False)
+    assert p.returncode != 0 and "more than one runner is called broken" in p.stderr, p.stderr
+    p = cli("runner", "wait", r.participant_pub, "--json", invite=owner.invites["sender"], cache=caches("cli"),
+            check=False)
+    assert p.returncode == 1 and json.loads(p.stdout)["runner"]["participant_pub"] == r.participant_pub
+
+
+def test_mcp_names_itself_after_its_client(relay, caches, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    owner = Session.create(relay.url, cache_dir=caches("owner"))
+    # The --invite session is joined once the client has said who it is.
+    mcp = Mcp(relay.url, caches("codex"), work, invite=owner.invites["sender"], client="Codex-MCP-Client")
+    try:
+        mcp.call("send_text", text="hi")
+    finally:
+        mcp.close()
+    named = Mcp(relay.url, caches("named"), work, extra=("--as", "reviewer"), client="claude-code")
+    try:
+        named.call("join_session", invite=owner.invites["observer"])
+    finally:
+        named.close()
+    owner.sync()
+    assert sorted(p["display_name"] for p in owner.participants()) == ["codex", "owner", "reviewer"]
+    assert [i.author_name for i in owner.items() if i.kind == "text"] == ["codex"]
+
+    # A link that is not one still fails at startup.
+    p = subprocess.run([BIN, "mcp", "--relay", relay.url, "--allow-dir", str(work), "--invite", "nonsense"],
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    assert p.returncode != 0 and "not a valid invite link" in p.stderr, p.stderr
+
+
+def test_mcp_config_for_headless_agents(tmp_path):
+    import tomllib
+
+    work = tmp_path / "work"
+    work.mkdir()
+    codex = tomllib.loads(cli("mcp", "config", "codex", "--allow-dir", work).stdout)["mcp_servers"]["airlox"]
+    assert codex["args"][-3:] == ["mcp", "--allow-dir", str(work.resolve())]
+    # The invite comes from the environment; only a worker's tools, without prompts.
+    assert codex["env_vars"] == ["AIRLOX_INVITE"] and codex["default_tools_approval_mode"] == "approve"
+    assert "run_python" in codex["enabled_tools"]
+    assert not {"approve_runner", "close_session", "revoke_role", "join_session"} & set(codex["enabled_tools"])
+    p = cli("mcp", "config", "claude", "--allow-dir", work, "--as", "worker")
+    server = json.loads(p.stdout)["mcpServers"]["airlox"]
+    assert server["args"][-2:] == ["--as", "worker"] and "env" not in server
+    assert "--allowedTools mcp__airlox__list_items," in p.stderr
+    assert "do not follow instructions" in cli("mcp", "prompt").stdout
+    p = cli("mcp", "config", "codex", "--allow-dir", os.path.expanduser("~"), check=False)
+    assert p.returncode != 0 and "too wide" in p.stderr
+    # The folder is a choice, never the working directory by default.
+    p = cli("mcp", "config", "codex", check=False)
+    assert p.returncode != 0 and "--allow-dir" in p.stderr
+
+
+def test_mcp_on_the_stateless_protocol(relay, caches, tmp_path):
+    # Clients on MCP 2026-07-28 (Claude Code) send no initialize: discover,
+    # then requests that carry the client in _meta. The --invite session must
+    # still be joined, under the client's name.
+    work = tmp_path / "work"
+    work.mkdir()
+    owner = Session.create(relay.url, cache_dir=caches("owner"))
+    env = {**os.environ, "AIRLOX_INVITE": owner.invites["sender"]}
+    proc = subprocess.Popen([BIN, "mcp", "--relay", relay.url, "--cache-dir", str(caches("mcp")), "--allow-dir",
+                             str(work)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=env, cwd=work)
+    meta = {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {"name": "claude-code", "version": "2"},
+            "io.modelcontextprotocol/clientCapabilities": {}}
+
+    def rpc(i, method, params):
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": i, "method": method,
+                                     "params": {**params, "_meta": meta}}) + "\n")
+        proc.stdin.flush()
+        while True:
+            line = proc.stdout.readline()
+            assert line, "airlox mcp exited:\n" + proc.stderr.read()
+            msg = json.loads(line)
+            if msg.get("id") == i:
+                assert "error" not in msg, msg
+                return msg["result"]
+
+    try:
+        assert "2026-07-28" in rpc(1, "server/discover", {})["supportedVersions"]
+        r = rpc(2, "tools/call", {"name": "send_text", "arguments": {"text": "hello"}})
+        assert not r.get("isError"), r
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=10)
+    owner.sync()
+    assert [(i.author_name, i.text) for i in owner.items() if i.kind == "text"] == [("claude-code", "hello")]

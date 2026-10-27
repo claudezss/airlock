@@ -62,6 +62,17 @@ fn which(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file())
 }
 
+/// An exclusive lock on `path`, held until the returned guard is dropped.
+#[cfg(unix)]
+async fn lock(path: PathBuf) -> Result<nix::fcntl::Flock<std::fs::File>> {
+    tokio::task::spawn_blocking(move || {
+        let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
+        nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusive)
+            .map_err(|(_, e)| anyhow::anyhow!("locking {}: {e}", path.display()))
+    })
+    .await?
+}
+
 async fn run_ok(cmd: &mut Command, what: &str) -> Result<()> {
     let out = cmd.stdin(Stdio::null()).output().await.with_context(|| format!("could not run {what}"))?;
     if !out.status.success() {
@@ -91,6 +102,12 @@ impl Local {
         crate::view::write_atomic(&self.shim, airlox_core::shim::SHIM_PY.as_bytes(), 0o644)?;
         let venv = self.state_dir.join("runtimes").join(spec.hash());
         let python = venv.join(if cfg!(windows) { "Scripts/python.exe" } else { "bin/python" });
+        // Runners sharing a cache (the default) may start together: one
+        // builds the runtime while the others wait, instead of each deleting
+        // the venv another is building.
+        std::fs::create_dir_all(self.state_dir.join("runtimes"))?;
+        #[cfg(unix)]
+        let _building = lock(self.state_dir.join("runtimes").join(format!("{}.lock", spec.hash()))).await?;
         if !venv.join(".ready").exists() {
             let Some(uv) = which("uv") else {
                 bail!(

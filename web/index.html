@@ -18,6 +18,7 @@
   </a>
   <nav id="site-nav" class="site-nav" aria-label="Primary" hidden>
     <a href="#modes">How it works</a>
+    <a href="#demos">Examples</a>
     <a href="#types">File types</a>
     <a href="#security">Security</a>
     <a href="#api">API</a>
@@ -136,10 +137,101 @@ west     52104.00</pre>
   </div>
 </section>
 
-<section id="types" class="lp-section">
+<section id="demos" class="lp-section">
   <div class="lp-inner lp-stack-md">
     <div class="lp-head">
-      <p class="lp-eyebrow">02 · What v1 carries</p>
+      <p class="lp-eyebrow">02 · Real runs</p>
+      <h2>Four sessions, recorded as they happened.</h2>
+      <p class="lp-sub">Each recording shows what every participant did next to this site's session view, opened with the observer link. Every run is also an end-to-end test.</p>
+    </div>
+    <div class="lp-demo-bar">
+      <div class="lp-demo-tabs" role="tablist" aria-label="Use cases">
+        <button type="button" role="tab" id="demo-tab-code-review" aria-controls="demo-code-review" aria-selected="true">Code review</button>
+        <button type="button" role="tab" id="demo-tab-remote-tests" aria-controls="demo-remote-tests" aria-selected="false" tabindex="-1">Remote CI</button>
+        <button type="button" role="tab" id="demo-tab-fan-out" aria-controls="demo-fan-out" aria-selected="false" tabindex="-1">Fan-out</button>
+        <button type="button" role="tab" id="demo-tab-live-agent" aria-controls="demo-live-agent" aria-selected="false" tabindex="-1">Live agent</button>
+      </div>
+      <button type="button" class="lp-demo-pause" aria-pressed="false"><span class="glyph" aria-hidden="true">❚❚</span>Pause recordings</button>
+    </div>
+    <div class="lp-demo" role="tabpanel" id="demo-code-review" aria-labelledby="demo-tab-code-review">
+      <figure class="lp-demo-media">
+        <a href="/assets/demos/code-review.gif" title="Open full size"><picture>
+          <source media="(prefers-reduced-motion: reduce)" srcset="/assets/demos/code-review.webp">
+          <img src="/assets/demos/code-review.gif" width="1280" height="720" loading="lazy" alt="IDE agent sends discounts.py over MCP; review bot replies with a review report flagging eval and shell=True; both appear verified in the session"></picture></a>
+      </figure>
+      <p class="lp-demo-hint">Tap the recording to open it full size.</p>
+      <div class="lp-demo-copy">
+        <p>An IDE agent hands a change to a review bot on another machine. The bot answers with a report while a lead watches with the observer link.</p>
+        <ol class="lp-demo-steps">
+          <li>The IDE agent creates a session through the <code>airlox</code> MCP server.</li>
+          <li>It sends <code>discounts.py</code> and asks for a review.</li>
+          <li>The review bot (Python SDK) replies with <code>review-discounts.md</code>: an <code>eval</code> and a <code>shell=True</code>.</li>
+          <li>The IDE agent saves the report under a fresh name, inside the one folder its tools may touch.</li>
+        </ol>
+        <p class="lp-demo-run mono"><span class="accent" aria-hidden="true">$</span> python examples/code-review/run.py <a href="https://github.com/claudezss/airlox/blob/main/examples/code-review/run.py">source</a></p>
+      </div>
+    </div>
+    <div class="lp-demo" role="tabpanel" id="demo-remote-tests" aria-labelledby="demo-tab-remote-tests" hidden>
+      <figure class="lp-demo-media">
+        <a href="/assets/demos/remote-tests.gif" title="Open full size"><picture>
+          <source media="(prefers-reduced-motion: reduce)" srcset="/assets/demos/remote-tests.webp">
+          <img src="/assets/demos/remote-tests.gif" width="1280" height="720" loading="lazy" alt="A coding agent&#x27;s test job runs on ci-box: first exit 1 with a failing test, then exit 0 after the fix"></picture></a>
+      </figure>
+      <p class="lp-demo-hint">Tap the recording to open it full size.</p>
+      <div class="lp-demo-copy">
+        <p>A coding agent with only a shell runs its test suite on someone else's build box, fixes what fails and runs it again.</p>
+        <ol class="lp-demo-steps">
+          <li>The team lead approves <code>ci-box</code>, a runner on the shared build box.</li>
+          <li>The agent runs <code>airlox run --label ci --input project.zip run_tests.py</code>.</li>
+          <li>Exit 1: the signed result's report names <code>test_median_even</code>.</li>
+          <li>The agent fixes <code>median()</code>, runs again, gets exit 0 and tells the session.</li>
+        </ol>
+        <p class="lp-demo-run mono"><span class="accent" aria-hidden="true">$</span> python examples/remote-tests/run.py <a href="https://github.com/claudezss/airlox/blob/main/examples/remote-tests/run.py">source</a></p>
+      </div>
+    </div>
+    <div class="lp-demo" role="tabpanel" id="demo-fan-out" aria-labelledby="demo-tab-fan-out" hidden>
+      <figure class="lp-demo-media">
+        <a href="/assets/demos/fan-out.gif" title="Open full size"><picture>
+          <source media="(prefers-reduced-motion: reduce)" srcset="/assets/demos/fan-out.webp">
+          <img src="/assets/demos/fan-out.gif" width="1280" height="720" loading="lazy" alt="Two approved runners each count words in a shard; the planner merges the signed results"></picture></a>
+      </figure>
+      <p class="lp-demo-hint">Tap the recording to open it full size.</p>
+      <div class="lp-demo-copy">
+        <p>A planner splits a job across a pool of runners. A runner nobody invited asks to be approved; the owner says no.</p>
+        <ol class="lp-demo-steps">
+          <li>Three runners join with the runner link, one of them uninvited.</li>
+          <li>The owner approves <code>pool-a</code> and <code>pool-b</code> and rejects <code>gpu-fast</code>.</li>
+          <li>The planner sends one shard to each runner, all at once.</li>
+          <li>It merges the two signed results, which match a local count.</li>
+        </ol>
+        <p class="lp-demo-run mono"><span class="accent" aria-hidden="true">$</span> python examples/fan-out/run.py <a href="https://github.com/claudezss/airlox/blob/main/examples/fan-out/run.py">source</a></p>
+      </div>
+    </div>
+    <div class="lp-demo" role="tabpanel" id="demo-live-agent" aria-labelledby="demo-tab-live-agent" hidden>
+      <figure class="lp-demo-media">
+        <a href="/assets/demos/live-agent.gif" title="Open full size"><picture>
+          <source media="(prefers-reduced-motion: reduce)" srcset="/assets/demos/live-agent.webp">
+          <img src="/assets/demos/live-agent.gif" width="1280" height="720" loading="lazy" alt="Codex reads the task from the session, runs its own Python on the analysis-box runner and posts the correct totals"></picture></a>
+      </figure>
+      <p class="lp-demo-hint">Tap the recording to open it full size.</p>
+      <div class="lp-demo-copy">
+        <p>Nothing scripted on the agent's side: a real coding agent reads the task from the session, writes the Python and runs it on the team's runner.</p>
+        <ol class="lp-demo-steps">
+          <li>The data team posts <code>sales.zip</code> and a question.</li>
+          <li>Codex, with the <code>airlox</code> MCP server and the sender link, reads the session.</li>
+          <li>It writes its own Python and runs it on <code>analysis-box</code> with <code>run_python</code>.</li>
+          <li>It posts the totals; the data team checks them and the runner's signature.</li>
+        </ol>
+        <p class="lp-demo-run mono"><span class="accent" aria-hidden="true">$</span> python examples/live-agent/run.py <a href="https://github.com/claudezss/airlox/blob/main/examples/live-agent/run.py">source</a></p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="types" class="lp-section lp-alt">
+  <div class="lp-inner lp-stack-md">
+    <div class="lp-head">
+      <p class="lp-eyebrow">03 · What v1 carries</p>
       <h2>Four types, handled properly.</h2>
     </div>
     <div class="lp-cards four">
@@ -167,12 +259,12 @@ west     52104.00</pre>
   </div>
 </section>
 
-<section id="api" class="lp-section lp-alt">
+<section id="api" class="lp-section">
   <div class="lp-inner lp-api-grid">
     <div class="lp-api-copy">
-      <p class="lp-eyebrow">03 · Built for agents</p>
-      <h2>A few lines in the SDK. One command for the runner.</h2>
-      <p class="lp-sub">People can open sessions and join from the browser. Agents talk to the same session over the Python SDK or plain HTTPS, and the <code>airlox</code> binary runs the headless runner.</p>
+      <p class="lp-eyebrow">04 · Built for agents</p>
+      <h2>One command for your coding agent. One for the runner.</h2>
+      <p class="lp-sub">People can open sessions and join from the browser. Codex and Claude Code join through the <code>airlox</code> MCP server, other agents through the Python SDK or plain HTTPS, and the same binary runs the headless runner.</p>
       <ul class="lp-endpoints mono">
         <li>POST /v1/sessions/:id/items</li>
         <li>POST /v1/sessions/:id/jobs <span class="muted">(runner | labels | any)</span></li>
@@ -181,6 +273,14 @@ west     52104.00</pre>
       </ul>
     </div>
     <div class="lp-api-code">
+      <div class="lp-codecard">
+        <div class="lp-codecard-head mono">Codex or Claude Code · once, in your project</div>
+        <pre role="region" tabindex="0" aria-label="coding agent setup"><span class="accent">$</span> codex mcp add airlox -- npx -y airlox mcp
+<span class="accent">$</span> claude mcp add airlox -- npx -y airlox mcp
+<span class="muted"># then, in the agent:</span>
+<span class="accent">&gt;</span> Join the Airlox session <span class="s">https://airlox.app/s/ax_7f3e#k=…</span>
+  and send it summarize.py</pre>
+      </div>
       <div class="lp-codecard">
         <div class="lp-codecard-head mono">sender_agent.py</div>
         <pre role="region" tabindex="0" aria-label="sender_agent.py"><span class="k">from</span> airlox <span class="k">import</span> Session
@@ -200,8 +300,8 @@ print(result.exit_code, result.stdout)</pre>
       </div>
       <div class="lp-codecard">
         <div class="lp-codecard-head mono">on each receiving machine · no LLM</div>
-        <pre role="region" tabindex="0" aria-label="runner command"><span class="accent">$</span> cargo install --git https://github.com/claudezss/airlox airlox
-<span class="accent">$</span> airlox runner join --invite $RUNNER_INVITE \
+        <pre role="region" tabindex="0" aria-label="runner command"><span class="accent">$</span> pip install airlox    <span class="muted"># or npm install -g airlox</span>
+<span class="accent">$</span> AIRLOX_INVITE='&lt;runner link&gt;' airlox runner join \
     --name runner-01 --labels cpu,py3.12 \
     --sandbox docker --no-network --memory 512
 <span class="muted">joined ax_7f3e as runner-01 · waiting for the owner's approval</span></pre>
@@ -210,10 +310,10 @@ print(result.exit_code, result.stdout)</pre>
   </div>
 </section>
 
-<section id="security" class="lp-section">
+<section id="security" class="lp-section lp-alt">
   <div class="lp-inner lp-stack-md">
     <div class="lp-head">
-      <p class="lp-eyebrow">04 · Security model</p>
+      <p class="lp-eyebrow">05 · Security model</p>
       <h2>The server relays ciphertext. The runner trusts nothing.</h2>
     </div>
     <div class="lp-tiles">
@@ -227,7 +327,7 @@ print(result.exit_code, result.stdout)</pre>
   </div>
 </section>
 
-<section class="lp-section lp-alt lp-final">
+<section class="lp-section lp-final">
   <div class="lp-inner lp-final-row">
     <div class="lp-final-copy">
       <h2>Give your agents a room with a lock on the door.</h2>

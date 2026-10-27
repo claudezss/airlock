@@ -193,7 +193,7 @@ select:focus { border-color: var(--accent); outline: none; }
 .inputfiles summary { cursor: pointer; min-height: 36px; display: flex; align-items: center; font-size: 13px; color: var(--muted); }
 .pickfiles { padding-bottom: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
 .jobpanel legend { font-size: 13px; margin-bottom: 6px; color: var(--muted); font-weight: 500; }
-.toolbar button[aria-pressed=true] { border-color: var(--accent); color: var(--accent); background: var(--accent-bg); }
+.toolbar button[aria-pressed=true], .agent-pick button[aria-pressed=true] { border-color: var(--accent); color: var(--accent); background: var(--accent-bg); }
 
 .state { font-family: var(--mono); font-size: 12px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--info-line); color: var(--link); overflow-wrap: anywhere; min-width: 0; }
 .state.good { color: var(--ok); border-color: var(--ok-line); }
@@ -231,6 +231,7 @@ select:focus { border-color: var(--accent); outline: none; }
 .runner .key { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--muted); }
 .runner .confirm-note, .runner .net-note { margin: 0; }
 .runner .net-note { color: var(--accent); }
+.runner .setup-failed { color: var(--bad); overflow-wrap: anywhere; }
 .people .desc, .runner .desc { font-size: 12.5px; color: var(--text); margin-top: 2px; overflow-wrap: anywhere; unicode-bidi: isolate; }
 .desc .claim { color: var(--muted); font-style: italic; }
 .chip.good { color: var(--ok); border-color: var(--ok-line); }
@@ -353,6 +354,29 @@ body.landing .top-right { display: none; }
 .lp-steps strong { font-weight: 600; }
 .lp-steps li > span:last-child { color: var(--muted); font-size: 15px; }
 
+.lp-demo-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 16px; }
+.lp-demo-pause { color: var(--muted); }
+.lp-demo-pause:hover { color: var(--text); }
+.lp-demo-pause[aria-pressed=true] { border-color: var(--accent); color: var(--accent); background: var(--accent-bg); }
+.lp-demo-pause .glyph { font-size: 12px; letter-spacing: 1px; }
+.lp-demo-hint { display: none; margin: -14px 0 0; font-size: 13px; color: var(--muted); }
+.lp-demo-tabs { display: flex; flex-wrap: wrap; gap: 8px; }
+.lp-demo-tabs button { min-height: 44px; padding: 0 18px; border-radius: 999px; color: var(--muted); background: transparent; font-weight: 500; }
+.lp-demo-tabs button:hover { color: var(--text); }
+.lp-demo-tabs button[aria-selected=true] { border-color: var(--accent); color: var(--accent); background: var(--accent-bg); }
+.lp-demo { display: flex; flex-direction: column; gap: 28px; }
+.lp-demo[hidden] { display: none; }
+.lp-demo-media { margin: 0; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; background: var(--panel); box-shadow: 0 30px 80px rgba(0, 0, 0, 0.45); }
+.lp-demo-media a, .lp-demo-media img { display: block; }
+.lp-demo-media img { width: 100%; height: auto; }
+.lp-demo-copy { display: flex; flex-direction: column; gap: 22px; }
+.lp-demo-copy > p { margin: 0; max-width: 760px; color: var(--soft); font-size: 17px; }
+.lp-demo-steps { margin: 0; padding: 0; list-style: none; counter-reset: step; display: grid; gap: 20px 24px; grid-template-columns: repeat(auto-fit, minmax(min(230px, 100%), 1fr)); }
+.lp-demo-steps li { counter-increment: step; position: relative; padding: 14px 0 0 30px; border-top: 1px solid var(--line-2); color: var(--muted); font-size: 15px; }
+.lp-demo-steps li::before { content: counter(step); position: absolute; left: 0; top: 14px; font-family: var(--mono); color: var(--accent); }
+.lp-demo-run { margin: 0; font-size: 13px; color: var(--soft); overflow-wrap: anywhere; }
+.lp-demo-run a { margin-left: 8px; color: var(--link); }
+
 .lp-api-grid { align-items: start; gap: 40px; grid-template-columns: repeat(auto-fit, minmax(min(480px, 100%), 1fr)); }
 .lp-api-copy { display: flex; flex-direction: column; gap: 16px; }
 .lp-api-copy > * { margin: 0; }
@@ -396,4 +420,9 @@ body.landing .top-right { display: none; }
   .lp-card { padding: 20px; }
   .lp-mock-body { padding: 14px; }
   .lp-actions .cta { flex: 1 1 100%; }
+  .lp-demo-bar { display: block; }
+  .lp-demo-tabs { display: grid; grid-template-columns: 1fr 1fr; }
+  .lp-demo-tabs button { padding: 0 12px; }
+  .lp-demo-pause { width: 100%; margin-top: 12px; }
+  .lp-demo-hint { display: block; }
 }

@@ -16,7 +16,7 @@ use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 
 use crate::client;
-use crate::files::{clean_line, clean_text, out_file_name, received_name, save_new};
+use crate::files::{clean_line, clean_text, out_file_name, received_name, save_new, unpack_out_zip};
 use crate::session::{
     default_cache_root, file_type, Item, JobSpec, NewSession, NoRunnerAvailable, Outcome, Profile, Session,
     Status, Target, DEFAULT_TYPES, FILE_TYPES_HELP,
@@ -545,7 +545,8 @@ pub async fn run(a: RunArgs) -> Result<i32> {
     };
     if a.no_wait {
         if a.conn.json {
-            print_json(&json!({"job": job, "runner": runner}));
+            let runner_name = runner.as_deref().and_then(|k| s.participant_name(k));
+            print_json(&json!({"job": job, "runner": runner, "runner_name": runner_name}));
         } else {
             println!("submitted job {job}; get its result with: airlox result -- {job}");
         }
@@ -593,16 +594,20 @@ async fn finish(
         }
         return Ok(75); // EX_TEMPFAIL
     };
-    let saved = match out_dir {
-        Some(d) => save_out_files(&r, d)?,
-        None => vec![],
+    let (saved, notes) = match out_dir {
+        Some(d) => save_out_files(&r, d),
+        None => (vec![], vec![]),
     };
     if json_out {
         let mut v = serde_json::to_value(&r)?;
         v["saved"] = json!(saved);
+        v["notes"] = json!(notes);
         print_json(&v);
     } else {
         print_outcome(&r, &saved, out_dir.is_none());
+        for n in &notes {
+            eprintln!("   {}", clean_line(n));
+        }
     }
     Ok(exit_status(&r))
 }
@@ -617,19 +622,43 @@ fn exit_status(r: &Outcome) -> i32 {
     }
 }
 
-/// Save a job's out files into `dir`, never over an existing file. Only
-/// the names runners produce (top-level images, `out.zip`) are saved.
-pub fn save_out_files(r: &Outcome, dir: &Path) -> Result<Vec<String>> {
-    let mut saved = Vec::new();
+/// Unpacked files listed by name in `saved`; past this, a note counts them.
+const MAX_LISTED: usize = 20;
+
+/// Save a job's out files into `dir`, never over an existing file: the
+/// names runners produce (top-level images, `out.zip`), and `out.zip`
+/// unpacked into a new `out/` beside it ([`unpack_out_zip`]). Returns what
+/// was saved and notes on what was not. Saving never fails the result: a
+/// file that cannot be saved is a note.
+pub fn save_out_files(r: &Outcome, dir: &Path) -> (Vec<String>, Vec<String>) {
+    let (mut saved, mut notes) = (Vec::new(), Vec::new());
     for f in &r.out_files {
         let Some(data) = &f.data else { continue };
         let Some(name) = out_file_name(&f.name) else {
-            eprintln!("   not saving out file {:?}: not an image or out.zip", clean_line(&f.name));
+            notes.push(format!("not saving out file {:?}: not an image or out.zip", clean_line(&f.name)));
             continue;
         };
-        saved.push(save_new(dir, name, data)?.display().to_string());
+        match save_new(dir, name, data) {
+            Ok(p) => saved.push(p.display().to_string()),
+            Err(e) => {
+                notes.push(format!("could not save {name}: {e:#}"));
+                continue;
+            }
+        }
+        if name == "out.zip" {
+            match unpack_out_zip(data, dir) {
+                Ok((dest, files, skipped)) => {
+                    saved.extend(files.iter().take(MAX_LISTED).map(|p| p.display().to_string()));
+                    if files.len() > MAX_LISTED {
+                        notes.push(format!("{} more files in {}", files.len() - MAX_LISTED, dest.display()));
+                    }
+                    notes.extend(skipped);
+                }
+                Err(e) => notes.push(format!("could not unpack out.zip (it is saved as is): {e:#}")),
+            }
+        }
     }
-    Ok(saved)
+    (saved, notes)
 }
 
 fn print_outcome(r: &Outcome, saved: &[String], hint: bool) {
@@ -647,7 +676,11 @@ fn print_outcome(r: &Outcome, saved: &[String], hint: bool) {
     }
     let code = r.exit_code.map(|c| format!("exit {c}")).unwrap_or_else(|| "no exit code".into());
     let reason = r.reason.as_deref().map(|x| format!(" ({})", clean_line(x))).unwrap_or_default();
-    let signed = if r.signed { "signed by the runner" } else { "reported by the relay, unsigned" };
+    let signed = match (r.signed, &r.runner_name) {
+        (true, Some(n)) => format!("signed by runner {}", clean_line(n)),
+        (true, None) => "signed by the runner".into(),
+        (false, _) => "reported by the relay, unsigned".into(),
+    };
     eprintln!("── {} · {code}{reason} · {} ms · {signed}", r.status, r.wall_ms);
     if r.stdout_truncated || r.stderr_truncated {
         eprintln!("   output was truncated by the runner");
@@ -724,6 +757,8 @@ pub fn item_json(s: &Session, i: &Item, max_content: Option<usize>) -> Value {
         "author": i.author,
         "author_role": i.author_role,
         "author_name": i.author_name,
+        // Posted by this participant: what it sent itself, not a reply.
+        "mine": i.author == s.me,
         "created_at_ms": i.created_at_ms,
         "status": i.status,
         "ref": i.item_ref,
@@ -907,8 +942,13 @@ pub async fn runner_list(conn: Conn) -> Result<()> {
         println!("no runners have joined");
     }
     for r in rs {
+        let failed = r.detail.as_deref().map(|d| format!("failed: {}", clean_line(d)));
         let state = if r.rejected {
             "rejected"
+        } else if r.state.as_deref() == Some("failed") {
+            "setup failed"
+        } else if r.state.as_deref() == Some("preparing") && !r.online {
+            "preparing"
         } else if !r.approved {
             "awaiting approval"
         } else if !r.online {
@@ -930,8 +970,80 @@ pub async fn runner_list(conn: Conn) -> Result<()> {
         if let Some(d) = &r.description {
             println!("{:<20} {}", "", clean_line(d));
         }
+        if let Some(f) = failed.filter(|_| r.state.as_deref() == Some("failed")) {
+            println!("{:<20} {f}", "");
+        }
     }
     Ok(())
+}
+
+#[derive(Args, Debug)]
+pub struct WaitArgs {
+    #[command(flatten)]
+    pub conn: Conn,
+    /// Runner name or key.
+    pub runner: String,
+    /// Also wait until the owner's signed approval has reached you, so a job
+    /// sent next is not refused.
+    #[arg(long)]
+    pub approved: bool,
+    /// Give up after this long.
+    #[arg(long, default_value = "2m", value_parser = parse_duration)]
+    pub timeout: Duration,
+}
+
+pub async fn runner_wait(a: WaitArgs) -> Result<i32> {
+    let mut s = a.conn.join().await?;
+    let deadline = std::time::Instant::now() + a.timeout;
+    loop {
+        let rs = s.runners().await?;
+        // A key names one runner; only then names, of which a runner can
+        // pick any (another's included), so a name two runners use is refused.
+        let by_key: Vec<_> = rs.iter().filter(|r| r.participant_pub == a.runner).collect();
+        let found =
+            if by_key.is_empty() { rs.iter().filter(|r| r.name == a.runner).collect() } else { by_key };
+        if found.len() > 1 {
+            bail!(
+                "more than one runner is called {}; use its key (airlox runner list)",
+                clean_line(&a.runner)
+            );
+        }
+        if let Some(r) = found.first() {
+            let (code, what) = if r.state.as_deref() == Some("failed") {
+                (
+                    1,
+                    format!(
+                        "could not start: {}",
+                        clean_line(r.detail.as_deref().unwrap_or("no reason given"))
+                    ),
+                )
+            } else if r.rejected {
+                (1, "was rejected".into())
+            } else if r.online && (r.approved || !a.approved) {
+                (0, if r.approved { "is online and approved".into() } else { "is online".into() })
+            } else {
+                (-1, String::new())
+            };
+            if code >= 0 {
+                if a.conn.json {
+                    print_json(&json!({"runner": r}));
+                } else if code == 0 {
+                    println!("runner {} {what}", clean_line(&r.name));
+                } else {
+                    eprintln!("runner {} {what}", clean_line(&r.name));
+                }
+                return Ok(code);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            if a.conn.json {
+                print_json(&json!({"runner": found.first(), "status": "timeout"}));
+            }
+            eprintln!("runner {} is not ready after {}s", clean_line(&a.runner), a.timeout.as_secs());
+            return Ok(75); // EX_TEMPFAIL
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 pub async fn runner_approve(conn: Conn, name: String) -> Result<()> {
@@ -954,4 +1066,119 @@ pub async fn runner_reject(conn: Conn, name: String, reason: Option<String>) -> 
         println!("rejected {}", clean_line(&r.name));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+    use crate::session::OutFile;
+
+    fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, data) in files {
+            w.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(data).unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    fn outcome(out_zip: Vec<u8>) -> Outcome {
+        Outcome {
+            job: "j".into(),
+            status: "completed".into(),
+            exit_code: Some(0),
+            reason: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            wall_ms: 0,
+            peak_mem_mb: 0,
+            out_files: vec![OutFile {
+                name: "out.zip".into(),
+                size: out_zip.len() as u64,
+                item_ref: json!({}),
+                data: Some(out_zip),
+            }],
+            out_text: vec![],
+            runner: None,
+            runner_name: None,
+            signed: true,
+        }
+    }
+
+    #[test]
+    fn out_zip_is_unpacked_beside_it_into_a_new_directory() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("out")).unwrap();
+        std::fs::write(d.path().join("out/report.json"), "mine").unwrap();
+        let r = outcome(zip_of(&[("report.json", b"{}"), ("logs/run.txt", b"ok")]));
+        let (saved, notes) = save_out_files(&r, d.path());
+        let names: Vec<_> =
+            saved.iter().map(|p| Path::new(p).strip_prefix(d.path()).unwrap().to_owned()).collect();
+        assert_eq!(
+            names,
+            [Path::new("out.zip"), Path::new("out (1)/report.json"), Path::new("out (1)/logs/run.txt")]
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(std::fs::read_to_string(d.path().join("out/report.json")).unwrap(), "mine");
+    }
+
+    #[test]
+    fn unpacked_files_are_never_ones_tools_load() {
+        let d = tempfile::tempdir().unwrap();
+        let r = outcome(zip_of(&[
+            ("conftest.py", b"x"),
+            ("tests/test_x.py", b"x"),
+            ("CLAUDE.md", b"x"),
+            ("Makefile", b"x"),
+            ("package.json", b"x"),
+            ("report.md", b"x"),
+            (".envrc", b"x"),
+            (".claude/settings.json", b"x"),
+            (".git/config", b"x"),
+        ]));
+        let (saved, notes) = save_out_files(&r, d.path());
+        let mut names: Vec<_> =
+            saved.iter().map(|p| p.strip_prefix(&*d.path().to_string_lossy()).unwrap()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "/out.zip",
+                "/out/CLAUDE.md.txt",
+                "/out/Makefile.txt",
+                "/out/conftest.py.txt",
+                "/out/package.json.txt",
+                "/out/report.md",
+                "/out/tests/test_x.py.txt"
+            ]
+        );
+        assert_eq!(notes.iter().filter(|n| n.contains("hidden")).count(), 3, "{notes:?}");
+        assert!(!d.path().join("out/.git").exists() && !d.path().join("out/.claude").exists());
+    }
+
+    #[test]
+    fn a_hostile_out_zip_writes_nothing_outside_and_keeps_the_result() {
+        let d = tempfile::tempdir().unwrap();
+        let inner = d.path().join("save");
+        let r = outcome(zip_of(&[("ok.txt", b"x"), ("../escaped.txt", b"x")]));
+        let (saved, notes) = save_out_files(&r, &inner);
+        assert_eq!(saved.len(), 1, "out.zip itself is kept: {saved:?}");
+        assert!(notes.iter().any(|n| n.contains("could not unpack out.zip")), "{notes:?}");
+        assert!(!d.path().join("escaped.txt").exists());
+        assert!(crate::session::out_text(&r.out_files).is_empty());
+    }
+
+    #[test]
+    fn many_unpacked_files_are_counted_not_listed() {
+        let d = tempfile::tempdir().unwrap();
+        let names: Vec<String> = (0..50).map(|i| format!("f{i}.txt")).collect();
+        let files: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), b"x".as_slice())).collect();
+        let (saved, notes) = save_out_files(&outcome(zip_of(&files)), d.path());
+        assert_eq!(saved.len(), 1 + MAX_LISTED);
+        assert!(notes.iter().any(|n| n.starts_with("30 more files in")), "{notes:?}");
+    }
 }

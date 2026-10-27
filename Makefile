@@ -21,7 +21,7 @@ VENV := $(CURDIR)/.venv
 
 python:
 	[ -d $(VENV) ] || uv venv -q --python 3.12 $(VENV)
-	VIRTUAL_ENV=$(VENV) uv pip install -q pytest httpx
+	VIRTUAL_ENV=$(VENV) uv pip install -q pytest httpx "mcp>=2,<3"
 	cd python/airlox && VIRTUAL_ENV=$(VENV) maturin develop -q --uv
 
 server:

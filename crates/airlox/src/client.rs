@@ -228,9 +228,18 @@ impl Relay {
     }
 
     pub async fn heartbeat(&self, job: Option<&str>) -> Result<Value> {
-        let body = serde_json::json!({ "job": job }).to_string();
-        let r = self.post("/runners/me/heartbeat").timeout(Duration::from_secs(20)).body(body).send().await?;
-        read_json(check(r).await?).await
+        self.send_heartbeat(serde_json::json!({ "job": job })).await
+    }
+
+    /// A heartbeat that also reports the runner's setup (`preparing`,
+    /// `ready`, `failed`), so the session sees a runner that cannot start.
+    pub async fn report(&self, state: &str, detail: Option<&str>) -> Result<Value> {
+        self.send_heartbeat(serde_json::json!({ "job": null, "state": state, "detail": detail })).await
+    }
+
+    async fn send_heartbeat(&self, body: Value) -> Result<Value> {
+        let r = self.post("/runners/me/heartbeat").timeout(Duration::from_secs(20)).body(body.to_string());
+        read_json(check(r.send().await?).await?).await
     }
 
     /// Open the runner's assignment stream (SSE).

@@ -24,15 +24,18 @@ not match the workspace version. It builds the `airlox` binary for macOS
 | PyPI | `airlox`: abi3 wheels for each platform, with the Rust core as `airlox._core` and the binary as a script, and an sdist (no binary) |
 | npm | `airlox`, a wrapper whose `bin` runs the binary from `@airlox/<os>-<cpu>`, one package per platform |
 | GitHub release | each binary archived with the licenses, the MCPB bundle `airlox-<version>.mcpb`, and `SHA256SUMS` |
+| GHCR | `ghcr.io/claudezss/airlox-server:<version>` (no `v`): the relay image for linux/amd64 and linux/arm64, built from the `Dockerfile` (the arm64 half under QEMU, so it takes a while). `:latest` is not touched: `deploy.yml` moves it with `main` |
 | MCP registry | `io.github.claudezss/airlox`, naming the npm and PyPI packages and the bundle |
 
-Nothing is published unless every build succeeded. PyPI, npm and the GitHub
-release go out in parallel, then the registry entry, since the registry checks
-that each package exists and names the server (`mcpName` in the npm wrapper's
-`package.json`, `mcp-name:` in the PyPI README, `mcp` in the bundle's URL).
+Nothing is published unless every build succeeded. PyPI, npm, the GitHub
+release and the relay image go out in parallel, then the registry entry, since
+the registry checks that each package exists and names the server (`mcpName`
+in the npm wrapper's `package.json`, `mcp-name:` in the PyPI README, `mcp` in
+the bundle's URL).
 
 If a release fails partway, use **Re-run failed jobs**: the builds' artifacts
-are kept, and each publish step skips what is already published. A full
+are kept, and each publish step skips what is already published (the image job
+skips a version tag that already exists, and never overwrites it). A full
 re-run rebuilds the files, which then differ from those already out, so the
 GitHub release step refuses to replace them. Fix forward with a new version
 instead.
@@ -56,6 +59,10 @@ instead.
   3. Just before tagging the first release (a new trust lapses unless it
      publishes within two days), `sh packaging/npm/bootstrap.sh trust` lets
      `release.yml` in the `release` environment publish all six.
+- The relay image needs no secret: the workflow pushes with its own
+  `GITHUB_TOKEN`. The first time, the `airlox-server` package is the one
+  `deploy.yml` created, and must stay public (Package settings) so that
+  `docker run` needs no login.
 - The MCP registry needs no secret: the workflow logs in with the repository's
   GitHub OIDC token, which grants the `io.github.claudezss/*` namespace.
 

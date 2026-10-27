@@ -227,26 +227,20 @@ pub async fn run(args: JoinArgs) -> Result<()> {
     if nix::unistd::getuid().is_root() && matches!(args.sandbox, SandboxArg::Local) {
         bail!("refusing to run the local sandbox as root; run the runner as an unprivileged user, or use --sandbox docker");
     }
-    let spec = RuntimeSpec { runtime: limits.runtime.clone(), packages: limits.packages.clone() };
-    backend.prepare(&spec).await.context("preparing the sandbox")?;
-    if backend.network_unblocked() && !limits.network {
-        tracing::warn!(
-            "the local backend cannot block network access here, but this session says network: false; \
-             only run code you trust, or use --sandbox docker"
-        );
-    }
-
+    // Join before preparing the sandbox, and say how that goes: a runner
+    // that cannot start then shows as failed, with why, rather than missing.
     let (kp, token) = match saved {
         Some(i) => (Keypair::from_seed(&seed_from_hex(&i.participant_seed)?), i.token),
         None => join(&http, &invite, &args, &backend).await?,
     };
     let mut relay = Relay::new(http.clone(), &invite.base_url, &sid, &token);
-    let (kp, relay) = match relay.heartbeat(None).await {
+    let (kp, relay) = match relay.report("preparing", None).await {
         Err(e) if status_of(&e) == Some(401) => {
             tracing::info!("saved identity is no longer valid; joining again");
             let (kp, token) = join(&http, &invite, &args, &backend).await?;
             relay = Relay::new(http.clone(), &invite.base_url, &sid, &token);
             save_identity(&id_path, &kp, &token, &base)?;
+            relay.report("preparing", None).await?;
             (kp, relay)
         }
         Err(e) => return Err(e),
@@ -259,10 +253,33 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         session = %sid, name = %args.name, participant = %kp.public().fingerprint(),
         sandbox = ?backend.kind(), "joined as a runner"
     );
+    let spec = RuntimeSpec { runtime: limits.runtime.clone(), packages: limits.packages.clone() };
+    if let Err(e) = backend.prepare(&spec).await {
+        let _ = relay.report("failed", Some(&failure_detail(&e))).await;
+        return Err(e.context("preparing the sandbox"));
+    }
+    // Unsandboxed (the local backend off Linux): jobs are plain processes.
+    let unsandboxed = backend.network_unblocked();
+    if unsandboxed {
+        tracing::warn!(
+            "the local backend cannot sandbox jobs here: they run as plain processes that can read this \
+             user's files and reach the network{}; only run code you trust, or use --sandbox docker",
+            if limits.network { "" } else { " (this session says network: false)" }
+        );
+    }
+    relay.report("ready", None).await?;
 
     let view = View::new(relay.clone(), signed, invite.session_key(), kp.public(), dir.clone())?;
     let view = Arc::new(Mutex::new(view));
-    let jobs_dir = dir.join("jobs");
+    // Unsandboxed jobs see their real paths (in tracebacks, os.getcwd()):
+    // under the system temp directory those do not name this user or where
+    // the runner keeps its cache. Sandboxed jobs see /work.
+    let temp_jobs =
+        if unsandboxed { Some(tempfile::Builder::new().prefix("airlox-jobs-").tempdir()?) } else { None };
+    let jobs_dir = match &temp_jobs {
+        Some(t) => t.path().to_path_buf(),
+        None => dir.join("jobs"),
+    };
     let _ = std::fs::remove_dir_all(&jobs_dir);
     std::fs::create_dir_all(&jobs_dir)?;
     let ctx = Arc::new(Ctx {
@@ -275,12 +292,25 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         network: limits.network && !args.no_network,
     });
     let outcome = serve(&ctx, &view, &relay, args.max_jobs).await;
+    drop(temp_jobs);
     let closed = view.lock().await.closed;
     if closed {
         tracing::info!("the session has ended");
         let _ = std::fs::remove_dir_all(&dir);
     }
     outcome
+}
+
+/// A setup error as one short line for the session: the first lines of its
+/// chain, whitespace collapsed, within the relay's limit.
+fn failure_detail(e: &anyhow::Error) -> String {
+    let text = format!("preparing the sandbox: {e:#}");
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: String = line.chars().take(299).collect();
+    if out.len() < line.len() {
+        out.push('…');
+    }
+    out
 }
 
 fn save_identity(path: &std::path::Path, kp: &Keypair, token: &str, base_url: &str) -> Result<()> {
@@ -396,8 +426,26 @@ async fn serve(
     let mut handled = 0usize;
     let mut tick = tokio::time::interval(HEARTBEAT);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
+    // Ctrl-C, or SIGTERM from `kill` or a service manager: stop cleanly, so
+    // the running job is cancelled and its files are removed.
+    let stop = async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            match signal(SignalKind::terminate()) {
+                Ok(mut term) => tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                },
+                Err(_) => {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    tokio::pin!(stop);
 
     let start = async |job: String| -> Option<Running> {
         match relay.claim(&job).await {
@@ -496,7 +544,7 @@ async fn serve(
             _ = lost.changed() => {
                 break Err(anyhow::anyhow!("the relay no longer accepts this runner"));
             }
-            _ = &mut ctrl_c => {
+            _ = &mut stop => {
                 tracing::info!("interrupted");
                 break Ok(());
             }

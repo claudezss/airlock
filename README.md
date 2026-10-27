@@ -11,6 +11,7 @@
 
 <p align="center">
   <a href="https://airlox.app"><strong>airlox.app</strong></a> ·
+  <a href="docs/use-cases.md">Use cases</a> ·
   <a href="docs/DESIGN.md">Design</a> ·
   <a href="docs/protocol.md">Protocol</a> ·
   <a href="docs/deploy.md">Self-hosting</a>
@@ -136,6 +137,22 @@ codex mcp add airlox -- npx -y airlox mcp     # Codex
 { "mcpServers": { "airlox": { "command": "npx", "args": ["-y", "airlox", "mcp", "--allow-dir", "/path/to/workdir"] } } }
 ```
 
+The server joins sessions under the name the MCP client gives itself
+(`claude-code`, `codex`, …) unless you pass `--as`.
+
+Headless agents (`claude -p`, `codex exec`) cannot answer approval prompts,
+so tools that send or run anything are refused unless allowed up front.
+`airlox mcp config claude` and `airlox mcp config codex` print a ready
+config: the invite comes from `AIRLOX_INVITE`, and only a worker's tools
+(read, send, run Python) are allowed, on files in the one folder you give
+it: a folder for this work, not your project. `airlox mcp prompt` prints a
+prompt for an agent that does the work posted in a session:
+
+```bash
+mkdir -p ~/airlox-work && airlox mcp config codex --allow-dir ~/airlox-work >> ~/.codex/config.toml
+AIRLOX_INVITE='<sender link>' codex exec "$(airlox mcp prompt)"
+```
+
 `uvx airlox mcp` works the same way. For Claude Desktop, download
 `airlox-<version>.mcpb` from the
 [releases page](https://github.com/claudezss/airlox/releases) and open it:
@@ -197,7 +214,8 @@ job = agent.run_python(open("summarize.py").read(), filename="summarize.py",
                        files=[data], runner="runner-01")
 res = job.wait()
 print(res.status, res.exit_code, res.stdout)
-chart = res.out_file("chart.png").data   # files the job wrote to $AIRLOX_OUT
+chart = res.read("chart.png")            # files the job wrote to $AIRLOX_OUT
+summary = res.read("summary.json")       # by path, whether or not it came zipped
 ```
 
 The runner builds its job image once (`python:3.12-slim` plus the session's
@@ -205,13 +223,28 @@ package allowlist) and refuses any job not signed by a sender or the owner.
 `--sandbox local` runs jobs with `uv` instead of Docker: sandboxed with
 namespaces and Landlock on Linux, and as a plain process on macOS, which is
 only suitable for trusted code. A complete example is in
-[examples/summarize](examples/summarize).
+[examples/summarize](examples/summarize), and
+[docs/use-cases.md](docs/use-cases.md) walks through four more: a code
+review handoff over MCP, remote CI from the CLI, fan-out across a runner
+pool, and a real Claude Code or Codex agent doing work on a runner.
 
 ## Self-hosting
 
 A session's relay is simply the host in its invite links, so anyone can run
 their own. The relay is one static binary that needs a single writable
-directory:
+directory. It is published as an image: `:latest` follows `main`
+(linux/amd64), and from the release after 0.1.0 each release is also tagged
+with its version (`0.2.0`, without the `v`) for amd64 and arm64:
+
+```bash
+docker run -p 8080:8080 -v airlox-data:/data ghcr.io/claudezss/airlox-server:latest
+```
+
+It listens on port 8080 and keeps sessions in `/data`. To try it out, or to
+test an integration against a local relay, add `--ephemeral` after the image
+name: nothing then survives a restart.
+
+To build it yourself instead:
 
 ```bash
 docker build -t airlox-server . && docker run -p 8080:8080 -v airlox-data:/data airlox-server
@@ -260,7 +293,7 @@ Please report vulnerabilities privately through
 | `skills/airlox` | Agent skill that teaches coding agents the CLI |
 | `packaging` | The npm packages, the MCPB bundle and the MCP registry entry, staged around the release binaries |
 | `deploy` | Docker Compose, Caddy and Droplet scripts for the hosted relay |
-| `examples` | End-to-end examples |
+| `examples` | End-to-end examples, run as tests by `test_use_cases.py` ([docs/use-cases.md](docs/use-cases.md)) |
 
 ## Development
 

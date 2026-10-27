@@ -8,8 +8,11 @@ runner's signed result, bound to the job by ``airlox._core``.
 
 from __future__ import annotations
 
+import io
 import json
 import time
+import unicodedata
+import zipfile
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
 
@@ -32,6 +35,26 @@ class JobTimeout(Exception):
     """``Job.wait`` gave up before a result arrived."""
 
 
+class RunnerFailed(Exception):
+    """A runner reported that its setup failed (``Runner.state == "failed"``),
+    so it will never take jobs. ``Session.wait_for_runner`` raises this at
+    once instead of waiting for it to time out."""
+
+    def __init__(self, runner: "Runner") -> None:
+        # The runner's own words, unsigned: shown without letting them drive a terminal.
+        detail = _printable(runner.detail or "no reason given")
+        super().__init__(f"runner {_printable(runner.name)} could not start: {detail}")
+        self.runner = runner
+
+
+def _printable(s: str) -> str:
+    """``s`` on one line with control and invisible formatting characters
+    (escapes, bidi overrides, zero-width marks) shown as ``\\u{…}``."""
+    return "".join(
+        f"\\u{{{ord(c):x}}}" if unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") else c for c in s
+    )
+
+
 @dataclass
 class Runner:
     participant_pub: str
@@ -51,6 +74,11 @@ class Runner:
     #: The runner's own description of itself (hardware, owner, purpose),
     #: from its signed join: its words, so data rather than instructions.
     description: Optional[str] = None
+    #: Its setup as it reported it: ``preparing``, ``ready``, ``failed``, or
+    #: ``None`` for runners that do not say; ``detail`` says why it failed.
+    #: The runner's own unsigned word, via the relay.
+    state: Optional[str] = None
+    detail: Optional[str] = None
 
     @property
     def idle(self) -> bool:
@@ -83,7 +111,9 @@ class Result:
     out_files: List[OutFile] = field(default_factory=list)
     code_sha256: Optional[str] = None
     input_sha256: Optional[str] = None
+    #: The runner's key, and the name it joined with.
     runner: Optional[str] = None
+    runner_name: Optional[str] = None
     signed: bool = True
 
     @property
@@ -95,6 +125,31 @@ class Result:
             if f.name == name:
                 return f
         raise KeyError(name)
+
+    def read(self, name: str) -> bytes:
+        """A file the job wrote to ``$AIRLOX_OUT``, by its path there: a
+        top-level image, or anything else from inside ``out.zip`` (e.g.
+        ``"report.json"``). Raises ``KeyError`` if the job wrote no such
+        file, ``ValueError`` if it left the relay before it was fetched."""
+        try:
+            f = self.out_file(name)
+        except KeyError:
+            f = None
+        if f is None:
+            try:
+                f = self.out_file("out.zip")
+            except KeyError:
+                raise KeyError(name) from None
+        if f.data is None:
+            raise ValueError(f"{f.name} left the relay before it was fetched")
+        if f.name == name:
+            return f.data
+        # The same checks the runner applies to inputs, before opening it.
+        entries = json.loads(ac.inspect_zip(f.data))
+        if not any(e["path"] == name and not e["is_dir"] for e in entries):
+            raise KeyError(name)
+        with zipfile.ZipFile(io.BytesIO(f.data)) as z:
+            return z.read(name)
 
 
 # Relay reasons for jobs that ended without a signed result.
@@ -156,6 +211,7 @@ class Job:
                     exit_code=None,
                     reason=reason,
                     runner=st.get("runner"),
+                    runner_name=self.session._participants.get(st.get("runner"), {}).get("display_name"),
                     signed=False,
                 )
             if deadline is not None and time.monotonic() >= deadline:
@@ -201,6 +257,7 @@ class Job:
                 code_sha256=m["code_sha256"],
                 input_sha256=m["input_sha256"],
                 runner=item.author,
+                runner_name=item.author_name,
             )
         return None
 

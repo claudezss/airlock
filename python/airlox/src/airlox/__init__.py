@@ -14,7 +14,7 @@
 
 from ._core import AirloxError, DecryptError, PolicyError, SignatureError, ValidationError
 
-from .execute import Job, JobTimeout, NoRunnerAvailable, OutFile, Result, Runner
+from .execute import Job, JobTimeout, NoRunnerAvailable, OutFile, Result, Runner, RunnerFailed
 from .session import Item, RelayError, Session
 
 __all__ = [
@@ -29,6 +29,7 @@ __all__ = [
     "RelayError",
     "Result",
     "Runner",
+    "RunnerFailed",
     "Session",
     "SignatureError",
     "ValidationError",
