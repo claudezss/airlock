@@ -1,17 +1,42 @@
-# Weekly update PRs for what the relay and releases are built from: pinned
-# actions, the Docker base images (pinned by digest) and Rust crates.
+# Grouped update PRs for what the relay and releases are built from: at most
+# one PR per group below instead of one per dependency. Security updates
+# still come as soon as they are published.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
   - package-ecosystem: docker
     directories: [/, /deploy]
     schedule:
-      interval: weekly
+      interval: monthly
+    groups:
+      docker:
+        patterns: ["*"]
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    groups:
+      # The protocol's primitives move together: one PR, ported and
+      # checked against the test vectors.
+      rustcrypto:
+        patterns:
+          - aes-gcm
+          - ed25519-dalek
+          - hkdf
+          - sha2
+          - rand_core
+          - getrandom
+          - zeroize
+      cargo-patch:
+        patterns: ["*"]
+        update-types: [patch]
+      # Breaking bumps (for 0.x crates, minor ones too) need code changes.
+      cargo-breaking:
+        patterns: ["*"]
+        update-types: [minor, major]
