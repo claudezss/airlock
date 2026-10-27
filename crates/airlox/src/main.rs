@@ -42,6 +42,9 @@ enum Cmd {
     Items(cli::ItemsArgs),
     /// Print items as they arrive.
     Watch(cli::WatchArgs),
+    /// Wait for items meant for you (addressed to you, replies, the owner's
+    /// messages) and wake an agent: print and exit, or run a command.
+    Listen(cli::ListenArgs),
     /// Runners: run jobs for a session, or list, approve and reject them.
     #[command(subcommand)]
     Runner(RunnerCmd),
@@ -151,6 +154,7 @@ fn main() -> std::process::ExitCode {
             Cmd::Cancel(a) => cli::cancel(a).await.map(|()| 0),
             Cmd::Items(a) => cli::items(a).await.map(|()| 0),
             Cmd::Watch(a) => cli::watch(a).await.map(|()| 0),
+            Cmd::Listen(a) => cli::listen(a).await,
             Cmd::Receive(a) => cli::receive(a).await.map(|()| 0),
             Cmd::Runner(RunnerCmd::Join(args)) => runner::run(*args).await.map(|()| 0),
             #[cfg(windows)]

@@ -134,6 +134,21 @@ impl Cache {
         write_atomic(&self.dir.join(format!("identity-{role}.json")), &serde_json::to_vec(id)?, 0o600)
     }
 
+    /// How far this role's listener has handled the session (`airlox
+    /// listen`, `mark_handled`): a local cursor, never sent to the relay.
+    fn handled(&self, role: &str) -> Option<u64> {
+        let b = fs::read(self.dir.join(format!("handled-{role}.json"))).ok()?;
+        serde_json::from_slice::<Value>(&b).ok()?["seq"].as_u64()
+    }
+
+    fn save_handled(&self, role: &str, seq: u64) -> Result<()> {
+        write_atomic(
+            &self.dir.join(format!("handled-{role}.json")),
+            json!({"seq": seq}).to_string().as_bytes(),
+            0o600,
+        )
+    }
+
     fn load_manifest(&self) -> Option<String> {
         fs::read_to_string(self.dir.join("manifest.json")).ok()
     }
@@ -253,6 +268,20 @@ impl Item {
 
     pub fn name(&self) -> Option<&str> {
         (self.kind == "file").then(|| self.meta.as_ref()?["name"].as_str()).flatten()
+    }
+
+    /// The participants a message is addressed to; `None` for everyone.
+    pub fn to(&self) -> Option<Vec<&str>> {
+        let to = self.meta.as_ref()?.get("to")?.as_array()?;
+        Some(to.iter().filter_map(Value::as_str).collect())
+    }
+
+    /// The item this one answers: the first reference of a message or file,
+    /// the job of a result.
+    pub fn reply_to(&self) -> Option<&str> {
+        matches!(self.kind.as_str(), "text" | "file" | "result")
+            .then(|| self.refs.get(0)?["id"].as_str())
+            .flatten()
     }
 }
 
@@ -522,6 +551,9 @@ pub struct Session {
     reseeded: HashSet<String>,
     unacked: HashSet<String>,
     last_seq: Option<u64>,
+    /// When this client last heard from the relay: a sync that went through,
+    /// or data on the event stream.
+    pub synced_at_ms: Option<u64>,
     /// Why the session is over, once it is.
     pub closed: Option<String>,
     /// This process joined as a new participant (no cached identity), so
@@ -659,6 +691,7 @@ impl Session {
             reseeded: HashSet::new(),
             unacked: HashSet::new(),
             last_seq: None,
+            synced_at_ms: None,
             closed: None,
             joined_now,
         };
@@ -758,13 +791,87 @@ impl Session {
 
     // ---------------------------------------------------------- sending --
 
-    pub async fn send_text(&mut self, text: &str) -> Result<Value> {
-        self.send("text", None, json!({"type": "text", "text": text}), vec![], vec![]).await
+    /// Send a message addressed to `to` (participant keys, from
+    /// [`Session::resolve_recipients`]; empty for everyone), as a reply to
+    /// item `reply_to` if given. Returns the item reference.
+    pub async fn send_message(&mut self, text: &str, to: &[String], reply_to: Option<&str>) -> Result<Value> {
+        let mut meta = json!({"type": "text", "text": text});
+        if !to.is_empty() {
+            meta["to"] = json!(to);
+        }
+        let refs = self.reply_refs(reply_to).await?;
+        self.send("text", None, meta, vec![], refs).await
     }
 
-    /// Send a file the protocol can carry. Images are re-encoded first to
-    /// strip metadata; ZIPs are checked. Returns the item reference.
-    pub async fn send_file(&mut self, data: Vec<u8>, name: &str) -> Result<Value> {
+    /// The reference list for a reply: the parent item, pinned by blob hash.
+    pub async fn reply_refs(&mut self, reply_to: Option<&str>) -> Result<Vec<Value>> {
+        let Some(id) = reply_to else { return Ok(vec![]) };
+        if self.get(id).is_none() {
+            self.sync().await?;
+        }
+        let item = self.get(id).with_context(|| format!("no item {id} in this session to reply to"))?;
+        Ok(vec![item.item_ref.clone()])
+    }
+
+    /// Participant keys for `specs`: a key, a display name (`@` optional),
+    /// or `role:<owner|sender|observer|runner>`. A name that several
+    /// participants share addresses all of them. Never yourself.
+    pub fn resolve_recipients(&self, specs: &[String]) -> Result<Vec<String>> {
+        let live: Vec<&Participant> = self.participants.values().filter(|p| !p.left).collect();
+        let mut out: Vec<String> = Vec::new();
+        for spec in specs {
+            let spec = spec.trim();
+            let found: Vec<&&Participant> = if let Some(role) = spec.strip_prefix("role:") {
+                live.iter().filter(|p| p.role == role).collect()
+            } else {
+                let name = spec.strip_prefix('@').unwrap_or(spec);
+                let by_key: Vec<_> = live.iter().filter(|p| p.participant_pub == spec).collect();
+                if by_key.is_empty() {
+                    live.iter().filter(|p| p.display_name == name).collect()
+                } else {
+                    by_key
+                }
+            };
+            let found: Vec<_> = found.into_iter().filter(|p| p.participant_pub != self.me).collect();
+            if found.is_empty() {
+                let mut names: Vec<_> = live
+                    .iter()
+                    .filter(|p| p.participant_pub != self.me)
+                    .map(|p| p.display_name.as_str())
+                    .collect();
+                names.sort();
+                names.dedup();
+                bail!("no other participant matches {spec:?}; participants: {}", names.join(", "));
+            }
+            for p in found {
+                if !out.contains(&p.participant_pub) {
+                    out.push(p.participant_pub.clone());
+                }
+            }
+        }
+        if out.len() > 64 {
+            bail!("a message can be addressed to at most 64 participants");
+        }
+        Ok(out)
+    }
+
+    /// For this participant's own items, who has stored each one
+    /// (`delivered`) and who the relay still holds it for (`waiting`), keyed
+    /// by item id. Delivered means fetched, not read.
+    pub async fn delivery(&self) -> Result<Value> {
+        Ok(self.relay.get_json("/delivery").await?["items"].take())
+    }
+
+    /// Send a file the protocol can carry, as a reply to item `reply_to` if
+    /// given. Images are re-encoded first to strip metadata; ZIPs are
+    /// checked. Returns the item reference.
+    pub async fn send_file_reply(
+        &mut self,
+        data: Vec<u8>,
+        name: &str,
+        reply_to: Option<&str>,
+    ) -> Result<Value> {
+        let refs = self.reply_refs(reply_to).await?;
         let (subkind, mime) = file_type(name)
             .with_context(|| format!("unsupported file type for {name:?}; use {FILE_TYPES_HELP}"))?;
         let (mime, data) = match subkind {
@@ -778,7 +885,7 @@ impl Session {
             }
             _ => (mime.to_string(), data),
         };
-        self.send("file", Some(subkind), json!({"type": "file", "name": name, "mime": mime}), data, vec![])
+        self.send("file", Some(subkind), json!({"type": "file", "name": name, "mime": mime}), data, refs)
             .await
     }
 
@@ -1168,6 +1275,82 @@ impl Session {
         &self.items
     }
 
+    /// The cursor `mark_handled` keeps for this participant: items up to
+    /// this sequence number were handled.
+    pub fn handled_seq(&self) -> Option<u64> {
+        self.cache.handled(&self.role_name())
+    }
+
+    /// Record that items up to `seq` were handled. The cursor only moves
+    /// forward.
+    pub fn mark_handled(&self, seq: u64) -> Result<()> {
+        if self.handled_seq().is_some_and(|h| h >= seq) {
+            return Ok(());
+        }
+        self.cache.save_handled(&self.role_name(), seq)
+    }
+
+    /// The highest sequence number below every item still being fetched:
+    /// a cursor that never skips an item that arrives late.
+    pub fn settled_seq(&self) -> Option<u64> {
+        let pending = self.items.iter().filter(|i| i.status == Status::Pending).map(|i| i.seq).min();
+        match pending {
+            Some(p) => p.checked_sub(1),
+            None => self.items.iter().map(|i| i.seq).max(),
+        }
+    }
+
+    fn role_name(&self) -> String {
+        serde_json::to_value(self.role).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
+    }
+
+    /// The highest event sequence number this client has seen.
+    pub fn last_seq(&self) -> Option<u64> {
+        self.last_seq
+    }
+
+    /// Why `item` should wake this participant's listener, if it should:
+    /// `addressed` (its `to` names you), `reply` (it answers one of your
+    /// items, a job result included), or `owner` (the owner posted it to
+    /// everyone). Your own items, progress reports, items addressed only to
+    /// others and other participants' broadcasts wake no one.
+    pub fn wake_reason(&self, item: &Item) -> Option<&'static str> {
+        if item.author == self.me || item.status != Status::Ok || item.kind == "progress" {
+            return None;
+        }
+        if let Some(to) = item.to() {
+            return to.contains(&self.me.as_str()).then_some("addressed");
+        }
+        if self.parent(item).is_some_and(|p| p.author == self.me) {
+            return Some("reply");
+        }
+        if item.author_role.as_deref() == Some("owner") && matches!(item.kind.as_str(), "text" | "file") {
+            return Some("owner");
+        }
+        None
+    }
+
+    /// The item `item` replies to (its first reference), if this client has it.
+    pub fn parent(&self, item: &Item) -> Option<&Item> {
+        self.get(item.reply_to()?)
+    }
+
+    /// How many items in a row, walking up `item`'s reply chain from it,
+    /// were posted by programs (anything but the web client) rather than a
+    /// person. Listeners stop waking agents for long agent-only chains.
+    pub fn agent_hops(&self, item: &Item) -> usize {
+        let mut n = 0;
+        let mut cur = Some(item);
+        while let Some(i) = cur {
+            if self.participants.get(&i.author).is_some_and(|p| p.kind == "web") || n > 1000 {
+                break;
+            }
+            n += 1;
+            cur = self.parent(i);
+        }
+        n
+    }
+
     pub fn get(&self, id: &str) -> Option<&Item> {
         self.index.get(id).map(|&i| &self.items[i])
     }
@@ -1187,6 +1370,7 @@ impl Session {
             }
             Err(e) => return Err(e),
         };
+        self.synced_at_ms = Some(now_ms());
         for ev in &evs {
             if let Some(i) = self.apply(ev, true, true).await? {
                 if self.items[i].status != Status::Pending {
@@ -1340,6 +1524,7 @@ impl Session {
                     }
                     Ok(Some(Ok(c))) => c,
                 };
+                self.synced_at_ms = Some(now_ms());
                 let mut trade = false;
                 for ev in parser.push(&chunk) {
                     trade |= matches!(ev.event.as_str(), "want" | "reseeded" | "evicted");
