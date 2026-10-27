@@ -18,6 +18,8 @@ pub const MAX_META_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_STDIO_BYTES: usize = 1024 * 1024;
 pub const MAX_OUT_FILES: usize = 64;
 pub const MAX_REASON_CHARS: usize = 4096;
+/// Most participants one message may be addressed to.
+pub const MAX_RECIPIENTS: usize = 64;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -123,8 +125,17 @@ pub enum Event {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Meta {
-    Text { text: String },
-    File { name: String, mime: String },
+    Text {
+        text: String,
+        /// The participants this message is addressed to: the ones whose
+        /// listeners it wakes. Absent (never empty) for a message to everyone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<Vec<PublicKey>>,
+    },
+    File {
+        name: String,
+        mime: String,
+    },
     Job(JobSpec),
     Result(JobResult),
     Event(Event),
@@ -152,7 +163,7 @@ pub struct Payload {
 
 impl Payload {
     pub fn text(text: impl Into<String>) -> Self {
-        Payload { meta: Meta::Text { text: text.into() }, body: vec![] }
+        Payload { meta: Meta::Text { text: text.into(), to: None }, body: vec![] }
     }
 
     pub fn file(name: impl Into<String>, mime: impl Into<String>, body: Vec<u8>) -> Self {
@@ -259,6 +270,18 @@ mod tests {
         let mut raw = (meta.len() as u32).to_be_bytes().to_vec();
         raw.extend_from_slice(meta);
         assert!(Payload::decode(&raw).is_err());
+    }
+
+    #[test]
+    fn text_to_is_absent_unless_given() {
+        // A message to everyone keeps the canonical form older clients accept.
+        let meta = canonical_json(&Payload::text("hi").meta).unwrap();
+        assert_eq!(meta, br#"{"text":"hi","type":"text"}"#);
+        let pk = crate::keys::Keypair::from_seed(&[1u8; 32]).public();
+        let p = Payload { meta: Meta::Text { text: "hi".into(), to: Some(vec![pk]) }, body: vec![] };
+        let enc = p.encode().unwrap();
+        assert_eq!(Payload::decode(&enc).unwrap(), p);
+        assert!(String::from_utf8(canonical_json(&p.meta).unwrap()).unwrap().contains("\"to\":["));
     }
 
     #[test]

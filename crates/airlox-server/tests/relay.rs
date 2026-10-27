@@ -9,7 +9,7 @@ use airlox_core::payload::Payload;
 use airlox_core::session::{Mode, Role};
 use airlox_server::start;
 use reqwest::StatusCode;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 mod common;
 use common::*;
@@ -899,4 +899,39 @@ async fn asking_again_writes_nothing_and_needs_a_live_participant() {
     assert_eq!(audit_wants(audit(&env, &s, &owner).await.text().await.unwrap()), 1);
     let evs = events(&env, &s, &sender).await;
     assert_eq!(evs.iter().filter(|e| e["kind"] == "want").count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delivery_reports_who_stored_the_authors_items() {
+    let env = Env::new().await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    assert_eq!(create(&env, &s).await.status(), StatusCode::CREATED);
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let sender = join(&env, &s, Role::Sender, "planner-agent").await;
+    let observer = join(&env, &s, Role::Observer, "lead").await;
+    let item = seal_text(&s, &sender, "status?");
+    let id = item.envelope.header.id.clone();
+    assert_eq!(post(&env, &s, &sender, frame(&item)).await.status(), StatusCode::CREATED);
+    let delivery = |m: &Member| {
+        let req = env.http.get(env.url(&format!("/v1/sessions/{}/delivery", s.id))).bearer_auth(&m.token);
+        async move {
+            let r = req.send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+            r.json::<Value>().await.unwrap()["items"].clone()
+        }
+    };
+    let pk = |m: &Member| m.kp.public().to_b64();
+
+    let d = delivery(&sender).await;
+    assert_eq!(d[&id]["delivered"], json!([]));
+    let mut waiting = vec![pk(&owner), pk(&observer)];
+    waiting.sort();
+    assert_eq!(d[&id]["waiting"], json!(waiting));
+
+    ack(&env, &s, &owner, &id).await;
+    let d = delivery(&sender).await;
+    assert_eq!(d[&id]["delivered"], json!([pk(&owner)]));
+    assert_eq!(d[&id]["waiting"], json!([pk(&observer)]));
+    // Only the author learns this.
+    assert_eq!(delivery(&owner).await, json!({}));
 }

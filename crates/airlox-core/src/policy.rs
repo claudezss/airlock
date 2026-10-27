@@ -14,7 +14,7 @@ use crate::item::{ItemHeader, ItemKind, ItemRef};
 use crate::keys::PublicKey;
 use crate::payload::{
     Event, JobProgress, JobResult, JobSpec, JobStatus, Meta, Payload, Target, MAX_OUT_FILES,
-    MAX_PROGRESS_TAIL_BYTES, MAX_REASON_CHARS, MAX_STDIO_BYTES,
+    MAX_PROGRESS_TAIL_BYTES, MAX_REASON_CHARS, MAX_RECIPIENTS, MAX_STDIO_BYTES,
 };
 use crate::session::{ContentType, Manifest, Mode, Role};
 use crate::validate::{check_name_component, sniff};
@@ -103,13 +103,26 @@ pub fn check_payload(m: &Manifest, author_role: Role, h: &ItemHeader, p: &Payloa
         return Err(Error::policy("payload type does not match header kind"));
     }
     match &p.meta {
-        Meta::Text { .. } => Ok(()),
+        Meta::Text { to, .. } => check_recipients(to.as_deref()),
         Meta::File { name, mime } => check_file(h.subkind.expect("validated"), name, mime, &p.body),
         Meta::Job(spec) => check_job(m, spec),
         Meta::Result(r) => check_result(r),
         Meta::Event(e) => check_event(author_role, e),
         Meta::Progress(p) => check_progress(p),
     }
+}
+
+/// A text item's `to`: absent, or 1 to 64 distinct participant keys.
+pub fn check_recipients(to: Option<&[PublicKey]>) -> Result<()> {
+    let Some(to) = to else { return Ok(()) };
+    if to.is_empty() || to.len() > MAX_RECIPIENTS {
+        return Err(Error::policy("`to` names 1 to 64 participants, or is absent"));
+    }
+    let distinct: std::collections::HashSet<_> = to.iter().collect();
+    if distinct.len() != to.len() {
+        return Err(Error::policy("`to` names a participant twice"));
+    }
+    Ok(())
 }
 
 /// Shape checks on a progress item.
@@ -460,6 +473,17 @@ mod tests {
         .unwrap()
         .envelope
         .header
+    }
+
+    #[test]
+    fn recipients() {
+        let a = crate::keys::Keypair::from_seed(&[1u8; 32]).public();
+        let b = crate::keys::Keypair::from_seed(&[2u8; 32]).public();
+        assert!(check_recipients(None).is_ok());
+        assert!(check_recipients(Some(&[a, b])).is_ok());
+        assert!(check_recipients(Some(&[])).is_err());
+        assert!(check_recipients(Some(&[a, a])).is_err());
+        assert!(check_recipients(Some(&vec![a; MAX_RECIPIENTS + 1])).is_err());
     }
 
     #[test]
