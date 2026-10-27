@@ -226,6 +226,7 @@ pub fn generate() -> Result<Value> {
         }],
         code_sha256: crate::encoding::hex(&crate::encoding::sha256(job_spec.code.as_bytes())),
         input_sha256: crate::encoding::hex(&crate::encoding::sha256(&readme.blob)),
+        env: None,
     };
     seal_case(
         "result",

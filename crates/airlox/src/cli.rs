@@ -208,8 +208,12 @@ pub struct CreateArgs {
     #[arg(long)]
     pub network: bool,
     /// execute: a package jobs may use (repeat, or comma-separated). Names
-    /// are PEP 503 normalized: pyPowerGEM becomes pypowergem.
-    #[arg(long = "package", value_delimiter = ',')]
+    /// are PEP 503 normalized: pyPowerGEM becomes pypowergem. Add a version
+    /// specifier to pin what every runner installs or must already have:
+    /// --package 'cugrid==0.1.0' --package 'numpy>=1.26,<3' (quote it: the
+    /// shell reads > and <). A job's requirements still name the package
+    /// alone.
+    #[arg(long = "package")]
     pub packages: Vec<String>,
     /// execute: don't return files jobs write to $AIRLOX_OUT.
     #[arg(long)]
@@ -264,12 +268,32 @@ fn new_session(a: &CreateArgs, relay_max: Option<u64>) -> Result<NewSession> {
             memory_mb: job_memory,
             network: a.network,
             // Normalized when the manifest is built.
-            packages: a.packages.iter().map(|p| p.trim().to_string()).collect(),
+            packages: a.packages.iter().flat_map(|p| split_packages(p)).collect(),
             return_out: !a.no_out_files,
             approve_runners: !a.no_approval,
         }),
         insecure_http_host: a.insecure_http_host.as_deref().map(|h| h.trim().to_ascii_lowercase()),
     })
+}
+
+/// The allowlist entries in one `--package` value: it may list several,
+/// comma-separated, but a version specifier has commas of its own
+/// (`numpy>=1.26,<3,pandas`). A piece that starts with an operator continues
+/// the entry before it.
+fn split_packages(value: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for piece in value.split(',').map(str::trim) {
+        let continues = piece.starts_with(['=', '!', '<', '>', '~']);
+        match out.last_mut() {
+            Some(last) if continues => {
+                last.push(',');
+                last.push_str(piece);
+            }
+            _ if piece.is_empty() => {}
+            _ => out.push(piece.to_string()),
+        }
+    }
+    out
 }
 
 /// One line about what jobs may do.
@@ -971,6 +995,20 @@ pub fn save_out_files(r: &Outcome, dir: &Path) -> (Vec<String>, Vec<String>) {
     (saved, notes)
 }
 
+/// A job's environment on one line: "Python 3.12.4 (--python) · cugrid 0.1.0,
+/// numpy 2.1.0 · local sandbox · airlox 0.1.2". Everything in it came from the
+/// runner, so it is cleaned like any participant's text.
+fn env_line(e: &airlox_core::payload::JobEnv) -> String {
+    let packages = e.packages.iter().map(|(n, v)| format!("{n} {v}")).collect::<Vec<_>>().join(", ");
+    let mut parts = vec![format!("Python {} ({})", e.python, e.interpreter)];
+    if !packages.is_empty() {
+        parts.push(packages);
+    }
+    parts.push(format!("{} sandbox", format!("{:?}", e.sandbox).to_lowercase()));
+    parts.push(format!("airlox {}", e.airlox));
+    clean_line(&parts.join(" · "))
+}
+
 fn print_outcome(r: &Outcome, saved: &[String], hint: bool) {
     if !r.stdout.is_empty() {
         print!("{}", clean_text(&r.stdout));
@@ -992,6 +1030,9 @@ fn print_outcome(r: &Outcome, saved: &[String], hint: bool) {
         (false, _) => "reported by the relay, unsigned".into(),
     };
     eprintln!("── {} · {code}{reason} · {} ms · {signed}", r.status, r.wall_ms);
+    if let Some(env) = &r.env {
+        eprintln!("   ran on {}", env_line(env));
+    }
     if r.stdout_truncated || r.stderr_truncated {
         eprintln!("   output was truncated by the runner");
     }
@@ -1810,6 +1851,71 @@ mod tests {
     }
 
     #[test]
+    fn the_environment_prints_on_one_line_without_control_characters() {
+        let env = airlox_core::payload::JobEnv {
+            python: "3.12.4".into(),
+            packages: [("cugrid".to_string(), "0.1.0".to_string()), ("numpy".into(), "2.1.0".into())].into(),
+            airlox: "0.1.2".into(),
+            sandbox: airlox_core::cert::SandboxKind::Process,
+            interpreter: "--python".into(),
+        };
+        assert_eq!(
+            env_line(&env),
+            "Python 3.12.4 (--python) · cugrid 0.1.0, numpy 2.1.0 · process sandbox · airlox 0.1.2"
+        );
+        let bare = airlox_core::payload::JobEnv {
+            packages: Default::default(),
+            interpreter: "uv-runtime\x1b[2J\nforged".into(),
+            ..env
+        };
+        let line = env_line(&bare);
+        assert!(!line.contains('\x1b') && !line.contains('\n'), "{line:?}");
+        assert!(line.starts_with("Python 3.12.4 (uv-runtime"));
+    }
+
+    #[test]
+    fn package_flags_take_names_and_version_pins() {
+        let pkgs = |args: &[&str]| {
+            let mut v = vec!["--execute"];
+            v.extend_from_slice(args);
+            new_session(&create(&v), None).unwrap().job_limits.unwrap().packages
+        };
+        assert_eq!(pkgs(&["--package", "pandas,pyPowerGEM"]), ["pandas", "pyPowerGEM"]);
+        assert_eq!(
+            pkgs(&["--package", "cugrid==0.1.0", "--package", "numpy>=1.26,<3"]),
+            ["cugrid==0.1.0", "numpy>=1.26,<3"]
+        );
+        // One value, several entries, one of them with commas in its pin.
+        assert_eq!(
+            pkgs(&["--package", "numpy>=1.26,<3,pandas, cugrid ==0.1.0"]),
+            ["numpy>=1.26,<3", "pandas", "cugrid ==0.1.0"]
+        );
+        assert_eq!(pkgs(&["--package", ",pandas,,"]), ["pandas"]);
+        // A profile takes pins like any other session.
+        let n = new_session(&create(&["--profile", "host-runner", "--package", "CuGrid == 0.1.0"]), None)
+            .unwrap();
+        assert_eq!(n.job_limits.unwrap().packages, ["CuGrid == 0.1.0"]);
+        // The manifest records them in canonical form, and says so.
+        let m = airlox_core::session::SessionSecrets::generate()
+            .manifest(&airlox_core::session::SessionParams {
+                mode: airlox_core::session::Mode::Execute,
+                created_at_ms: 1,
+                ttl_ms: Some(1000),
+                allowed_types: vec![airlox_core::session::ContentType::Py],
+                max_item_bytes: 1 << 20,
+                job_limits: Some(JobLimits {
+                    packages: pkgs(&["--package", "CuGrid == 0.1.0,pyPowerGEM>=1, <2"]),
+                    ..JobLimits::default()
+                }),
+                insecure_http_host: None,
+            })
+            .unwrap();
+        let l = m.manifest.job_limits.unwrap();
+        assert_eq!(l.packages, ["cugrid==0.1.0", "pypowergem>=1,<2"]);
+        assert!(jobs_line(&l).contains("packages [cugrid==0.1.0, pypowergem>=1,<2]"));
+    }
+
+    #[test]
     fn durations_and_sizes_read_naturally() {
         assert_eq!(human_minutes(1440), "1 d");
         assert_eq!(human_minutes(1441), "1 d");
@@ -1845,6 +1951,7 @@ mod tests {
             stderr_truncated: false,
             wall_ms: 0,
             peak_mem_mb: 0,
+            env: None,
             out_files: vec![OutFile {
                 name: "out.zip".into(),
                 size: out_zip.len() as u64,

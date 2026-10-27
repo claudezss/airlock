@@ -99,6 +99,27 @@ def test_unapproved_runners_get_nothing_then_summarize_runs(execute):
     assert owner.items() and any(i.kind == "result" for i in owner.items())
 
 
+def test_results_say_where_the_job_ran_and_refusals_say_nothing(execute):
+    owner, agent, runner = execute
+    owner.approve_runner("runner-01")
+    agent.wait_for_runner("runner-01", approved=True)
+    res = agent.run_python("import sys\nprint(sys.version_info[:2])", runner="runner-01").wait(timeout=60)
+    assert res.ok, (res, runner.output())
+    env = res.env
+    sandbox = os.environ.get("AIRLOX_TEST_SANDBOX", "local")
+    assert set(env) == {"python", "packages", "airlox", "sandbox", "interpreter"}, env
+    assert env["python"].startswith("3.12."), env
+    assert (env["packages"], env["sandbox"]) == ({}, sandbox)
+    assert env["interpreter"] == "uv-runtime" if sandbox == "local" else env["interpreter"].startswith("docker:")
+    assert env["airlox"]
+    # No path of the runner's: not its cache, not an interpreter.
+    assert str(runner.log.parent) not in str(env) and sys.executable not in str(env)
+
+    # A refusal never ran anything, so it has no environment to report.
+    res = agent.run_python("import scipy", requirements=["scipy"]).wait(timeout=30)
+    assert res.status == "refused" and res.env is None, res
+
+
 def test_wait_for_runner_waits_for_the_senders_view_of_the_approval(execute):
     owner, agent, runner = execute
     r = agent.wait_for_runner("runner-01")  # online, but nobody approved it yet

@@ -110,10 +110,20 @@ pub struct JobLimits {
     pub timeout_s: u32,
     pub memory_mb: u32,
     pub network: bool,
-    /// Normalized package names a job may require. Empty = stdlib only.
+    /// Packages a job may require: a PEP 503 normalized name, optionally
+    /// followed by a PEP 440 version specifier (`cugrid==0.1.0`,
+    /// `numpy>=1.26,<3`) that every runner installs or checks. Empty =
+    /// stdlib only.
     pub packages: Vec<String>,
     pub return_out: bool,
     pub approve_runners: bool,
+}
+
+impl JobLimits {
+    /// Whether jobs may require the package with this normalized name.
+    pub fn allows_package(&self, name: &str) -> bool {
+        self.packages.iter().any(|p| crate::policy::allowlist_name(p) == name)
+    }
 }
 
 impl Default for JobLimits {
@@ -268,24 +278,41 @@ fn validate_job_limits(l: &JobLimits) -> Result<()> {
     if l.memory_mb < 32 || l.memory_mb > 65536 {
         return Err(Error::invalid("job_limits", "memory_mb must be 32..=65536"));
     }
+    let mut names: Vec<&str> = Vec::with_capacity(l.packages.len());
     for p in &l.packages {
-        let n = crate::policy::normalize_package(p)?;
-        if n != *p {
-            return Err(Error::invalid("job_limits", format!("package {p:?} is not normalized; use {n:?}")));
+        let c = crate::policy::canonical_allowlist_entry(p)?;
+        if c != *p {
+            return Err(Error::invalid("job_limits", format!("package {p:?} is not normalized; use {c:?}")));
         }
+        let name = crate::policy::allowlist_name(p);
+        if names.contains(&name) {
+            return Err(Error::invalid("job_limits", format!("package {name:?} is listed twice")));
+        }
+        names.push(name);
     }
     Ok(())
 }
 
-/// Packages as the manifest records them: PEP 503 normalized, each once, so
-/// `pyPowerGEM` and `PyPowerGem` both become `pypowergem`.
+/// Packages as the manifest records them: PEP 503 normalized names, each
+/// once, so `pyPowerGEM` and `PyPowerGem` both become `pypowergem`, each
+/// with its version specifier (if any) in canonical form (`numpy >= 1.26,
+/// < 3` becomes `numpy>=1.26,<3`). One name with two different entries is
+/// refused: give it one entry with one specifier.
 fn normalize_limits(mut l: JobLimits) -> Result<JobLimits> {
     let mut packages: Vec<String> = Vec::with_capacity(l.packages.len());
     for p in &l.packages {
-        let n = crate::policy::normalize_package(p)?;
-        if !packages.contains(&n) {
-            packages.push(n);
+        let n = crate::policy::canonical_allowlist_entry(p)?;
+        if packages.contains(&n) {
+            continue;
         }
+        let name = crate::policy::allowlist_name(&n);
+        if let Some(other) = packages.iter().find(|o| crate::policy::allowlist_name(o) == name) {
+            return Err(Error::invalid(
+                "job_limits",
+                format!("package {name:?} is listed as both {other:?} and {n:?}; give it one entry"),
+            ));
+        }
+        packages.push(n);
     }
     l.packages = packages;
     Ok(l)
@@ -540,6 +567,44 @@ mod tests {
         assert!(e.contains("\"pypowergem\""), "{e}");
         p.job_limits.as_mut().unwrap().packages = vec!["not a name".into()];
         assert!(create_session(&p).is_err());
+    }
+
+    #[test]
+    fn version_pins_are_kept_in_canonical_form() {
+        let mut p = params(Mode::Execute);
+        p.job_limits.as_mut().unwrap().packages = vec![
+            "CuGrid == 0.1.0".into(),
+            "numpy >= 1.26, < 3".into(),
+            "pandas".into(),
+            "cugrid==0.1.0".into(), // the same entry again
+        ];
+        let (_, m) = create_session(&p).unwrap();
+        let limits = m.manifest.job_limits.as_ref().unwrap();
+        assert_eq!(limits.packages, ["cugrid==0.1.0", "numpy>=1.26,<3", "pandas"]);
+        assert!(limits.allows_package("cugrid") && limits.allows_package("pandas"));
+        assert!(!limits.allows_package("cugrid==0.1.0") && !limits.allows_package("scipy"));
+        m.verify().unwrap();
+        // The signed form must already be canonical.
+        for not_canonical in ["cugrid == 0.1.0", "CuGrid==0.1.0", "numpy>=1.26, <3"] {
+            let l = JobLimits { packages: vec![not_canonical.into()], ..JobLimits::default() };
+            assert!(validate_job_limits(&l).is_err(), "{not_canonical}");
+        }
+        // One name, one entry.
+        for dup in [vec!["numpy>=1", "numpy<3"], vec!["numpy", "numpy>=1"]] {
+            p.job_limits.as_mut().unwrap().packages = dup.iter().map(|s| s.to_string()).collect();
+            let e = create_session(&p).unwrap_err().to_string();
+            assert!(e.contains("numpy"), "{e}");
+            let l =
+                JobLimits { packages: dup.iter().map(|s| s.to_string()).collect(), ..JobLimits::default() };
+            assert!(validate_job_limits(&l).is_err());
+        }
+        p.job_limits.as_mut().unwrap().packages = vec!["numpy>=".into()];
+        assert!(create_session(&p).is_err());
+        // Names alone sign exactly the bytes they signed before pins existed.
+        p.job_limits.as_mut().unwrap().packages = vec!["numpy".into(), "pandas".into()];
+        let (_, m) = create_session(&p).unwrap();
+        let json = String::from_utf8(m.manifest.canonical_bytes().unwrap()).unwrap();
+        assert!(json.contains(r#""packages":["numpy","pandas"]"#), "{json}");
     }
 
     #[test]

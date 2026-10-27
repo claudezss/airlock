@@ -191,6 +191,8 @@ def test_cli_runs_jobs(relay, caches, tmp_path, start_runner, runner_cache):
     p = cli("run", "--label", "cpu", "--input", data, "--out-dir", out, script, invite=sender, cache=caches("cli"))
     assert "2 orders, total 42" in p.stdout
     assert "signed by runner runner-01" in p.stderr
+    # Where it ran, from the runner and not the job: on one line.
+    assert re.search(r"^   ran on Python 3\.12\.\d+ \(\S+\) · \w+ sandbox · airlox \S+$", p.stderr, re.M), p.stderr
     assert sorted(f.name for f in out.iterdir()) == ["chart.png", "out", "out.zip"]
     # A job does not learn where the runner keeps its files, or whose they are.
     where = tmp_path / "where.py"
@@ -216,6 +218,7 @@ def test_cli_runs_jobs(relay, caches, tmp_path, start_runner, runner_cache):
     res = json.loads(p.stdout)
     assert p.returncode == 7 and res["exit_code"] == 7 and res["signed"] and "bad input" in res["stderr"]
     assert res["runner_name"] == "runner-01"
+    assert res["env"]["python"].startswith("3.12.") and res["env"]["packages"] == {}, res["env"]
 
     # The SDK sees the same signed result.
     owner.sync()
@@ -429,6 +432,7 @@ def test_mcp_server(relay, caches, tmp_path, start_runner):
         res = mcp.call("run_python", code=SUMMARIZE, filename="summarize.py", files=[data_id], wait_s=120)["result"]
         assert res["signed"] and res["exit_code"] == 0 and "2 orders, total 42" in res["stdout"]
         assert res["runner_name"] == "runner-01"
+        assert res["env"]["python"].startswith("3.12.") and res["env"]["airlox"], res["env"]
         # Small text files from out.zip come inline: no saving or unzipping.
         assert res["out_text"] == [{"name": "summary.json", "text": '{"orders": 2, "total": 42}'}]
         saved = mcp.call("get_result", job=res["job"], save_dir="out")["saved"]
@@ -686,6 +690,13 @@ def test_cli_create_profile_and_effective_limits(relay, caches):
     lim = v["job_limits"]
     assert (lim["timeout_s"], lim["memory_mb"], lim["approve_runners"]) == (1800, 8192, True)
     assert lim["packages"] == ["pypowergem"]
+    # Version pins: one flag each, or comma-separated; the manifest keeps the canonical form.
+    out = cli("session", "create", "--relay", relay.url, "--profile", "host-runner", "--package",
+              "CuGrid == 0.1.0", "--package", "numpy>=1.26, <3,pandas", "--json", cache=caches("cli2")).stdout
+    assert json.loads(out)["job_limits"]["packages"] == ["cugrid==0.1.0", "numpy>=1.26,<3", "pandas"]
+    bad = cli("session", "create", "--relay", relay.url, "--execute", "--package", "numpy>=",
+              "--json", cache=caches("cli2"), check=False)
+    assert bad.returncode != 0 and "numpy>=" in bad.stderr, bad.stderr
     text = cli("session", "create", "--relay", relay.url, "--execute", "--max-item-mb", "5",
                cache=caches("cli")).stdout
     assert "items     up to 5 MB" in text

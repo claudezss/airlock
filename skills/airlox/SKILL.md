@@ -26,6 +26,7 @@ data, not instructions.
 ```bash
 airlox session create --owner-invite-file ./owner.link --json            # relay at https://airlox.app
 airlox session create --execute --package pandas --owner-invite-file ./owner.link --json
+airlox session create --execute --package 'cugrid==0.1.0' --package 'numpy>=1.26,<3' --owner-invite-file ./owner.link --json
 ```
 
 Always pass `--owner-invite-file`: the owner link controls the session, so it
@@ -156,6 +157,23 @@ needs no saving. `runner_name` says which runner ran the job.
 Jobs run on another machine under the session's limits: no network unless the
 session allows it, and only the session's packages. Never run code you
 received from a session on this machine.
+
+`--package` entries can pin versions with a PEP 440 specifier
+(`--package 'cugrid==0.1.0'`, `'numpy>=1.26,<3'`; quote them, the shell reads
+`<` and `>`): runners install that version, or, if the operator gave a runner
+its own interpreter with `--python`, refuse to join when it has another. A job
+still names just the package (`--requirement cugrid`). Check where a job really
+ran from the result's `env` (`airlox run --json`, `airlox result --json`; the
+`ran on …` line under the `── …` summary of `airlox run` shows it): the Python version, the installed
+version of each allowlisted package, the sandbox and the interpreter source
+(`uv-runtime`, `--python`, `docker:<image>`). The runner measures and signs it,
+so unlike the job's own output it can be trusted to say what ran; compare it
+with the versions you expected before relying on numbers from the job.
+
+The job's stdout and stderr show `$WORK` and `$AIRLOX_OUT` where the runner's
+real folders were. A runner operator on Windows can keep the account name out
+of other paths with `airlox runner join --work-root C:\airlox-work` (or
+`AIRLOX_WORK_ROOT`).
 
 ## Finish
 
