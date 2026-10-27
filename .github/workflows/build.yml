@@ -71,7 +71,7 @@ jobs:
         if: github.ref_type != 'tag'
         with:
           key: dist-${{ matrix.name }}
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         if: matrix.build == 'zigbuild'
       # cargo-zigbuild runs zig through `python3 -m ziglang`, so both go in a
       # venv put first on PATH.
@@ -180,7 +180,7 @@ jobs:
           container: ${{ matrix.container }}
       # Install the wheel, load the Rust core and run the binary, where the
       # runner can run them.
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         if: matrix.native
       - if: matrix.native
         env:
