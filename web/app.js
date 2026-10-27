@@ -580,19 +580,55 @@ function newSession() {
       const base = location.origin;
       const owner = ac.ownerInvite(base, s.ownerSeed);
       const heading = el("h2", { tabindex: -1 }, "Hand out invites");
+      const ownerRow = inviteRow("Owner", owner, "you · keep it private");
+      // Without the owner link nobody can approve runners, revoke or close:
+      // opening the session waits until it has been saved one way or another.
+      // A button, not a link: the owner key must not show in the status bar on hover.
+      const openBtn = el("button", { class: "primary cta", type: "button", disabled: true, "aria-describedby": "owner-gate",
+        onclick: () => openOwnerSession(owner) }, "Open session");
+      const gate = el("p", { class: "muted hint-text", id: "owner-gate" }, "Save the owner link first: copy it, download it or send it to another machine.");
+      const saved = el("input", { type: "checkbox", id: "owner-saved" });
+      const markSaved = () => {
+        openBtn.disabled = false;
+        gate.hidden = true;
+        saved.checked = true;
+      };
+      saved.addEventListener("change", () => (saved.checked ? markSaved() : ((openBtn.disabled = true), (gate.hidden = false))));
+      const download = el("button", { class: "small", type: "button", onclick: () => {
+        const name = `airlox-owner-${session_id.slice(0, 7)}.txt`;
+        const body = `Airlox owner link for session ${session_id}\n\n${owner}\n\n` +
+          "Anyone with this link controls the session: keep it private. It cannot be shown again.\n";
+        const url = URL.createObjectURL(new Blob([body], { type: "text/plain" }));
+        const a = el("a", { href: url, download: name, hidden: true });
+        document.body.append(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+        announce(`Downloaded ${name}`);
+        markSaved();
+      } }, "Download as .txt");
+      ownerRow.querySelector(".send-code").before(el("div", { class: "row" }, download));
+      // Copy and Send to another machine both count as saving it.
+      ownerRow.addEventListener("click", (ev) => {
+        if (ev.target.closest("button")) markSaved();
+      });
       aside.replaceChildren(
         el("div", { class: "eyebrow" }, `Created · ${session_id.slice(0, 7)}`),
         heading,
-        el("p", { class: "muted" }, "Copy the owner link now: it cannot be shown again. Sender, observer and runner links stay available under Invites in the session."),
+        el("div", { class: "callout", role: "note" },
+          el("strong", {}, "Save your owner link now: it is shown only once."),
+          el("span", {}, "Without it you cannot approve runners, revoke access or close the session. Sender, observer and runner links stay available under Invites in the session.")),
         el("p", { class: "muted hint-text" }, MASKED_NOTE),
-        inviteRow("Owner", owner, "you · keep it private"),
+        ownerRow,
+        el("label", { class: "option check" }, saved, "I've saved it somewhere safe"),
         senderInviteRow(ac.memberInvite(base, s.ownerSeed, "sender")),
         inviteRow("Observer", ac.memberInvite(base, s.ownerSeed, "observer"), "can read everything and export the audit log"),
         ...(execute ? [runnerInviteRow(ac.memberInvite(base, s.ownerSeed, "runner"))] : []),
         el("div", { class: "row" },
           // A button, not a link: the owner key must not show in the status bar on hover.
-          el("button", { class: "primary cta", type: "button", onclick: () => openOwnerSession(owner) }, "Open session"),
-          el("button", { type: "button", onclick: () => { invitesShown = false; location.reload(); } }, "Create another")));
+          openBtn,
+          el("button", { type: "button", onclick: () => { invitesShown = false; location.reload(); } }, "Create another")),
+        gate);
       heading.focus();
       invitesShown = true;
       invitesCreated = true;

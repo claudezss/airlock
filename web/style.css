@@ -83,6 +83,8 @@ main.wide { max-width: none; padding: 0; }
 .mode .option span:last-child { font-size: 13px; color: var(--muted); }
 .size { display: flex; align-items: center; gap: 8px; max-width: 200px; }
 .eyebrow { font-family: var(--mono); font-size: 12px; color: var(--ok); letter-spacing: 0.04em; }
+.callout { display: flex; flex-direction: column; gap: 4px; border: 1px solid var(--accent-line); background: var(--accent-bg); border-radius: 8px; padding: 12px 14px; font-size: 14px; }
+.callout span { color: var(--soft); }
 .invite-row { display: flex; flex-direction: column; gap: 6px; }
 .invite-row .head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
 .invite { display: flex; gap: 8px; align-items: center; }
