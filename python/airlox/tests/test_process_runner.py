@@ -1,6 +1,7 @@
 """The process sandbox end to end: an operator's interpreter, progress
 reports, one job at a time, and the network gap it cannot close."""
 
+import json
 import platform
 import sys
 import time
@@ -80,3 +81,37 @@ def test_process_runner_names_missing_packages(relay, caches, start_runner):
     start_process_runner(owner, start_runner, "proc-03")
     with pytest.raises(RunnerFailed, match="surely-not-installed-pkg"):
         owner.wait_for_runner("proc-03", timeout=60)
+
+
+ANSWER_JOB = """
+import json, os
+print("answer-saved-marker")
+json.dump({"answer": 42, "items": ["a", "b"]}, open(os.path.join(os.environ["AIRLOX_OUT"], "answer.json"), "w"))
+"""
+
+
+def test_a_result_saved_before_a_crash_is_posted_after_restart(relay, caches, start_runner):
+    owner = Session.create(relay.url, mode="execute", job_limits=PROCESS_LIMITS, cache_dir=caches("owner"))
+    agent = Session.join(owner.invites["sender"], cache_dir=caches("agent"))
+    runner = start_process_runner(owner, start_runner, "proc-04", "--accept-network-gap", "--exit-before-posting")
+    wait_runner(owner, "proc-04", lambda r: r.online, proc=runner)
+    owner.approve_runner("proc-04")
+    agent.wait_for_runner("proc-04", approved=True)
+
+    job = agent.run_python(ANSWER_JOB, runner="proc-04")
+    # The answer is in the runner's outbox, but nothing reached the relay.
+    runner.proc.wait(timeout=60)
+    assert runner.proc.returncode == 3, runner.output()
+    agent.sync()
+    assert job.result() is None, runner.output()
+
+    # Same name, same cache: the same runner, which posts the saved answer.
+    # (Its log replaces the first run's.)
+    again = start_process_runner(owner, start_runner, "proc-04", "--accept-network-gap")
+    res = job.wait(timeout=60)
+    assert (res.status, res.exit_code) == ("completed", 0), (res, again.output())
+    assert "answer-saved-marker" in res.stdout
+    assert res.signed
+    assert json.loads(res.read("answer.json")) == {"answer": 42, "items": ["a", "b"]}
+    results = [i for i in agent.items() if i.kind == "result" and i.meta.get("job", {}).get("id") == job.id]
+    assert len(results) == 1, (results, again.output())

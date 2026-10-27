@@ -8,9 +8,13 @@
 //! nothing runs.
 //!
 //! While a job runs the runner posts signed `progress` items (elapsed time
-//! and the tail of the job's `progress_file`). Its result is posted with
-//! retries for as long as the relay is unreachable, so a job that outlives a
-//! dropped connection still reports.
+//! and the tail of the job's `progress_file`). Its answer (out files and
+//! result) is sealed and kept on disk ([`outbox`]) before any of it is
+//! posted, then posted with retries for as long as the relay is unreachable,
+//! so a job that outlives a dropped connection, or a runner restart, still
+//! reports, exactly once.
+
+mod outbox;
 
 use std::fs;
 use std::io::Write;
@@ -32,7 +36,7 @@ use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use tokio::sync::{watch, Mutex};
 
-use crate::client::{is_transient, Relay};
+use crate::client::{is_duplicate, is_transient, Relay};
 use crate::sandbox::{Backend, PreparedJob, RawResult};
 use crate::view::View;
 
@@ -42,7 +46,7 @@ const APPROVAL_WAIT: Duration = Duration::from_secs(5);
 
 /// How long a finished job's result keeps being offered to an unreachable
 /// relay before the runner gives up on it.
-const RESULT_PATIENCE: Duration = Duration::from_secs(24 * 60 * 60);
+pub(crate) const RESULT_PATIENCE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// What stays fixed for a runner across jobs.
 pub struct Ctx {
@@ -61,6 +65,10 @@ pub struct Ctx {
     pub progress_interval: Duration,
     /// Most bytes of a job's `progress_file` sent with each progress item.
     pub progress_tail: usize,
+    /// Where finished jobs' answers wait until the relay has them.
+    pub outbox: PathBuf,
+    /// Tests: exit once an answer is saved, before posting any of it.
+    pub exit_before_posting: bool,
 }
 
 fn now_ms() -> u64 {
@@ -85,18 +93,41 @@ fn run_record(ctx: &Ctx, id: &str) -> Option<bool> {
 
 /// Jobs this runner started but never answered: it stopped while they ran.
 fn interrupted(ctx: &Ctx) -> Vec<String> {
-    let text = fs::read_to_string(&ctx.done_file).unwrap_or_default();
+    unanswered(&ctx.done_file)
+}
+
+/// The jobs `done_file` records as started but not answered, oldest first.
+pub(crate) fn unanswered(done_file: &Path) -> Vec<String> {
+    let text = fs::read_to_string(done_file).unwrap_or_default();
     let mut started: Vec<&str> = text.lines().filter(|l| !l.contains(' ')).collect();
     started.retain(|id| !text.lines().any(|l| l.strip_suffix(" posted") == Some(*id)));
     started.dedup();
     started.into_iter().map(String::from).collect()
 }
 
-/// After a restart, answer each job that was running when the runner
-/// stopped with a signed `failed` result (it is never run again), so its
-/// sender learns why instead of only that the relay lost the runner.
+/// After a restart, finish what the runner left: post the saved answer of
+/// each job that finished before it stopped, and answer each job that was
+/// still running with a signed `failed` result (it is never run again), so
+/// its sender learns why instead of only that the relay lost the runner.
 pub async fn report_interrupted(ctx: &Arc<Ctx>, view: &Arc<Mutex<View>>) {
+    // Answers delivered just before a stop, whose folder outlived it.
+    for e in fs::read_dir(&ctx.outbox).into_iter().flatten().flatten() {
+        if e.file_name().to_str().is_some_and(|id| run_record(ctx, id) == Some(true)) {
+            let _ = fs::remove_dir_all(e.path());
+        }
+    }
     for id in interrupted(ctx) {
+        let saved = ctx.outbox.join(&id);
+        if outbox::is_complete(&saved) {
+            let poster = Poster::of(&*view.lock().await);
+            match outbox::deliver(ctx, &poster, &saved).await {
+                Ok(()) => {
+                    tracing::info!(job = %id, "posted the saved result of a job that finished before a restart")
+                }
+                Err(e) => tracing::warn!(job = %id, "could not post a saved result: {e:#}"),
+            }
+            continue;
+        }
         let (_, never) = watch::channel(false);
         if let Err(e) = handle(ctx.clone(), view.clone(), id.clone(), never).await {
             tracing::warn!(job = %id, "could not report the interrupted job: {e:#}");
@@ -418,6 +449,13 @@ async fn retry<T, Fut: std::future::Future<Output = Result<T>>>(
     }
 }
 
+/// A sealed item, as it goes over the wire.
+struct Sealed {
+    env: String,
+    blob: Vec<u8>,
+    item_ref: ItemRef,
+}
+
 /// What it takes to post items without holding the session view.
 #[derive(Clone)]
 struct Poster {
@@ -435,16 +473,14 @@ impl Poster {
         }
     }
 
-    /// Seal and upload an item, retrying for up to `patience`; returns its reference.
-    async fn post(
+    fn seal(
         &self,
         kp: &Keypair,
         kind: ItemKind,
         subkind: Option<ContentType>,
         refs: Vec<ItemRef>,
         p: Payload,
-        patience: Duration,
-    ) -> Result<ItemRef> {
+    ) -> Result<Sealed> {
         let new = NewItem {
             id: new_item_id(),
             session_id: self.session_id.clone(),
@@ -455,8 +491,31 @@ impl Poster {
         };
         let sealed = seal(&self.key, kp, new, &p.encode()?)?;
         let env = String::from_utf8(canonical_json(&sealed.envelope)?)?;
-        retry(patience, || self.relay.post_item(&env, &sealed.blob)).await?;
-        Ok(ItemRef::to(&sealed))
+        Ok(Sealed { env, item_ref: ItemRef::to(&sealed), blob: sealed.blob })
+    }
+
+    /// Upload a sealed item, retrying for up to `patience`. One the relay
+    /// already has (sent before a restart) counts as sent.
+    async fn send(&self, env: &str, blob: &[u8], patience: Duration) -> Result<()> {
+        match retry(patience, || self.relay.post_item(env, blob)).await {
+            Err(e) if is_duplicate(&e) => Ok(()),
+            r => r,
+        }
+    }
+
+    /// Seal and upload an item; returns its reference.
+    async fn post(
+        &self,
+        kp: &Keypair,
+        kind: ItemKind,
+        subkind: Option<ContentType>,
+        refs: Vec<ItemRef>,
+        p: Payload,
+        patience: Duration,
+    ) -> Result<ItemRef> {
+        let item = self.seal(kp, kind, subkind, refs, p)?;
+        self.send(&item.env, &item.blob, patience).await?;
+        Ok(item.item_ref)
     }
 }
 
@@ -577,6 +636,7 @@ pub async fn handle(
     if !matches!(verdict, Verdict::Interrupted) {
         record(&ctx, &job_id)?;
     }
+    let mut outbox = outbox::Outbox::create(&ctx.outbox, &job_id)?;
     match verdict {
         Verdict::Interrupted => {
             tracing::warn!(job = %job_id, "this job was running when the runner stopped; not running it again");
@@ -652,26 +712,20 @@ pub async fn handle(
                         notes.push(format!("could not collect /out: {e:#}"));
                         vec![]
                     });
+                    // Sealed and saved one at a time, so they are never all in memory.
                     for o in outs {
                         let size = o.body.len() as u64;
                         let name = o.name.clone();
                         let file = Payload::file(&o.name, &o.mime, o.body);
-                        let posted = poster
-                            .post(
-                                &ctx.keypair,
-                                ItemKind::File,
-                                Some(o.subkind),
-                                vec![],
-                                file,
-                                RESULT_PATIENCE,
-                            )
-                            .await;
-                        match posted {
+                        let saved = poster
+                            .seal(&ctx.keypair, ItemKind::File, Some(o.subkind), vec![], file)
+                            .and_then(|item| outbox.add_file(&item));
+                        match saved {
                             Ok(r) => {
                                 result.out_files.push(OutFile { name: o.name, size, item: r.clone() });
                                 refs.push(r);
                             }
-                            Err(e) => notes.push(format!("could not upload out/{name}: {e:#}")),
+                            Err(e) => notes.push(format!("could not keep out/{name} for upload: {e:#}")),
                         }
                     }
                 }
@@ -692,9 +746,12 @@ pub async fn handle(
         }
     }
     let status = result.status;
-    let result = Payload::result(result);
-    poster.post(&ctx.keypair, ItemKind::Result, None, refs, result, RESULT_PATIENCE).await?;
-    record(&ctx, &format!("{job_id} posted"))?;
+    let saved = outbox.finish(&result, &refs)?;
+    if ctx.exit_before_posting {
+        tracing::warn!(job = %job_id, "--exit-before-posting: exiting with the answer saved");
+        std::process::exit(3);
+    }
+    outbox::deliver(&ctx, &poster, &saved).await?;
     tracing::info!(job = %job_id, ?status, "result posted");
     Ok(())
 }

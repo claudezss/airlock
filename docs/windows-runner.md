@@ -66,9 +66,15 @@ the relay answers again. The relay keeps the job `running` for its
 job as `runner_lost`, but takes the job back if the runner returns, and a
 result posted later still counts.
 
-A job runs at most once. If the runner itself restarts while a job runs, the
-Job Object ends the job with it, and on startup the runner posts a signed
-`failed` result for that job (it was not finished, and is not run again).
+A job runs at most once. A finished job's answer (its sealed out files and
+result) stays in the runner's cache until the relay has accepted it. While
+the relay is unreachable the runner keeps retrying it, for up to a day, and
+after a restart it picks the saved answer up again: if the runner stops after
+a job finished but before posting, it posts that job's real signed result
+when it starts again, once. Only a job that was still running when the
+runner stopped is lost: the Job Object ends the job with the runner, and on
+startup the runner posts a signed `failed` result for it (it was not
+finished, and is not run again).
 
 ### Progress
 

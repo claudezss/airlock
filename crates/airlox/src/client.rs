@@ -92,6 +92,15 @@ pub fn is_transient(e: &anyhow::Error) -> bool {
     }
 }
 
+/// The relay already has an item with this id: a `409 duplicate`, or the
+/// generic `409 conflict` older relays send for it.
+pub fn is_duplicate(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<RelayError>().is_some_and(|r| {
+        r.status == 409
+            && (r.code == "duplicate" || (r.code == "conflict" && r.message.contains("already exists")))
+    })
+}
+
 async fn check(r: reqwest::Response) -> Result<reqwest::Response> {
     if r.status().is_success() {
         return Ok(r);
@@ -271,8 +280,10 @@ impl Relay {
 
     /// A heartbeat that also reports the runner's setup (`preparing`,
     /// `ready`, `failed`), so the session sees a runner that cannot start.
-    pub async fn report(&self, state: &str, detail: Option<&str>) -> Result<Value> {
-        self.send_heartbeat(serde_json::json!({ "job": null, "state": state, "detail": detail })).await
+    /// `job` is one it still owes an answer for (from before a restart), so
+    /// the relay does not count that job lost while the answer is on its way.
+    pub async fn report(&self, state: &str, detail: Option<&str>, job: Option<&str>) -> Result<Value> {
+        self.send_heartbeat(serde_json::json!({ "job": job, "state": state, "detail": detail })).await
     }
 
     async fn send_heartbeat(&self, body: Value) -> Result<Value> {

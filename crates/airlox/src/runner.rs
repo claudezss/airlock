@@ -139,6 +139,10 @@ pub struct JoinArgs {
     /// Exit after this many jobs (for tests and one-shot use).
     #[arg(long, hide = true)]
     pub exit_after: Option<usize>,
+    /// Exit with status 3 once a job's answer is saved, before posting it
+    /// (for tests of delivery after a restart).
+    #[arg(long, hide = true)]
+    pub exit_before_posting: bool,
     /// Run under the Windows service manager as this service (set by
     /// `airlox runner service install`).
     #[arg(long, hide = true)]
@@ -434,14 +438,20 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         Some(i) => (Keypair::from_seed(&seed_from_hex(&i.participant_seed)?), i.token),
         None => join(&http, &url, &invite, &args, &backend, python.as_deref()).await?,
     };
+    // A job this runner started before it last stopped and still owes an
+    // answer for: named in the setup heartbeats, so the relay keeps it
+    // running until the answer arrives (runners take one job at a time).
+    let done_file = dir.join(format!("jobs-done-{}.txt", args.name));
+    let owed = job::unanswered(&done_file).pop();
+    let owed = owed.as_deref();
     let mut relay = Relay::new(http.clone(), &url, &sid, &token);
-    let (kp, relay) = match relay.report("preparing", None).await {
+    let (kp, relay) = match relay.report("preparing", None, owed).await {
         Err(e) if status_of(&e) == Some(401) => {
             tracing::info!("saved identity is no longer valid; joining again");
             let (kp, token) = join(&http, &url, &invite, &args, &backend, python.as_deref()).await?;
             relay = Relay::new(http.clone(), &url, &sid, &token);
             save_identity(&id_path, &kp, &token, &base)?;
-            relay.report("preparing", None).await?;
+            relay.report("preparing", None, owed).await?;
             (kp, relay)
         }
         Err(e) => return Err(e),
@@ -463,11 +473,11 @@ pub async fn run(args: JoinArgs) -> Result<()> {
             "this session runs jobs without network access, but --sandbox process cannot block it; restart \
              with --accept-network-gap to run them anyway, or use --sandbox docker"
         );
-        let _ = relay.report("failed", Some(&failure_detail(&e))).await;
+        let _ = relay.report("failed", Some(&failure_detail(&e)), None).await;
         return Err(e);
     }
     if let Err(e) = backend.prepare(&spec).await {
-        let _ = relay.report("failed", Some(&failure_detail(&e))).await;
+        let _ = relay.report("failed", Some(&failure_detail(&e)), None).await;
         return Err(e.context("preparing the sandbox"));
     }
     // Unsandboxed (the local backend off Linux, or process mode): jobs are
@@ -480,7 +490,7 @@ pub async fn run(args: JoinArgs) -> Result<()> {
             if no_network { " (this session says network: false)" } else { "" }
         );
     }
-    relay.report("ready", None).await?;
+    relay.report("ready", None, owed).await?;
 
     let view = View::new(relay.clone(), signed, invite.session_key(), kp.public(), dir.clone())?;
     let view = Arc::new(Mutex::new(view));
@@ -500,11 +510,13 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         labels: args.labels.clone(),
         backend,
         jobs_dir,
-        done_file: dir.join(format!("jobs-done-{}.txt", args.name)),
+        done_file,
         memory_cap_mb: args.memory,
         network: limits.network && !args.no_network,
         progress_interval: args.progress_interval,
         progress_tail: args.progress_tail as usize,
+        outbox: dir.join(format!("outbox-{}", args.name)),
+        exit_before_posting: args.exit_before_posting,
     });
     job::report_interrupted(&ctx, &view).await;
     let outcome = serve(&ctx, &view, &relay, args.exit_after).await;

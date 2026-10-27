@@ -545,7 +545,7 @@ pub(crate) async fn receive_upload(
     let mut reservation = {
         let mut g = s.lock();
         if g.items.contains_key(&item_id) || g.pending.contains(&item_id) {
-            return Err(ApiError::conflict("an item with this id already exists"));
+            return Err(ApiError::conflict_code("duplicate", "an item with this id already exists"));
         }
         if g.items.len() + g.pending.len() >= cfg.max_items {
             return Err(ApiError::limit("session is at its item limit"));

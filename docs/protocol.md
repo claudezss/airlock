@@ -239,7 +239,8 @@ sig      = Ed25519(author, "item", canonical(header) || SHA-256(blob))
   that item's blob agree. Anyone holding `K` (observers included) can seal a
   different item under an existing id, so references never name an item by id
   alone, and receivers fetch referenced items and check the hash.
-- Item ids are unique per session. The server rejects duplicates; a client
+- Item ids are unique per session. The server rejects duplicates with `409`
+  and error code `duplicate`; a client
   that sees two items with the same id treats the later one as a conflict and
   ignores it.
 - Because the header is the AAD, re-labelling a header (even re-signed by a
@@ -331,7 +332,12 @@ verify the author's certificate chains to the sender (or owner) role, that a
 and keep a per-session record of job ids, written before a job runs, so a
 relayed duplicate never runs twice, also across restarts. A job a runner
 started but never answered (it stopped while the job ran) gets a `failed`
-result when the runner starts again; it does not run again.
+result when the runner starts again; it does not run again. A runner keeps a
+finished job's answer (its sealed out files and result) on disk until the
+relay has it, so a result is not lost if the runner stops before posting it;
+after a restart it posts the saved items instead of a `failed` result. They
+are the same sealed items, so a resend the relay already has is a
+`409 duplicate`, which counts as delivered.
 Runners install the manifest's `packages` from wheels only (`--only-binary
 :all:`) when they join, before approval: a source distribution's build script
 would otherwise run outside the sandbox.
@@ -431,7 +437,7 @@ sends nothing for 30 seconds is answered with `408`.
 | `GET /v1/sessions/{id}/participants` | bearer | none | `200 {"participants": [participant…]}`, excluding those who left |
 | `GET /v1/sessions/{id}/events?after=N` | bearer | none | `200 {"events": [event…]}` with `seq > N`; omit `after` for all |
 | `GET /v1/sessions/{id}/stream` | bearer | none | SSE, see below |
-| `POST /v1/sessions/{id}/items` | bearer | upload frame | `201 {"id", "seq"}` |
+| `POST /v1/sessions/{id}/items` | bearer | upload frame | `201 {"id", "seq"}`; `409 duplicate` if the item id exists |
 | `GET /v1/sessions/{id}/items/{item}/blob` | bearer | none | `200` ciphertext, or `410 evicted` |
 | `POST /v1/sessions/{id}/items/{item}/ack` | bearer, recipient | none | `204` |
 | `POST /v1/sessions/{id}/items/{item}/want` | bearer, never received it | none | `202 {"open": true}`; `409 present` if the blob is on the relay |
@@ -576,7 +582,7 @@ purged with the session. The relay builds two exports at a time; more are
 | 403 | `forbidden`, `revoked` | role, author or content policy not allowed; a join with a revoked role's invite |
 | 404 | `not_found` | no such session or item |
 | 408 | `timeout` | request body stalled or upload too slow |
-| 409 | `conflict`, `present`, `not_wanted`, `uploading` | duplicate session, item id, or participant key; a want or re-seed for a blob the relay has; a re-seed nobody asked for; enough re-seeds of that blob already in flight |
+| 409 | `conflict`, `duplicate`, `present`, `not_wanted`, `uploading` | duplicate session or participant key; a duplicate item id (`duplicate`); a want or re-seed for a blob the relay has; a re-seed nobody asked for; enough re-seeds of that blob already in flight |
 | 410 | `closed`, `evicted` | session closed (or closed and not re-creatable), or blob already delivered |
 | 413 | `too_large` | body, envelope, item, session storage or session history limit (re-seeds included) |
 | 429 | `limit` | relay, address, participant, stream, item, transfer, want or re-seed limit; two audit exports already being built |
@@ -683,6 +689,9 @@ grace: the job keeps running on the runner, which reconnects with backoff and
 posts the result when the relay answers. A runner that reports, in a
 heartbeat, a job the relay already failed as `runner_lost` gets it back as
 `running`, and such a job's result from its runner still makes it `done`.
+A runner that restarts names the job it still owes an answer for in its
+setup heartbeats (`preparing`, `ready`), so that job stays `running` until
+the answer arrives.
 While a job runs, its runner may post signed `progress` items (§7) whose
 `refs` include it.
 

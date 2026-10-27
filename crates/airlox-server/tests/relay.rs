@@ -102,7 +102,8 @@ async fn auth_and_policy_are_enforced() {
     assert_eq!(post(&env, &s, &sender, body).await.status(), StatusCode::BAD_REQUEST);
     // Duplicate id.
     assert_eq!(post(&env, &s, &sender, frame(&item)).await.status(), StatusCode::CREATED);
-    assert_eq!(post(&env, &s, &sender, frame(&item)).await.status(), StatusCode::CONFLICT);
+    let r = post(&env, &s, &sender, frame(&item)).await;
+    assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "duplicate".into()));
     // Runners cannot join relay sessions.
     let kp = Keypair::generate();
     let cert = issue_cert(&s.secrets.role_keypair(Role::Runner), &s.id, Role::Runner, kp.public(), now_ms())
