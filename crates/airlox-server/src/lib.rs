@@ -13,6 +13,8 @@ pub mod store;
 mod util;
 mod web;
 
+pub use web::warm as warm_web_assets;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;

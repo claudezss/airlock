@@ -40,8 +40,12 @@ async fn assets_are_gzipped_with_etags_and_revalidate() {
         .unwrap();
     assert_eq!(out, plain_body);
 
-    let refused = env.http.get(&url).header(ACCEPT_ENCODING, "gzip;q=0").send().await.unwrap();
-    assert!(refused.headers().get(CONTENT_ENCODING).is_none());
+    for refuse in ["gzip;q=0", "gzip; Q=0", "gzip;q=0, *", "identity", "br"] {
+        let r = env.http.get(&url).header(ACCEPT_ENCODING, refuse).send().await.unwrap();
+        assert!(r.headers().get(CONTENT_ENCODING).is_none(), "{refuse}");
+    }
+    let star = env.http.get(&url).header(ACCEPT_ENCODING, "br;q=0.5, *").send().await.unwrap();
+    assert_eq!(star.headers()[CONTENT_ENCODING], "gzip");
 
     let again = env.http.get(&url).header(IF_NONE_MATCH, &plain_tag).send().await.unwrap();
     assert_eq!(again.status(), StatusCode::NOT_MODIFIED);

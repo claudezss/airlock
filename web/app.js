@@ -198,11 +198,13 @@ async function copyText(btn, text, label) {
 const touchOnly = () => matchMedia("(hover: none) and (pointer: coarse)").matches;
 const pressCopy = () => (touchOnly() ? "Long-press to copy" : navigator.platform.startsWith("Mac") ? "Press ⌘C" : "Press Ctrl+C");
 
-function inviteRow(name, url, hint, label = "Copy") {
+// `onSaved` runs once the link has really left this page: copied, or its
+// transfer code picked up.
+function inviteRow(name, url, hint, label = "Copy", onSaved = () => {}) {
   const shown = el("code", {}, maskInvite(url));
   const box = el("div", { class: "invite" }, shown);
   const btn = el("button", { class: "small", type: "button", onclick: async () => {
-    if (await copyText(btn, url, label)) return;
+    if (await copyText(btn, url, label)) return onSaved();
     // Clipboard denied: reveal the link in a selected field for manual copy.
     const input = el("input", { type: "text", readonly: true, value: url, "aria-label": `${name} invite link` });
     shown.replaceWith(input);
@@ -212,7 +214,7 @@ function inviteRow(name, url, hint, label = "Copy") {
   box.append(btn);
   return el("div", { class: "invite-row", "data-role": name.toLowerCase() },
     el("div", { class: "head" }, el("strong", {}, name), hint ? el("span", { class: "muted" }, hint) : null), box,
-    sendCode(name, url));
+    sendCode(name, url, onSaved));
 }
 
 // ---------- one-time transfer codes ----------
@@ -228,7 +230,7 @@ addEventListener("pagehide", () => {
 const relayFlag = () => (location.origin === PUBLIC_RELAY ? "" : ` --relay ${location.origin}`);
 const mmss = (ms) => { const s = Math.max(0, Math.ceil(ms / 1000)); return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`; };
 
-function sendCode(name, url) {
+function sendCode(name, url, onSaved = () => {}) {
   const wrap = el("div", { class: "send-code" });
   const start = el("button", { class: "small", type: "button", onclick: () => open() }, "Send to another machine");
   const idle = ({ focus = false } = {}) => {
@@ -302,6 +304,7 @@ function sendCode(name, url) {
         const st = await (await api("GET", `/v1/drops/${n}`, { token })).json();
         if (drop !== mine) return;
         if (st.state === "picked_up") {
+          onSaved();
           ended("good", `Picked up ${hhmm(st.picked_up_at_ms)} · the code is gone.${name === "Owner" ? "" : ` If that wasn't you, revoke ${name}.`}`, { again: false });
         } else if (st.state === "burned") {
           ended("bad", "Someone typed wrong words too many times, so the code was cancelled. Make a new one.");
@@ -582,20 +585,26 @@ function newSession() {
       const base = location.origin;
       const owner = ac.ownerInvite(base, s.ownerSeed);
       const heading = el("h2", { tabindex: -1 }, "Hand out invites");
-      const ownerRow = inviteRow("Owner", owner, "you · keep it private");
+      const ownerRow = inviteRow("Owner", owner, "you · keep it private", "Copy", () => markSaved());
       // Without the owner link nobody can approve runners, revoke or close:
       // opening the session waits until it has been saved one way or another.
       // A button, not a link: the owner key must not show in the status bar on hover.
       const openBtn = el("button", { class: "primary cta", type: "button", disabled: true, "aria-describedby": "owner-gate",
         onclick: () => openOwnerSession(owner) }, "Open session");
-      const gate = el("p", { class: "muted hint-text", id: "owner-gate" }, "Save the owner link first: copy it, download it or send it to another machine.");
+      const gate = el("p", { class: "muted hint-text", id: "owner-gate" }, "Save the owner link first: copy it, download it, or send it to another machine and enter the code there.");
       const saved = el("input", { type: "checkbox", id: "owner-saved" });
       const markSaved = () => {
         openBtn.disabled = false;
+        openBtn.removeAttribute("aria-describedby");
         gate.hidden = true;
         saved.checked = true;
       };
-      saved.addEventListener("change", () => (saved.checked ? markSaved() : ((openBtn.disabled = true), (gate.hidden = false))));
+      saved.addEventListener("change", () => {
+        if (saved.checked) return markSaved();
+        openBtn.disabled = true;
+        openBtn.setAttribute("aria-describedby", "owner-gate");
+        gate.hidden = false;
+      });
       const download = el("button", { class: "small", type: "button", onclick: () => {
         const name = `airlox-owner-${session_id.slice(0, 7)}.txt`;
         const body = `Airlox owner link for session ${session_id}\n\n${owner}\n\n` +
@@ -610,10 +619,6 @@ function newSession() {
         markSaved();
       } }, "Download as .txt");
       ownerRow.querySelector(".send-code").before(el("div", { class: "row" }, download));
-      // Copy and Send to another machine both count as saving it.
-      ownerRow.addEventListener("click", (ev) => {
-        if (ev.target.closest("button")) markSaved();
-      });
       aside.replaceChildren(
         el("div", { class: "eyebrow" }, `Created · ${session_id.slice(0, 7)}`),
         heading,
@@ -820,6 +825,7 @@ function buildSessionLayout(s) {
     } finally {
       delete sendBtn.dataset.busy;
       sendBtn.disabled = !!s.closed || !!jobUi?.blocked();
+      jobUi?.refresh(); // also links the reason to a blocked Send job
     }
   };
   text.addEventListener("keydown", (ev) => {
@@ -1991,9 +1997,14 @@ function buildJobPanel(s, text, file) {
 
   // The relay's rule: approved (signed by the owner here), online, idle, and
   // matching the target. Anything else fails at once: there is no queue.
-  const usable = (r) => !r.rejected && r.approved && r.setup !== "failed" && r.online;
-  const runnerState = (r) => r.setup === "failed" ? "setup failed" : !r.approved ? "needs approval"
+  // A runner the relay approved counts even before the owner's signed
+  // approval reaches this browser (relayOnly): the relay would route the job
+  // there; only its results wait for the approval.
+  const cleared = (r) => r.approved || r.relayOnly;
+  const usable = (r) => !r.rejected && cleared(r) && r.setup !== "failed" && r.online;
+  const runnerState = (r) => r.setup === "failed" ? "setup failed" : !cleared(r) ? "needs approval"
     : !r.online ? (r.setup === "preparing" ? "preparing" : "offline") : r.job ? "busy" : "idle";
+  const approvalNote = (r) => r.relayOnly ? (s.inv.role === "owner" ? "needs your confirmation" : "approval not received here") : null;
   const wantedLabels = () => labels.value.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
   const matches = (r) => target === "any" ? true : target === "labels" ? wantedLabels().every((l) => r.labels?.includes(l)) : `runner:${r.pub}` === target;
 
@@ -2005,7 +2016,7 @@ function buildJobPanel(s, text, file) {
     const live = s.runners.filter((r) => !r.rejected);
     const fit = live.filter(matches);
     if (fit.some((r) => usable(r) && !r.job)) return null;
-    const pending = fit.find((r) => !r.approved && r.setup !== "failed");
+    const pending = fit.find((r) => !cleared(r) && r.setup !== "failed");
     const one = target.startsWith("runner:") ? fit[0] : null;
     let why;
     if (one) why = `${one.name} ${{ "needs approval": "needs approval", "setup failed": "failed to set up", preparing: "is still preparing its sandbox" }[runnerState(one)] || `is ${runnerState(one)}`}`;
@@ -2013,13 +2024,17 @@ function buildJobPanel(s, text, file) {
     else if (target === "labels" && !fit.length) why = `No runner has the labels ${wantedLabels().join(", ")}`;
     else if (!live.length) why = "No runner has joined yet";
     else why = target === "labels" ? "No approved runner with those labels is online" : "No approved runner is online";
-    return { text: `${why}, so a job sent now would fail right away.`, pending: s.inv.role === "owner" ? pending : null, none: !live.length };
+    return { text: `${why}, so a job sent now would fail right away.`, pending: s.inv.role === "owner" ? pending : null, none: !live.length,
+      busy: fit.some(usable) };
   }
 
+  let wasBlocked = null; // announce only changes, not the state job mode opens in
   function syncReady() {
-    if (!on) return;
+    if (!on) return (wasBlocked = null);
     const b = locked ? null : blocker();
     ready.hidden = !b;
+    if (wasBlocked !== null && wasBlocked !== !!b && s.announce) announce(b ? `Send job unavailable: ${b.text}` : "A runner is ready: you can send the job");
+    wasBlocked = !!b;
     // Not while a send is in flight: that would allow a second one.
     if (sendBtn && !sendBtn.dataset.busy) {
       sendBtn.disabled = !!s.closed || !!b;
@@ -2028,7 +2043,7 @@ function buildJobPanel(s, text, file) {
     }
     if (!b) return;
     readyText.textContent = b.text;
-    const sig = `${b.pending?.pub || ""}|${b.none}`;
+    const sig = `${b.pending?.pub || ""}|${b.none}|${b.busy}|${s.revokedRoles.has("runner")}`;
     if (readyAct.dataset.sig === sig) return;
     readyAct.dataset.sig = sig;
     const owner = s.inv.role === "owner";
@@ -2044,14 +2059,14 @@ function buildJobPanel(s, text, file) {
         if (!(await copyText(btn, cmd, "Copy runner command"))) btn.textContent = "Copy it from Invites";
       } }, "Copy runner command");
       readyAct.replaceChildren(btn);
-    } else readyAct.replaceChildren(...(owner ? [] : [el("span", { class: "muted" }, "Ask the session owner to start and approve a runner.")]));
+    } else readyAct.replaceChildren(...(owner || b.busy ? [] : [el("span", { class: "muted" }, "Ask the session owner to start and approve a runner.")]));
   }
 
   function drawChips() {
     const live = s.runners.filter((r) => !r.rejected);
     if (target.startsWith("runner:") && !live.some((r) => `runner:${r.pub}` === target)) target = "any";
     labelField.hidden = target !== "labels";
-    const sig = JSON.stringify([target, locked, live.map((r) => [r.pub, r.name, r.labels, runnerState(r)])]);
+    const sig = JSON.stringify([target, locked, live.map((r) => [r.pub, r.name, r.labels, runnerState(r), approvalNote(r)])]);
     if (sig === chipsSig) return;
     chipsSig = sig;
     const a = document.activeElement;
@@ -2067,7 +2082,8 @@ function buildJobPanel(s, text, file) {
       ...live.map((r) => {
         const st = runnerState(r);
         return chip(`runner:${r.pub}`, el("span", { class: `dot ${st === "idle" ? "on" : st === "needs approval" ? "wait" : st === "busy" ? "busy" : ""}`, "aria-hidden": "true" }),
-          r.name, r.labels?.length ? el("span", { class: "muted" }, ` · ${r.labels.join(", ")}`) : null, el("span", { class: "state" }, st));
+          r.name, r.labels?.length ? el("span", { class: "muted" }, ` · ${r.labels.join(", ")}`) : null,
+          el("span", { class: "state" }, approvalNote(r) ? `${st} · ${approvalNote(r)}` : st));
       }),
       chip("labels", "By label…"));
     if (keep) chips.querySelector(`[data-target="${CSS.escape(keep)}"]`)?.focus({ preventScroll: true });

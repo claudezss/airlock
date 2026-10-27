@@ -10,6 +10,7 @@ async fn main() -> std::io::Result<()> {
         .init();
     let cfg = airlox_server::Config::parse();
     let running = airlox_server::start(cfg).await?;
+    tokio::spawn(airlox_server::warm_web_assets());
     let shutdown = running_shutdown_handle(&running);
     tokio::spawn(async move {
         stop_signal().await;

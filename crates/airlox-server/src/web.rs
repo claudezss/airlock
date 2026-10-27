@@ -6,14 +6,16 @@
 //! instead of a download. The API is never compressed here: event streams
 //! must reach clients unbuffered.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::extract::Path;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use tokio::sync::OnceCell;
 
 #[derive(rust_embed::RustEmbed)]
 #[folder = "../../web/"]
@@ -33,40 +35,69 @@ fn compressible(mime: &str) -> bool {
         )
 }
 
-/// Whether the client accepts gzip (`gzip;q=0` and `identity`-only refuse it).
+/// Whether the client accepts gzip: an explicit `gzip` entry decides, else
+/// `*` does (RFC 9110 §12.5.3), so `gzip;q=0, *` refuses it.
 fn accepts_gzip(headers: &HeaderMap) -> bool {
-    headers
+    let entries = headers
         .get_all(header::ACCEPT_ENCODING)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(','))
-        .any(|part| {
+        .map(|part| {
             let mut it = part.split(';').map(str::trim);
-            let name = it.next().unwrap_or("");
-            let q0 =
-                it.any(|p| p.strip_prefix("q=").is_some_and(|q| q.parse::<f32>().is_ok_and(|q| q == 0.0)));
-            (name.eq_ignore_ascii_case("gzip") || name == "*") && !q0
+            let name = it.next().unwrap_or("").to_ascii_lowercase();
+            let q0 = it.any(|p| {
+                p.split_once('=').is_some_and(|(k, q)| {
+                    k.trim().eq_ignore_ascii_case("q") && q.trim().parse::<f32>().is_ok_and(|q| q == 0.0)
+                })
+            });
+            (name, !q0)
         })
+        .collect::<Vec<_>>();
+    let pick =
+        |want: &str| entries.iter().filter(|(n, _)| n == want).map(|(_, ok)| *ok).reduce(|a, b| a || b);
+    pick("gzip").or_else(|| pick("*")).unwrap_or(false)
 }
 
-/// A gzipped body and the hash of the file it was made from.
-type Gzipped = ([u8; 32], Bytes);
+/// One gzip per (path, content hash), made once even when requests race;
+/// the hash keys out stale entries when debug builds read changed files.
+type Gzipped = ([u8; 32], Arc<OnceCell<Bytes>>);
 
-/// Gzipped bodies by (path, content hash); the hash keys out stale entries
-/// when debug builds read changed files from disk.
-fn gzipped(path: &str, hash: [u8; 32], data: &[u8]) -> Bytes {
+async fn gzipped(path: &str, hash: [u8; 32], data: Cow<'static, [u8]>) -> Bytes {
     static CACHE: OnceLock<Mutex<HashMap<String, Gzipped>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(Default::default);
-    if let Some((h, body)) = cache.lock().unwrap().get(path) {
-        if *h == hash {
-            return body.clone();
+    let cell = {
+        let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
+        let entry = cache.entry(path.to_string()).or_insert_with(|| (hash, Arc::default()));
+        if entry.0 != hash {
+            *entry = (hash, Arc::default());
+        }
+        entry.1.clone()
+    };
+    cell.get_or_init(|| async move {
+        // Compressing the 1.6 MB wasm at the best level takes a while: keep it off the async workers.
+        tokio::task::spawn_blocking(move || {
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            enc.write_all(&data).expect("gzip to memory");
+            Bytes::from(enc.finish().expect("gzip to memory"))
+        })
+        .await
+        .expect("gzip task")
+    })
+    .await
+    .clone()
+}
+
+/// Gzip every compressible asset in the background at startup, so the first
+/// visitors after a deploy do not wait for it.
+pub async fn warm() {
+    for path in Assets::iter() {
+        if let Some(f) = Assets::get(&path) {
+            let mime = mime_guess::from_path(path.as_ref()).first_or_octet_stream();
+            if compressible(mime.as_ref()) && f.data.len() >= MIN_GZIP {
+                gzipped(&path, f.metadata.sha256_hash(), f.data).await;
+            }
         }
     }
-    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
-    enc.write_all(data).expect("gzip to memory");
-    let body = Bytes::from(enc.finish().expect("gzip to memory"));
-    cache.lock().unwrap().insert(path.to_string(), (hash, body.clone()));
-    body
 }
 
 fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
@@ -79,7 +110,7 @@ fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
         .any(|t| t == "*" || t == etag)
 }
 
-fn serve(path: &str, req: &HeaderMap) -> Response {
+async fn serve(path: &str, req: &HeaderMap) -> Response {
     let Some(f) = Assets::get(path) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
@@ -106,31 +137,31 @@ fn serve(path: &str, req: &HeaderMap) -> Response {
     h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     if gzip {
         h.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
-        (h, gzipped(path, hash, &f.data)).into_response()
+        (h, gzipped(path, hash, f.data).await).into_response()
     } else {
         (h, f.data).into_response()
     }
 }
 
 pub async fn index(req: HeaderMap) -> Response {
-    serve("index.html", &req)
+    serve("index.html", &req).await
 }
 
 pub async fn new_page(req: HeaderMap) -> Response {
-    serve("index.html", &req)
+    serve("index.html", &req).await
 }
 
 pub async fn receive_page(req: HeaderMap) -> Response {
-    serve("index.html", &req)
+    serve("index.html", &req).await
 }
 
 pub async fn session_page(Path(_id): Path<String>, req: HeaderMap) -> Response {
-    serve("index.html", &req)
+    serve("index.html", &req).await
 }
 
 pub async fn asset(Path(path): Path<String>, req: HeaderMap) -> Response {
     if path.split('/').any(|p| p == ".." || p.is_empty()) {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
-    serve(&path, &req)
+    serve(&path, &req).await
 }
