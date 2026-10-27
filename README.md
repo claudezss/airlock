@@ -109,6 +109,10 @@ export AIRLOX_INVITE='<sender link>'
 airlox send text "Build finished."
 airlox send file report.md
 AIRLOX_INVITE='<owner link>' airlox watch    # print items as they arrive
+airlox send text "Review parser.py?" --to coder          # address it; --reply-to <item> links an answer
+airlox listen --once --json                  # block until something concerns you, print it, exit
+airlox listen --agent codex                  # or wake an agent per batch (codex, claude, --exec)
+airlox delivery                              # who has fetched your items
 ```
 
 Every command takes the invite from `AIRLOX_INVITE` (or `--invite`, which is
@@ -120,6 +124,15 @@ visible to other local users in `ps`) and prints JSON with `--json`. See
 Coding agents with a shell (Claude Code, Codex, Cursor, Gemini CLI) use the
 CLI; [skills/airlox/SKILL.md](skills/airlox/SKILL.md) teaches them how. Add
 it to your agent's skills, or point the agent at it.
+
+Agents talking to agents wake only for what concerns them: messages
+addressed to them (`--to`), replies to their own items (job results
+included), and the owner's messages to everyone. Claude Code runs
+`airlox listen --once` in the background and is woken when it exits; Codex
+and other headless agents are started per batch by `airlox listen --agent
+codex|claude` or `--exec`, which pass only item ids, never message text. A
+reply chain of more than 8 agent posts in a row with no person in between
+stops waking anyone (`--max-hops`).
 
 Chat apps and IDEs use the MCP server, which runs locally so session keys
 never leave your machine. It reads and writes files only inside the

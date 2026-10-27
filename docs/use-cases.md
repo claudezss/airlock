@@ -68,7 +68,7 @@ async with mcp_server("--relay", relay, "--allow-dir", str(repo), "--as", "ide-a
     invites = s["invites"]            # sender, observer; the owner link is never shown to the model
     await tools.call("send_file", path="billing/discounts.py")
     await tools.call("send_text", text="Please review billing/discounts.py before I merge it.")
-    listed = await tools.call("list_items", wait_s=30)          # then after=listed["next_after"]
+    listed = await tools.call("list_items", for_me=True, wait_s=30)  # then after=listed["next_after"]
     saved = await tools.call("save_file", item=report_id, dir="reviews")
 ```
 
