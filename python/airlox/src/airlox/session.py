@@ -785,11 +785,14 @@ class Session:
         broadcasts concern no one."""
         if item.mine or item.status != "ok" or item.kind == "progress":
             return None
-        if item.to is not None:
-            return "addressed" if self.participant_pub in item.to else None
+        if item.to is not None and self.participant_pub in item.to:
+            return "addressed"
+        # A reply reaches the author of what it answers, whoever else it names.
         parent = self._items.get(item.reply_to) if item.reply_to else None
         if parent is not None and parent.mine:
             return "reply"
+        if item.to is not None:
+            return None
         if item.author_role == "owner" and item.kind in ("text", "file"):
             return "owner"
         return None

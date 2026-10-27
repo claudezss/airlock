@@ -414,6 +414,11 @@ def test_addressed_messages_replies_and_waking(relay, caches):
     planner.send_text("thanks", reply_to=done["id"])
     assert coder.wait_for_messages(timeout=2, settle=0, max_hops=2) == []
 
+    # A reply wakes the author of what it answers even when it names others.
+    q = coder.send_text("which branch?")
+    owner.send_text("main; @planner please merge", to=["planner"], reply_to=q["id"])
+    assert [coder.wake_reason(i) for i in coder.wait_for_messages(timeout=10, settle=0.2)] == ["reply"]
+
     # Delivery: the author sees who fetched its items; fetched, not read.
     assert wait_for(lambda: coder.participant_pub in planner.delivery()[ask["id"]]["delivered"])
     assert planner.synced_at_ms and planner.latest_seq

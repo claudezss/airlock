@@ -155,6 +155,8 @@ const I_DOWN = ["M12 5v14", "M6 13l6 6 6-6"];
 const I_UP = ["M6 15l6-6 6 6"];
 const I_CHEV = ["M6 9l6 6 6-6"];
 const I_SEND = ["M12 19V5", "M6 11l6-6 6 6"];
+const I_REPLY = ["M9 14L4 9l5-5", "M4 9h10a6 6 0 0 1 6 6v5"];
+const I_AT = ["M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0z", "M16 12v1.5a2.5 2.5 0 0 0 5 0V12a9 9 0 1 0-3.5 7.1"];
 const I_PANEL = ["M5 4h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z", "M15 4v16"];
 
 const MD_INLINE = new RegExp([
@@ -1022,8 +1024,33 @@ async function sessionView() {
     if (e.status === 401) return s.render.removed(REMOVED_UNSURE);
   }
   s.announce = true;
+  s.lastEventAt ||= Date.now(); // the catch-up read just now
+  s.render.fresh();
   streamLoop(s);
   reaskLoop(s);
+  deliveryLoop(s);
+}
+
+// Ask the relay who has fetched this participant's recent items while some
+// are still on their way, so their "fetched by" marks stay current. Only the
+// author can ask, and only about its own items.
+const DELIVERY_POLL_MS = 5000;
+const DELIVERY_WINDOW_MS = 30 * 60 * 1000;
+function deliveryLoop(s) {
+  if (!["owner", "sender"].includes(s.inv.role)) return;
+  const due = () => [...s.items.values()].some((it) => it.author === s.me && ["text", "file", "job"].includes(it.kind)
+    && Date.now() - it.created < DELIVERY_WINDOW_MS && (!s.delivery?.[it.id] || s.delivery[it.id].waiting?.length > 0));
+  const tick = async () => {
+    if (s.closed || document.visibilityState !== "visible" || !due()) return;
+    try {
+      s.delivery = (await (await api("GET", `/v1/sessions/${s.sid}/delivery`, { token: s.identity.token })).json()).items;
+      s.render.delivery();
+    } catch {
+      // An older relay has no delivery report: items just say "sent".
+    }
+  };
+  tick();
+  const timer = setInterval(() => (s.closed ? clearInterval(timer) : tick()), DELIVERY_POLL_MS);
 }
 
 function buildSessionLayout(s) {
@@ -1076,6 +1103,74 @@ function buildSessionLayout(s) {
   };
   file.addEventListener("change", showPending);
   text.addEventListener("input", update);
+
+  // Who the next message is for, and what it answers. `to` wakes those
+  // participants' agents; a reply links to its item and wakes its author.
+  const compose = { replyTo: null, to: new Set() };
+  const ctx = el("div", { class: "compose-ctx", hidden: true });
+  const toMenu = el("div", { class: "to-menu", role: "group", "aria-label": "Address the message to", hidden: true });
+  const toBtn = el("button", { class: "icon", type: "button", title: "Address it to someone (or type @name)",
+    "aria-label": "Choose who the message is for", "aria-expanded": "false" }, svg(I_AT, 18));
+  const others = () => [...s.participants.values()].filter((p) => !p.left && !p.revoked && p.participant_pub !== s.me);
+  const showCtx = () => {
+    const chips = [];
+    const r = compose.replyTo;
+    if (r) chips.push(el("span", { class: "ctx-chip reply" }, svg(I_REPLY, 12), "Replying to ", el("strong", {}, r.authorName),
+      el("span", { class: "snip" }, snippet(r)),
+      el("button", { type: "button", "aria-label": "Stop replying", onclick: () => {
+        compose.replyTo = null;
+        showCtx();
+        text.focus({ preventScroll: true });
+      } }, "✕")));
+    for (const k of compose.to) chips.push(el("span", { class: "ctx-chip" }, "→ ", nameOf(s, k),
+      el("button", { type: "button", "aria-label": `Do not address ${nameOf(s, k)}`, onclick: () => {
+        compose.to.delete(k);
+        showCtx();
+      } }, "✕")));
+    ctx.replaceChildren(...chips);
+    ctx.hidden = !chips.length;
+  };
+  const closeMenu = () => {
+    toMenu.hidden = true;
+    toBtn.setAttribute("aria-expanded", "false");
+  };
+  toBtn.addEventListener("click", () => {
+    if (!toMenu.hidden) return closeMenu();
+    const ps = others();
+    toMenu.replaceChildren(ps.length ? el("p", { class: "to-head" }, "Address to (wakes their agent)") : el("p", { class: "to-head" }, "No one else has joined yet"),
+      ...ps.map((p) => el("button", { type: "button", class: "to-opt", "aria-pressed": String(compose.to.has(p.participant_pub)), onclick: (ev) => {
+        const k = p.participant_pub;
+        if (compose.to.has(k)) compose.to.delete(k);
+        else compose.to.add(k);
+        ev.currentTarget.setAttribute("aria-pressed", String(compose.to.has(k)));
+        showCtx();
+      } }, el("span", { class: `av ${["owner", "sender", "runner"].includes(p.role) ? p.role : ""}`, "aria-hidden": "true" }, initials(p.display_name)),
+        el("span", { class: "who" }, p.display_name, el("span", { class: "muted" }, ` ${p.role}`)))));
+    toMenu.hidden = false;
+    toBtn.setAttribute("aria-expanded", "true");
+    toMenu.querySelector("button")?.focus();
+  });
+  document.addEventListener("pointerdown", (ev) => !toMenu.hidden && !toMenu.contains(ev.target) && !toBtn.contains(ev.target) && closeMenu());
+  toMenu.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Escape") return;
+    closeMenu();
+    toBtn.focus();
+  });
+  // "@name" in the text addresses that participant too.
+  const escapeRe = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const mentioned = (value) => others()
+    .filter((p) => new RegExp(`(^|[\\s(])@${escapeRe(p.display_name)}(?![\\w-])`, "u").test(value))
+    .map((p) => p.participant_pub);
+  const clearCompose = () => {
+    compose.replyTo = null;
+    compose.to.clear();
+    showCtx();
+  };
+  s.compose = canSend ? { reply: (it) => {
+    compose.replyTo = it;
+    showCtx();
+    text.focus({ preventScroll: true });
+  } } : null;
   if (jobUi) jobUi.setSend(sendBtn, update);
   const submit = async () => {
     if (sendBtn.disabled) return;
@@ -1095,19 +1190,25 @@ function buildSessionLayout(s) {
         return;
       }
       let sent = false;
+      const refs = compose.replyTo?.ref ? [compose.replyTo.ref] : [];
       if (file.files?.[0]) {
-        await sendFile(s, file.files[0]);
+        await sendFile(s, file.files[0], refs);
         file.value = "";
         showPending();
         sent = true;
       }
       const value = text.value.trim();
       if (value) {
-        await sendPayload(s, "text", null, { type: "text", text: value }, new Uint8Array());
+        const to = [...new Set([...compose.to, ...mentioned(value)])];
+        const meta = to.length ? { type: "text", text: value, to } : { type: "text", text: value };
+        await sendPayload(s, "text", null, meta, new Uint8Array(), { refs });
         text.value = "";
         sent = true;
       }
-      if (sent) announce("Sent");
+      if (sent) {
+        clearCompose();
+        announce("Sent");
+      }
     } catch (e) {
       if (e.clearFile) {
         file.value = "";
@@ -1126,6 +1227,10 @@ function buildSessionLayout(s) {
   // so Enter stays a line break and only Ctrl/Cmd+Enter sends; the same on
   // touch screens, where there is no Shift and the Send button is right there.
   text.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && (compose.replyTo || compose.to.size)) {
+      ev.preventDefault();
+      return clearCompose();
+    }
     if (ev.key !== "Enter" || ev.isComposing || ev.keyCode === 229) return;
     const mod = ev.metaKey || ev.ctrlKey;
     if (mod || (!ev.shiftKey && !jobUi?.active() && !touchOnly())) {
@@ -1138,8 +1243,8 @@ function buildSessionLayout(s) {
   const kbd = (...keys) => keys.flatMap((k, i) => [i ? "+" : null, el("kbd", {}, k)]).filter(Boolean);
   const setHint = () => {
     hint.replaceChildren(...(jobUi?.active() ? ["Python job · ", ...kbd(mac ? "⌘" : "Ctrl", "Enter"), " send · ", ...kbd("Enter"), " new line"]
-      : touchOnly() ? ["Markdown supported · encrypted in this browser"]
-      : ["Markdown supported · ", ...kbd("Enter"), " send · ", ...kbd("Shift", "Enter"), " new line · encrypted in this browser"]));
+      : touchOnly() ? ["Markdown · @name addresses it · encrypted in this browser"]
+      : ["Markdown · @name addresses it · ", ...kbd("Enter"), " send · ", ...kbd("Shift", "Enter"), " new line · encrypted in this browser"]));
   };
   jobUi?.toggle.addEventListener("click", setHint);
   setHint();
@@ -1151,8 +1256,10 @@ function buildSessionLayout(s) {
         el("div", { class: "composer" },
           jobUi?.panel,
           el("div", { class: "attach-slot" }, pending),
+          ctx,
           el("label", { for: "msg", class: "sr-only" }, "Message the session"), text,
-          el("div", { class: "cbar" }, attach, file, jobUi?.toggle, el("span", { class: "spacer" }), sendBtn)),
+          el("div", { class: "cbar" }, attach, file, toBtn, jobUi?.toggle, el("span", { class: "spacer" }), sendBtn),
+          toMenu),
         status, hint)
     : el("div", { class: "panel readonly", tabindex: -1 }, `You joined as ${inv.role}. You can read this session but not post to it.`);
   // The dock keeps its place under the timeline; the note that replaces the
@@ -1234,14 +1341,18 @@ function buildSessionLayout(s) {
   const invites = inv.role === "owner" ? el("details", {},
     el("summary", {}, "Invites"),
     el("div", { class: "stack" }, el("p", { class: "muted hint-text" }, MASKED_NOTE), Object.values(inviteRows))) : null;
+  const fresh = el("p", { class: "muted fresh", role: "status" });
   const runnerList = el("ul", { class: "runners" });
   const runnerNote = el("p", { class: "muted" });
   const rail = el("aside", { class: "rail", id: "rail", "aria-label": "Session details", tabindex: -1 },
     el("section", {}, el("h2", {}, "Participants"), people),
     execute ? el("section", { class: "stack", id: "runner-console", tabindex: -1, "aria-label": "Runner console" }, el("h2", {}, "Runners"), runnerList, runnerNote) : null,
     el("section", {}, el("h2", {}, "Allowed types"), el("div", { class: "chips" }, manifest.allowed_types.map((t) => el("span", { class: "chip" }, t)))),
+    execute && manifest.job_limits?.packages?.length ? el("section", {}, el("h2", {}, "Packages"),
+      el("div", { class: "chips" }, manifest.job_limits.packages.map((t) => el("span", { class: "chip", title: "Runners refuse to join without these versions" }, t)))) : null,
     el("section", { class: "stack" }, el("h2", {}, "Session"),
       el("p", { class: "mono muted" }, sid),
+      fresh,
       el("p", { class: "muted" }, manifest.expires_at_ms === null ? "Never expires: it lasts until the owner closes it"
         : `Expires ${new Date(manifest.expires_at_ms).toLocaleString()}`),
       el("p", { class: "muted" }, `Files up to ${fmtBytes(manifest.max_item_bytes)}`),
@@ -1373,7 +1484,18 @@ function buildSessionLayout(s) {
     followUntil = 0;
   };
   // Something the reader did (an expanded message) must not drag the view to the end.
-  s.ui = { scroller, release };
+  // A reply quote takes the reader to what it answers, and marks it a moment.
+  const reveal = (id) => {
+    const n = document.getElementById(`item-${id}`);
+    if (!n) return;
+    release();
+    toNode(n);
+    n.classList.remove("flash");
+    void n.offsetWidth; // restart the animation
+    n.classList.add("flash");
+    n.focus({ preventScroll: true });
+  };
+  s.ui = { scroller, release, reveal };
   const updateJump = () => {
     if (unread && atBottom()) unread = 0;
     const far = distance() > 240;
@@ -1524,6 +1646,7 @@ function buildSessionLayout(s) {
         if (was) toBottom(false);
       } else if (s.announce) arrived(node, it.author === s.me, was);
       settle(s, it);
+      if (it.author === s.me && s.delivery !== undefined) s.render.delivery();
       if (it.kind === "job") announceJob(s, it);
       else if (!old && s.announce && it.status === "ok" && it.author !== s.me && (it.kind === "text" || it.kind === "file"))
         announce(`${it.authorName}: ${it.kind === "text" ? it.meta.text : it.meta.name}`);
@@ -1542,9 +1665,31 @@ function buildSessionLayout(s) {
       toBottom(false);
       updateJump();
     },
+    // "live" while the event stream is up, so an empty timeline can be told
+    // from a stale one; the rail says when the relay last sent something.
     conn: (bad) => {
-      conn.textContent = bad && !s.closed ? "Reconnecting…" : "";
+      s.connected = !bad && !s.closed;
+      conn.classList.toggle("live", s.connected && !!s.streaming);
+      conn.textContent = bad && !s.closed ? "Reconnecting…" : s.connected && s.streaming ? "live" : "";
       conn.hidden = !conn.textContent;
+      s.render.fresh();
+    },
+    fresh: () => {
+      const at = s.lastEventAt ? new Date(s.lastEventAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : null;
+      const where = s.lastSeq >= 0 ? `#${s.lastSeq}` : "nothing yet";
+      fresh.textContent = s.closed ? `Ended · last event ${where}`
+        : `${s.connected && s.streaming ? "Live" : "Connecting…"} · latest ${where}${at ? ` · received ${at}` : ""}`;
+      conn.title = `Connected to the relay · latest event ${where}${at ? ` at ${at}` : ""}`;
+    },
+    // Your own items' delivery, as the relay reports it (see deliveryLoop).
+    // Once everyone has an item, only the newest of yours keeps saying so.
+    delivery: () => {
+      const lines = [...timeline.querySelectorAll("[data-dlv]")];
+      lines.forEach((line, i) => {
+        const it = s.items.get(line.dataset.dlv);
+        if (it) fillDelivery(s, line, it);
+        line.classList.toggle("latest", i === lines.length - 1);
+      });
     },
     revoked: () => {
       for (const b of revokeBtns) {
@@ -1782,7 +1927,8 @@ async function receive(s, seq, envelope, fetchBlob, attempt = 0) {
   if (attempt === 0 && prev && prev.status !== "retry") return;
   const author = s.participants.get(h.author);
   const it = { seq, id: h.id, kind: h.kind, subkind: h.subkind, author: h.author, created: h.created_at_ms,
-    authorName: author?.display_name || "unknown", role: author?.role, status: "ok", envelope };
+    authorName: author?.display_name || "unknown", role: author?.role, status: "ok", envelope,
+    refs: Array.isArray(h.refs) ? h.refs : [] };
   s.items.set(h.id, it);
   if (!author) {
     Object.assign(it, { status: "rejected", error: "The author is not a verified member of this session." });
@@ -1820,7 +1966,7 @@ async function receive(s, seq, envelope, fetchBlob, attempt = 0) {
   try {
     const out = ac.openChecked(s.signed, author.cert, s.inv.sessionKey, envelope, blob);
     Object.assign(it, { role: out.role, meta: JSON.parse(out.meta), body: out.body });
-    if (it.kind === "file" || it.kind === "job") it.ref = JSON.parse(ac.itemRef(envelope, blob));
+    it.ref = JSON.parse(ac.itemRef(envelope, blob)); // what a reply, a job or a result points at
   } catch (e) {
     Object.assign(it, { status: "rejected", error: explain(e), detail: String(e.message || e) });
     return s.render.item(it);
@@ -1928,7 +2074,107 @@ function collapseLong(s, node) {
   }
 }
 
+// ---------- conversation: replies, addressing, delivery ----------
+// A message or file answers the item its first reference names; a result its job.
+const replyId = (it) => (["text", "file", "result"].includes(it.kind) ? it.refs?.[0]?.id : undefined);
+// The participants a message is addressed to, or null for everyone.
+const recipients = (it) => (it.kind === "text" && Array.isArray(it.meta?.to) ? it.meta.to : null);
+const nameOf = (s, pub) => (pub === s.me ? "you" : s.participants.get(pub)?.display_name || "someone who left");
+
+// Why an item concerns this participant (the same rules as `airlox listen`):
+// addressed to you, a reply to one of your items, or the owner's message to
+// everyone. Other participants' broadcasts are for reading, not for answering.
+function forMe(s, it) {
+  if (it.author === s.me || it.status !== "ok" || it.kind === "progress" || it.kind === "event") return null;
+  const to = recipients(it);
+  if (to?.includes(s.me)) return "addressed";
+  if (s.items.get(replyId(it))?.author === s.me) return "reply"; // whoever else it names
+  if (to) return null;
+  return it.role === "owner" && (it.kind === "text" || it.kind === "file") ? "owner" : null;
+}
+
+// One line saying what an item is, for reply quotes and the reply chip.
+function snippet(it) {
+  if (it.status !== "ok") return `a ${it.kind}`;
+  const m = it.meta || {};
+  const t = m.type === "text" ? String(m.text ?? "") : m.type === "file" ? `file ${m.name}` : m.type === "job" ? `job ${m.filename}` : it.kind;
+  const line = t.replace(/[*`#>~]+/g, "").replace(/\s+/g, " ").trim(); // plain words, not markup
+  return line.length > 120 ? `${line.slice(0, 119)}…` : line;
+}
+
+// Above a reply: whom and what it answers. Clicking goes there.
+function replyQuote(s, it) {
+  const id = replyId(it);
+  if (!id || it.kind === "result") return null;
+  const p = s.items.get(id);
+  return el("button", { class: "quote", type: "button", title: "Go to the message this answers", onclick: () => s.ui?.reveal(id) },
+    svg(I_REPLY, 12), p ? [el("strong", {}, p.authorName), " ", el("span", {}, snippet(p))] : el("span", {}, "an earlier message"));
+}
+
+// In the header: who a message is for.
+function toLine(s, it) {
+  const to = recipients(it);
+  if (!to) return null;
+  const mine = to.includes(s.me);
+  return el("span", { class: `to${mine ? " me" : ""}`, title: "Addressed to" }, "→ ", to.map((k) => nameOf(s, k)).join(", "));
+}
+
+// Your own items say how far they got: sent, then fetched by the others.
+// Fetched means their client stored it, not that anyone read it.
+function deliveryText(s, it) {
+  const d = s.delivery?.[it.id];
+  if (!d) return { text: "sent", title: "Posted to the relay" };
+  const got = d.delivered || [];
+  const total = got.length + (d.waiting || []).length;
+  const names = got.map((k) => nameOf(s, k)).join(", ");
+  if (!total) return { text: "sent", title: "No one else has joined yet" };
+  if (got.length === total) return { text: total === 1 ? `fetched by ${names}` : "fetched by all", all: true, title: `Fetched by ${names} (stored, not necessarily read)` };
+  return { text: `fetched by ${got.length}/${total}`, title: got.length ? `Fetched by ${names}; waiting for ${(d.waiting || []).map((k) => nameOf(s, k)).join(", ")}` : "No one has fetched it yet" };
+}
+
 function renderItem(s, it) {
+  return decorate(s, it, itemNode(s, it));
+}
+
+function fillDelivery(s, span, it) {
+  const d = deliveryText(s, it);
+  span.replaceChildren(...[d.all ? svg(I_CHECK, 12) : null, d.text].filter(Boolean));
+  span.title = d.title;
+  span.classList.toggle("all", !!d.all);
+}
+
+// What a conversation adds to a message: the quote of what it answers, who
+// it is for, a Reply action, and for your own items how far they got.
+function decorate(s, it, node) {
+  if (!node?._slots || it.status !== "ok") return node;
+  const { head, content } = node._slots;
+  const mine = it.author === s.me;
+  const quote = replyQuote(s, it);
+  if (quote) content.before(quote);
+  const to = toLine(s, it);
+  if (to && mine) (quote || content).before(to);
+  else if (to) head.append(to);
+  if (forMe(s, it) === "addressed") node.classList.add("for-me");
+  let bar = node._slots.actions;
+  if (!bar) {
+    bar = el("div", { class: "actions" });
+    content.parentElement.append(bar);
+    node._slots.actions = bar;
+  }
+  // Under your own items, always in view: how far they got.
+  if (mine && ["text", "file", "job"].includes(it.kind)) {
+    const line = el("div", { class: "dlv", "data-dlv": it.id });
+    fillDelivery(s, line, it);
+    content.after(line);
+  }
+  if (s.compose && it.kind !== "progress") {
+    bar.append(el("button", { class: "act", type: "button", title: "Reply to this", onclick: () => s.compose.reply(it) },
+      svg(I_REPLY, 14), el("span", {}, "Reply")));
+  }
+  return node;
+}
+
+function itemNode(s, it) {
   const label = it.kind === "file" ? it.subkind : it.kind;
   const mine = it.author === s.me;
   const card = el("div", { class: "card" });
@@ -2211,9 +2457,18 @@ function renderResult(s, r, extra = "") {
       el("span", { class: "mono muted" }, parts.join(" · ")),
       extra ? el("span", { class: "chip" }, extra) : null),
     m.reason ? el("p", { class: "note" }, m.reason) : null,
+    m.env ? envLine(m.env) : null,
     logBlock("stdout", m.stdout, m.stdout_truncated), logBlock("stderr", m.stderr, m.stderr_truncated),
     files.length ? el("div", { class: "outfiles" }, el("div", { class: "logname" }, `Output files (${files.length})`),
       files.map((f) => renderOutFile(s, f))) : null);
+}
+
+// Where a job ran, as its runner reported and signed it.
+function envLine(env) {
+  const pkgs = Object.entries(env.packages || {}).map(([k, v]) => `${k} ${v}`);
+  const parts = [`Python ${env.python}`, ...pkgs, env.sandbox, env.interpreter, env.airlox && `airlox ${env.airlox}`].filter(Boolean);
+  return el("p", { class: "envline mono", title: "Reported and signed by the runner: the interpreter, package versions and sandbox this job ran with" },
+    el("span", { class: "muted" }, "ran on "), parts.join(" · "));
 }
 
 function renderOutFile(s, f) {
@@ -2777,12 +3032,12 @@ function buildJobPanel(s, text, file) {
 }
 
 // ---------- sending ----------
-async function sendPayload(s, kind, subkind, meta, body, { path = "items", headers = {} } = {}) {
+async function sendPayload(s, kind, subkind, meta, body, { path = "items", headers = {}, refs = [] } = {}) {
   const needed = kind === "text" ? "text" : kind === "event" || kind === "result" ? null : subkind;
   if (needed && !s.manifest.allowed_types.includes(needed)) throw new Error(`${needed} is not allowed in this session`);
   const payload = ac.encodePayload(JSON.stringify(meta), body);
   if (payload.length > s.manifest.max_item_bytes) throw new Error(`too large: the limit is ${fmtBytes(s.manifest.max_item_bytes)}`);
-  const item = { id: ac.newItemId(), session_id: s.sid, kind, subkind, created_at_ms: Date.now(), refs: [] };
+  const item = { id: ac.newItemId(), session_id: s.sid, kind, subkind, created_at_ms: Date.now(), refs };
   const out = ac.sealItem(s.inv.sessionKey, s.identity.seed, JSON.stringify(item), payload);
   const env = new TextEncoder().encode(out.envelope);
   const frame = new Uint8Array(4 + env.length + out.blob.length);
@@ -2802,7 +3057,7 @@ function rejectFile(f, why) {
   return e;
 }
 
-async function sendFile(s, f) {
+async function sendFile(s, f, refs = []) {
   const dot = f.name.lastIndexOf(".");
   const ext = dot < 0 ? "" : f.name.slice(dot).toLowerCase();
   const t = FILE_TYPES[ext];
@@ -2823,7 +3078,7 @@ async function sendFile(s, f) {
     Object.assign(err, { clearFile: true, detail: why });
     throw err;
   }
-  await sendPayload(s, "file", subkind, { type: "file", name: f.name, mime }, bytes);
+  await sendPayload(s, "file", subkind, { type: "file", name: f.name, mime }, bytes, { refs });
 }
 
 // ---------- live updates over SSE (fetch, so the token stays in a header) ----------
@@ -2887,6 +3142,7 @@ async function streamLoop(s) {
       }
       if (!r.ok) throw new Error(`stream ${r.status}`);
       delay = 1000;
+      s.streaming = true;
       connState(s, "stream", true);
       reask(s); // wants may have run out while the stream was down
       const reader = r.body.pipeThrough(new TextDecoderStream()).getReader();
@@ -2903,11 +3159,14 @@ async function streamLoop(s) {
           if (ev) {
             ev.at = Date.now();
             await applyEvent(s, ev, { fetch: true, record: true });
+            s.lastEventAt = ev.at;
+            s.render.fresh();
           }
         }
       }
     } catch (e) {
       console.warn("stream interrupted", e);
+      s.streaming = false;
       if (!s.closed) connState(s, "stream", false);
     }
     clearTimeout(watchdog);
