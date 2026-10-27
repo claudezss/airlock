@@ -454,3 +454,12 @@ def test_cli_revoke_and_audit(relay, caches, tmp_path):
     assert p.returncode != 0 and "new file" in p.stderr
     printed = cli("session", "audit", invite=invites["owner"], cache=caches("cli")).stdout
     assert len(printed.splitlines()) == len(actions)
+
+
+def test_cli_creates_a_session_that_never_expires(relay, caches):
+    created = json.loads(
+        cli("session", "create", "--relay", relay.url, "--ttl", "never", "--json", cache=caches("cli")).stdout
+    )
+    assert created["expires_at_ms"] is None
+    out = cli("session", "info", invite=created["invites"]["observer"], cache=caches("cli")).stdout
+    assert "expires   never" in out

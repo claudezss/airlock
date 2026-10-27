@@ -25,8 +25,9 @@ pub struct Config {
     #[arg(long, env = "AIRLOX_TRUST_PROXY")]
     pub trust_proxy: bool,
 
-    /// Longest session lifetime accepted.
-    #[arg(long = "max-ttl", env = "AIRLOX_MAX_TTL", default_value = "24h", value_parser = parse_duration_ms)]
+    /// Longest session lifetime accepted. `never` also accepts sessions that
+    /// never expire (they end when closed, or after `--idle-ttl-unexpiring`).
+    #[arg(long = "max-ttl", env = "AIRLOX_MAX_TTL", default_value = "never", value_parser = parse_duration_or_never)]
     pub max_ttl_ms: u64,
     /// Largest per-item limit a manifest may set.
     #[arg(long, env = "AIRLOX_MAX_ITEM_BYTES", default_value = "25MiB", value_parser = parse_size)]
@@ -45,6 +46,19 @@ pub struct Config {
     /// Purge a session after this long without joins, items, acks or downloads.
     #[arg(long = "idle-ttl", env = "AIRLOX_IDLE_TTL", default_value = "2h", value_parser = parse_duration_ms)]
     pub idle_ttl_ms: u64,
+    /// The same, for sessions that never expire; `never` keeps them until
+    /// they are closed.
+    #[arg(
+        long = "idle-ttl-unexpiring",
+        env = "AIRLOX_IDLE_TTL_UNEXPIRING",
+        default_value = "30d",
+        value_parser = parse_duration_or_never
+    )]
+    pub idle_ttl_unexpiring_ms: u64,
+    /// Ciphertext the uploads from one address may have held on the relay at
+    /// once, over all sessions (an IPv6 address counts by its /64).
+    #[arg(long, env = "AIRLOX_MAX_BYTES_PER_IP", default_value = "unlimited", value_parser = parse_size_or_unlimited)]
+    pub max_bytes_per_ip: u64,
     #[arg(long, env = "AIRLOX_MAX_SESSIONS_PER_IP", default_value_t = 20)]
     pub max_sessions_per_ip: usize,
     #[arg(long, env = "AIRLOX_MAX_SESSIONS", default_value_t = 1000)]
@@ -95,6 +109,22 @@ pub fn parse_duration_ms(s: &str) -> Result<u64, String> {
     n.checked_mul(mult).ok_or_else(|| format!("duration {s:?} too large"))
 }
 
+/// A duration, or `never` (`u64::MAX`).
+pub fn parse_duration_or_never(s: &str) -> Result<u64, String> {
+    if s.trim() == "never" {
+        return Ok(u64::MAX);
+    }
+    parse_duration_ms(s)
+}
+
+/// A size, or `unlimited` (`u64::MAX`).
+pub fn parse_size_or_unlimited(s: &str) -> Result<u64, String> {
+    if s.trim() == "unlimited" {
+        return Ok(u64::MAX);
+    }
+    parse_size(s)
+}
+
 /// `1024`, `64KiB`, `25MiB`, `1GiB` (also `KB`/`MB`/`GB` as powers of 1000).
 pub fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
@@ -127,8 +157,11 @@ mod tests {
         assert_eq!(parse_size("25MiB").unwrap(), 25 << 20);
         assert_eq!(parse_size("1GiB").unwrap(), 1 << 30);
         assert!(parse_size("1TiB").is_err());
+        assert_eq!(parse_duration_or_never("never").unwrap(), u64::MAX);
+        assert_eq!(parse_size_or_unlimited("2GiB").unwrap(), 2 << 30);
         let c = Config::with_data("/tmp/x");
         assert_eq!(c.blob_hold_ms, 3_600_000);
         assert_eq!(c.max_session_bytes, 200 << 20);
+        assert_eq!((c.max_ttl_ms, c.max_bytes_per_ip), (u64::MAX, u64::MAX));
     }
 }

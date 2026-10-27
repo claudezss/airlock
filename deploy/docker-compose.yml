@@ -10,6 +10,9 @@ services:
       # Caddy replaces X-Forwarded-For with the client address; the relay reads
       # its last entry for per-IP limits.
       AIRLOX_TRUST_PROXY: "true"
+      # Hosting cost: what each address may keep on the relay at once, over
+      # all its sessions. Self-hosted relays default to unlimited.
+      AIRLOX_MAX_BYTES_PER_IP: 2GiB
       NO_COLOR: "1"
     volumes:
       - airlox-data:/data

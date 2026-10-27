@@ -270,7 +270,8 @@ function newSession() {
         el("strong", {}, "Execute"), el("span", {}, "Run Python on runners you approve"))));
   const ttl = el("fieldset", {}, el("legend", {}, "Expires after"),
     el("div", { class: "options" },
-      radio("ttl", 900000, "15 min", false), radio("ttl", 3600000, "1 hour", true), radio("ttl", 86400000, "24 hours", false)));
+      radio("ttl", 900000, "15 min", false), radio("ttl", 3600000, "1 hour", true), radio("ttl", 86400000, "24 hours", false),
+      radio("ttl", "never", "Never (until closed)", false)));
   const types = el("fieldset", {}, el("legend", {}, "Allowed content"),
     el("div", { class: "options" }, TYPE_LABELS.map(([v, label, ext]) =>
       el("label", { class: "option" }, el("input", { type: "checkbox", name: "type", value: v, checked: true }),
@@ -341,7 +342,7 @@ function newSession() {
     if (!Number.isInteger(mb) || mb < 1 || mb > MAX_ITEM_MB) return (err.textContent = `Max file size must be 1 to ${MAX_ITEM_MB} MB.`);
     create.disabled = true;
     try {
-      const params = { mode: execute ? "execute" : "relay", created_at_ms: Date.now(), ttl_ms: Number(fd.get("ttl")), allowed_types: allowed,
+      const params = { mode: execute ? "execute" : "relay", created_at_ms: Date.now(), ttl_ms: fd.get("ttl") === "never" ? null : Number(fd.get("ttl")), allowed_types: allowed,
         max_item_bytes: mb * MB, job_limits };
       const s = ac.createSession(JSON.stringify(params), undefined);
       const { session_id } = await (await api("POST", "/v1/sessions", { body: s.signedManifest })).json();
@@ -653,7 +654,8 @@ function buildSessionLayout(s) {
     el("section", {}, el("h2", {}, "Allowed types"), el("div", { class: "chips" }, manifest.allowed_types.map((t) => el("span", { class: "chip" }, t)))),
     el("section", { class: "stack" }, el("h2", {}, "Session"),
       el("p", { class: "mono muted" }, sid),
-      el("p", { class: "muted" }, `Expires ${new Date(manifest.expires_at_ms).toLocaleString()}`),
+      el("p", { class: "muted" }, manifest.expires_at_ms === null ? "Never expires: it lasts until the owner closes it"
+        : `Expires ${new Date(manifest.expires_at_ms).toLocaleString()}`),
       el("p", { class: "muted" }, `Files up to ${fmtBytes(manifest.max_item_bytes)}`),
       invites, access, auditBtn, auditDone, auditHint, auditErr, closeBtn, closeErr),
     el("section", { class: "stack" }, el("h2", {}, "This browser"),
@@ -705,7 +707,8 @@ function buildSessionLayout(s) {
   const conn = el("span", { class: "conn mono", role: "status", hidden: true });
   expiry.before(conn);
   const tick = () => {
-    const left = manifest.expires_at_ms - Date.now();
+    const left = manifest.expires_at_ms === null ? Infinity : manifest.expires_at_ms - Date.now();
+    if (left === Infinity && !s.closed) return (expiry.textContent = "no expiry");
     if (left <= 0 || s.closed) {
       expiry.textContent = s.closed ? "closed" : "expired";
       expiry.classList.remove("soon");

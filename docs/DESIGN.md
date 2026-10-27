@@ -456,7 +456,8 @@ hash the blob while streaming it to disk.
 Server flags (each also reads an `AIRLOX_*` environment variable):
 `--data`, `--ephemeral`, `--listen`, `--trust-proxy`, `--max-ttl`,
 `--max-item-bytes`, `--max-session-bytes`, `--max-session-transfer`,
-`--max-items`, `--idle-ttl`, `--max-sessions-per-ip`, `--max-sessions`,
+`--max-items`, `--idle-ttl`, `--idle-ttl-unexpiring`, `--max-bytes-per-ip`,
+`--max-sessions-per-ip`, `--max-sessions`,
 `--disk-high-watermark`, `--blob-hold`, `--blob-grace` and
 `--sweep-interval`. `airlox-server --help` lists defaults.
 
@@ -532,7 +533,7 @@ better than a database server plus an object store:
 $AIRLOX_DATA/
   LOCK                         flock'd by the running server; a second server on the same dir refuses to start
   ip.key                       random secret for hashing client addresses (0600)
-  tombstones/<session_id>      closed sessions, kept until they would have expired, so they cannot be re-created
+  tombstones/<session_id>      closed sessions, kept until they would have expired (for good if they never would), so they cannot be re-created
   trash/                       purged session directories being deleted in the background
   sessions/<session_id>/
     manifest.json              signed manifest, canonical JSON, exactly as received
@@ -568,7 +569,8 @@ $AIRLOX_DATA/
   subscriptions live in memory only. After a restart, runners and clients
   reconnect and re-subscribe from their last seen `seq`.
 - **Purge.** The same sweeper purges sessions past `expires_at` or idle too
-  long; startup also skips expired sessions. Purging writes a tombstone,
+  long (a session that never expires has its own, longer idle limit);
+  startup also skips expired sessions. Purging writes a tombstone,
   renames the directory into `trash/` and deletes it in the background, so
   purge is instant and needs no cron job. The tombstone stops anyone who saw
   the public signed manifest from re-creating a closed session.
@@ -590,7 +592,7 @@ refuses a manifest or an upload that exceeds a limit.
 
 | Setting | Default | Effect |
 |---|---|---|
-| `AIRLOX_MAX_TTL` | 24 h | Rejects manifests that live longer, although the protocol allows 30 days. The web UI defaults to 1 h. |
+| `AIRLOX_MAX_TTL` | never | Rejects manifests that live longer (the protocol allows 30 days). `never` also accepts sessions that never expire; any duration refuses them. The web UI defaults to 1 h. |
 | `AIRLOX_MAX_ITEM_BYTES` | 25 MiB | A manifest's `max_item_bytes` may not exceed it. |
 | `AIRLOX_BLOB_HOLD` | 1 h | Longest a blob stays on the relay after upload, delivered or not. |
 | `AIRLOX_BLOB_GRACE` | 5 min | How long a blob stays after its last recipient acked. It absorbs a recipient that acks and then immediately re-fetches; late joiners need re-seeding (M4). |
@@ -599,6 +601,8 @@ refuses a manifest or an upload that exceeds a limit.
 | `AIRLOX_MAX_ITEMS` | 5 000 | Items per session. |
 | `AIRLOX_MAX_LOG_BYTES` | 4 MiB | Session log size (joins and envelopes). It bounds the per-session memory index; past it, joins and items get `413`. |
 | `AIRLOX_IDLE_TTL` | 2 h | Purges a session early after this long with no joins, items, acks or downloads, and no upload in progress. |
+| `AIRLOX_IDLE_TTL_UNEXPIRING` | 30 d | The same for sessions that never expire; `never` keeps them until they are closed. Without it, an abandoned session would hold its slot under the session limits for good. |
+| `AIRLOX_MAX_BYTES_PER_IP` | unlimited | Ciphertext the uploads from one address may have held on the relay at once, across all its sessions (IPv4 address, IPv6 /64); past it, `413`. Each held blob counts against the address that uploaded it (or re-seeded it) until it is evicted or its session ends. |
 | `AIRLOX_MAX_SESSIONS_PER_IP` | 20 | Active sessions per creator address: per IPv4 address, per IPv6 /64. With `--trust-proxy`, the address is the last `X-Forwarded-For` hop, the one the proxy appended. |
 | `AIRLOX_MAX_SESSIONS` | 1 000 | Active sessions in total. |
 | `AIRLOX_DISK_HIGH_WATERMARK` | 90 % | Above this volume usage, new sessions, joins and uploads get `507`. |
@@ -808,7 +812,7 @@ sandboxes need macOS or Linux), built and smoke-tested by
 | Replay / cross-session reuse | Reuse a signed job elsewhere | Signatures cover `session_id` and item `id`; per-item HKDF keys include `session_id`; server rejects duplicate ids |
 | Lost invite link | Full role access | Short expiry by default; server-side role revoke; close & purge |
 | A participant abusing re-seeding (M4) | Upload bytes for an item id, or make holders re-upload | Accepted only from a participant, while a `want` is open, if SHA-256 matches the author-signed envelope; `want` rate-limited; counted against the session transfer cap |
-| Someone who saw a closed session's manifest | Re-create the session so old invites work again | Tombstones refuse re-creation until the manifest would have expired |
+| Someone who saw a closed session's manifest | Re-create the session so old invites work again | Tombstones refuse re-creation until the manifest would have expired, or for good if it never expires |
 | Abusive clients of a public relay | Exhaust disk, memory, bandwidth or connections | Per-session caps on bytes, log size, items, transfer and streams; per-address session limit keyed on the proxy's hop and IPv6 /64; body timeouts; disk watermark; slow headers and request rates left to the reverse proxy |
 
 Out of scope for v1: side channels on shared hosts, a compromised sender

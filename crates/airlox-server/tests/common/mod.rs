@@ -72,6 +72,11 @@ pub struct Sess {
 }
 
 pub fn new_session(mode: Mode, ttl_ms: u64) -> Sess {
+    new_session_ttl(mode, Some(ttl_ms))
+}
+
+/// `None`: a session that never expires.
+pub fn new_session_ttl(mode: Mode, ttl_ms: Option<u64>) -> Sess {
     let secrets = SessionSecrets::generate();
     let params = SessionParams {
         mode,

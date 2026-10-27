@@ -8,6 +8,7 @@
 //! fails with `no_runner_available`.
 
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use airlox_core::cert::is_runner_token;
@@ -17,7 +18,7 @@ use airlox_core::payload::Target;
 use airlox_core::policy::target_matches;
 use airlox_core::session::{Mode, Role};
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::Json;
@@ -27,7 +28,7 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, watch};
 
 use crate::api::{
-    auth, blocking, commit_upload, item_path_ok, read_json_body, receive_upload, session, AppState,
+    auth, blocking, commit_upload, item_path_ok, read_json_body, receive_upload, session, uploader, AppState,
 };
 use crate::error::{ApiError, ApiResult};
 use crate::store::{Event, Inner, JobState, Rec, RunnerMsg, Session};
@@ -94,6 +95,7 @@ fn pick_runner(g: &Inner, target: &Target, now: u64, timeout_ms: u64) -> Option<
 /// `409 no_runner_available`.
 pub async fn post_job(
     State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(id): Path<String>,
     headers: HeaderMap,
     body: Body,
@@ -102,7 +104,8 @@ pub async fn post_job(
     let (who, role) = auth(&s, &headers)?;
     require_execute(&s)?;
     let target = parse_target(&headers)?;
-    let up = receive_upload(&st, &s, &who, role, body, |h| match h.kind {
+    let ip_hash = uploader(&st, &headers, peer);
+    let up = receive_upload(&st, &s, &who, role, ip_hash, body, |h| match h.kind {
         ItemKind::Job => Ok(()),
         _ => Err(ApiError::forbidden("POST /jobs takes job items only")),
     })

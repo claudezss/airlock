@@ -278,3 +278,11 @@ def test_revoking_a_role_and_exporting_the_audit_trail(relay, caches):
     assert [a["action"] for a in trail] == ["create", "join", "join", "join", "item", "revoke"]
     assert trail[-1]["participants"] == [agent.participant_pub]
     assert trail[4]["actor"] == agent.participant_pub and trail[4]["blob_sha256"]
+
+
+def test_a_session_can_last_until_it_is_closed(relay, caches):
+    owner = Session.create(relay.url, ttl=None, cache_dir=caches("owner"))
+    assert owner.manifest["expires_at_ms"] is None
+    agent = Session.join(owner.invites["sender"], cache_dir=caches("agent"))
+    agent.send_text("no deadline")
+    assert [i.text for i in owner.items()] == ["no deadline"]

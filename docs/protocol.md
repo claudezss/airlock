@@ -56,7 +56,7 @@ links pin the manifest only through the session id, which is why it carries
     "roles": { "sender": "<b64>", "runner": "<b64>", "observer": "<b64>" },
     "mode": "relay" | "execute",
     "created_at_ms": 1761400000000,
-    "expires_at_ms": 1761403600000,
+    "expires_at_ms": 1761403600000 | null,
     "allowed_types": ["text", "py", "md", "zip", "image"],
     "max_item_bytes": 26214400,
     "job_limits": null | {
@@ -72,7 +72,11 @@ links pin the manifest only through the session id, which is why it carries
 Validity rules (all enforced by `Manifest::validate`):
 
 - `session_id` equals the derivation from `owner_pub`; `v == 1`.
-- `0 < expires_at_ms − created_at_ms ≤ 30 days`.
+- `0 < expires_at_ms − created_at_ms ≤ 30 days`, or `expires_at_ms` is
+  `null` (present, not omitted): the session never expires and lasts until it
+  is closed. A relay may refuse such sessions (`400 ttl`) or purge them after
+  a long idle period. In session params, `ttl_ms` is likewise required and
+  `null` for no expiry.
 - `allowed_types` is non-empty and has no duplicates.
 - `0 < max_item_bytes ≤ 1 GiB`.
 - The four public keys are pairwise distinct.

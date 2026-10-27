@@ -64,7 +64,7 @@ pub fn check_header(m: &Manifest, author_role: Role, h: &ItemHeader) -> Result<(
     if h.size > m.max_item_bytes {
         return Err(Error::policy(format!("item exceeds {} bytes", m.max_item_bytes)));
     }
-    if h.created_at_ms < m.created_at_ms || h.created_at_ms >= m.expires_at_ms {
+    if h.created_at_ms < m.created_at_ms || m.expires_at_ms.is_some_and(|e| h.created_at_ms >= e) {
         return Err(Error::policy("item timestamp is outside the session lifetime"));
     }
     match h.kind {
@@ -362,7 +362,7 @@ mod tests {
             .manifest(&SessionParams {
                 mode,
                 created_at_ms: 1000,
-                ttl_ms: 1000,
+                ttl_ms: Some(1000),
                 allowed_types: vec![ContentType::Text, ContentType::Py, ContentType::Md, ContentType::Zip],
                 max_item_bytes: 1024 * 1024,
                 job_limits: (mode == Mode::Execute).then_some(limits),
