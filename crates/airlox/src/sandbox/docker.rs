@@ -15,11 +15,14 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use airlox_core::cert::SandboxKind;
+use airlox_core::payload::JobEnv;
 use anyhow::{bail, Context, Result};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::watch;
 
+use super::local::{PythonInfo, PROBE_PY};
 use super::{read_shim_result, supervise, PreparedJob, RawResult, RuntimeSpec, KILL_GRACE};
 
 pub struct Docker {
@@ -34,6 +37,8 @@ pub struct Docker {
     /// The embedded shim, written once at prepare time.
     shim: PathBuf,
     resolved_image: Option<String>,
+    /// Where jobs run, measured once in `prepare`.
+    env: Option<JobEnv>,
 }
 
 async fn docker_ok(bin: &str, args: &[&str]) -> Result<bool> {
@@ -63,16 +68,26 @@ impl Docker {
             runtime,
             shim: state_dir.join("shim.py"),
             resolved_image: None,
+            env: None,
         }
+    }
+
+    /// Where jobs run (see [`super::Backend::env`]).
+    pub fn env(&self) -> Option<JobEnv> {
+        self.env.clone()
     }
 
     pub fn dockerfile(spec: &RuntimeSpec) -> String {
         let mut f = format!("FROM python:{}-slim\n", spec.python_version());
         if !spec.packages.is_empty() {
+            // Entries are validated to name characters and PEP 440 operators
+            // and versions (`numpy>=1.26,<3`): quoted, the shell leaves
+            // `<` and `>` alone.
+            let quoted: Vec<String> = spec.packages.iter().map(|p| format!("'{p}'")).collect();
             f += &format!(
                 // Wheels only: no build scripts from the session's packages.
                 "RUN pip install --no-cache-dir --disable-pip-version-check --only-binary :all: {}\n",
-                spec.packages.join(" ")
+                quoted.join(" ")
             );
         }
         // Writable paths are mounts; give them a home in the image.
@@ -88,11 +103,28 @@ impl Docker {
             std::fs::create_dir_all(parent)?;
         }
         crate::view::write_atomic(&self.shim, airlox_core::shim::SHIM_PY.as_bytes(), 0o644)?;
-        if let Some(img) = &self.image {
-            if !docker_ok(&self.bin, &["image", "inspect", img]).await? {
+        if let Some(img) = self.image.clone() {
+            if !docker_ok(&self.bin, &["image", "inspect", &img]).await? {
                 bail!("image {img} not found locally; pull it first");
             }
-            self.resolved_image = Some(img.clone());
+            // The image is the operator's: nothing installs into it, so
+            // check it against the session's pins like --python.
+            let info = self.probe_image(&img, spec).await.with_context(|| format!("checking image {img}"))?;
+            if !info.missing.is_empty() {
+                tracing::warn!(
+                    "image {img} lacks packages the session allows: {}; jobs that import them will fail",
+                    info.missing.join(", ")
+                );
+            }
+            let conflicts = spec.pin_conflicts("the image", &info.packages);
+            if !conflicts.is_empty() {
+                bail!(
+                    "{}. Use an image with the pinned versions, or leave out --docker-image to build one",
+                    conflicts.join("; ")
+                );
+            }
+            self.set_env(&info, &img);
+            self.resolved_image = Some(img);
             return Ok(());
         }
         let tag = format!("airlox-rt:{}", spec.hash());
@@ -112,8 +144,51 @@ impl Docker {
                 bail!("building {tag} failed:\n{}", String::from_utf8_lossy(&out.stderr));
             }
         }
+        match self.probe_image(&tag, spec).await {
+            Ok(info) => self.set_env(&info, &tag),
+            Err(e) => tracing::warn!("could not read the installed versions from {tag}: {e:#}"),
+        }
         self.resolved_image = Some(tag);
         Ok(())
+    }
+
+    fn set_env(&mut self, info: &PythonInfo, image: &str) {
+        self.env = Some(JobEnv {
+            python: info.version.clone(),
+            packages: info.packages.iter().map(|p| (p.name.clone(), p.version.clone())).collect(),
+            airlox: env!("CARGO_PKG_VERSION").to_string(),
+            sandbox: SandboxKind::Docker,
+            interpreter: format!("docker:{image}"),
+        });
+    }
+
+    /// What the image's `python3` reports about itself and the allowlisted
+    /// packages (read from their metadata; nothing is imported), in a
+    /// throwaway container with no network.
+    async fn probe_image(&self, image: &str, spec: &RuntimeSpec) -> Result<PythonInfo> {
+        let mut cmd = Command::new(&self.bin);
+        cmd.args(["run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL"])
+            .args(["--security-opt", "no-new-privileges", "--memory", "256m", "--pids-limit", "64"])
+            .args(["--user", &Self::user()]);
+        if let Some(rt) = &self.runtime {
+            cmd.args(["--runtime", rt]);
+        }
+        cmd.arg(image).args(["python3", "-I", "-c", PROBE_PY]).args(spec.names());
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            cmd.stdin(Stdio::null()).kill_on_drop(true).output(),
+        )
+        .await
+        .context("python3 in the image did not answer within 120 s")?
+        .context("could not run docker")?;
+        if !out.status.success() {
+            bail!(
+                "python3 failed in the image ({}):\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        serde_json::from_slice(&out.stdout).context("unexpected answer from python3 in the image")
     }
 
     fn container_name(job: &PreparedJob) -> String {
@@ -251,5 +326,22 @@ impl Docker {
             peak_mem_kb: None,
             error,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_dockerfile_installs_pins_through_the_shell_unharmed() {
+        let spec = RuntimeSpec {
+            runtime: "python3.12".into(),
+            packages: vec!["cugrid==0.1.0".into(), "numpy>=1.26,<3".into(), "pandas".into()],
+        };
+        let f = Docker::dockerfile(&spec);
+        assert!(f.contains(" 'cugrid==0.1.0' 'numpy>=1.26,<3' 'pandas'\n"), "{f}");
+        let bare = RuntimeSpec { runtime: "python3.12".into(), packages: vec![] };
+        assert_eq!(Docker::dockerfile(&bare).lines().count(), 2);
     }
 }

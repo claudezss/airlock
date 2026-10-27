@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use airlox_core::cert::SandboxKind;
 use airlox_core::encoding::{hex, sha256};
+use airlox_core::payload::JobEnv;
 use airlox_core::shim::ShimResult;
 use anyhow::{Context, Result};
 use tokio::sync::watch;
@@ -38,17 +39,57 @@ pub const STOP_GRACE: Duration = Duration::from_secs(5);
 pub struct RuntimeSpec {
     /// e.g. "python3.12"
     pub runtime: String,
-    /// Normalized package names.
+    /// The manifest's allowlist entries: normalized names, each optionally
+    /// with a version specifier (`cugrid==0.1.0`).
     pub packages: Vec<String>,
 }
 
 impl RuntimeSpec {
+    /// The allowlisted package names, without version specifiers.
+    pub fn names(&self) -> Vec<String> {
+        self.packages.iter().map(|p| airlox_core::policy::allowlist_name(p).to_string()).collect()
+    }
+
+    /// The entries that carry a version specifier, parsed.
+    pub fn pins(&self) -> Vec<airlox_core::policy::AllowedPackage> {
+        self.packages
+            .iter()
+            .filter_map(|p| airlox_core::policy::AllowedPackage::parse(p).ok())
+            .filter(|p| p.specifier.is_some())
+            .collect()
+    }
+
+    /// What the session's pins say about the installed `packages`: one line
+    /// for each pinned package that is installed at a version its entry does
+    /// not allow, such as "--python has cugrid 0.2.1, but the session pins
+    /// cugrid==0.1.0". (A package that is not installed at all is not a
+    /// conflict here; the backends check for missing ones.)
+    pub fn pin_conflicts(&self, what: &str, installed: &[local::PackageInfo]) -> Vec<String> {
+        let mut out = Vec::new();
+        for pin in self.pins() {
+            if let Some(i) = installed.iter().find(|i| i.name == pin.name) {
+                if !pin.allows_version(&i.version) {
+                    out.push(format!(
+                        "{what} has {} {}, but the session pins {}",
+                        pin.name,
+                        if i.version.is_empty() { "(no version)" } else { &i.version },
+                        pin.canonical()
+                    ));
+                }
+            }
+        }
+        out
+    }
+
     /// "3.12" from "python3.12".
     pub fn python_version(&self) -> &str {
         self.runtime.strip_prefix("python").unwrap_or(&self.runtime)
     }
 
-    /// Identifies a built runtime: `sha256(runtime + sorted(packages))`.
+    /// Identifies a built runtime: `sha256(runtime + sorted(packages))`, the
+    /// entries with their version specifiers, so a different pin is a
+    /// different runtime (and an allowlist of bare names hashes as it always
+    /// did).
     pub fn hash(&self) -> String {
         let mut p = self.packages.clone();
         p.sort();
@@ -125,6 +166,15 @@ impl Backend {
         match self {
             Backend::Local(b) => b.prepare(spec).await,
             Backend::Docker(b) => b.prepare(spec).await,
+        }
+    }
+
+    /// Where jobs run, as measured when the runtime was prepared (not per
+    /// job); `None` if it could not be.
+    pub fn env(&self) -> Option<JobEnv> {
+        match self {
+            Backend::Local(b) => b.env(),
+            Backend::Docker(b) => b.env(),
         }
     }
 

@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use airlox_core::cert::SandboxKind;
+use airlox_core::payload::JobEnv;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use tokio::process::Command;
@@ -51,8 +52,10 @@ pub struct Local {
     runtime_dirs: Vec<PathBuf>,
     shim: PathBuf,
     opts: LocalOpts,
-    /// The allowlisted packages as the operator's interpreter reported them.
+    /// The allowlisted packages as the interpreter reported them.
     packages: Option<Vec<PackageInfo>>,
+    /// Where jobs run, measured once in `prepare`.
+    env: Option<JobEnv>,
 }
 
 /// What an interpreter reports about itself.
@@ -132,7 +135,7 @@ pub struct Footprint {
 /// they come from: version, location, whether the install is editable, and
 /// the file each top-level module would load from (found, not imported).
 /// Standard library only.
-const PROBE_PY: &str = r#"
+pub(crate) const PROBE_PY: &str = r#"
 import json, platform, re, sys
 from importlib import metadata, util
 def norm(n):
@@ -406,7 +409,13 @@ impl Local {
             shim: state_dir.join("shim.py"),
             opts,
             packages: None,
+            env: None,
         }
+    }
+
+    /// Where jobs run (see [`super::Backend::env`]).
+    pub fn env(&self) -> Option<JobEnv> {
+        self.env.clone()
     }
 
     pub fn sandboxed(&self) -> bool {
@@ -435,14 +444,32 @@ impl Local {
                 }
             }
         }
-        let python = match self.opts.python.clone() {
+        let (python, info, interpreter) = match self.opts.python.clone() {
             Some(p) => {
-                let (python, packages) = self.check_python(&p, spec).await?;
-                self.packages = Some(packages);
-                python
+                let (python, info) = self.check_python(&p, spec).await?;
+                (python, Some(info), "--python")
             }
-            None => self.build_runtime(spec).await?,
+            None => {
+                let python = self.build_runtime(spec).await?;
+                // What the runtime we built holds, for the results' `env`.
+                let info = match probe_python(&python, &spec.names(), &self.opts.pass_env).await {
+                    Ok(i) => Some(i),
+                    Err(e) => {
+                        tracing::warn!("could not read the installed versions from the job runtime: {e:#}");
+                        None
+                    }
+                };
+                (python, info, "uv-runtime")
+            }
         };
+        self.env = info.as_ref().map(|i| JobEnv {
+            python: i.version.clone(),
+            packages: i.packages.iter().map(|p| (p.name.clone(), p.version.clone())).collect(),
+            airlox: env!("CARGO_PKG_VERSION").to_string(),
+            sandbox: self.kind(),
+            interpreter: interpreter.to_string(),
+        });
+        self.packages = info.map(|i| i.packages);
         // The venv's interpreter is a link into a Python installation that
         // the sandbox must also see.
         if self.opts.sandboxed {
@@ -458,12 +485,12 @@ impl Local {
 
     /// The operator's interpreter: it must run the session's Python and
     /// already have every allowlisted package. Nothing is installed.
-    async fn check_python(&self, python: &Path, spec: &RuntimeSpec) -> Result<(PathBuf, Vec<PackageInfo>)> {
+    async fn check_python(&self, python: &Path, spec: &RuntimeSpec) -> Result<(PathBuf, PythonInfo)> {
         if !python.is_file() {
             bail!("--python {} is not a file", python.display());
         }
         let python = std::path::absolute(python)?;
-        let info = probe_python(&python, &spec.packages, &self.opts.pass_env).await?;
+        let info = probe_python(&python, &spec.names(), &self.opts.pass_env).await?;
         let want = spec.python_version();
         if info.version != want && !info.version.starts_with(&format!("{want}.")) {
             bail!(
@@ -481,13 +508,22 @@ impl Local {
                 python.display()
             );
         }
+        let conflicts = spec.pin_conflicts("--python", &info.packages);
+        if !conflicts.is_empty() {
+            bail!(
+                "{}. Install the pinned versions into {}, or point --python at an interpreter that has them; \
+                 the runner never installs anything into it",
+                conflicts.join("; "),
+                python.display()
+            );
+        }
         tracing::info!(
             python = %info.executable.as_deref().unwrap_or(&python.display().to_string()),
             version = %info.version,
             "using the operator's interpreter"
         );
         report_packages(&info.packages);
-        Ok((python, info.packages))
+        Ok((python, info))
     }
 
     /// How much memory importing the allowlisted packages takes, for
@@ -505,7 +541,7 @@ impl Local {
         let packages = match &self.packages {
             Some(p) => p,
             None => {
-                probed = probe_python(python, &spec.packages, &self.opts.pass_env).await.ok()?.packages;
+                probed = probe_python(python, &spec.names(), &self.opts.pass_env).await.ok()?.packages;
                 &probed
             }
         };
@@ -763,6 +799,92 @@ mod tests {
         // What older probes (and runners) report still parses.
         let old: PythonInfo = serde_json::from_str(r#"{"version": "3.12.4", "missing": ["x"]}"#).unwrap();
         assert!(old.packages.is_empty() && old.executable.is_none());
+    }
+
+    fn installed(pkgs: &[(&str, &str)]) -> Vec<PackageInfo> {
+        pkgs.iter()
+            .map(|(name, version)| {
+                serde_json::from_value(
+                    serde_json::json!({"name": name, "version": version, "location": "/v"}),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn installed_versions_are_checked_against_the_sessions_pins() {
+        let spec = RuntimeSpec {
+            runtime: "python3.12".into(),
+            packages: vec!["cugrid==0.1.0".into(), "numpy>=1.26,<3".into(), "pandas".into()],
+        };
+        assert_eq!(spec.names(), ["cugrid", "numpy", "pandas"]);
+        assert_eq!(spec.pins().len(), 2);
+        let ok = installed(&[("cugrid", "0.1.0"), ("numpy", "2.1.0"), ("pandas", "0.0.1")]);
+        assert!(spec.pin_conflicts("--python", &ok).is_empty());
+        let bad = installed(&[("cugrid", "0.2.1"), ("numpy", "3.0.0"), ("pandas", "9")]);
+        assert_eq!(
+            spec.pin_conflicts("--python", &bad),
+            [
+                "--python has cugrid 0.2.1, but the session pins cugrid==0.1.0",
+                "--python has numpy 3.0.0, but the session pins numpy>=1.26,<3"
+            ]
+        );
+        // A missing package is the missing-package check's to report.
+        assert!(spec.pin_conflicts("--python", &installed(&[("pandas", "1")])).is_empty());
+        // Bare names, as before, pin nothing and hash as before.
+        let bare = RuntimeSpec { runtime: "python3.12".into(), packages: vec!["numpy".into()] };
+        assert!(bare.pins().is_empty());
+        assert_eq!(bare.hash(), RuntimeSpec { packages: vec!["numpy".into()], ..bare.clone() }.hash());
+        assert_ne!(
+            bare.hash(),
+            RuntimeSpec { packages: vec!["numpy==2.1.0".into()], ..bare.clone() }.hash(),
+            "a different pin is a different runtime"
+        );
+    }
+
+    /// An interpreter that answers the probe with this JSON.
+    #[cfg(unix)]
+    fn fake_python(dir: &Path, answer: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("python");
+        std::fs::write(&path, format!("#!/bin/sh\ncat <<'EOF'\n{answer}\nEOF\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn python_with_the_wrong_version_of_a_pinned_package_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = RuntimeSpec { runtime: "python3.12".into(), packages: vec!["cugrid==0.1.0".into()] };
+        let answer = |v: &str| {
+            format!(
+                r#"{{"version": "3.12.4", "missing": [], "executable": "/v/bin/python", "packages": [
+                    {{"name": "cugrid", "version": "{v}", "location": "/v/lib",
+                      "imports": [{{"module": "cugrid", "origin": "/v/lib/cugrid/__init__.py"}}]}}]}}"#
+            )
+            .replace('\n', " ")
+        };
+        let opts = |p: PathBuf| LocalOpts { python: Some(p), process: true, ..Default::default() };
+
+        let wrong = fake_python(dir.path(), &answer("0.2.1"));
+        let mut local = Local::new(&dir.path().join("state"), opts(wrong));
+        let e = local.prepare(&spec).await.unwrap_err().to_string();
+        assert!(e.contains("--python has cugrid 0.2.1, but the session pins cugrid==0.1.0"), "{e}");
+
+        let right = fake_python(dir.path(), &answer("0.1.0"));
+        let mut local = Local::new(&dir.path().join("state"), opts(right));
+        // The fake is not a real interpreter, so only the check is under test:
+        // it passes the pin, and what it learned becomes the results' env.
+        let _ = local.prepare(&spec).await;
+        let env = local.env().expect("env is measured when the interpreter is accepted");
+        assert_eq!(
+            (env.python.as_str(), env.interpreter.as_str(), env.packages.get("cugrid").map(String::as_str)),
+            ("3.12.4", "--python", Some("0.1.0"))
+        );
+        assert_eq!(env.sandbox, SandboxKind::Process);
+        assert!(!serde_json::to_string(&env).unwrap().contains("/v/bin"), "no paths in the env");
     }
 
     /// Some Python 3 on PATH to run the embedded scripts with, if any.

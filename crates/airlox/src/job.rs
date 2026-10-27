@@ -15,6 +15,7 @@
 //! reports, exactly once.
 
 mod outbox;
+mod redact;
 
 use std::fs;
 use std::io::Write;
@@ -26,7 +27,7 @@ use airlox_core::encoding::{b64e, canonical_json, hex, sha256};
 use airlox_core::item::{new_item_id, seal, ItemKind, ItemRef, NewItem};
 use airlox_core::keys::Keypair;
 use airlox_core::payload::{
-    JobProgress, JobResult, JobSpec, JobStatus, Meta, OutFile, Payload, MAX_PROGRESS_TAIL_BYTES,
+    JobEnv, JobProgress, JobResult, JobSpec, JobStatus, Meta, OutFile, Payload, MAX_PROGRESS_TAIL_BYTES,
     MAX_STDIO_BYTES,
 };
 use airlox_core::policy::{check_file_name, target_matches};
@@ -69,6 +70,9 @@ pub struct Ctx {
     pub outbox: PathBuf,
     /// Tests: exit once an answer is saved, before posting any of it.
     pub exit_before_posting: bool,
+    /// Where jobs run, measured once when the runtime was prepared; every
+    /// result of a job that ran carries it.
+    pub env: Option<JobEnv>,
 }
 
 fn now_ms() -> u64 {
@@ -728,6 +732,7 @@ pub async fn handle(
         out_files: vec![],
         code_sha256: hex(&sha256(b"")),
         input_sha256: hex(&sha256(b"")),
+        env: None,
     };
     let mut refs = vec![job_ref.clone()];
     let poster = Poster::of(&*view.lock().await);
@@ -763,6 +768,7 @@ pub async fn handle(
         Verdict::Run(a) => {
             result.code_sha256 = hex(&sha256(a.spec.code.as_bytes()));
             result.input_sha256 = a.input_sha256.clone();
+            result.env = ctx.env.clone();
             let memory_mb =
                 a.spec.memory_mb.unwrap_or(limits.memory_mb).min(ctx.memory_cap_mb.unwrap_or(u32::MAX));
             let dir = tempfile::Builder::new().prefix("job-").tempdir_in(&ctx.jobs_dir)?;
@@ -815,6 +821,14 @@ pub async fn handle(
                 result.peak_mem_mb = (peak_kb / 1024) as u32;
                 (result.stdout, result.stdout_truncated) = stdio(&job.meta_dir().join("stdout.txt"));
                 (result.stderr, result.stderr_truncated) = stdio(&job.meta_dir().join("stderr.txt"));
+                // A job run as a plain process saw its real directories; its
+                // output must not carry where the runner keeps them.
+                let hide =
+                    [(job.work_dir(), "$WORK"), (job.out_dir(), "$AIRLOX_OUT"), (job.root.clone(), "$JOB")];
+                let hide: Vec<(&Path, &str)> = hide.iter().map(|(p, n)| (p.as_path(), *n)).collect();
+                result.stdout = redact::paths(&result.stdout, &hide);
+                result.stderr = redact::paths(&result.stderr, &hide);
+                result.reason = result.reason.take().map(|r| redact::paths(&r, &hide));
                 let mut notes = Vec::new();
                 if limits.return_out {
                     // The payload adds a few hundred bytes of meta to the file.
@@ -973,6 +987,7 @@ mod tests {
                 out_files: vec![],
                 code_sha256: "a".repeat(64),
                 input_sha256: "b".repeat(64),
+                env: None,
             };
             airlox_core::policy::check_result(&r).unwrap();
         }

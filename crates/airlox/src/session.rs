@@ -423,6 +423,11 @@ pub struct Outcome {
     pub out_files: Vec<OutFile>,
     /// Small text files from `out.zip`, inline.
     pub out_text: Vec<OutText>,
+    /// Where the job ran, as its runner measured and signed it (interpreter
+    /// version, installed versions of the allowlisted packages, sandbox, where
+    /// the interpreter came from). `None` for unsigned outcomes and for
+    /// runners that do not report it.
+    pub env: Option<airlox_core::payload::JobEnv>,
     /// The runner's key, and the name it joined with.
     pub runner: Option<String>,
     pub runner_name: Option<String>,
@@ -450,6 +455,7 @@ impl Outcome {
             peak_mem_mb: 0,
             out_files: vec![],
             out_text: vec![],
+            env: None,
             runner,
             runner_name,
             signed: false,
@@ -1079,6 +1085,9 @@ impl Session {
                 peak_mem_mb: m["peak_mem_mb"].as_u64().unwrap_or(0),
                 out_text: out_text(&outs),
                 out_files: outs,
+                // Shaped like a `JobEnv` already: the result passed the core's
+                // checks, which refuse unknown fields.
+                env: serde_json::from_value(m["env"].clone()).ok(),
                 runner: Some(item.author.clone()),
                 runner_name: item.author_name.clone(),
                 signed: true,

@@ -517,7 +517,7 @@ mod tests {
         ] {
             assert!(SpecifierSet::parse(bad).is_err(), "{bad:?}");
         }
-        assert!(SpecifierSet::parse(&vec![">=1"; 9].join(",")).is_err());
+        assert!(SpecifierSet::parse(&[">=1"; 9].join(",")).is_err());
         assert!(SpecifierSet::parse(&format!("==1.{}", "0".repeat(70))).is_err());
         // Local versions stay with equality.
         assert!(SpecifierSet::parse("==1.0+cpu,!=1.0+gpu").is_ok());
