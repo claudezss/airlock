@@ -30,7 +30,7 @@ use tokio::sync::{broadcast, watch};
 use crate::error::{ApiError, ApiResult};
 use crate::store::{
     sync_dir, CreateError, Event, Inner, JobState, Rec, Session, Store, MAX_OPEN_WANTS, MAX_PARTICIPANTS,
-    MAX_STREAMS_PER_PARTICIPANT, MAX_WANTS, MAX_WANT_LINES, MAX_WANT_LINES_SESSION,
+    MAX_STREAMS_PER_PARTICIPANT, MAX_WANTS, MAX_WANT_LINES, MAX_WANT_LINES_SESSION, WANT_TTL_MS,
 };
 use crate::util::{new_token, now_ms, random_suffix, sha256_hex};
 
@@ -794,7 +794,8 @@ pub async fn ack(
 /// holding an evicted blob to upload it again. Only for a participant that
 /// never received it, and for a runner only once it is approved;
 /// rate-limited per participant. Asking again while the want is open
-/// refreshes it in memory: no log line, no event. A re-seed upload in
+/// refreshes it in memory, with no log line or event, except every
+/// `WANT_TTL_MS`, when it is announced to holders again. A re-seed upload in
 /// progress does not answer a want: it may fail, and the wanter must stay a
 /// recipient if it succeeds.
 pub async fn want(
@@ -827,15 +828,21 @@ pub async fn want(
         let now = now_ms();
         g.prune_wants(now);
         if let Some(t) = g.wants.get_mut(&item).and_then(|w| w.get_mut(&who)) {
+            // Open: keep it open. Tell holders again (a logged line) only
+            // every WANT_TTL_MS, for those whose earlier upload was refused.
             *t = now;
-            return Ok((StatusCode::ACCEPTED, Json(json!({"open": true}))));
-        }
-        if g.open_wants(&who) >= MAX_OPEN_WANTS {
-            return Err(ApiError::limit("too many open wants; wait for some to be answered"));
-        }
-        let asked = g.wanted_items.get(&who);
-        if asked.is_some_and(|a| a.len() >= MAX_WANTS && !a.contains(&item)) {
-            return Err(ApiError::limit("this participant has asked for too many blobs"));
+            let announced = g.want_announced.get(&item).and_then(|w| w.get(&who)).copied().unwrap_or(0);
+            if now.saturating_sub(announced) < WANT_TTL_MS {
+                return Ok((StatusCode::ACCEPTED, Json(json!({"open": true}))));
+            }
+        } else {
+            if g.open_wants(&who) >= MAX_OPEN_WANTS {
+                return Err(ApiError::limit("too many open wants; wait for some to be answered"));
+            }
+            let asked = g.wanted_items.get(&who);
+            if asked.is_some_and(|a| a.len() >= MAX_WANTS && !a.contains(&item)) {
+                return Err(ApiError::limit("this participant has asked for too many blobs"));
+            }
         }
         if g.want_lines.get(&who).copied().unwrap_or(0) >= MAX_WANT_LINES
             || g.want_lines.values().sum::<u32>() >= MAX_WANT_LINES_SESSION
