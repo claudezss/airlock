@@ -1105,6 +1105,13 @@ impl Session {
         if self.closed.is_some() {
             return;
         }
+        // Every holder sees the same want: wait a moment at random, so the
+        // first upload usually lands before the others start.
+        if !self.asked.is_empty() {
+            let jitter =
+                SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos() % 2000).unwrap_or(0);
+            tokio::time::sleep(Duration::from_millis(u64::from(jitter))).await;
+        }
         for id in self.asked.clone() {
             let Some(blob) = self.cache.read_blob(&id) else {
                 self.asked.remove(&id);

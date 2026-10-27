@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use airlox_core::cert::{RunnerInfo, SignedJoinRequest};
 use airlox_core::encoding::{parse_canonical, sha256};
-use airlox_core::item::ItemEnvelope;
+use airlox_core::item::{ItemEnvelope, ItemKind};
 use airlox_core::session::{is_session_id, Mode, Role, SignedManifest};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -38,15 +38,20 @@ pub const MAX_STREAMS_PER_PARTICIPANT: usize = 4;
 /// How long a `want` stays open for holders to answer. Clients ask again
 /// while they still lack the blob.
 pub const WANT_TTL_MS: u64 = 10 * 60 * 1000;
-/// Asking again for an open want refreshes it, and tells holders again,
-/// at most this often.
-pub const WANT_REFRESH_MS: u64 = 60 * 1000;
 /// Open wants per participant, and distinct items a participant may ask
 /// for over the session.
 pub const MAX_OPEN_WANTS: usize = 16;
 pub const MAX_WANTS: usize = 1024;
+/// `want` log lines per participant and per session (about 140 bytes
+/// each), so asking cannot fill the session log.
+pub const MAX_WANT_LINES: u32 = 256;
+pub const MAX_WANT_LINES_SESSION: u32 = 2048;
 /// The longest a re-seeded blob stays (capped by the blob hold).
 pub const RESEED_HOLD_MS: u64 = 10 * 60 * 1000;
+/// The owner's signed events (runner approvals and rejections, close) up to
+/// this size stay on the relay for the session's life, so a late joiner can
+/// always check who the owner approved.
+pub const KEEP_EVENT_BYTES: u64 = 16 * 1024;
 const EVENT_BUFFER: usize = 1024;
 
 /// One state change. Serialized as a line of `log.jsonl`.
@@ -119,6 +124,10 @@ pub enum Rec {
         runner: Option<String>,
         reason: Option<String>,
     },
+    /// A record from a newer relay, read by an older one after a rollback:
+    /// skipped, so the session survives instead of being purged.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,6 +266,8 @@ pub struct ItemRec {
     pub blob_len: u64,
     pub blob_present: bool,
     pub evict_at: u64,
+    /// Never evicted: a small signed event from the owner.
+    pub keep: bool,
 }
 
 pub struct Inner {
@@ -285,6 +296,8 @@ pub struct Inner {
     pub wants: HashMap<String, HashMap<String, u64>>,
     /// The items each participant has asked for.
     pub wanted_items: HashMap<String, HashSet<String>>,
+    /// `want` log lines per participant.
+    pub want_lines: HashMap<String, u32>,
     /// Roles the owner revoked.
     pub revoked: HashSet<Role>,
     /// Held bytes per uploader address, shared by every session.
@@ -310,7 +323,7 @@ impl Inner {
     fn check_delivered(&mut self, item: &str, ts: u64) {
         let grace = self.grace_ms;
         if let Some(r) = self.items.get_mut(item) {
-            if r.blob_present && !r.recipients.is_empty() && r.recipients.is_subset(&r.acked) {
+            if r.blob_present && !r.keep && !r.recipients.is_empty() && r.recipients.is_subset(&r.acked) {
                 let t = ts.saturating_add(grace);
                 if t < r.evict_at {
                     r.evict_at = t;
@@ -386,21 +399,28 @@ impl Inner {
                 let env: ItemEnvelope =
                     parse_canonical(envelope, "item envelope").map_err(|e| e.to_string())?;
                 let id = env.header.id.clone();
-                let evict_at = ts.saturating_add(self.hold_ms);
+                let author = env.header.author.to_b64();
+                let keep = env.header.kind == ItemKind::Event
+                    && *blob_len <= KEEP_EVENT_BYTES
+                    && self.participants.get(&author).is_some_and(|p| p.role == Role::Owner);
+                let evict_at = if keep { u64::MAX } else { ts.saturating_add(self.hold_ms) };
                 self.items.insert(
                     id.clone(),
                     ItemRec {
                         seq: line.seq,
                         ip_hash: ip_hash.clone(),
-                        author: env.header.author.to_b64(),
+                        author,
                         recipients: recipients.iter().cloned().collect(),
                         acked: HashSet::new(),
                         blob_len: *blob_len,
                         blob_present: true,
                         evict_at,
+                        keep,
                     },
                 );
-                self.evictions.entry(evict_at).or_default().push(id);
+                if !keep {
+                    self.evictions.entry(evict_at).or_default().push(id);
+                }
                 self.held_bytes += blob_len;
                 self.transfer_bytes += blob_len;
                 self.usage.add(ip_hash.as_deref(), *blob_len);
@@ -484,7 +504,8 @@ impl Inner {
             Rec::Want { item, by } => {
                 self.wants.entry(item.clone()).or_default().insert(by.clone(), ts);
                 self.wanted_items.entry(by.clone()).or_default().insert(item.clone());
-                self.last_activity_ms = self.last_activity_ms.max(ts);
+                *self.want_lines.entry(by.clone()).or_default() += 1;
+                // Not activity: asking alone must not keep a session alive.
                 Ok(self.push_event(line.seq, "want", json!({"item": item, "by": by})))
             }
             Rec::Reseed { item, by, ip_hash } => {
@@ -540,6 +561,7 @@ impl Inner {
                 self.closed = true;
                 Ok(self.push_event(line.seq, "closed", json!({"reason": reason})))
             }
+            Rec::Unknown => Ok(None),
         }
     }
 
@@ -662,6 +684,7 @@ impl Session {
             evictions: BTreeMap::new(),
             wants: HashMap::new(),
             wanted_items: HashMap::new(),
+            want_lines: HashMap::new(),
             revoked: HashSet::new(),
             usage,
             hold_ms: cfg.blob_hold_ms,
@@ -971,6 +994,7 @@ impl Session {
                     set("action", json!("close"));
                     set("reason", json!(reason));
                 }
+                Rec::Unknown => set("action", json!("unknown")),
             }
             serde_json::to_writer(&mut out, &a).map_err(invalid)?;
             out.push(b'\n');
@@ -1304,5 +1328,19 @@ impl Store {
             }
             keep
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_records_are_skipped() {
+        let line: LogLine =
+            serde_json::from_str(r#"{"seq":3,"ts_ms":1,"type":"from_the_future","x":[1,2]}"#).unwrap();
+        assert!(matches!(line.rec, Rec::Unknown));
+        let line: LogLine = serde_json::from_str(r#"{"seq":4,"ts_ms":1,"type":"evict","item":"a"}"#).unwrap();
+        assert!(matches!(line.rec, Rec::Evict { .. }));
     }
 }

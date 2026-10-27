@@ -450,7 +450,7 @@ async fn serve(
                 }
                 Some(Msg::Rejected) => break Err(anyhow::anyhow!("the owner rejected this runner")),
                 Some(Msg::Unauthorized) => {
-                    break Err(anyhow::anyhow!("the relay no longer accepts this runner (rejected or left)"))
+                    break Err(anyhow::anyhow!("the relay no longer accepts this runner (rejected, revoked or left)"))
                 }
                 Some(Msg::Gone) | None => {
                     view.lock().await.closed = true;
