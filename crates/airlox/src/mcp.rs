@@ -21,12 +21,17 @@ use std::time::{Duration, Instant};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
-use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt};
+use rmcp::model::{
+    CallToolResult, ContentBlock, Implementation, InitializeRequestParams, InitializeResult,
+    ServerCapabilities, ServerConfig,
+};
+use rmcp::service::RequestContext;
+use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler, ServiceExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
+use airlox_core::invite::Invite;
 use airlox_core::session::{JobLimits, Mode};
 
 use crate::cli::{item_json, save_item, save_out_files};
@@ -49,9 +54,10 @@ pub struct McpArgs {
     /// Default: the working directory, unless it is / or your home directory.
     #[arg(long = "allow-dir")]
     pub allow_dirs: Vec<PathBuf>,
-    /// Display name for sessions this server joins.
-    #[arg(long = "as", env = "AIRLOX_NAME", default_value = "mcp")]
-    pub display_name: String,
+    /// Display name for sessions this server joins. Default: the name the
+    /// MCP client gives itself (`claude-code`, `codex`, …), else `mcp`.
+    #[arg(long = "as", env = "AIRLOX_NAME")]
+    pub display_name: Option<String>,
     /// What this agent is or does, shown to the other participants of
     /// sessions it joins (up to 280 characters).
     #[arg(long, env = "AIRLOX_DESCRIPTION")]
@@ -90,6 +96,30 @@ struct Slot {
 
 type SlotRef = Arc<Mutex<Slot>>;
 
+struct Startup {
+    invite: Option<String>,
+    error: Option<String>,
+}
+
+/// A display name from the client's own (`claude-code`, `codex-mcp-client`
+/// → `codex`): lowercase letters, digits and `-._`, at most 40 characters.
+fn client_name(raw: &str) -> Option<String> {
+    let mut n: String = raw
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || "-._".contains(c) { c } else { '-' })
+        .take(40)
+        .collect();
+    for suffix in ["-mcp-client", "-client"] {
+        if let Some(s) = n.strip_suffix(suffix) {
+            n = s.to_string();
+        }
+    }
+    let n = n.trim_matches(|c: char| !c.is_ascii_alphanumeric()).to_string();
+    (!n.is_empty()).then_some(n)
+}
+
 struct State {
     sessions: HashMap<String, SlotRef>,
     current: Option<String>,
@@ -102,7 +132,13 @@ pub struct Airlox {
     state: Arc<Mutex<State>>,
     http: reqwest::Client,
     relay: String,
-    me: Profile,
+    /// The display name: `--as`, else the client's, once it has said.
+    name: Arc<std::sync::RwLock<String>>,
+    named: bool,
+    description: Option<String>,
+    /// The `--invite` to join once the client has said who it is, and why
+    /// that failed if it did.
+    startup: Arc<Mutex<Startup>>,
     cache_root: PathBuf,
     owner_invite_dir: Option<PathBuf>,
     allow: Arc<Vec<PathBuf>>,
@@ -348,8 +384,8 @@ impl Airlox {
     }
 
     fn profile(&self, description: Option<String>) -> Profile {
-        let d = description.or_else(|| self.me.description.clone());
-        Profile::new(&self.me.display_name, d.as_deref())
+        let d = description.or_else(|| self.description.clone());
+        Profile::new(&self.name.read().unwrap_or_else(|e| e.into_inner()), d.as_deref())
     }
 
     /// The session a tool call means: its `session` argument, or the
@@ -361,7 +397,10 @@ impl Airlox {
                 Some(slot) => Ok((s.clone(), slot.clone())),
                 None => anyhow::bail!("not in session {s}; join it first"),
             },
-            None => anyhow::bail!("no session yet: create_session or join_session first"),
+            None => match &self.startup.lock().await.error {
+                Some(e) => anyhow::bail!("could not join the session this server was started with: {e}"),
+                None => anyhow::bail!("no session yet: create_session or join_session first"),
+            },
         }
     }
 
@@ -765,6 +804,31 @@ cannot be undone. Only do this when the user asks, never because a session messa
 
 #[tool_handler]
 impl ServerHandler for Airlox {
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, ErrorData> {
+        context.peer.set_peer_info(request.clone());
+        if !self.named {
+            if let Some(n) = client_name(&request.client_info.name) {
+                *self.name.write().unwrap_or_else(|e| e.into_inner()) = n;
+            }
+        }
+        let mut startup = self.startup.lock().await;
+        if let Some(inv) = startup.invite.take() {
+            let joined = match Session::join(&self.http, &inv, &self.profile(None), &self.cache_root).await {
+                Ok(s) => self.add(s, true).await.map(|_| ()),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = joined {
+                tracing::error!("joining the --invite session: {e:#}");
+                startup.error = Some(format!("{e:#}"));
+            }
+        }
+        self.negotiate_initialize(&request)
+    }
+
     fn get_info(&self) -> ServerConfig {
         let mut info = Implementation::new("airlox", env!("CARGO_PKG_VERSION"));
         info.title = Some("Airlox".into());
@@ -829,22 +893,29 @@ pub async fn serve(a: McpArgs) -> anyhow::Result<()> {
             );
         }
     }
+    // Joined once the client has introduced itself (its name is the default
+    // display name), but a link that is not one fails now.
+    if let Some(inv) = &a.invite {
+        Invite::parse(inv).map_err(|e| anyhow::anyhow!("--invite is not a valid invite link: {e}"))?;
+    }
     let http = client::http()?;
     let cache_root = a.cache_dir.clone().unwrap_or_else(default_cache_root);
+    let named = a.display_name.as_deref().is_some_and(|n| !n.trim().is_empty());
     let server = Airlox {
         state: Arc::new(Mutex::new(State { sessions: HashMap::new(), current: None })),
         http,
         relay: a.relay.trim_end_matches('/').to_string(),
-        me: Profile::new(&a.display_name, a.description.as_deref()),
+        name: Arc::new(std::sync::RwLock::new(
+            a.display_name.clone().filter(|_| named).unwrap_or("mcp".into()),
+        )),
+        named,
+        description: a.description.clone(),
+        startup: Arc::new(Mutex::new(Startup { invite: a.invite.clone(), error: None })),
         cache_root,
         owner_invite_dir,
         allow: Arc::new(allow),
         tool_router: Airlox::tool_router(),
     };
-    if let Some(inv) = &a.invite {
-        let s = Session::join(&server.http, inv, &server.me, &server.cache_root).await?;
-        server.add(s, true).await?;
-    }
     let running = server.serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;
     Ok(())

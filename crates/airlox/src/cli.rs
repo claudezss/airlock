@@ -740,6 +740,8 @@ pub fn item_json(s: &Session, i: &Item, max_content: Option<usize>) -> Value {
         "author": i.author,
         "author_role": i.author_role,
         "author_name": i.author_name,
+        // Posted by this participant: what it sent itself, not a reply.
+        "mine": i.author == s.me,
         "created_at_ms": i.created_at_ms,
         "status": i.status,
         "ref": i.item_ref,

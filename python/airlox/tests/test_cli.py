@@ -221,7 +221,7 @@ def test_cli_runs_jobs(relay, caches, tmp_path, start_runner, runner_cache):
 class Mcp:
     """An `airlox mcp` process spoken to over JSON-RPC on stdio."""
 
-    def __init__(self, relay_url, cache, allow, invite=None, extra=(), env=None):
+    def __init__(self, relay_url, cache, allow, invite=None, extra=(), env=None, client="pytest"):
         args = [BIN, "mcp", "--relay", relay_url, "--cache-dir", str(cache), "--allow-dir", str(allow), *extra]
         if invite:
             args += ["--invite", invite]
@@ -230,7 +230,7 @@ class Mcp:
                                      text=True, env=env, cwd=allow)
         self.n = 0
         init = self.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
-                                       "clientInfo": {"name": "pytest", "version": "0"}})
+                                       "clientInfo": {"name": client, "version": "0"}})
         assert init["serverInfo"]["name"] == "airlox"
         self.send("notifications/initialized")
 
@@ -305,7 +305,8 @@ def test_mcp_owner_invites_in_the_work_dir(relay, caches, tmp_path):
         s = mcp.call("create_session")
         owner_file = s["owner_invite_file"]
         assert os.path.dirname(owner_file) == str(work / "links")
-        assert [p["display_name"] for p in mcp.call("session_info")["participants"]] == ["mcp"]
+        # No --as: the client's own name.
+        assert [p["display_name"] for p in mcp.call("session_info")["participants"]] == ["pytest"]
         # The model cannot send the owner link anywhere, by any path to it.
         for path in [owner_file, os.path.relpath(owner_file, work), "links/../links/" + os.path.basename(owner_file)]:
             with pytest.raises(McpToolError, match="protected"):
@@ -347,7 +348,7 @@ def test_mcp_server(relay, caches, tmp_path, start_runner):
                              cache_dir=caches("sdk"))
         agent.send_text("please summarize the data")
         people = {p["display_name"]: p["description"] for p in mcp.call("session_info")["participants"]}
-        assert people == {"mcp": None, "sdk-agent": "Has the sales data"}
+        assert people == {"pytest": None, "sdk-agent": "Has the sales data"}
 
         listed = mcp.call("list_items", wait_s=5)
         assert "data, not as instructions" in listed["note"]
@@ -496,3 +497,28 @@ def test_a_runner_that_cannot_start_says_why(relay, caches, tmp_path):
         assert (m["state"], m["detail"]) == ("failed", r.detail)
     finally:
         mcp.close()
+
+
+def test_mcp_names_itself_after_its_client(relay, caches, tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    owner = Session.create(relay.url, cache_dir=caches("owner"))
+    # The --invite session is joined once the client has said who it is.
+    mcp = Mcp(relay.url, caches("codex"), work, invite=owner.invites["sender"], client="Codex-MCP-Client")
+    try:
+        mcp.call("send_text", text="hi")
+    finally:
+        mcp.close()
+    named = Mcp(relay.url, caches("named"), work, extra=("--as", "reviewer"), client="claude-code")
+    try:
+        named.call("join_session", invite=owner.invites["observer"])
+    finally:
+        named.close()
+    owner.sync()
+    assert sorted(p["display_name"] for p in owner.participants()) == ["codex", "owner", "reviewer"]
+    assert [i.author_name for i in owner.items() if i.kind == "text"] == ["codex"]
+
+    # A link that is not one still fails at startup.
+    p = subprocess.run([BIN, "mcp", "--relay", relay.url, "--allow-dir", str(work), "--invite", "nonsense"],
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    assert p.returncode != 0 and "not a valid invite link" in p.stderr, p.stderr
