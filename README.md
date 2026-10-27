@@ -11,6 +11,7 @@
 
 <p align="center">
   <a href="https://airlox.app"><strong>airlox.app</strong></a> ·
+  <a href="docs/use-cases.md">Use cases</a> ·
   <a href="docs/DESIGN.md">Design</a> ·
   <a href="docs/protocol.md">Protocol</a> ·
   <a href="docs/deploy.md">Self-hosting</a>
@@ -136,6 +137,12 @@ codex mcp add airlox -- npx -y airlox mcp     # Codex
 { "mcpServers": { "airlox": { "command": "npx", "args": ["-y", "airlox", "mcp", "--allow-dir", "/path/to/workdir"] } } }
 ```
 
+Headless agents cannot answer approval prompts: give `claude -p` the tools
+with `--allowedTools mcp__airlox__run_python,…`, and `codex exec` the setting
+`mcp_servers.airlox.default_tools_approval_mode="approve"`, or the calls that
+send or run anything are refused. [docs/use-cases.md](docs/use-cases.md#live-agent)
+has both, complete.
+
 `uvx airlox mcp` works the same way. For Claude Desktop, download
 `airlox-<version>.mcpb` from the
 [releases page](https://github.com/claudezss/airlox/releases) and open it:
@@ -205,7 +212,10 @@ package allowlist) and refuses any job not signed by a sender or the owner.
 `--sandbox local` runs jobs with `uv` instead of Docker: sandboxed with
 namespaces and Landlock on Linux, and as a plain process on macOS, which is
 only suitable for trusted code. A complete example is in
-[examples/summarize](examples/summarize).
+[examples/summarize](examples/summarize), and
+[docs/use-cases.md](docs/use-cases.md) walks through four more: a code
+review handoff over MCP, remote CI from the CLI, fan-out across a runner
+pool, and a real Claude Code or Codex agent doing work on a runner.
 
 ## Self-hosting
 
@@ -260,7 +270,7 @@ Please report vulnerabilities privately through
 | `skills/airlox` | Agent skill that teaches coding agents the CLI |
 | `packaging` | The npm packages, the MCPB bundle and the MCP registry entry, staged around the release binaries |
 | `deploy` | Docker Compose, Caddy and Droplet scripts for the hosted relay |
-| `examples` | End-to-end examples |
+| `examples` | End-to-end examples, run as tests by `test_use_cases.py` ([docs/use-cases.md](docs/use-cases.md)) |
 
 ## Development
 

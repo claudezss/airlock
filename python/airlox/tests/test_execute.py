@@ -10,6 +10,8 @@ import pytest
 
 from airlox import NoRunnerAvailable, Session
 
+from conftest import RunnerProc
+
 LIMITS = {
     "runtime": "python3.12",
     "timeout_s": 20,
@@ -153,6 +155,20 @@ def test_rejected_runner_stops(execute):
     runner.proc.wait(timeout=30)
     assert runner.proc.returncode != 0
     assert "rejected" in runner.output()
+
+
+def test_runners_sharing_a_cache_start_together(relay, caches, tmp_path):
+    # Runners on one machine share ~/.cache/airlox by default. Started at
+    # once on a fresh cache, one builds the job runtime and the others wait
+    # for it, rather than deleting the venv another is building.
+    owner = Session.create(relay.url, mode="execute", job_limits=LIMITS, cache_dir=caches("owner"))
+    procs = [RunnerProc(owner.invites["runner"], f"runner-{n}", tmp_path / "shared") for n in range(8)]
+    try:
+        for n, p in enumerate(procs):
+            wait_runner(owner, f"runner-{n}", lambda r: r.online, proc=p)
+    finally:
+        for p in procs:
+            p.stop()
 
 
 PROBE = """

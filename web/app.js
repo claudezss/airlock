@@ -725,7 +725,9 @@ function buildSessionLayout(s) {
   tick();
 
   if (execute) runnerLoop(s);
-  const nearBottom = () => window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 160;
+  // At the end of the timeline, not of the page: on narrow screens the
+  // sidebar follows the timeline.
+  const nearBottom = () => timeline.getBoundingClientRect().bottom <= window.innerHeight + 160;
   // Timeline entries are kept in event order.
   const place = (node, seq, old) => {
     node.dataset.seq = seq;
@@ -789,7 +791,9 @@ function buildSessionLayout(s) {
       const node = renderItem(s, it);
       place(node, it.seq, old);
       if (held) (held.keep && node.querySelector(`[data-keep="${held.keep}"]:not(:disabled)`) || node).focus({ preventScroll: true });
-      if (stick && !old) node.scrollIntoView({ block: "end" });
+      // A reader at the bottom stays there, also when a card grows in place
+      // (its file arrives, its job gets a result).
+      if (stick) timeline.lastElementChild?.scrollIntoView({ block: "end" });
       settle(s, it);
       if (it.kind === "job") announceJob(s, it);
       else if (!old && s.announce && it.status === "ok" && it.author !== s.me && (it.kind === "text" || it.kind === "file"))
@@ -1924,11 +1928,38 @@ function showHome() {
   app.classList.add("wide");
   document.title = "Airlox · Secure sessions for code and LLM agents";
   show(document.getElementById("home-tpl").content.cloneNode(true));
+  demoTabs(document.querySelector(".lp-demo-tabs"));
   let target = null;
   try {
     target = location.hash.length > 1 ? document.getElementById(decodeURIComponent(location.hash.slice(1))) : null;
   } catch {}
   if (target) target.scrollIntoView();
+}
+
+// The use case tabs: one panel shown at a time, arrow keys move between tabs.
+function demoTabs(list) {
+  const tabs = [...list.querySelectorAll("[role=tab]")];
+  const select = (tab) => {
+    for (const t of tabs) {
+      const on = t === tab;
+      t.setAttribute("aria-selected", String(on));
+      t.tabIndex = on ? 0 : -1;
+      document.getElementById(t.getAttribute("aria-controls")).hidden = !on;
+    }
+  };
+  list.addEventListener("click", (e) => {
+    const tab = e.target.closest("[role=tab]");
+    if (tab) select(tab);
+  });
+  list.addEventListener("keydown", (e) => {
+    const i = tabs.indexOf(document.activeElement);
+    const step = { ArrowRight: 1, ArrowLeft: -1, Home: -i, End: tabs.length - 1 - i }[e.key];
+    if (i < 0 || step === undefined) return;
+    e.preventDefault();
+    const next = tabs[(i + step + tabs.length) % tabs.length];
+    select(next);
+    next.focus();
+  });
 }
 
 // ---------- boot ----------
