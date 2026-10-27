@@ -46,6 +46,29 @@ pub struct JobSpec {
     /// Package names; each must be in the manifest allowlist.
     pub requirements: Vec<String>,
     pub target: Target,
+    /// A file in the work dir (a relative `/`-separated path) whose tail
+    /// the runner sends in its progress items while the job runs, such as
+    /// a simulator's log. Absent from the canonical form when not given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_file: Option<String>,
+}
+
+/// Longest log tail a progress item carries.
+pub const MAX_PROGRESS_TAIL_BYTES: usize = 64 * 1024;
+
+/// A running job's progress, posted by its runner (`kind: progress`, with a
+/// reference to the job).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct JobProgress {
+    /// The job, pinned by blob hash.
+    pub job: ItemRef,
+    /// Time since the job started, measured by the runner.
+    pub elapsed_ms: u64,
+    /// The end of the job's `progress_file`, as UTF-8 (lossy), if it exists.
+    pub tail: Option<String>,
+    /// More of the file came before `tail`.
+    pub tail_truncated: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -105,6 +128,7 @@ pub enum Meta {
     Job(JobSpec),
     Result(JobResult),
     Event(Event),
+    Progress(JobProgress),
 }
 
 impl Meta {
@@ -115,6 +139,7 @@ impl Meta {
             Meta::Job(_) => ItemKind::Job,
             Meta::Result(_) => ItemKind::Result,
             Meta::Event(_) => ItemKind::Event,
+            Meta::Progress(_) => ItemKind::Progress,
         }
     }
 }
@@ -144,6 +169,10 @@ impl Payload {
 
     pub fn event(e: Event) -> Self {
         Payload { meta: Meta::Event(e), body: vec![] }
+    }
+
+    pub fn progress(p: JobProgress) -> Self {
+        Payload { meta: Meta::Progress(p), body: vec![] }
     }
 
     pub fn kind(&self) -> ItemKind {
@@ -205,6 +234,7 @@ mod tests {
                 files: vec![],
                 requirements: vec![],
                 target: Target::Labels { labels: vec!["gpu".into()] },
+                progress_file: None,
             }),
             Payload::event(Event::JobCancel {
                 job: ItemRef {

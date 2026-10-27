@@ -6,6 +6,7 @@ library only, so it works in any python3.8+ image.
 
     python3 shim.py --work DIR --entry FILE --timeout SECONDS --result PATH
                     [--out DIR] [--fsize-mb N] [--memory-mb N] [--nproc N]
+                    [--pass-env NAME ...]
 
 Writes PATH (result.json) plus stdout.txt and stderr.txt beside it. Always
 exits 0 when it managed to write result.json; the job's own outcome is inside.
@@ -40,6 +41,14 @@ SHIM_VERSION = 1
 IS_LINUX = sys.platform.startswith("linux")
 IS_WINDOWS = os.name == "nt"
 PR_SET_CHILD_SUBREAPER = 36
+# Windows variables that describe the machine, not the user, and that
+# programs expect (license managers, cmd, subprocess with shell=True).
+WINDOWS_SYSTEM_ENV = (
+    "WINDIR", "COMSPEC", "PATHEXT", "OS", "SystemDrive", "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER", "PROCESSOR_LEVEL", "PROCESSOR_REVISION",
+    "ProgramData", "ALLUSERSPROFILE", "PUBLIC", "ProgramFiles", "ProgramFiles(x86)",
+    "ProgramW6432", "CommonProgramFiles", "CommonProgramFiles(x86)", "CommonProgramW6432",
+)
 
 
 def become_subreaper():
@@ -163,6 +172,12 @@ def main(argv=None):
     ap.add_argument("--fsize-mb", type=int, default=1024)
     ap.add_argument("--memory-mb", type=int, default=0, help="RLIMIT_AS; prefer cgroups")
     ap.add_argument("--nproc", type=int, default=0, help="RLIMIT_NPROC; needs a dedicated uid")
+    ap.add_argument(
+        "--pass-env",
+        action="append",
+        default=[],
+        help="copy this variable from the shim's environment into the job's (repeatable)",
+    )
     a = ap.parse_args(argv)
 
     work = os.path.abspath(a.work)
@@ -210,7 +225,24 @@ def main(argv=None):
         env["AIRLOX_OUT"] = os.path.abspath(a.out)
     if IS_WINDOWS:
         env["SYSTEMROOT"] = os.environ.get("SYSTEMROOT", r"C:\Windows")
-        env["PATH"] = os.path.dirname(python)
+        env["PATH"] = os.pathsep.join(
+            [os.path.dirname(python), os.path.join(env["SYSTEMROOT"], "System32"), env["SYSTEMROOT"]]
+        )
+        env["TEMP"] = env["TMP"] = tmpdir
+        env["USERPROFILE"] = work
+        for name in WINDOWS_SYSTEM_ENV:
+            if name in os.environ:
+                env[name] = os.environ[name]
+    # Variables the runner's operator chose to share, such as a license
+    # server; PATH is extended, never replaced, so the job's Python stays first.
+    for name in a.pass_env:
+        value = os.environ.get(name)
+        if value is None or name.upper().startswith("AIRLOX_"):
+            continue
+        if name.upper() == "PATH":
+            env["PATH"] = os.pathsep.join([env["PATH"], value])
+        else:
+            env[name] = value
 
     popen_kw = {}
     if IS_WINDOWS:

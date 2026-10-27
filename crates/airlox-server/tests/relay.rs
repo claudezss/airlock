@@ -102,7 +102,8 @@ async fn auth_and_policy_are_enforced() {
     assert_eq!(post(&env, &s, &sender, body).await.status(), StatusCode::BAD_REQUEST);
     // Duplicate id.
     assert_eq!(post(&env, &s, &sender, frame(&item)).await.status(), StatusCode::CREATED);
-    assert_eq!(post(&env, &s, &sender, frame(&item)).await.status(), StatusCode::CONFLICT);
+    let r = post(&env, &s, &sender, frame(&item)).await;
+    assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "duplicate".into()));
     // Runners cannot join relay sessions.
     let kp = Keypair::generate();
     let cert = issue_cert(&s.secrets.role_keypair(Role::Runner), &s.id, Role::Runner, kp.public(), now_ms())
@@ -122,6 +123,8 @@ async fn auth_and_policy_are_enforced() {
                 host: "h".into(),
                 sandbox: airlox_core::cert::SandboxKind::Docker,
                 network_unblocked: false,
+                version: None,
+                python: None,
             }),
             created_at_ms: now_ms(),
         },
@@ -426,7 +429,7 @@ async fn session_history_and_item_size_limits() {
         assert!(accepted < 50, "log cap never applied");
     };
     assert!(accepted > 0);
-    assert_eq!(error_code(last).await, (StatusCode::PAYLOAD_TOO_LARGE, "too_large".into()));
+    assert_eq!(error_code(last).await, (StatusCode::PAYLOAD_TOO_LARGE, "session_full".into()));
     let (_, body) = join_body(&s, Role::Observer, "late");
     assert_eq!(post_join(&env, &s, body).await.status(), StatusCode::PAYLOAD_TOO_LARGE);
 

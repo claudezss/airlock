@@ -38,7 +38,9 @@ impl Default for ZipLimits {
             max_entries: 10_000,
             max_total_bytes: 1024 * 1024 * 1024,
             max_entry_bytes: 512 * 1024 * 1024,
-            max_ratio: 100,
+            // Fixed-width text reports padded with blanks reach ~300:1;
+            // the total and per-entry caps bound what a bomb can write.
+            max_ratio: 500,
             ratio_floor_bytes: 1024 * 1024,
             max_path_len: 512,
             max_depth: 32,

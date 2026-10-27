@@ -615,6 +615,16 @@ impl Inner {
             .is_some_and(|p| p.streams > 0 && now.saturating_sub(p.last_seen_ms) <= timeout_ms)
     }
 
+    /// A job its runner `who` lost (the relay failed it as `runner_lost`)
+    /// that the runner may still finish: it reconnected, or posted the result.
+    pub fn lost_by(&self, job: &str, who: &str) -> bool {
+        self.jobs.get(job).is_some_and(|j| {
+            j.state == JobState::Failed
+                && j.reason.as_deref() == Some("runner_lost")
+                && j.runner.as_deref() == Some(who)
+        })
+    }
+
     pub fn approve_runners(&self) -> bool {
         self.approve_runners
     }
@@ -884,8 +894,9 @@ impl Session {
     }
 
     /// Fail jobs that were not claimed in time or whose runner stopped
-    /// sending heartbeats.
-    fn sweep_jobs(&self, now: u64, claim_ms: u64, runner_ms: u64) -> io::Result<()> {
+    /// sending heartbeats: an assigned job after `runner_ms`, a running one
+    /// after `grace_ms` (its runner may only have lost its connection).
+    fn sweep_jobs(&self, now: u64, claim_ms: u64, runner_ms: u64, grace_ms: u64) -> io::Result<()> {
         let mut g = self.lock();
         let mut due = Vec::new();
         for (id, j) in g.jobs.iter().filter(|(_, j)| j.state.active()) {
@@ -893,7 +904,9 @@ impl Session {
             let seen = g.presence.get(&runner).map(|p| p.last_seen_ms).unwrap_or(0);
             if j.state == JobState::Assigned && now.saturating_sub(j.since_ms) > claim_ms {
                 due.push((id.clone(), runner, "runner_unresponsive"));
-            } else if now.saturating_sub(seen.max(j.since_ms)) > runner_ms {
+            } else if now.saturating_sub(seen.max(j.since_ms))
+                > if j.state == JobState::Running { grace_ms.max(runner_ms) } else { runner_ms }
+            {
                 due.push((id.clone(), runner, "runner_lost"));
             }
         }
@@ -1329,7 +1342,9 @@ impl Store {
             if let Err(e) = s.sweep_evictions(now) {
                 tracing::error!(session = %s.id, "eviction failed: {e}");
             }
-            if let Err(e) = s.sweep_jobs(now, self.cfg.claim_timeout_ms, self.cfg.runner_timeout_ms) {
+            let (claim, runner, grace) =
+                (self.cfg.claim_timeout_ms, self.cfg.runner_timeout_ms, self.cfg.job_reconnect_grace_ms);
+            if let Err(e) = s.sweep_jobs(now, claim, runner, grace) {
                 tracing::error!(session = %s.id, "job sweep failed: {e}");
             }
         }

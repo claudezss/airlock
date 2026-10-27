@@ -425,6 +425,9 @@ pub struct RunParams {
     pub timeout_s: Option<u32>,
     /// Job memory limit in MB (default: the session's).
     pub memory_mb: Option<u32>,
+    /// A file in the job's work dir or $AIRLOX_OUT, such as a log, whose
+    /// last lines the runner reports while the job runs.
+    pub progress_file: Option<String>,
     /// Wait up to this many seconds for the result (default 120, max 600; 0 to return at once).
     pub wait_s: Option<u64>,
     pub session: Option<String>,
@@ -834,16 +837,19 @@ inline in out_text; use get_result with save_dir to save them all.")]
                 timeout_s: p.timeout_s,
                 memory_mb: p.memory_mb,
                 requirements: p.requirements,
+                progress_file: p.progress_file,
             };
             match s.run_python(spec).await {
                 Ok(j) => j,
                 Err(e) => match e.downcast_ref::<NoRunnerAvailable>() {
                     Some(n) => {
-                        return fail(
-                            json!({"job": n.job, "status": "failed", "reason": "no_runner_available",
-                            "message": client::relay_text(&n.message),
-                            "hint": "list_runners: a runner must be online, idle and approved; jobs are not queued"}),
-                        )
+                        let hint = if n.reason == "runner_busy" {
+                            "the runner is running another job; jobs are not queued: retry when list_runners shows it idle"
+                        } else {
+                            "list_runners: a runner must be online, idle and approved; jobs are not queued"
+                        };
+                        return fail(json!({"job": n.job, "status": "failed", "reason": n.reason,
+                            "message": client::relay_text(&n.message), "hint": hint}));
                     }
                     None => return fail(format!("{e:#}")),
                 },

@@ -80,7 +80,7 @@ class RunnerProc:
         self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=self.log.open("w"), env=env)
 
     def output(self) -> str:
-        return self.log.read_text()
+        return self.log.read_text(encoding="utf-8", errors="replace")
 
     def stop(self) -> None:
         if self.proc.poll() is None:

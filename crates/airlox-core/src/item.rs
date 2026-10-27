@@ -39,6 +39,9 @@ pub enum ItemKind {
     Job,
     Result,
     Event,
+    /// A runner's signed note that a job is still running: elapsed time and
+    /// the tail of a log file the job named.
+    Progress,
 }
 
 impl ItemKind {
@@ -49,6 +52,7 @@ impl ItemKind {
             ItemKind::Job => "job",
             ItemKind::Result => "result",
             ItemKind::Event => "event",
+            ItemKind::Progress => "progress",
         }
     }
 }
@@ -140,6 +144,7 @@ impl ItemHeader {
                 | (ItemKind::Job, Some(C::Py))
                 | (ItemKind::Result, None)
                 | (ItemKind::Event, None)
+                | (ItemKind::Progress, None)
         );
         if !ok {
             return Err(Error::invalid(

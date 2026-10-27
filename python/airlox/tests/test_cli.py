@@ -195,7 +195,10 @@ def test_cli_runs_jobs(relay, caches, tmp_path, start_runner, runner_cache):
     where = tmp_path / "where.py"
     where.write_text("import os\nprint(os.getcwd())\n")
     cwd = cli("run", where, invite=sender, cache=caches("cli")).stdout.strip()
-    assert not cwd.startswith(str(runner_cache)) and os.path.expanduser("~") not in cwd, cwd
+    assert not cwd.startswith(str(runner_cache)), cwd
+    # On Windows the system temp folder is inside the user's profile (a
+    # service's virtual account has no user name to give away).
+    assert os.name == "nt" or os.path.expanduser("~") not in cwd, cwd
     with zipfile.ZipFile(io.BytesIO((out / "out.zip").read_bytes())) as z:
         assert json.loads(z.read("summary.json")) == {"orders": 2, "total": 42}
     # out.zip is also unpacked beside it.
@@ -222,7 +225,9 @@ def test_cli_runs_jobs(relay, caches, tmp_path, start_runner, runner_cache):
     assert "unexpected argument" not in p.stderr and "not a job id" not in p.stderr, p.stderr
 
     # SIGTERM stops it cleanly, and an unsandboxed runner's temporary job
-    # directory goes with it.
+    # directory goes with it. (Windows has no SIGTERM: terminate() kills.)
+    if os.name == "nt":
+        return
     runner.proc.terminate()
     assert runner.proc.wait(timeout=20) == 0, runner.output()
     assert set(glob.glob(os.path.join(tempfile.gettempdir(), "airlox-jobs-*"))) <= temp_jobs

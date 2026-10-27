@@ -84,12 +84,32 @@ pub fn status_of(e: &anyhow::Error) -> Option<u16> {
     e.downcast_ref::<RelayError>().map(|r| r.status)
 }
 
-/// Worth retrying: network trouble, rate limits and server errors.
+/// Worth retrying: network trouble, rate limits, server errors, a session
+/// short of storage until deliveries free some, and an upload of the same
+/// item still in progress. Not a session at a limit that will not lift
+/// (`session_full`; older relays say so only in the message).
 pub fn is_transient(e: &anyhow::Error) -> bool {
-    match status_of(e) {
-        Some(s) => s == 429 || s >= 500,
-        None => e.downcast_ref::<reqwest::Error>().is_some(),
+    let Some(r) = e.downcast_ref::<RelayError>() else {
+        return e.downcast_ref::<reqwest::Error>().is_some();
+    };
+    let older_full =
+        r.code == "limit" && (r.message.contains("item limit") || r.message.contains("transfer limit"));
+    let older_storage = r.code == "too_large" && r.message.contains("wait for deliveries");
+    match (r.status, r.code.as_str()) {
+        (_, "session_full") => false,
+        (409, "uploading") | (413, "storage_wait") => true,
+        (413, _) => older_storage,
+        (s, _) => (s == 429 && !older_full) || s >= 500,
     }
+}
+
+/// The relay already has an item with this id: a `409 duplicate`, or the
+/// generic `409 conflict` older relays send for it.
+pub fn is_duplicate(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<RelayError>().is_some_and(|r| {
+        r.status == 409
+            && (r.code == "duplicate" || (r.code == "conflict" && r.message.contains("already exists")))
+    })
 }
 
 async fn check(r: reqwest::Response) -> Result<reqwest::Response> {
@@ -252,7 +272,9 @@ impl Relay {
         frame.extend_from_slice(&(envelope_json.len() as u32).to_be_bytes());
         frame.extend_from_slice(envelope_json.as_bytes());
         frame.extend_from_slice(blob);
-        check(self.post("/items").body(frame).send().await?).await?;
+        // Large items on a slow link: five minutes plus a second per 32 KiB.
+        let timeout = Duration::from_secs(300 + blob.len() as u64 / (32 << 10));
+        check(self.post("/items").timeout(timeout).body(frame).send().await?).await?;
         Ok(())
     }
 
@@ -271,8 +293,10 @@ impl Relay {
 
     /// A heartbeat that also reports the runner's setup (`preparing`,
     /// `ready`, `failed`), so the session sees a runner that cannot start.
-    pub async fn report(&self, state: &str, detail: Option<&str>) -> Result<Value> {
-        self.send_heartbeat(serde_json::json!({ "job": null, "state": state, "detail": detail })).await
+    /// `job` is one it still owes an answer for (from before a restart), so
+    /// the relay does not count that job lost while the answer is on its way.
+    pub async fn report(&self, state: &str, detail: Option<&str>, job: Option<&str>) -> Result<Value> {
+        self.send_heartbeat(serde_json::json!({ "job": job, "state": state, "detail": detail })).await
     }
 
     async fn send_heartbeat(&self, body: Value) -> Result<Value> {

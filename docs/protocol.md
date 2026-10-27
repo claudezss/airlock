@@ -82,7 +82,7 @@ Validity rules (all enforced by `Manifest::validate`):
 - The four public keys are pairwise distinct.
 - `mode == relay` ⇔ `job_limits == null`. Execute mode requires `py` in
   `allowed_types`, `runtime` of the form `python3.<minor>`,
-  `1 ≤ timeout_s ≤ 3600`, `32 ≤ memory_mb ≤ 65536`, and every package already
+  `1 ≤ timeout_s ≤ 86400`, `32 ≤ memory_mb ≤ 65536`, and every package already
   PEP 503-normalized.
 
 The manifest is plaintext policy. The server reads it to enforce expiry,
@@ -162,7 +162,8 @@ The join request is signed by the participant key the certificate names:
     "description": "A100 80 GB, CUDA 12; data team",   // optional
     "kind": "sdk|cli|web|runner",
     "runner": null | { "name": "runner-01", "labels": ["cpu"], "host": "build-box",
-                       "sandbox": "local|docker|kubernetes", "network_unblocked": false },
+                       "sandbox": "local|docker|kubernetes|process", "network_unblocked": false,
+                       "version": "0.1.1", "python": "3.12.4" },   // version, python optional
     "created_at_ms": 0
   },
   "sig": "<participant signature, context join, over canonical(join)>"
@@ -184,6 +185,13 @@ between visible characters (emoji sequences, Persian, Indic scripts);
 variation selectors (U+FE00–FE0F, Mongolian U+180B–180D) and the combining
 grapheme joiner only directly after a visible character, never in a run.
 Direction marks (LRM, RLM, ALM) are allowed.
+
+A runner's `version` (the airlox version it runs) and `python` (the
+interpreter version its jobs get) are optional, up to 32 characters of
+`[A-Za-z0-9.+-]`, and omitted rather than `null` when absent. Runners send
+`version` always. Relays and clients from before these fields (and before the
+`process` sandbox) reject such joins as malformed, so upgrade the relay
+before its runners.
 
 `description` is optional (the rules above apply): text in which the
 participant says what it is or does (a receiving agent's purpose, a runner's
@@ -214,7 +222,7 @@ Every message, file, job, result and event is an item: a plaintext
     "id": "<22-char base64url of 16 random bytes>",
     "session_id": "…",
     "author": "<participant public key>",
-    "kind": "text|file|job|result|event",
+    "kind": "text|file|job|result|event|progress",
     "subkind": null | "py|md|zip|image",
     "size": 31,
     "created_at_ms": 0,
@@ -230,7 +238,7 @@ blob     = nonce(12) || AES-256-GCM(item_key, nonce, payload, aad = canonical(he
 sig      = Ed25519(author, "item", canonical(header) || SHA-256(blob))
 ```
 
-- `subkind` rules: `text`, `result`, `event` → `null`; `file` → one of
+- `subkind` rules: `text`, `result`, `event`, `progress` → `null`; `file` → one of
   `py|md|zip|image`; `job` → `py`.
 - `size` is the plaintext payload length; `len(blob) == size + 28`.
 - `id` must decode (strict base64url) to exactly 16 bytes.
@@ -239,7 +247,8 @@ sig      = Ed25519(author, "item", canonical(header) || SHA-256(blob))
   that item's blob agree. Anyone holding `K` (observers included) can seal a
   different item under an existing id, so references never name an item by id
   alone, and receivers fetch referenced items and check the hash.
-- Item ids are unique per session. The server rejects duplicates; a client
+- Item ids are unique per session. The server rejects duplicates with `409`
+  and error code `duplicate`; a client
   that sees two items with the same id treats the later one as a conflict and
   ignores it.
 - Because the header is the AAD, re-labelling a header (even re-signed by a
@@ -259,9 +268,17 @@ meta. Only `file` carries a non-empty `body`.
 |---|---|
 | `text` | `text` |
 | `file` | `name` (bare file name, ≤ 255 bytes), `mime` |
-| `job` | `filename`, `code`, `runtime`, `timeout_s`, `memory_mb` (nullable), `files` (item references), `requirements` (package names), `target` |
+| `job` | `filename`, `code`, `runtime`, `timeout_s`, `memory_mb` (nullable), `files` (item references), `requirements` (package names), `target`, and optionally `progress_file` (absent, never `null`, when not given) |
 | `result` | `job` (item reference), `exit_code` (nullable), `status`, `reason` (nullable), `wall_ms`, `peak_mem_mb`, `stdout`, `stderr`, `stdout_truncated`, `stderr_truncated`, `out_files` [`{name, size, item}`] where `item` is an item reference, `code_sha256`, `input_sha256` (lowercase hex) |
 | `event` | tagged by `event`: `runner_approve {participant_pub}`, `runner_reject {participant_pub, reason}`, `job_cancel {job}` (item reference), `session_close` |
+| `progress` | `job` (item reference), `elapsed_ms`, `tail` (nullable), `tail_truncated` |
+
+A `progress` item is a runner's signed note that a job is still running:
+the time since it started and, if the job named a `progress_file` (a
+relative `/`-separated path in its work dir, such as a simulator's log), the
+end of that file as text (at most 64 KiB, starting at a line).
+`progress_file` follows the component rules of §9, no component may start
+with `.`, at most 8 components and 255 bytes.
 
 `target` is `{"type":"runner","participant_pub":…,"name":…}` (one runner,
 pinned by its participant key; `name` is for display),
@@ -292,13 +309,13 @@ Never from relay metadata or caller input.
 |---|---|
 | owner | all |
 | sender | text, file, job, event |
-| runner | result, file |
+| runner | result, file, progress |
 | observer | none |
 
 Plus: runners may post only in execute mode; `size ≤ max_item_bytes`;
 `created_at_ms` within the session lifetime; `text` needs `text` allowed;
 `file` needs its subkind allowed; `job` needs execute mode and `py` allowed;
-`result` needs execute mode.
+`result` and `progress` need execute mode.
 
 **Client and runner** (after decryption): payload type equals header kind;
 file rules from §7; events other than `job_cancel` come from the owner only;
@@ -309,7 +326,10 @@ and item reference; `reason` ≤ 4096 characters and present for `refused` and
 `failed`; `completed` has an `exit_code`, `refused`/`timed_out`/`cancelled`
 have none. A result is accepted for a job only if its `job` reference matches
 the job item, and, for a `runner` target, only if its author is that runner's
-participant key. Clients accept the first valid result per job.
+participant key. Clients accept the first valid result per job. Progress
+items follow the same binding (their `job` reference matches, a `runner`
+target's key authored them, the runner is approved) and carry a `tail` of at
+most 64 KiB.
 A runner additionally refuses a job unless: entry file is a bare `.py` name;
 code ≤ 1 MiB; `runtime` equals the manifest runtime;
 `1 ≤ timeout_s ≤ limit`; `memory_mb` (if set) `≤ limit`; at most 32 `files`,
@@ -317,7 +337,15 @@ each fetched and matched against its reference; every requirement,
 PEP 503-normalized, is in `packages`; the target is well-formed. Runners also
 verify the author's certificate chains to the sender (or owner) role, that a
 `runner_approve` event for themselves is signed by an owner-role participant,
-and keep a per-session set of job ids so a relayed duplicate never runs twice.
+and keep a per-session record of job ids, written before a job runs, so a
+relayed duplicate never runs twice, also across restarts. A job a runner
+started but never answered (it stopped while the job ran) gets a `failed`
+result when the runner starts again; it does not run again. A runner keeps a
+finished job's answer (its sealed out files and result) on disk until the
+relay has it, so a result is not lost if the runner stops before posting it;
+after a restart it posts the saved items instead of a `failed` result. They
+are the same sealed items, so a resend the relay already has is a
+`409 duplicate`, which counts as delivered.
 Runners install the manifest's `packages` from wheels only (`--only-binary
 :all:`) when they join, before approval: a source distribution's build script
 would otherwise run outside the sandbox.
@@ -333,7 +361,7 @@ extension). Also rejected: more than 10 000 entries; absolute paths; paths
 over 512 bytes or depth 32; duplicates after Unicode NFC normalization and
 lowercasing; symlinks (unix mode `0o120000`); encrypted entries; compression
 other than stored or deflate; an entry over 512 MiB; a total over 1 GiB; a
-compression ratio above 100 for any entry over 1 MiB, or for the archive as a
+compression ratio above 500 for any entry over 1 MiB, or for the archive as a
 whole (total declared size / archive size) once the total exceeds 1 MiB.
 
 Extraction writes only into an existing, **empty** directory that nothing
@@ -360,6 +388,7 @@ All sandbox backends run the embedded `shim.py`:
 ```text
 python3 shim.py --work DIR --entry FILE --timeout SECONDS --result PATH
                 [--out DIR] [--fsize-mb N] [--memory-mb N] [--nproc N]
+                [--pass-env NAME ...]
 ```
 
 - **Environment.** Only a fixed `PATH` (the interpreter's directory plus
@@ -368,7 +397,12 @@ python3 shim.py --work DIR --entry FILE --timeout SECONDS --result PATH
   `--out`, `AIRLOX_OUT` (the output directory: `/out` in containers) reach
   the job. It runs as `python -E -s -u -B -X utf8 FILE`: the work dir is
   importable, `PYTHON*` variables and user site-packages are ignored, output
-  is unbuffered so it survives a kill, and no `.pyc` files are written.
+  is unbuffered so it survives a kill, and no `.pyc` files are written. On
+  Windows the job also gets `SYSTEMROOT`, `TEMP` and `TMP` (the same
+  directory as `TMPDIR`) and `USERPROFILE` (the work dir), and `PATH` is the
+  interpreter's directory plus the system directories. Each `--pass-env NAME`
+  copies that variable from the shim's own environment (a `PATH` is appended
+  to the job's; `AIRLOX_*` names are never copied).
 - **Containment.** The job runs in its own process group. That group is
   killed when the job exits, on timeout, and when the shim receives SIGTERM,
   SIGINT or SIGHUP; the result then records `cancelled: true`. On Linux the
@@ -411,7 +445,7 @@ sends nothing for 30 seconds is answered with `408`.
 | `GET /v1/sessions/{id}/participants` | bearer | none | `200 {"participants": [participant…]}`, excluding those who left |
 | `GET /v1/sessions/{id}/events?after=N` | bearer | none | `200 {"events": [event…]}` with `seq > N`; omit `after` for all |
 | `GET /v1/sessions/{id}/stream` | bearer | none | SSE, see below |
-| `POST /v1/sessions/{id}/items` | bearer | upload frame | `201 {"id", "seq"}` |
+| `POST /v1/sessions/{id}/items` | bearer | upload frame | `201 {"id", "seq"}`; `409 duplicate` if the item id exists |
 | `GET /v1/sessions/{id}/items/{item}/blob` | bearer | none | `200` ciphertext, or `410 evicted` |
 | `POST /v1/sessions/{id}/items/{item}/ack` | bearer, recipient | none | `204` |
 | `POST /v1/sessions/{id}/items/{item}/want` | bearer, never received it | none | `202 {"open": true}`; `409 present` if the blob is on the relay |
@@ -556,10 +590,10 @@ purged with the session. The relay builds two exports at a time; more are
 | 403 | `forbidden`, `revoked` | role, author or content policy not allowed; a join with a revoked role's invite |
 | 404 | `not_found` | no such session or item |
 | 408 | `timeout` | request body stalled or upload too slow |
-| 409 | `conflict`, `present`, `not_wanted`, `uploading` | duplicate session, item id, or participant key; a want or re-seed for a blob the relay has; a re-seed nobody asked for; enough re-seeds of that blob already in flight |
+| 409 | `conflict`, `duplicate`, `present`, `not_wanted`, `uploading`, `runner_busy` | duplicate session or participant key; a duplicate item id (`duplicate`), or one still being uploaded (`uploading`: retry); a want or re-seed for a blob the relay has; a re-seed nobody asked for; enough re-seeds of that blob already in flight; a job whose matching runner is busy |
 | 410 | `closed`, `evicted` | session closed (or closed and not re-creatable), or blob already delivered |
-| 413 | `too_large` | body, envelope, item, session storage or session history limit (re-seeds included) |
-| 429 | `limit` | relay, address, participant, stream, item, transfer, want or re-seed limit; two audit exports already being built |
+| 413 | `too_large`, `storage_wait`, `session_full` | body, envelope or item limit; the session's storage is full until deliveries free some (`storage_wait`: retry); the session history limit (`session_full`) |
+| 429 | `limit`, `session_full` | relay, address, participant, stream, want or re-seed limit, or two audit exports already being built (`limit`: retry later); the session's item or transfer limit (`session_full`: it will not lift). `progress` items also get `session_full` once a session has used nine tenths of its item or history limit, which is kept for results |
 | 507 | `storage_full` | relay disk above its high watermark |
 
 **Address limits.** The per-address session limit counts IPv4 addresses
@@ -595,7 +629,7 @@ items stay the source of truth.
 | `GET /v1/sessions/{id}/jobs/{job}` | any | none | `200 {"job", "state", "runner", "reason"}` |
 | `POST /v1/sessions/{id}/jobs/{job}/claim` | the assigned runner | none | `204` |
 | `POST /v1/sessions/{id}/jobs/{job}/cancel` | owner, or the job's sender | none | `202 {"job", "state", "runner", "reason"}` |
-| `GET /v1/sessions/{id}/runners` | any | none | `200 {"runners": [runner…], "approval_required"}` |
+| `GET /v1/sessions/{id}/runners` | any | none | `200 {"runners": [runner…], "approval_required"}`; each runner has `busy` (it has an active job) |
 | `POST /v1/sessions/{id}/runners/{participant_pub}/approve` | owner | none | `204` |
 | `POST /v1/sessions/{id}/runners/{participant_pub}/reject` | owner | none | `204` |
 | `GET /v1/sessions/{id}/runners/me/stream` | runner | none | SSE, see below |
@@ -624,9 +658,11 @@ relay routes on this copy; the runner refuses a job whose signed target does
 not match it. Candidates are runners that are eligible, online, idle and
 match the target (a `runner` target matches only that key; `labels` needs
 every label; `any` matches all). The earliest joined candidate gets the job.
-There is no queue: with no candidate the job item is still stored, its state
-becomes `failed` with reason `not_available`, and the answer is
-`409 no_runner_available`.
+There is no queue: with no candidate the job item is still stored and its
+state becomes `failed`. If a runner that would have matched is online but
+busy with another job (runners take one job at a time) the reason is
+`runner_busy` and the answer `409 runner_busy`; otherwise the reason is
+`not_available` and the answer `409 no_runner_available`.
 
 **Job states** (relay view): `assigned` → `running` (claimed) → `done`
 (the assigned runner posted a `result` item whose `refs` include the job),
@@ -635,8 +671,9 @@ or `failed` with a reason:
 | reason | when |
 |---|---|
 | `not_available` | no candidate at submission |
+| `runner_busy` | no idle candidate at submission, but a matching one was busy |
 | `runner_unresponsive` | not claimed within the claim timeout (default 5 s); the runner is offline until its next heartbeat |
-| `runner_lost` | no heartbeat within the runner timeout (default 30 s), or a heartbeat reported a different job |
+| `runner_lost` | an assigned job's runner sent no heartbeat within the runner timeout (default 30 s); a running job's within the job reconnect grace (default 15 min, at least the runner timeout); or a heartbeat reported a different job |
 | `runner_left`, `runner_rejected`, `runner_revoked` | its runner left, was rejected, or its role was revoked |
 | `author_revoked` | the sender who submitted it had its role revoked |
 | `cancelled` | cancelled before it was claimed |
@@ -654,13 +691,27 @@ runner that reconnects does not lose it. A runner is **online** while it
 holds this stream and has sent a heartbeat within the runner timeout;
 heartbeats go every 10 seconds. At most 2 streams per runner.
 
+**Reconnecting.** A runner that loses its connection goes offline after the
+runner timeout, but its running job stays `running` for the job reconnect
+grace: the job keeps running on the runner, which reconnects with backoff and
+posts the result when the relay answers. A runner that reports, in a
+heartbeat, a job the relay already failed as `runner_lost` gets it back as
+`running`, and such a job's result from its runner still makes it `done`.
+A runner that restarts names the job it still owes an answer for in its
+setup heartbeats (`preparing`, `ready`), so that job stays `running` until
+the answer arrives.
+While a job runs, its runner may post signed `progress` items (§7) whose
+`refs` include it.
+
 **Claiming and results.** A runner claims an assignment right away, then
 verifies and runs it, then posts its output files and the `result` item
 through `POST /items`. A claim for a job that has failed or was reassigned is
 `409`, and the runner drops the job. The relay takes items from a runner only
 while it is eligible (approved when approval is required, not rejected, not
-left or revoked, checked again when an upload commits), and
-a `result` only if its `refs` include a job assigned to that runner.
+left or revoked, checked again when an upload commits),
+a `result` only if its `refs` include a job assigned to that runner, and a
+`progress` item only if its `refs` include a job that runner is running (or
+that the relay failed as `runner_lost`).
 
 Clients accept a result for a job only if, besides the §8 rules, its author
 holds the runner role and, when the session requires approval, has a

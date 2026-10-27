@@ -17,6 +17,8 @@ use crate::{Error, Result, PROTOCOL_VERSION};
 pub const DEFAULT_MAX_ITEM_BYTES: u64 = 25 * 1024 * 1024;
 pub const MAX_ITEM_BYTES_CEILING: u64 = 1024 * 1024 * 1024;
 pub const MAX_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+/// Longest job timeout a manifest may allow: a day, for long simulations.
+pub const MAX_JOB_TIMEOUT_S: u32 = 24 * 60 * 60;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
@@ -250,8 +252,8 @@ fn validate_job_limits(l: &JobLimits) -> Result<()> {
     if !rt_ok {
         return Err(Error::invalid("job_limits", format!("runtime {:?}", l.runtime)));
     }
-    if l.timeout_s == 0 || l.timeout_s > 3600 {
-        return Err(Error::invalid("job_limits", "timeout_s must be 1..=3600"));
+    if l.timeout_s == 0 || l.timeout_s > MAX_JOB_TIMEOUT_S {
+        return Err(Error::invalid("job_limits", format!("timeout_s must be 1..={MAX_JOB_TIMEOUT_S}")));
     }
     if l.memory_mb < 32 || l.memory_mb > 65536 {
         return Err(Error::invalid("job_limits", "memory_mb must be 32..=65536"));

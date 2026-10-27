@@ -14,7 +14,7 @@ import time
 import unicodedata
 import zipfile
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 from . import _core as ac
 
@@ -29,6 +29,12 @@ class NoRunnerAvailable(Exception):
     def __init__(self, job: "Job", message: str) -> None:
         super().__init__(message)
         self.job = job
+
+
+class RunnerBusy(NoRunnerAvailable):
+    """A runner that matches the job is online but busy with another one
+    (runners take one job at a time). The job was not queued; submit it
+    again once ``Runner.busy`` is false."""
 
 
 class JobTimeout(Exception):
@@ -79,6 +85,16 @@ class Runner:
     #: The runner's own unsigned word, via the relay.
     state: Optional[str] = None
     detail: Optional[str] = None
+    #: The airlox version it runs and the Python version its jobs get, from
+    #: its signed join (``None`` for runners that do not say).
+    version: Optional[str] = None
+    python: Optional[str] = None
+
+    @property
+    def busy(self) -> bool:
+        """Running a job, per the relay: a new job for it is refused with
+        ``RunnerBusy`` until it finishes."""
+        return self.job is not None
 
     @property
     def idle(self) -> bool:
@@ -152,6 +168,28 @@ class Result:
             return z.read(name)
 
 
+@dataclass
+class Progress:
+    """A running job's progress, signed by its runner."""
+
+    #: Time since the job started, by the runner's clock.
+    elapsed_ms: int
+    #: The end of the job's ``progress_file`` (``None`` until it exists).
+    tail: Optional[str]
+    #: More of the file came before ``tail``.
+    tail_truncated: bool
+    #: When the runner posted this report: milliseconds since the Unix
+    #: epoch by the runner's clock, from the item's signed header.
+    created_at_ms: int
+    runner: str
+    runner_name: Optional[str] = None
+
+    @property
+    def elapsed(self) -> float:
+        """Time since the job started in seconds (``elapsed_ms / 1000``)."""
+        return self.elapsed_ms / 1000.0
+
+
 # Relay reasons for jobs that ended without a signed result.
 _UNSIGNED_STATUS = {"cancelled": "cancelled"}
 
@@ -187,18 +225,89 @@ class Job:
             self._result = self._find()
         return self._result
 
-    def wait(self, timeout: Optional[float] = 60.0, poll: float = 0.25) -> Result:
+    def progress(self) -> List[Progress]:
+        """The runner's progress reports so far, oldest first (after a
+        ``sync``). Only reports signed by a runner that may answer this job
+        count."""
+        s = self.session
+        items = [s._items[i] for i in s._order]
+        approved = approved_runners(items) if s.manifest["job_limits"]["approve_runners"] else None
+        target = self.meta.get("target") or {}
+        out = []
+        for item in items:
+            if item.kind != "progress" or item.status != "ok" or item.author_role != "runner":
+                continue
+            m = item.meta
+            if m.get("job") != self.ref:
+                continue
+            if target.get("type") == "runner" and item.author != target.get("participant_pub"):
+                continue
+            if approved is not None and item.author not in approved:
+                continue
+            out.append(
+                Progress(
+                    elapsed_ms=m["elapsed_ms"],
+                    tail=m["tail"],
+                    tail_truncated=m["tail_truncated"],
+                    created_at_ms=item.created_at_ms,
+                    runner=item.author,
+                    runner_name=item.author_name,
+                )
+            )
+        return out
+
+    def latest_progress(self) -> Optional[Progress]:
+        """The newest progress report, if any."""
+        p = self.progress()
+        return p[-1] if p else None
+
+    def wait(
+        self,
+        timeout: Optional[float] = 60.0,
+        poll: float = 0.25,
+        *,
+        on_progress: Optional[Callable[[Progress], None]] = None,
+        lost_grace: float = 0.0,
+    ) -> Result:
         """Block until the job has a result. Jobs that failed on the relay
         (no runner, runner lost, cancelled before it started) return an
-        unsigned result with the relay's reason."""
+        unsigned result with the relay's reason.
+
+        ``timeout`` is in seconds; past it this raises ``JobTimeout`` (the
+        job keeps running, so ``wait`` again or check ``result()`` later).
+        The default of 60 s suits short jobs: for long ones pass
+        ``timeout=None`` to wait as long as the job runs (its own time
+        limit still applies).
+
+        ``on_progress`` is called with each new progress report while
+        waiting. A runner that loses its connection keeps running the job
+        and posts the result once it is back; the relay waits for it (its
+        ``--job-reconnect-grace``) before it calls the runner lost. With
+        ``lost_grace`` this call waits that many seconds more for a late
+        result after that (``job.result()`` also finds one later)."""
         deadline = None if timeout is None else time.monotonic() + timeout
+        seen = 0
+        lost_until: Optional[float] = None
         while True:
             self.session.sync()
             r = self.result()
             if r is not None:
                 return r
+            if on_progress is not None:
+                reports = self.progress()
+                for p in reports[seen:]:
+                    on_progress(p)
+                seen = len(reports)
             st = self.state()
             self.runner = st.get("runner") or self.runner
+            if st["state"] == "failed" and st.get("reason") == "runner_lost" and lost_grace > 0:
+                if lost_until is None:
+                    lost_until = time.monotonic() + lost_grace
+                if time.monotonic() < lost_until and (deadline is None or time.monotonic() < deadline):
+                    time.sleep(poll)
+                    continue
+            elif st["state"] != "failed":
+                lost_until = None
             if st["state"] == "failed":
                 # A runner that ran the job may still post its result; give it a moment.
                 self.session.sync()

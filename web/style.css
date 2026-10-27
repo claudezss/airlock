@@ -238,6 +238,8 @@ select:focus { border-color: var(--accent); outline: none; }
 .jobmeta dt { color: var(--muted); }
 .jobmeta dd { margin: 0; word-break: break-word; }
 .codebox summary { cursor: pointer; padding: 8px 14px; border-top: 1px solid var(--line); color: var(--soft); font-size: 13px; min-height: 36px; }
+.card .note.progress { padding: 4px 14px 10px; font-size: 13px; color: var(--link); }
+.progress-log pre { max-height: 280px; }
 .result { border-top: 1px solid var(--line-2); }
 .result-head { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 10px 14px; background: var(--panel-2); }
 .logblock .logname, .outfiles .logname { display: flex; gap: 8px; align-items: center; padding: 8px 14px 0; font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }

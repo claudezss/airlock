@@ -512,6 +512,10 @@ pub struct RunArgs {
     /// A package from the session's allowlist the job needs (repeat).
     #[arg(long = "requirement")]
     pub requirements: Vec<String>,
+    /// A file in the job's work dir (e.g. a simulator's log) whose tail the
+    /// runner posts as progress while the job runs.
+    #[arg(long)]
+    pub progress_file: Option<String>,
     /// Save the job's out files here.
     #[arg(long)]
     pub out_dir: Option<PathBuf>,
@@ -545,6 +549,7 @@ pub async fn run(a: RunArgs) -> Result<i32> {
         timeout_s: a.timeout.map(|t| t.as_secs().max(1) as u32),
         memory_mb: a.memory,
         requirements: a.requirements.clone(),
+        progress_file: a.progress_file.clone(),
     };
     let (job, runner) = match s.run_python(spec).await {
         Ok(j) => j,
@@ -552,7 +557,7 @@ pub async fn run(a: RunArgs) -> Result<i32> {
             if let Some(n) = e.downcast_ref::<NoRunnerAvailable>() {
                 if a.conn.json {
                     print_json(
-                        &json!({"job": n.job, "status": "failed", "reason": "no_runner_available", "message": client::relay_text(&n.message)}),
+                        &json!({"job": n.job, "status": "failed", "reason": n.reason, "message": client::relay_text(&n.message)}),
                     );
                     return Ok(1);
                 }
@@ -620,6 +625,10 @@ async fn finish(
         v["saved"] = json!(saved);
         v["notes"] = json!(notes);
         print_json(&v);
+    } else if r.runner_lost() {
+        eprintln!(
+            "lost contact with the runner; it may still finish and post its result: airlox result --wait 30m -- {job}"
+        );
     } else {
         print_outcome(&r, &saved, out_dir.is_none());
         for n in &notes {
@@ -630,9 +639,14 @@ async fn finish(
 }
 
 /// The process exit status for an outcome: the job's own exit code when the
-/// runner signed one, else 1 (timed out, out of memory, cancelled, or failed
-/// on the relay; `--json` tells these apart).
+/// runner signed one; 75 (EX_TEMPFAIL, as when the wait runs out) when the
+/// relay lost the runner, which may still post a result; else 1 (timed out,
+/// out of memory, cancelled, or failed on the relay; `--json` tells these
+/// apart).
 fn exit_status(r: &Outcome) -> i32 {
+    if r.runner_lost() {
+        return 75;
+    }
     match (r.signed, r.exit_code) {
         (true, Some(c)) if r.status == "completed" || c != 0 => c.clamp(0, 255) as i32,
         _ => 1,
@@ -864,6 +878,7 @@ fn item_line(s: &Session, i: &Item) -> String {
             "event" => {
                 format!("event {}", clean_line(i.meta.as_ref().unwrap()["event"].as_str().unwrap_or("?")))
             }
+            "progress" => progress_line(i.meta.as_ref().unwrap()),
             k => clean_line(k),
         },
         Status::Evicted => format!("{} (left the relay before it was fetched)", clean_line(&i.kind)),
@@ -873,6 +888,37 @@ fn item_line(s: &Session, i: &Item) -> String {
         }
     };
     format!("#{:<4} {who}: {what}", i.seq)
+}
+
+/// Longest tail line shown for a progress item, in characters.
+const PROGRESS_TAIL_CHARS: usize = 120;
+
+/// "progress for <job>: running 2 min 5 s · <last line of the tail>".
+fn progress_line(m: &Value) -> String {
+    let job = clean_line(m["job"]["id"].as_str().unwrap_or("?"));
+    let elapsed = human_elapsed(m["elapsed_ms"].as_u64().unwrap_or(0));
+    // A carriage return ends a line too: progress bars redraw themselves with it.
+    let last = m["tail"].as_str().and_then(|t| t.split(['\n', '\r']).rev().find(|l| !l.trim().is_empty()));
+    match last {
+        Some(l) => {
+            let mut l = clean_line(l.trim());
+            if l.chars().count() > PROGRESS_TAIL_CHARS {
+                l = l.chars().take(PROGRESS_TAIL_CHARS).collect::<String>() + "…";
+            }
+            format!("progress for {job}: running {elapsed} · {l}")
+        }
+        None => format!("progress for {job}: running {elapsed}"),
+    }
+}
+
+/// "45 s", "2 min 5 s", "3 h 10 min", "2 d 4 h".
+fn human_elapsed(ms: u64) -> String {
+    match ms / 1000 {
+        s if s < 60 => format!("{s} s"),
+        s if s < 3600 => format!("{} min {} s", s / 60, s % 60),
+        s if s < 86_400 => format!("{} h {} min", s / 3600, (s % 3600) / 60),
+        s => format!("{} d {} h", s / 86_400, (s % 86_400) / 3600),
+    }
 }
 
 /// Save a received file in `dir` under [`received_name`] (never a name the
@@ -976,8 +1022,14 @@ pub async fn runner_list(conn: Conn) -> Result<()> {
             "idle"
         };
         let net = if r.network_unblocked { " · cannot block network" } else { "" };
+        let versions = match (&r.version, &r.python) {
+            (Some(v), Some(p)) => format!(" · airlox {} · python {}", clean_line(v), clean_line(p)),
+            (Some(v), None) => format!(" · airlox {}", clean_line(v)),
+            (None, Some(p)) => format!(" · python {}", clean_line(p)),
+            (None, None) => String::new(),
+        };
         println!(
-            "{:<20} {:<18} {} on {} [{}]{net}",
+            "{:<20} {:<18} {} on {} [{}]{net}{versions}",
             clean_line(&r.name),
             state,
             clean_line(&r.sandbox),
@@ -1158,8 +1210,10 @@ mod tests {
             (".git/config", b"x"),
         ]));
         let (saved, notes) = save_out_files(&r, d.path());
-        let mut names: Vec<_> =
-            saved.iter().map(|p| p.strip_prefix(&*d.path().to_string_lossy()).unwrap()).collect();
+        let mut names: Vec<_> = saved
+            .iter()
+            .map(|p| p.strip_prefix(&*d.path().to_string_lossy()).unwrap().replace('\\', "/"))
+            .collect();
         names.sort();
         assert_eq!(
             names,
@@ -1197,5 +1251,30 @@ mod tests {
         let (saved, notes) = save_out_files(&outcome(zip_of(&files)), d.path());
         assert_eq!(saved.len(), 1 + MAX_LISTED);
         assert!(notes.iter().any(|n| n.starts_with("30 more files in")), "{notes:?}");
+    }
+
+    #[test]
+    fn progress_lines_show_elapsed_time_and_the_last_line() {
+        let m = json!({"job": {"id": "j1"}, "elapsed_ms": 125_000,
+            "tail": "step 1\nstep 2\x1b[31m\n\n", "tail_truncated": false});
+        assert_eq!(progress_line(&m), "progress for j1: running 2 min 5 s · step 2\\u{1b}[31m");
+        let m = json!({"job": {"id": "j1"}, "elapsed_ms": 7_265_000,
+            "tail": "10%\r50%\r90%\r", "tail_truncated": false});
+        assert_eq!(progress_line(&m), "progress for j1: running 2 h 1 min · 90%");
+        let m = json!({"job": {"id": "j1"}, "elapsed_ms": 4_000, "tail": null, "tail_truncated": false});
+        assert_eq!(progress_line(&m), "progress for j1: running 4 s");
+        let m =
+            json!({"job": {"id": "j1"}, "elapsed_ms": 0, "tail": "x".repeat(500), "tail_truncated": true});
+        assert_eq!(progress_line(&m), format!("progress for j1: running 0 s · {}…", "x".repeat(120)));
+    }
+
+    #[test]
+    fn a_lost_runner_exits_like_a_wait_that_ran_out() {
+        let mut r = outcome(vec![]);
+        r.out_files.clear();
+        (r.signed, r.status, r.reason) = (false, "failed".into(), Some("runner_lost".into()));
+        assert_eq!(exit_status(&r), 75);
+        r.reason = Some("no_runner_available".into());
+        assert_eq!(exit_status(&r), 1);
     }
 }

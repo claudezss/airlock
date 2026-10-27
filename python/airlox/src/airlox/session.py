@@ -19,7 +19,7 @@ from . import _core as ac
 import httpx
 
 from .cache import Cache, default_root
-from .execute import Job, NoRunnerAvailable, Runner, RunnerFailed, signed_approvals
+from .execute import Job, NoRunnerAvailable, Runner, RunnerBusy, RunnerFailed, signed_approvals
 
 DEFAULT_TYPES = ("text", "py", "md", "zip", "image")
 FILE_TYPES = {
@@ -440,6 +440,8 @@ class Session:
                     state=r.get("state"),
                     # The relay caps it, but the relay is not trusted either.
                     detail=r["detail"][:300] if isinstance(r.get("detail"), str) else None,
+                    version=info.get("version"),
+                    python=info.get("python"),
                 )
             )
         return out
@@ -525,14 +527,19 @@ class Session:
         timeout: Optional[int] = None,
         memory_mb: Optional[int] = None,
         requirements: Iterable[str] = (),
+        progress_file: Optional[str] = None,
     ) -> Job:
         """Submit Python to a runner. ``files`` are item references from
         ``send_file`` (ZIPs are unpacked into the work dir). Target one
         ``runner`` (by name, key or ``Runner``), any runner with all of
         ``labels``, or any idle runner. Raises ``NoRunnerAvailable`` at once
-        if nothing matches: jobs are never queued. Files the job writes to
-        ``os.environ["AIRLOX_OUT"]`` (``/out`` in containers) come back as
-        out files."""
+        if nothing matches, ``RunnerBusy`` if what matches is busy: jobs are
+        never queued. Files the job writes to ``os.environ["AIRLOX_OUT"]``
+        (``/out`` in containers) come back as out files.
+
+        ``progress_file`` names a file in the job's work dir (``"logs/run.log"``)
+        whose tail the runner posts while the job runs; read it with
+        ``Job.progress()`` or ``Job.wait(on_progress=...)``."""
         limits = self._require_execute()
         if runner is not None and labels is not None:
             raise ValueError("pass runner or labels, not both")
@@ -559,11 +566,16 @@ class Session:
             "requirements": list(requirements),
             "target": target,
         }
+        # Absent rather than null: the canonical form leaves it out.
+        if progress_file is not None:
+            meta["progress_file"] = progress_file
         _, env, blob, frame = self._seal("job", "py", meta, b"", [])
         job = Job(self, json.loads(ac.item_ref(env, blob)), meta)
         try:
             resp = self._req("POST", "/jobs", content=frame, headers={"Airlox-Target": json.dumps(target)})
         except RelayError as e:
+            if e.code == "runner_busy":
+                raise RunnerBusy(job, e.message) from None
             if e.code == "no_runner_available":
                 raise NoRunnerAvailable(job, e.message) from None
             raise

@@ -7,7 +7,7 @@ use std::time::Duration;
 use airlox_core::cert::{issue_cert, sign_join, ClientKind, JoinRequest, RunnerInfo, SandboxKind};
 use airlox_core::item::{new_item_id, seal, ItemKind, ItemRef, NewItem, SealedItem};
 use airlox_core::keys::Keypair;
-use airlox_core::payload::{Event, JobResult, JobSpec, JobStatus, Meta, Payload, Target};
+use airlox_core::payload::{Event, JobProgress, JobResult, JobSpec, JobStatus, Meta, Payload, Target};
 use airlox_core::session::{ContentType, Mode, Role};
 use airlox_server::Config;
 use bytes::Bytes;
@@ -54,6 +54,8 @@ fn runner_join_body(s: &Sess, name: &str, labels: &[&str]) -> (Keypair, String) 
                 host: "test-host".into(),
                 sandbox: SandboxKind::Docker,
                 network_unblocked: false,
+                version: None,
+                python: None,
             }),
             created_at_ms: now_ms(),
         },
@@ -76,6 +78,7 @@ fn seal_job(s: &Sess, author: &Member, target: &Target) -> SealedItem {
         files: vec![],
         requirements: vec![],
         target: target.clone(),
+        progress_file: None,
     };
     seal_kind(s, author, ItemKind::Job, Some(ContentType::Py), vec![], Payload::job(spec))
 }
@@ -333,6 +336,7 @@ async fn unclaimed_jobs_fail_and_quiet_runners_are_lost() {
     let (env, s, owner, sender) = execute_env(|c| {
         c.claim_timeout_ms = 200;
         c.runner_timeout_ms = 600;
+        c.job_reconnect_grace_ms = 600;
     })
     .await;
     let runner = join_runner(&env, &s, "runner-01", &[]).await;
@@ -378,6 +382,72 @@ async fn unclaimed_jobs_fail_and_quiet_runners_are_lost() {
     assert_eq!(hb["job"], id.as_str());
     heartbeat(&env, &s, &runner, None).await;
     assert_eq!(job_state(&env, &s, &owner, &id).await["reason"], "runner_lost");
+}
+
+fn seal_progress(s: &Sess, runner: &Member, job: &SealedItem, tail: &str) -> SealedItem {
+    let job_ref = ItemRef::to(job);
+    let p = JobProgress {
+        job: job_ref.clone(),
+        elapsed_ms: 1000,
+        tail: Some(tail.into()),
+        tail_truncated: false,
+    };
+    seal_kind(s, runner, ItemKind::Progress, None, vec![job_ref], Payload::progress(p))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn busy_runners_refuse_and_lost_jobs_come_back() {
+    let (env, s, owner, sender) = execute_env(|c| {
+        c.runner_timeout_ms = 400;
+        c.job_reconnect_grace_ms = 800;
+    })
+    .await;
+    let runner = join_runner(&env, &s, "runner-01", &[]).await;
+    let _stream = RunnerStream::open(&env, &s, &runner).await;
+    approve(&env, &s, &owner, &runner).await;
+    assert_eq!(runners(&env, &s, &owner).await[0]["busy"], false);
+
+    let job = seal_job(&s, &sender, &Target::Any);
+    let id = job.envelope.header.id.clone();
+    assert_eq!(submit(&env, &s, &sender, &job).await.status(), StatusCode::CREATED);
+    assert_eq!(claim(&env, &s, &runner, &id).await, StatusCode::NO_CONTENT);
+    assert_eq!(runners(&env, &s, &owner).await[0]["busy"], true);
+
+    // Busy: refused at once with its own code, never queued.
+    let other = seal_job(&s, &sender, &Target::Any);
+    let r = submit(&env, &s, &sender, &other).await;
+    assert_eq!(r.status(), StatusCode::CONFLICT);
+    assert_eq!(r.json::<Value>().await.unwrap()["error"], "runner_busy");
+    let other_id = other.envelope.header.id.clone();
+    assert_eq!(job_state(&env, &s, &owner, &other_id).await["reason"], "runner_busy");
+
+    // Progress only for the job it runs.
+    let p = seal_progress(&s, &runner, &job, "step 3 of 10");
+    assert_eq!(post(&env, &s, &runner, frame(&p)).await.status(), StatusCode::CREATED);
+    let p = seal_progress(&s, &runner, &other, "not mine");
+    assert_eq!(post(&env, &s, &runner, frame(&p)).await.status(), StatusCode::FORBIDDEN);
+    let p = seal_progress(&s, &sender, &job, "senders do not report progress");
+    assert_eq!(post(&env, &s, &sender, frame(&p)).await.status(), StatusCode::FORBIDDEN);
+
+    // Silent past the runner timeout: offline, but the job keeps running
+    // through the grace period.
+    tokio::time::sleep(Duration::from_millis(550)).await;
+    assert_eq!(runners(&env, &s, &owner).await[0]["online"], false);
+    assert_eq!(job_state(&env, &s, &owner, &id).await["state"], "running");
+    // Past the grace: lost.
+    assert!(eventually(|| async { job_state(&env, &s, &owner, &id).await["reason"] == "runner_lost" }).await);
+
+    // The runner reconnects still working on it: it is running again.
+    let hb: Value = heartbeat(&env, &s, &runner, Some(&id)).await.json().await.unwrap();
+    assert_eq!(hb["job"], id.as_str());
+    assert_eq!(job_state(&env, &s, &owner, &id).await["state"], "running");
+
+    // Lost again, and the result arrives later: it still finishes the job.
+    assert!(eventually(|| async { job_state(&env, &s, &owner, &id).await["reason"] == "runner_lost" }).await);
+    let res = seal_result(&s, &runner, &job);
+    assert_eq!(post(&env, &s, &runner, frame(&res)).await.status(), StatusCode::CREATED);
+    assert_eq!(job_state(&env, &s, &owner, &id).await["state"], "done");
+    assert_eq!(runners(&env, &s, &owner).await[0]["busy"], false);
 }
 
 #[tokio::test(flavor = "multi_thread")]

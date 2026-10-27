@@ -292,6 +292,10 @@ pub struct Runner {
     /// own unsigned word, via the relay.
     pub state: Option<String>,
     pub detail: Option<String>,
+    /// The airlox version it runs and its jobs' Python version, from its
+    /// signed join, when it said.
+    pub version: Option<String>,
+    pub python: Option<String>,
 }
 
 /// Which runner a job goes to.
@@ -311,18 +315,30 @@ pub struct JobSpec {
     pub timeout_s: Option<u32>,
     pub memory_mb: Option<u32>,
     pub requirements: Vec<String>,
+    /// A file in the work dir whose tail the runner reports while the job runs.
+    pub progress_file: Option<String>,
 }
 
 /// No approved, online, idle runner matched; jobs are never queued.
 #[derive(Debug)]
 pub struct NoRunnerAvailable {
     pub job: String,
+    /// `runner_busy` (a matching runner is busy) or `no_runner_available`.
+    pub reason: String,
     pub message: String,
 }
 
 impl std::fmt::Display for NoRunnerAvailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "no runner available: {:?}", client::relay_text(&self.message))
+        let message = client::relay_text(&self.message);
+        if self.reason == "runner_busy" {
+            write!(
+                f,
+                "runner busy: {message}; jobs are not queued. Retry when 'airlox runner list' shows it idle."
+            )
+        } else {
+            write!(f, "no runner available: {message:?}")
+        }
     }
 }
 
@@ -438,6 +454,13 @@ impl Outcome {
             runner_name,
             signed: false,
         }
+    }
+
+    /// The relay lost contact with the job's runner and no signed result
+    /// has come. Not final: the runner may still be running the job and
+    /// post its result when it is back, so check again later.
+    pub fn runner_lost(&self) -> bool {
+        !self.signed && self.reason.as_deref() == Some("runner_lost")
     }
 }
 
@@ -859,6 +882,8 @@ impl Session {
                     Some((cut, _)) => format!("{}…", &d[..cut]),
                     None => d.to_string(),
                 }),
+                version: info["version"].as_str().map(String::from),
+                python: info["python"].as_str().map(String::from),
                 participant_pub: public,
             });
         }
@@ -923,7 +948,7 @@ impl Session {
             Target::Labels(l) => json!({"type": "labels", "labels": l}),
             Target::Any => json!({"type": "any"}),
         };
-        let meta = json!({
+        let mut meta = json!({
             "type": "job",
             "filename": spec.filename,
             "code": spec.code,
@@ -934,6 +959,10 @@ impl Session {
             "requirements": spec.requirements,
             "target": target,
         });
+        // Absent rather than null: the canonical form leaves it out.
+        if let Some(p) = &spec.progress_file {
+            meta["progress_file"] = json!(p);
+        }
         let (id, _, _, frame) = self.seal("job", Some("py"), &meta, b"", vec![])?;
         match self.relay.post_raw("/jobs", frame, &[("Airlox-Target", target.to_string())]).await {
             Ok(resp) => {
@@ -945,8 +974,9 @@ impl Session {
                 Ok((id, v["runner"].as_str().map(String::from)))
             }
             Err(e) => match e.downcast_ref::<RelayError>() {
-                Some(r) if r.code == "no_runner_available" => {
-                    Err(NoRunnerAvailable { job: id, message: r.message.clone() }.into())
+                Some(r) if r.code == "no_runner_available" || r.code == "runner_busy" => {
+                    Err(NoRunnerAvailable { job: id, reason: r.code.clone(), message: r.message.clone() }
+                        .into())
                 }
                 _ => Err(e),
             },
@@ -1053,7 +1083,9 @@ impl Session {
 
     /// Wait for a job's outcome. A job that failed on the relay (no runner,
     /// runner lost, cancelled before it started) gives an unsigned outcome
-    /// with the relay's reason. `None` if `timeout` passes first.
+    /// with the relay's reason. `None` if `timeout` passes first. A
+    /// `runner_lost` outcome ([`Outcome::runner_lost`]) is not final: a
+    /// late signed result still completes the job.
     pub async fn wait(&mut self, job: &str, timeout: Option<Duration>) -> Result<Option<Outcome>> {
         let deadline = timeout.map(|t| Instant::now() + t);
         loop {

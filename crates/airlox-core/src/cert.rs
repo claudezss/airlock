@@ -85,6 +85,9 @@ pub enum SandboxKind {
     Local,
     Docker,
     Kubernetes,
+    /// A plain process on the runner's host, with an operator-provided
+    /// interpreter (a Windows Job Object caps and contains it on Windows).
+    Process,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -96,6 +99,23 @@ pub struct RunnerInfo {
     pub sandbox: SandboxKind,
     /// True when the sandbox cannot block network access (local on macOS/Windows).
     pub network_unblocked: bool,
+    /// The airlox version the runner runs, e.g. "0.3.0". Absent from the
+    /// canonical form when not given, so older joins are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// The version of the interpreter jobs run with, e.g. "3.12.4", when
+    /// the runner knows it at join.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python: Option<String>,
+}
+
+/// Longest `version` or `python` string in a runner's join.
+pub const MAX_VERSION_CHARS: usize = 32;
+
+fn is_version_text(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_VERSION_CHARS
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -232,6 +252,14 @@ impl SignedJoinRequest {
                     return Err(Error::invalid("runner labels", "up to 16 labels of [a-z0-9._-]"));
                 }
                 check_display_text("runner host", &r.host, 128)?;
+                for v in [&r.version, &r.python].into_iter().flatten() {
+                    if !is_version_text(v) {
+                        return Err(Error::invalid(
+                            "runner version",
+                            "up to 32 characters of [A-Za-z0-9.+-]",
+                        ));
+                    }
+                }
             }
             (ClientKind::Runner, _, _) | (_, Some(_), _) | (_, _, true) => {
                 return Err(Error::invalid(
@@ -298,6 +326,8 @@ mod tests {
                 host: "yan-mbp".into(),
                 sandbox: SandboxKind::Docker,
                 network_unblocked: false,
+                version: None,
+                python: None,
             }),
             created_at_ms: 3,
         };

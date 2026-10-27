@@ -544,21 +544,40 @@ pub(crate) async fn receive_upload(
     }
     let mut reservation = {
         let mut g = s.lock();
-        if g.items.contains_key(&item_id) || g.pending.contains(&item_id) {
-            return Err(ApiError::conflict("an item with this id already exists"));
+        if g.items.contains_key(&item_id) {
+            return Err(ApiError::conflict_code("duplicate", "an item with this id already exists"));
+        }
+        // Not stored yet: the upload may still fail, so the sender retries.
+        if g.pending.contains(&item_id) {
+            return Err(ApiError::conflict_code("uploading", "this item is being uploaded; try again"));
         }
         if g.items.len() + g.pending.len() >= cfg.max_items {
-            return Err(ApiError::limit("session is at its item limit"));
+            return Err(ApiError::session_full("session is at its item limit"));
         }
         if g.log_len() + env_json.len() as u64 + LOG_LINE_OVERHEAD > cfg.max_log_bytes {
-            return Err(ApiError::too_large("session history limit reached"));
+            return Err(ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "session_full",
+                "session history limit reached",
+            ));
+        }
+        // Progress is a nicety: the last tenth of a session's item and
+        // history budget is kept for what answers jobs.
+        let nearly_full = (g.items.len() + g.pending.len()) * 10 >= cfg.max_items * 9
+            || g.log_len() * 10 >= cfg.max_log_bytes * 9;
+        if h.kind == ItemKind::Progress && nearly_full {
+            return Err(ApiError::session_full("session is nearly full; progress reports are paused"));
         }
         if g.held_bytes + g.pending_bytes + blob_len > cfg.max_session_bytes {
-            return Err(ApiError::too_large("session would exceed its storage limit; wait for deliveries"));
+            return Err(ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "storage_wait",
+                "session would exceed its storage limit; wait for deliveries",
+            ));
         }
         // Pending uploads are already charged, so concurrent uploads cannot overshoot.
         if g.transfer_bytes + blob_len > cfg.max_session_transfer {
-            return Err(ApiError::limit("session transfer limit reached"));
+            return Err(ApiError::session_full("session transfer limit reached"));
         }
         charge_ip(&g, &ip_hash, blob_len, cfg.max_bytes_per_ip)?;
         g.pending.insert(item_id.clone());
@@ -720,7 +739,8 @@ pub async fn post_item(
         }
         if role == Role::Runner {
             // A runner posts only as an eligible runner, and a result only
-            // for a job the relay gave it.
+            // for a job the relay gave it; progress only while that job runs
+            // (or after the relay lost track of the runner).
             let g = s2.lock();
             if !g.runner_eligible(&who2) {
                 return Err(ApiError::forbidden("this runner is not approved"));
@@ -729,6 +749,13 @@ pub async fn post_item(
                 h.refs.iter().any(|r| g.jobs.get(&r.id).is_some_and(|j| j.runner.as_deref() == Some(&who2)));
             if h.kind == ItemKind::Result && !assigned {
                 return Err(ApiError::forbidden("results must reference a job assigned to this runner"));
+            }
+            let running = h.refs.iter().any(|r| {
+                g.jobs.get(&r.id).is_some_and(|j| j.state.active() && j.runner.as_deref() == Some(&who2))
+                    || g.lost_by(&r.id, &who2)
+            });
+            if h.kind == ItemKind::Progress && !running {
+                return Err(ApiError::forbidden("progress must reference a job this runner is running"));
             }
         }
         Ok(())
@@ -739,12 +766,14 @@ pub async fn post_item(
     let refs: Vec<String> = up.env.header.refs.iter().map(|r| r.id.clone()).collect();
     let (seq, ()) = blocking(move || {
         commit_upload(&s, &who.clone(), up, |s, g, _| {
-            // A result from the runner a job is assigned to finishes that job.
+            // A result from the runner a job is assigned to finishes that job,
+            // also one the relay failed when it lost the runner's connection.
             if is_result {
                 let done: Vec<String> = refs
                     .iter()
                     .filter(|j| {
                         g.jobs.get(*j).is_some_and(|r| r.state.active() && r.runner.as_deref() == Some(&who))
+                            || g.lost_by(j, &who)
                     })
                     .cloned()
                     .collect();
@@ -784,7 +813,7 @@ pub async fn get_blob(
         }
         let len = r.blob_len;
         if g.transfer_bytes + len > st.store.cfg.max_session_transfer {
-            return Err(ApiError::limit("session transfer limit reached"));
+            return Err(ApiError::session_full("session transfer limit reached"));
         }
         g.transfer_bytes += len;
         g.last_activity_ms = now_ms();
@@ -964,7 +993,7 @@ pub async fn reseed(
             return Err(ApiError::too_large("session would exceed its storage limit; wait for deliveries"));
         }
         if g.transfer_bytes + blob_len > cfg.max_session_transfer {
-            return Err(ApiError::limit("session transfer limit reached"));
+            return Err(ApiError::session_full("session transfer limit reached"));
         }
         charge_ip(&g, &ip_hash, blob_len, cfg.max_bytes_per_ip)?;
         g.pending.insert(key.clone());
