@@ -837,10 +837,17 @@ function copyButton(label, text, shown, name, cls = "small") {
 
 // Runner invites come with the command that uses them. The shown command
 // carries the masked link; Copy command always copies the full one.
-function runnerInviteRow(url, shell = false) {
-  const cmd = (link) => `airlox runner join --invite '${link}' --name my-runner --sandbox docker`;
+// `limits`: the session's job limits, for the flags its runners need.
+function runnerFlags(limits) {
+  return `--name my-runner --sandbox docker${limits?.workspace ? " --workspace" : ""}`;
+}
+
+function runnerInviteRow(url, limits = {}) {
+  const shell = !!limits.kinds?.includes("shell");
+  const flags = runnerFlags(limits);
+  const cmd = (link) => `airlox runner join --invite '${link}' ${flags}`;
   // Only the link part may break mid-word; the rest wraps at spaces.
-  const shown = el("code", {}, "airlox runner join --invite '", el("span", { class: "link" }, maskInvite(url)), "' --name my-runner --sandbox docker");
+  const shown = el("code", {}, "airlox runner join --invite '", el("span", { class: "link" }, maskInvite(url)), `' ${flags}`);
   const btn = copyButton("Copy command", () => cmd(url), () => shown, "Runner command", "small primary");
   const row = inviteRow("Runner", url, "a machine that runs jobs", "Copy link");
   row.append(el("div", { class: "runner-cmd stack" },
@@ -849,7 +856,10 @@ function runnerInviteRow(url, shell = false) {
     el("p", { class: "muted hint-text" }, "Then run this on the runner host. Change ", el("code", {}, "my-runner"), " to a name senders will recognise."),
     shown, el("div", { class: "row" }, btn),
     shell ? el("p", { class: "muted hint-text" }, "This session allows shell jobs. A docker runner offers them only with ", el("code", {}, "--image IMAGE"),
-      " (an image with python3 and the tools your scripts need); ", el("code", {}, "--sandbox process"), " runs them on the host itself.") : null));
+      " (an image with python3 and the tools your scripts need); ", el("code", {}, "--sandbox process"), " runs them on the host itself.") : null,
+    limits.workspace ? el("p", { class: "muted hint-text" }, "This session keeps workspaces: ", el("code", {}, "--workspace"),
+      " lets the runner keep each sender's files between jobs, so later jobs send only what changed.") : null,
+    el("p", { class: "muted hint-text" }, "Add ", el("code", {}, "--concurrency N"), " to run up to N jobs at once.")));
   return row;
 }
 
@@ -1005,11 +1015,11 @@ function newSession() {
     const allowed = fd.getAll("type");
     if (isExecute() && !allowed.includes("py")) allowed.push("py"); // a disabled box is not in the form data
     const ttlWord = TTL_WORDS[fd.get("ttl")];
-    sum.mode.textContent = isExecute() ? `Execute${lim.shell.checked ? " · Python + shell" : ""}${lim.approve.checked ? " · approval on" : ""}` : "Relay";
+    sum.mode.textContent = isExecute() ? `Execute${lim.shell.checked ? " · Python + shell" : ""}${lim.workspace.checked ? " · workspaces" : ""}${lim.approve.checked ? " · approval on" : ""}` : "Relay";
     sum.ttl.textContent = fd.get("ttl") === "never" ? "Never (until closed)" : ttlWord;
     sum.types.textContent = allowed.length ? TYPE_LABELS.filter(([t]) => allowed.includes(t)).map(([, label]) => label).join(", ") : "none";
     sum.size.textContent = `${size.value || "?"} MB per file`;
-    sumLine.textContent = `${isExecute() ? (lim.shell.checked ? "Execute+shell" : "Execute") : "Relay"} · ${fd.get("ttl") === "never" ? "no expiry" : ttlWord} · ${allowed.length} type${allowed.length === 1 ? "" : "s"} · ${size.value || "?"} MB`;
+    sumLine.textContent = `${isExecute() ? `Execute${lim.shell.checked ? " · Python + shell" : ""}${lim.workspace.checked ? " · workspaces" : ""}` : "Relay"} · ${fd.get("ttl") === "never" ? "no expiry" : ttlWord} · ${allowed.length} type${allowed.length === 1 ? "" : "s"} · ${size.value || "?"} MB`;
   };
   const err = el("p", { class: "error", role: "alert" });
   const create = el("button", { class: "primary cta", type: "submit" }, "Create session",
@@ -1063,7 +1073,7 @@ function newSession() {
       const s = ac.createSession(JSON.stringify(params), undefined);
       const { session_id } = await (await api("POST", "/v1/sessions", { body: s.signedManifest })).json();
       summarize();
-      createdView(session_id, s, execute, aside.querySelector("dl"), execute && lim.shell.checked);
+      createdView(session_id, s, execute, aside.querySelector("dl"), execute ? job_limits : {});
     } catch (e) {
       err.textContent = `Could not create the session: ${e.message || e}`;
       create.disabled = false;
@@ -1083,7 +1093,7 @@ function newSession() {
 }
 
 // Step two: the owner link, shown once, then the invites to hand out.
-function createdView(session_id, s, execute, summary, shell = false) {
+function createdView(session_id, s, execute, summary, limits = {}) {
   const base = location.origin;
   const owner = ac.ownerInvite(base, s.ownerSeed);
   let steps = newSteps(1);
@@ -1143,7 +1153,7 @@ function createdView(session_id, s, execute, summary, shell = false) {
         el("p", { class: "nsub" }, "These links stay available under Invites in the session, so you can hand them out later."),
         el("section", { class: "ncard" }, senderInviteRow(ac.memberInvite(base, s.ownerSeed, "sender"))),
         el("section", { class: "ncard" }, inviteRow("Observer", ac.memberInvite(base, s.ownerSeed, "observer"), "can read everything and export the audit log")),
-        ...(execute ? [el("section", { class: "ncard" }, runnerInviteRow(ac.memberInvite(base, s.ownerSeed, "runner"), shell))] : [])),
+        ...(execute ? [el("section", { class: "ncard" }, runnerInviteRow(ac.memberInvite(base, s.ownerSeed, "runner"), limits))] : [])),
       el("aside", { class: "nside" },
         el("div", { class: "ncard sum" }, el("h2", {}, "Session"), summary, openBtn, gate,
           el("button", { type: "button", onclick: () => { invitesShown = false; location.reload(); } }, "Create another"))))));
@@ -1578,7 +1588,7 @@ function buildSessionLayout(s) {
   const inviteRows = inv.role === "owner" ? {
     sender: senderInviteRow(ac.memberInvite(location.origin, inv.roleSeed, "sender")),
     observer: inviteRow("Observer", ac.memberInvite(location.origin, inv.roleSeed, "observer"), "can read everything and export the audit log"),
-    runner: execute ? runnerInviteRow(ac.memberInvite(location.origin, inv.roleSeed, "runner"), !!manifest.job_limits?.kinds?.includes("shell")) : null } : {};
+    runner: execute ? runnerInviteRow(ac.memberInvite(location.origin, inv.roleSeed, "runner"), manifest.job_limits || {}) : null } : {};
   const invites = inv.role === "owner" ? el("details", {},
     el("summary", {}, "Invites"),
     el("div", { class: "stack" }, el("p", { class: "muted hint-text" }, MASKED_NOTE), Object.values(inviteRows))) : null;
@@ -2628,6 +2638,9 @@ function progressOk(s, p, job) {
   return !approved || approved.includes(p.author);
 }
 
+// "1 of 2 slots running" for a runner with free slots and jobs on it.
+const slotsText = (r) => r.running && r.slots > 1 ? `idle · ${r.running} of ${r.slots} slots running` : null;
+
 // The newest acceptable progress report for a job, if any (and `want` it).
 function lastProgress(s, job, want = () => true) {
   let best = null;
@@ -2726,9 +2739,12 @@ function stitch(list) {
     parts.push(data);
     end = offset + n;
   }
-  let text = parts.join("");
-  const cut = text.length > LIVE_SHOWN;
-  if (cut) text = text.slice(-LIVE_SHOWN);
+  // Only the end is shown: join no more parts than that takes.
+  let i = parts.length;
+  for (let n = 0; i > 0 && n <= LIVE_SHOWN; ) n += parts[--i].length;
+  let text = parts.slice(i).join("");
+  const cut = i > 0 || text.length > LIVE_SHOWN;
+  if (text.length > LIVE_SHOWN) text = text.slice(-LIVE_SHOWN);
   return { text, cut };
 }
 
@@ -2987,6 +3003,7 @@ async function pollRunners(s) {
           version: typeof j.runner.version === "string" ? j.runner.version : null,
           python: typeof j.runner.python === "string" ? j.runner.python : null,
           networkUnblocked: !!j.runner.network_unblocked, online: !!e.online, job: e.job, busy: !!(e.busy ?? e.job),
+          running: Array.isArray(e.jobs) ? e.jobs.length : e.job ? 1 : 0, slots: Number.isSafeInteger(e.slots) && e.slots > 0 ? e.slots : 1,
           jobs: runnerJobs(j.runner), kinds: runnerKinds(j.runner), shell: typeof j.runner.shell === "string" ? j.runner.shell : null,
           setup: e.state || null, detail: typeof e.detail === "string" ? (e.detail.length > 300 ? `${e.detail.slice(0, 300)}…` : e.detail) : null,
           ...runnerStatus(s, e) });
@@ -3056,7 +3073,7 @@ function renderRunners(s, list, note) {
       : "awaiting approval";
     const live = r.rejected ? "rejected" : r.setup === "failed" ? "setup failed"
       : r.setup === "preparing" && !r.online ? "preparing its sandbox"
-      : !r.approved ? "awaiting approval" : r.online ? (r.busy ? (r.job ? `busy · #${short(r.job)}` : "busy") : "idle") : "offline";
+      : !r.approved ? "awaiting approval" : r.online ? (r.busy ? (r.slots > 1 ? `busy · ${r.slots} of ${r.slots} slots` : r.job ? `busy · #${short(r.job)}` : "busy") : slotsText(r) || "idle") : "offline";
     return { approval, live, err: s.runnerErrors.get(r.pub) };
   };
   const revoked = s.revokedRoles.has("runner");
@@ -3184,10 +3201,15 @@ function buildJobPanel(s, text, file, onKind) {
     el("div", { class: "seg kindseg", role: "radiogroup", "aria-labelledby": "job-kind-label" }, allowed.map((k) =>
       el("label", {}, el("input", { type: "radio", name: "job-kind", value: k, checked: k === kind, onchange: () => setKind(k) }), el("span", {}, KIND_NAMES[k]))))) : null;
   const kindNote = el("p", { class: "muted hint-text kindnote", id: "job-kind-note", hidden: true });
-  const cwd = el("input", { type: "text", id: "job-cwd", placeholder: "optional, e.g. build", autocomplete: "off", spellcheck: false });
-  const cwdField = el("div", { class: "stack field", hidden: true }, el("label", { for: "job-cwd" }, "Start in folder"), cwd);
+  const cwd = el("input", { type: "text", id: "job-cwd", placeholder: "e.g. build", autocomplete: "off", spellcheck: false, "aria-describedby": "job-cwd-hint" });
+  const cwdField = el("div", { class: "stack field" }, el("label", { for: "job-cwd" }, "Start in folder"), cwd,
+    el("span", { class: "muted hint-text", id: "job-cwd-hint" }, "A folder that already exists in your workspace on the runner."));
   const fresh = el("input", { type: "checkbox", id: "job-fresh" });
   const freshField = el("label", { class: "option check", title: "Runners that keep a workspace for you empty it before this job" }, fresh, "Start with an empty workspace");
+  const wsSummary = el("summary", {}, "Workspace options");
+  // A runner that keeps a workspace for a sender runs one of that sender's jobs at a time.
+  const wsNote = el("p", { class: "muted hint-text", hidden: true },
+    "You have a job running: a runner that keeps your workspace refuses a second one until it ends.");
   const timeout = el("input", { type: "number", id: "job-timeout", min: 1, max: lim.timeout_s, step: 1, value: lim.timeout_s,
     title: `1 to ${lim.timeout_s} seconds` });
   const timeoutField = el("div", { class: "stack field narrow" }, el("label", { for: "job-timeout" }, "Timeout (s)"), timeout);
@@ -3202,8 +3224,9 @@ function buildJobPanel(s, text, file, onKind) {
     kindField ? el("div", { class: "jobrow" }, kindField, timeoutField) : null,
     el("div", { class: "stack field" }, el("span", { class: "field-label", id: "job-target-label" }, "Run on"), chips),
     el("div", { class: "jobrow" }, labelField, kindField ? null : timeoutField),
-    lim.workspace ? el("div", { class: "jobrow" }, cwdField, freshField) : null,
     kindNote,
+    lim.workspace ? el("details", { class: "inputfiles wsopts" }, wsSummary, el("div", { class: "jobrow" }, cwdField, freshField)) : null,
+    lim.workspace ? wsNote : null,
     ready,
     el("details", { class: "inputfiles" }, filesSummary, files));
   const countPicked = () => {
@@ -3257,8 +3280,11 @@ function buildJobPanel(s, text, file, onKind) {
     kindNote.textContent = shell === "pwsh" ? "Runs with pwsh -NoProfile -Command, with the tools in the runner's sandbox."
       : shell ? "Runs with sh -e: stops at the first failing command, and uses the tools in the runner's sandbox."
       : "Runs with the runner's shell (sh -e, or pwsh on Windows) and the tools in its sandbox.";
-    cwdField.hidden = !sh;
+    const opts = [cwd.value.trim() && `in ${cwd.value.trim()}`, fresh.checked && "empty workspace"].filter(Boolean);
+    wsSummary.textContent = `Workspace options${opts.length ? ` · ${opts.join(", ")}` : ""}`;
   }
+  cwd.addEventListener("input", () => syncKind());
+  fresh.addEventListener("change", () => syncKind());
   labels.addEventListener("input", () => syncReady());
 
   // The relay's rule: approved (signed by the owner here), online, idle, and
@@ -3273,8 +3299,7 @@ function buildJobPanel(s, text, file, onKind) {
   const approvalNote = (r) => r.relayOnly ? (s.inv.role === "owner" ? "needs your confirmation" : "approval not received here") : null;
   const wantedLabels = () => labels.value.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
   const matches = (r) => target === "any" ? true : target === "labels" ? wantedLabels().every((l) => r.labels?.includes(l)) : `runner:${r.pub}` === target;
-  // The kinds a runner declared in its signed join. The relay does not look at them: it would route a shell job
-  // to any idle runner, and the runner would refuse it, so submit() steers jobs to runners that take them.
+  // The kinds a runner declared in its signed join; the relay routes a job only to runners that take its kind.
   const accepts = (r) => r.kinds.includes(kind);
 
   // null when a job could go now; otherwise { text, act }.
@@ -3331,7 +3356,7 @@ function buildJobPanel(s, text, file, onKind) {
         (sec?.querySelector(`button[data-act=approve][data-pub="${CSS.escape(b.pending.pub)}"]`) || sec)?.focus({ preventScroll: true });
       } }, `Review ${b.pending.name}`));
     } else if (b.none && owner && !s.revokedRoles.has("runner")) {
-      const cmd = `airlox runner join --invite '${ac.memberInvite(location.origin, s.inv.roleSeed, "runner")}' --name my-runner --sandbox docker${isShell() ? " --image python:3.12-slim" : ""}`;
+      const cmd = `airlox runner join --invite '${ac.memberInvite(location.origin, s.inv.roleSeed, "runner")}' ${runnerFlags(lim)}${isShell() ? " --image python:3.12-slim" : ""}`;
       const btn = el("button", { type: "button", class: "small", onclick: async () => {
         if (!(await copyText(btn, cmd, "Copy runner command"))) btn.textContent = "Copy it from Invites";
       } }, "Copy runner command");
@@ -3342,15 +3367,20 @@ function buildJobPanel(s, text, file, onKind) {
   function drawChips() {
     const live = s.runners.filter((r) => !r.rejected);
     // A runner that is gone, or does not take this kind of job, cannot stay the target.
-    if (target.startsWith("runner:") && !live.some((r) => `runner:${r.pub}` === target && accepts(r))) target = "any";
+    if (target.startsWith("runner:") && !live.some((r) => `runner:${r.pub}` === target && accepts(r))) {
+      const gone = live.find((r) => `runner:${r.pub}` === target);
+      target = "any";
+      if (gone && s.announce) announce(`${gone.name} does not run ${isShell() ? "shell" : "Python"} jobs: Run on is now Any idle runner`);
+    }
     labelField.hidden = target !== "labels";
-    const sig = JSON.stringify([target, locked, kind, live.map((r) => [r.pub, r.name, r.labels, runnerState(r), approvalNote(r), accepts(r)])]);
+    const sig = JSON.stringify([target, locked, kind, live.map((r) => [r.pub, r.name, r.labels, runnerState(r), slotsText(r), approvalNote(r), accepts(r)])]);
     if (sig === chipsSig) return;
     chipsSig = sig;
     const a = document.activeElement;
     const keep = chips.contains(a) ? a.dataset.target : null;
     const chip = (value, ...label) => el("button", { type: "button", class: "small runchip", "data-target": value, disabled: locked,
-      "aria-pressed": String(target === value), onclick: () => {
+      "aria-pressed": String(target === value), onclick: (ev) => {
+        if (ev.currentTarget.getAttribute("aria-disabled") === "true") return announce(ev.currentTarget.title);
         target = value;
         refresh();
         if (value === "labels") labels.focus();
@@ -3362,9 +3392,11 @@ function buildJobPanel(s, text, file, onKind) {
         const fits = accepts(r);
         const c = chip(`runner:${r.pub}`, el("span", { class: `dot ${fits && st === "idle" ? "on" : fits && st === "needs approval" ? "wait" : fits && st === "busy" ? "busy" : ""}`, "aria-hidden": "true" }),
           r.name, r.labels?.length ? el("span", { class: "muted" }, ` · ${r.labels.join(", ")}`) : null,
-          el("span", { class: "state" }, !fits ? `no ${isShell() ? "shell" : "Python"} jobs` : approvalNote(r) ? `${st} · ${approvalNote(r)}` : st));
+          el("span", { class: "state" }, !fits ? `no ${isShell() ? "shell" : "Python"} jobs` : approvalNote(r) ? `${st} · ${approvalNote(r)}`
+            : st === "idle" ? slotsText(r) || st : st));
         if (!fits) {
-          c.disabled = true;
+          // Focusable, so keyboard and screen reader users meet the reason; it just cannot be chosen.
+          c.setAttribute("aria-disabled", "true");
           c.title = `${r.name} does not run ${isShell() ? "shell" : "Python"} jobs`;
         }
         return c;
@@ -3378,6 +3410,8 @@ function buildJobPanel(s, text, file, onKind) {
     syncKind();
     drawChips();
     syncReady();
+    wsNote.hidden = ![...s.items.values()].some((i) => i.kind === "job" && i.author === s.me && ["assigned", "running"].includes(s.jobs.get(i.id)?.state)
+      && !(s.results.get(i.id) || []).some((r) => r.status === "ok" && resultCheck(s, r).ok));
     const cands = [...s.items.values()].filter((i) => i.kind === "file" && i.status === "ok" && i.ref).sort((a, b) => a.seq - b.seq);
     countPicked();
     const fsig = cands.map((i) => i.id).join("|");
@@ -3414,7 +3448,7 @@ function buildJobPanel(s, text, file, onKind) {
       if (!code.trim()) throw new Error("attach a .py file or write code in the message box");
     }
     if (new TextEncoder().encode(code).length > MB) throw new Error("the code is over 1 MiB");
-    const dir = sh && lim.workspace ? cwd.value.trim().replace(/^\.?\/+|\/+$/g, "") : "";
+    const dir = lim.workspace ? cwd.value.trim().replace(/^\.?\/+|\/+$/g, "") : "";
     const dirBad = dir && cwdError(dir);
     if (dirBad) throw new Error(`the start folder is not valid: ${dirBad}`);
     const t = Number(timeout.value);
@@ -3432,15 +3466,6 @@ function buildJobPanel(s, text, file, onKind) {
       const r = s.runners.find((x) => `runner:${x.pub}` === target);
       if (!r) throw new Error("that runner is gone");
       tgt = { type: "runner", participant_pub: r.pub, name: r.name };
-    }
-    // The relay routes by target alone: with runners that do not take this kind among the candidates, name one that does.
-    if (tgt.type !== "runner" && s.runnersLoaded && !s.connBad?.has("poll")) {
-      const idle = s.runners.filter((r) => !r.rejected && usable(r) && !r.busy && matches(r));
-      const fit = idle.filter(accepts);
-      if (fit.length && fit.length < idle.length) {
-        const r = fit[Math.floor(Math.random() * fit.length)];
-        tgt = { type: "runner", participant_pub: r.pub, name: r.name };
-      }
     }
     const refs = [...s.picked].map((id) => s.items.get(id)?.ref).filter(Boolean);
     const meta = { type: "job", filename, code, runtime: lim.runtime, timeout_s: t, memory_mb: null, files: refs, requirements: [], target: tgt };

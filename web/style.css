@@ -482,7 +482,8 @@ select:focus { border-color: var(--accent); outline: none; }
 @media (pointer: fine) { .kindseg { padding: 3px; border-radius: 10px; } .kindseg label { min-height: 30px; font-size: 13px; } }
 .kindnote { margin: 0; }
 .jobrow > .option.check { flex: 0 0 auto; min-height: 44px; }
-.runchip:disabled { background: transparent; border-style: dashed; color: var(--muted); }
+.runchip:disabled, .runchip[aria-disabled=true] { background: transparent; border-style: dashed; color: var(--muted); }
+.runchip[aria-disabled=true] { cursor: not-allowed; }
 .kinds { gap: 14px; margin: 0; }
 .kinds legend { padding: 0; }
 .kinds .switch input:disabled { opacity: 0.6; }
@@ -716,6 +717,8 @@ body.landing .top-right { display: none; }
 .lp-foot-row a { display: inline-flex; align-items: center; min-height: 44px; color: var(--muted); }
 .lp-foot-row a:hover { color: var(--text); }
 .lp-foot-row > span { display: inline-flex; align-items: center; min-height: 44px; }
+.lp-foot-row .nowrap { white-space: nowrap; }
+#live-sessions { white-space: nowrap; }
 
 /* Phones: the brand alone in the first row, the section links scrolling
    sideways in the second, all on the page's own gutter. The hero has its own
