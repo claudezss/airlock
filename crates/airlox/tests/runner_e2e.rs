@@ -573,11 +573,22 @@ async fn docker_without_an_image_refuses_shell_jobs() {
 /// A shell job that waits, up to 20 s, for `wait` to exist in `dir`, after
 /// creating `mark` there.
 fn rendezvous(dir: &std::path::Path, mark: &str, wait: &str) -> Job {
+    rendezvous_all(dir, mark, &[wait])
+}
+
+/// `rendezvous`, waiting for each of `waits` in turn (up to 20 s each).
+fn rendezvous_all(dir: &std::path::Path, mark: &str, waits: &[&str]) -> Job {
     let dir = dir.display();
-    shell(&format!(
-        "touch '{dir}/{mark}'; i=0; while [ ! -e '{dir}/{wait}' ]; do i=$((i+1)); [ $i -gt 200 ] && echo alone && exit 1; \
-         sleep 0.1; done; echo met\n"
-    ))
+    let waits: String = waits
+        .iter()
+        .map(|w| {
+            format!(
+                "i=0; while [ ! -e '{dir}/{w}' ]; do i=$((i+1)); [ $i -gt 200 ] && echo alone && exit 1; \
+                 sleep 0.1; done; "
+            )
+        })
+        .collect();
+    shell(&format!("touch '{dir}/{mark}'; {waits}echo met\n"))
 }
 
 async fn wait_for_file(path: &std::path::Path) {
@@ -611,8 +622,10 @@ async fn a_runner_with_two_slots_runs_two_jobs_at_once_and_refuses_a_third() {
     assert_eq!(runners().await["runner"]["slots"], 2);
 
     // Each job waits for the other's mark: only jobs that overlap finish.
-    let a = rig.submit(&rig.sender, rendezvous(dir, "a", "b")).await;
-    let b = rig.submit(&rig.sender, rendezvous(dir, "b", "a")).await;
+    // Then both hold their slots until released, so neither has ended
+    // before the checks below.
+    let a = rig.submit(&rig.sender, rendezvous_all(dir, "a", &["b", "release"])).await;
+    let b = rig.submit(&rig.sender, rendezvous_all(dir, "b", &["a", "release"])).await;
     wait_for_file(&dir.join("a")).await;
     wait_for_file(&dir.join("b")).await;
     let row = runners().await;
@@ -624,6 +637,7 @@ async fn a_runner_with_two_slots_runs_two_jobs_at_once_and_refuses_a_third() {
     assert_eq!(r.status(), 409);
     assert_eq!(r.json::<Value>().await.unwrap()["error"], "runner_busy");
 
+    std::fs::write(dir.join("release"), "").unwrap();
     for id in [&a, &b] {
         let r = rig.result(id).await;
         assert_eq!(

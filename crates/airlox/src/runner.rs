@@ -882,6 +882,12 @@ fn active_ids(active: &Active) -> Vec<String> {
     active.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// Held across a claim and across a background heartbeat, so the two never
+/// cross on the wire: a heartbeat that read the jobs before a claim but
+/// reached the relay after it would leave that job out, and the relay would
+/// fail it as lost while it runs.
+type Wire = Arc<tokio::sync::Mutex<()>>;
+
 /// What the assignment stream tells the loop.
 enum Msg {
     Assigned(String),
@@ -942,12 +948,16 @@ async fn stream_assignments(relay: Relay, tx: tokio::sync::mpsc::Sender<Msg>) {
 
 /// Heartbeat every 10 s with the current jobs, whatever the stream is doing.
 /// Ends (and says so) once the relay refuses the token.
-async fn heartbeats(relay: Relay, active: Active, lost: watch::Sender<bool>) {
+async fn heartbeats(relay: Relay, active: Active, wire: Wire, lost: watch::Sender<bool>) {
     let mut tick = tokio::time::interval(HEARTBEAT);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        if let Err(e) = relay.heartbeat(&active_ids(&active)).await {
+        let sent = {
+            let _wire = wire.lock().await;
+            relay.heartbeat(&active_ids(&active)).await
+        };
+        if let Err(e) = sent {
             if status_of(&e) == Some(401) {
                 let _ = lost.send(true);
                 return;
@@ -995,8 +1005,9 @@ async fn serve(
         tracing::info!("waiting for the owner's approval");
     }
     let active: Active = Default::default();
+    let wire: Wire = Default::default();
     let (lost_tx, mut lost) = watch::channel(false);
-    let hb = tokio::spawn(heartbeats(relay.clone(), active.clone(), lost_tx));
+    let hb = tokio::spawn(heartbeats(relay.clone(), active.clone(), wire.clone(), lost_tx));
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let streamer = tokio::spawn(stream_assignments(relay.clone(), tx));
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
@@ -1020,13 +1031,17 @@ async fn serve(
     tokio::pin!(stop);
 
     // Claim a job and start it. It counts as active (and so is named in
-    // heartbeats) from before the claim, so a heartbeat in flight never
-    // reports it missing.
+    // heartbeats) from before the claim, and no background heartbeat is in
+    // flight while it is claimed, so none reports it missing.
     let start = async |job: String,
                        tasks: &mut JoinSet<Result<()>>,
                        running: &mut HashMap<tokio::task::Id, Running>| {
-        active.lock().unwrap_or_else(|e| e.into_inner()).push(job.clone());
-        match relay.claim(&job).await {
+        let claimed = {
+            let _wire = wire.lock().await;
+            active.lock().unwrap_or_else(|e| e.into_inner()).push(job.clone());
+            relay.claim(&job).await
+        };
+        match claimed {
             Ok(true) => {
                 tracing::info!(job = %job, "claimed");
                 let (tx, rx) = watch::channel(false);
