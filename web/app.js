@@ -1210,7 +1210,7 @@ async function sessionView() {
     wanted: new Map(), askOk: new Set(), askErrors: new Map(), asked: new Set(), uploads: new Set(), uploaded: new Map(), uploading: 0,
     revokedRoles: new Set(),
     lastSeq: -1, closed: null, jobs: new Map(), results: new Map(), progress: new Map(), runners: [], picked: new Set(), decisions: null,
-    said: new Map(), announce: false, jobErrors: new Map(), runnerErrors: new Map(), runnerSeen: new Map(), open: new Set() };
+    said: new Map(), announce: false, jobErrors: new Map(), runnerErrors: new Map(), runnerSeen: new Map(), open: new Set(), chunkTimers: new Map() };
   buildSessionLayout(s);
 
   // Cached history first, then catch up, then stream. Blobs missing locally
@@ -2221,6 +2221,7 @@ async function receive(s, seq, envelope, fetchBlob, attempt = 0) {
     if (!list.some((r) => r.id === it.id)) list.push(it);
     byJob.set(it.meta.job.id, list);
   }
+  if (it.kind === "progress" && it.meta?.stream) return chunkArrived(s, it.meta.job?.id);
   s.render.item(it);
   if (it.kind === "event" && it.role === "owner" && ["runner_approve", "runner_reject"].includes(it.meta?.event)) approvalsChanged(s);
 }
@@ -2586,6 +2587,18 @@ function hostJob(s, it) {
   return job && job.status === "ok" && job.kind === "job" ? job : null;
 }
 
+// Output chunks arrive by the second, and a job's card is rebuilt whole: draw
+// it at most a few times a second, and once more when the last one is in.
+const CHUNK_REDRAW_MS = 250;
+function chunkArrived(s, jobId) {
+  if (!jobId || s.chunkTimers.has(jobId)) return;
+  s.chunkTimers.set(jobId, setTimeout(() => {
+    s.chunkTimers.delete(jobId);
+    const job = s.items.get(jobId);
+    if (job?.status === "ok") s.render.item(job);
+  }, CHUNK_REDRAW_MS));
+}
+
 // A progress report counts only from a runner (for a runner-targeted job,
 // that runner's key), approved when the session requires approval, and
 // about this exact job (pinned by blob hash).
@@ -2598,11 +2611,11 @@ function progressOk(s, p, job) {
   return !approved || approved.includes(p.author);
 }
 
-// The newest acceptable progress report for a job, if any.
-function lastProgress(s, job) {
+// The newest acceptable progress report for a job, if any (and `want` it).
+function lastProgress(s, job, want = () => true) {
   let best = null;
   for (const p of s.progress.get(job.id) || []) {
-    if (!progressOk(s, p, job)) continue;
+    if (!progressOk(s, p, job) || !want(p)) continue;
     if (!best || p.meta.elapsed_ms > best.meta.elapsed_ms || (p.meta.elapsed_ms === best.meta.elapsed_ms && p.seq > best.seq)) best = p;
   }
   return best;
@@ -2651,6 +2664,8 @@ function claimedBy(s, f) {
 // After a card is drawn: drop standalone copies of what it now contains.
 function settle(s, it) {
   const rs = it.kind === "job" ? s.results.get(it.id) || [] : it.kind === "result" ? [it] : [];
+  const jobId = it.kind === "job" ? it.id : it.meta?.job?.id;
+  if (jobId && rs.some((r) => r.status === "ok" && resultCheck(s, r).ok)) dropChunks(s, jobId);
   for (const r of rs) {
     if (r.status !== "ok") continue;
     if (it.kind === "job") document.getElementById(`item-${r.id}`)?.remove();
@@ -2673,6 +2688,72 @@ function logBlock(label, text, truncated) {
     el("pre", { tabindex: 0 }, text || "(empty)"));
 }
 
+// ---------- streamed output ----------
+// Chunks of a running job's stdout and stderr, as its runner posted them.
+// They are display only: once the signed result is accepted its stdout and
+// stderr replace them, never a stitch of chunks.
+const LIVE_SHOWN = 256 * 1024; // the end of each stream is shown; the result has all of it
+const utf8 = new TextEncoder();
+
+// One stream's chunks in order of offset, end to end. A chunk this browser
+// lacks (the relay dropped it before this browser fetched it) leaves a marker.
+function stitch(list) {
+  list.sort((a, b) => a.meta.offset - b.meta.offset || a.seq - b.seq);
+  const parts = [];
+  let end = 0;
+  for (const p of list) {
+    const { offset, data } = p.meta;
+    const n = (p.bytes ??= utf8.encode(data).length);
+    if (offset < end) continue; // a repeat of what is shown
+    if (offset > end) parts.push(`\n[… ${fmtBytes(offset - end)} not received here …]\n`);
+    parts.push(data);
+    end = offset + n;
+  }
+  let text = parts.join("");
+  const cut = text.length > LIVE_SHOWN;
+  if (cut) text = text.slice(-LIVE_SHOWN);
+  return { text, cut };
+}
+
+// The blocks showing a running job's streamed output, newest line last.
+function liveOutput(s, job) {
+  const by = { stdout: [], stderr: [] };
+  let stopped = false;
+  for (const p of s.progress.get(job.id) || []) {
+    const m = p.meta;
+    if (!by[m.stream] || !progressOk(s, p, job) || typeof m.data !== "string" || !Number.isSafeInteger(m.offset) || m.offset < 0) continue;
+    by[m.stream].push(p);
+    stopped ||= !!m.truncated;
+  }
+  const blocks = Object.entries(by).filter(([, list]) => list.some((p) => p.meta.data)).map(([stream, list]) => {
+    const { text, cut } = stitch(list);
+    const pre = el("pre", { tabindex: 0 }, text);
+    // Follow the end while the reader is at it; leave them where they scrolled to otherwise.
+    const old = document.getElementById(`item-${job.id}`)?.querySelector(`.live.${stream} pre`);
+    const top = old?.scrollTop ?? 0;
+    const follow = !old || old.scrollHeight - old.scrollTop - old.clientHeight < 24;
+    requestAnimationFrame(() => (pre.scrollTop = follow ? pre.scrollHeight : top));
+    return el("div", { class: `logblock live ${stream}` },
+      el("div", { class: "logname" }, stream, el("span", { class: "chip" }, "live"), cut ? el("span", { class: "chip" }, "end only") : null), pre);
+  });
+  if (stopped) blocks.push(el("p", { class: "note" }, "The runner stopped streaming output here; the result will have the rest."));
+  return blocks;
+}
+
+// An accepted result replaces a job's streamed chunks: forget them here and
+// in this browser's cache, which would otherwise keep every one.
+function dropChunks(s, jobId) {
+  const all = s.progress.get(jobId) || [];
+  const chunks = all.filter((p) => p.meta?.stream);
+  if (!chunks.length) return;
+  s.progress.set(jobId, all.filter((p) => !p.meta?.stream));
+  for (const p of chunks) {
+    s.items.delete(p.id);
+    tx("events", "readwrite", (o) => o.delete([s.sid, p.seq])).catch(() => {});
+    tx("blobs", "readwrite", (o) => o.delete([s.sid, p.id])).catch(() => {});
+  }
+}
+
 function renderResult(s, r, extra = "") {
   const m = r.meta;
   const out = outcome(m);
@@ -2686,18 +2767,36 @@ function renderResult(s, r, extra = "") {
       el("span", { class: "mono muted" }, parts.join(" · ")),
       extra ? el("span", { class: "chip" }, extra) : null),
     m.reason ? el("p", { class: "note" }, m.reason) : null,
-    m.env ? envLine(m.env) : null,
+    m.env ? envLine(m.env, s.items.get(m.job?.id)?.meta) : null,
     logBlock("stdout", m.stdout, m.stdout_truncated), logBlock("stderr", m.stderr, m.stderr_truncated),
     files.length ? el("div", { class: "outfiles" }, el("div", { class: "logname" }, `Output files (${files.length})`),
       files.map((f) => renderOutFile(s, f))) : null);
 }
 
-// Where a job ran, as its runner reported and signed it.
-function envLine(env) {
-  const pkgs = Object.entries(env.packages || {}).map(([k, v]) => `${k} ${v}`);
-  const parts = [`Python ${env.python}`, ...pkgs, env.sandbox, env.interpreter, env.airlox && `airlox ${env.airlox}`].filter(Boolean);
-  return el("p", { class: "envline mono", title: "Reported and signed by the runner: the interpreter, package versions and sandbox this job ran with" },
+// Where a job ran, as its runner reported and signed it. `job`: the job's meta, when known.
+function envLine(env, job) {
+  const shell = job?.kind === "shell";
+  const pkgs = shell ? [] : Object.entries(env.packages || {}).map(([k, v]) => `${k} ${v}`);
+  const t = env.tree;
+  const tree = t && `tree ${t.head ? t.head.slice(0, 8) : "(no git)"}${t.dirty ? " + changes" : ""}, ${t.count} file${t.count === 1 ? "" : "s"}`;
+  const parts = [shell ? `shell ${env.shell || "sh"}` : `Python ${env.python}`, ...pkgs, env.sandbox, env.interpreter,
+    env.airlox && `airlox ${env.airlox}`, tree].filter(Boolean);
+  return el("p", { class: "envline mono", title: "Reported and signed by the runner: the interpreter or shell, package versions, sandbox and working tree this job ran with" },
     el("span", { class: "muted" }, "ran on "), parts.join(" · "));
+}
+
+// What a runner says it runs, from its newest accepted result (signed by the runner).
+function runnerJobs(s, pub) {
+  let best = null;
+  for (const list of s.results.values()) {
+    for (const r of list) {
+      if (r.author !== pub || r.status !== "ok" || !r.meta?.env?.kinds || (best && r.seq < best.seq) || !resultCheck(s, r).ok) continue;
+      best = r;
+    }
+  }
+  if (!best) return null;
+  const { kinds, shell } = best.meta.env;
+  return `${kinds.join(", ")}${kinds.includes("shell") && shell ? ` (${shell})` : ""}`;
 }
 
 function renderOutFile(s, f) {
@@ -2767,7 +2866,8 @@ function renderJob(s, it, card) {
   const m = it.meta;
   const { st, entries, accepted, text, tone, runner } = jobStatus(s, it);
   const rendered = entries.map((e) => (e.error ? rejectedResult(e.error, e.pending) : renderResult(s, e.r, e.dup ? "ignored: duplicate" : "")));
-  const code = codeBlock(m.code, "python", { set: s.open, key: `code:${it.id}` });
+  const shell = m.kind === "shell";
+  const code = codeBlock(m.code, shell ? "sh" : "python", { set: s.open, key: `code:${it.id}` });
   const files = (m.files || []).map((ref) => s.items.get(ref.id)?.meta?.name || `item ${short(ref.id)}`);
   const active = !accepted && (st?.state === "assigned" || st?.state === "running");
   const canCancel = active && (s.inv.role === "owner" || it.author === s.me);
@@ -2781,8 +2881,9 @@ function renderJob(s, it, card) {
       am?.code_sha256 ? el("dt", {}, "Result code") : null, am?.code_sha256 ? el("dd", { class: "mono" }, am.code_sha256) : null,
       am?.input_sha256 ? el("dt", {}, "Result inputs") : null, am?.input_sha256 ? el("dd", { class: "mono" }, am.input_sha256) : null)));
   const err = s.jobErrors.get(it.id);
-  // Until a result is accepted, the runner's newest progress report.
+  // Until a result is accepted, the runner's newest progress report and its output so far.
   const p = accepted ? null : lastProgress(s, it);
+  const pt = accepted ? null : lastProgress(s, it, (x) => typeof x.meta.tail === "string");
   const progress = [];
   if (p) {
     const t = Math.floor(p.meta.elapsed_ms / 1000);
@@ -2790,17 +2891,18 @@ function renderJob(s, it, card) {
     const took = fmtDuration(t >= 60 ? t - (t % 60) : t);
     progress.push(el("p", { class: "note progress" }, live ? `Running · ${took} (last report ${hhmm(p.created)})`
       : `Ran for at least ${took} (last report ${hhmm(p.created)})`));
-    if (typeof p.meta.tail === "string") {
-      const log = el("pre", { tabindex: 0 }, p.meta.tail || "(empty)");
-      const box = el("details", { class: "codebox progress-log" },
-        el("summary", {}, `Last lines of ${m.progress_file || "its log file"}`), log);
-      // Open at the end of the log, where the newest lines are.
-      box.addEventListener("toggle", () => box.open && requestAnimationFrame(() => (log.scrollTop = log.scrollHeight)));
-      progress.push(keepOpen(s, `progress:${it.id}`, box));
-    }
+    progress.push(...liveOutput(s, it));
+  }
+  if (pt) {
+    const log = el("pre", { tabindex: 0 }, pt.meta.tail || "(empty)");
+    const box = el("details", { class: "codebox progress-log" },
+      el("summary", {}, `Last lines of ${m.progress_file || "its log file"}`), log);
+    // Open at the end of the log, where the newest lines are.
+    box.addEventListener("toggle", () => box.open && requestAnimationFrame(() => (log.scrollTop = log.scrollHeight)));
+    progress.push(keepOpen(s, `progress:${it.id}`, box));
   }
   card.append(
-    el("div", { class: "file-head job-head" }, el("span", { class: "chip type" }, "job"), el("span", { class: "fname", title: m.filename }, m.filename),
+    el("div", { class: "file-head job-head" }, el("span", { class: "chip type" }, shell ? "shell" : "job"), el("span", { class: "fname", title: m.filename }, m.filename),
       el("span", { class: "mono muted jobid", title: it.id }, `#${short(it.id)}`),
       el("span", { class: `state ${tone}` }, text),
       canCancel ? el("button", { type: "button", class: "small danger", onclick: (ev) => cancelJob(s, it, ev.currentTarget) }, "Cancel") : null),
@@ -2808,7 +2910,10 @@ function renderJob(s, it, card) {
     el("dl", { class: "jobmeta" },
       el("dt", {}, "Target"), el("dd", {}, targetText(m.target)),
       runner ? el("dt", {}, "Runner") : null, runner ? el("dd", {}, runner) : null,
-      el("dt", {}, "Limits"), el("dd", {}, `${m.runtime} · ${fmtDuration(m.timeout_s)}${m.memory_mb ? ` · ${m.memory_mb} MB` : ""}`),
+      el("dt", {}, "Limits"), el("dd", {}, `${shell ? "shell" : m.runtime} · ${fmtDuration(m.timeout_s)}${m.memory_mb ? ` · ${m.memory_mb} MB` : ""}`),
+      m.cwd ? el("dt", {}, "Directory") : null, m.cwd ? el("dd", { class: "mono" }, m.cwd) : null,
+      m.tree || m.fresh ? el("dt", {}, "Workspace") : null,
+      m.tree || m.fresh ? el("dd", {}, [m.tree && "the sender's working tree", m.fresh && "starts empty (fresh)"].filter(Boolean).join(" · ")) : null,
       files.length ? el("dt", {}, "Inputs") : null, files.length ? el("dd", {}, files.join(", ")) : null),
     ...progress,
     el("div", { class: "jobcode" }, code),
@@ -2865,6 +2970,7 @@ async function pollRunners(s) {
           version: typeof j.runner.version === "string" ? j.runner.version : null,
           python: typeof j.runner.python === "string" ? j.runner.python : null,
           networkUnblocked: !!j.runner.network_unblocked, online: !!e.online, job: e.job, busy: !!(e.busy ?? e.job),
+          jobs: runnerJobs(s, e.participant_pub),
           setup: e.state || null, detail: typeof e.detail === "string" ? (e.detail.length > 300 ? `${e.detail.slice(0, 300)}…` : e.detail) : null,
           ...runnerStatus(s, e) });
       } catch (err) {
@@ -2940,7 +3046,7 @@ function renderRunners(s, list, note) {
   // The poll runs every few seconds: leave the list (and keyboard focus) alone
   // unless something it shows has changed.
   const sig = JSON.stringify([!!s.closed, revoked, s.runners.map((r) => [r.pub, r.name, r.description, r.labels, r.host, r.sandbox, r.version, r.python, r.networkUnblocked,
-    r.rejected, r.approved, r.relayOnly, r.setup, r.detail, text(r)])]);
+    r.rejected, r.approved, r.relayOnly, r.setup, r.detail, r.jobs, text(r)])]);
   if (list.dataset.sig === sig) return;
   list.dataset.sig = sig;
   const a = document.activeElement;
@@ -2973,6 +3079,7 @@ function renderRunners(s, list, note) {
         el("span", { class: "key", title: "Key fingerprint" }, ac.fingerprint(r.pub).slice(0, 4))),
       el("div", { class: "sub" }, `${r.sandbox} · ${r.host}`),
       versions ? el("div", { class: "sub" }, versions) : null,
+      r.jobs ? el("div", { class: "sub", title: "From this runner's newest accepted result, signed by the runner" }, `runs ${r.jobs}`) : null,
       r.description ? el("div", { class: "desc", title: "The runner's own description, not verified" }, el("span", { class: "claim" }, "says "), r.description) : null,
       r.labels.length ? el("div", { class: "chips" }, r.labels.map((l) => el("span", { class: "chip" }, l))) : null,
       el("div", { class: "chips" },

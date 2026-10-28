@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Mutex;
 
+use airlox_core::keys::PublicKey;
 use airlox_core::transfer::{claim_hash, MAX_BOX_BYTES};
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, State};
@@ -50,6 +51,8 @@ struct DropRec {
     expires_at_ms: u64,
     wrong: u8,
     state: DropState,
+    /// The key the claimant said it will join with, as given at pickup.
+    participant_pub: Option<String>,
 }
 
 impl DropRec {
@@ -94,6 +97,10 @@ struct NewDrop {
 #[derive(Deserialize)]
 struct Claim {
     claim: String,
+    /// The Ed25519 key the claimant will join the session with, which the
+    /// creator learns from the drop's status. The claimant's own word.
+    #[serde(default)]
+    participant_pub: Option<String>,
 }
 
 fn nameplate(s: &str) -> ApiResult<u32> {
@@ -156,6 +163,7 @@ pub async fn create(
             expires_at_ms,
             wrong: 0,
             state: DropState::Waiting,
+            participant_pub: None,
         },
     );
     Ok((
@@ -166,7 +174,8 @@ pub async fn create(
     ))
 }
 
-/// `POST /v1/drops/:n/claim` — body: `{claim}`. Returns `{box}` once.
+/// `POST /v1/drops/:n/claim` — body: `{claim, participant_pub?}`. Returns
+/// `{box}` once.
 pub async fn claim(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -179,6 +188,16 @@ pub async fn claim(
         .map_err(|e| ApiError::bad_request("invalid", e.to_string()))?;
     let hash =
         claim_hash(&c.claim).map_err(|_| ApiError::bad_request("invalid", "claim must be base64url"))?;
+    // Checked before the drop is looked at, so a malformed key is neither a wrong claim nor a pickup.
+    let participant_pub = c
+        .participant_pub
+        .as_deref()
+        .map(|k| {
+            PublicKey::from_b64(k).map(|k| k.to_b64()).map_err(|_| {
+                ApiError::bad_request("invalid", "participant_pub must be a base64url Ed25519 public key")
+            })
+        })
+        .transpose()?;
     let ttl = st.store.cfg.drop_ttl_ms;
     let ip_hash = st.store.ip_hash(&client_bucket(&st, &headers, peer));
     let now = now_ms();
@@ -221,6 +240,7 @@ pub async fn claim(
         });
     }
     d.state = DropState::PickedUp { at_ms: now };
+    d.participant_pub = participant_pub;
     Ok(Json(json!({"box": d.sealed_box.take()})))
 }
 
@@ -231,7 +251,8 @@ fn owned<'a>(g: &'a mut Inner, n: u32, headers: &HeaderMap) -> ApiResult<&'a mut
 }
 
 /// `GET /v1/drops/:n` — the sender's view: `waiting`, `picked_up`, `burned`,
-/// `cancelled` or `expired`.
+/// `cancelled` or `expired`, and for a pickup the `participant_pub` the
+/// claimant named (`null` if it named none).
 pub async fn status(
     State(st): State<AppState>,
     Path(n): Path<String>,
@@ -247,7 +268,12 @@ pub async fn status(
         DropState::Burned => ("burned", None),
         DropState::Cancelled => ("cancelled", None),
     };
-    Ok(Json(json!({"state": state, "picked_up_at_ms": at, "expires_at_ms": d.expires_at_ms})))
+    Ok(Json(json!({
+        "state": state,
+        "picked_up_at_ms": at,
+        "expires_at_ms": d.expires_at_ms,
+        "participant_pub": d.participant_pub,
+    })))
 }
 
 /// `DELETE /v1/drops/:n` — the sender cancels a code. Its number stays

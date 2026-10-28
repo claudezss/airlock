@@ -7,8 +7,10 @@ use std::time::Duration;
 use airlox_core::cert::{issue_cert, sign_join, ClientKind, JoinRequest, RunnerInfo, SandboxKind};
 use airlox_core::item::{new_item_id, seal, ItemKind, ItemRef, NewItem, SealedItem};
 use airlox_core::keys::Keypair;
-use airlox_core::payload::{Event, JobProgress, JobResult, JobSpec, JobStatus, Meta, Payload, Target};
-use airlox_core::session::{ContentType, Mode, Role};
+use airlox_core::payload::{
+    Event, JobKind, JobProgress, JobResult, JobSpec, JobStatus, Meta, Payload, Stream as OutStream, Target,
+};
+use airlox_core::session::{ContentType, JobLimits, Mode, Role};
 use airlox_server::Config;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
@@ -402,6 +404,243 @@ fn seal_progress(s: &Sess, runner: &Member, job: &SealedItem, tail: &str) -> Sea
         truncated: false,
     };
     seal_kind(s, runner, ItemKind::Progress, None, vec![job_ref], Payload::progress(p))
+}
+
+fn seal_chunk(
+    s: &Sess,
+    runner: &Member,
+    job: &SealedItem,
+    stream: OutStream,
+    offset: u64,
+    data: &str,
+) -> SealedItem {
+    let job_ref = ItemRef::to(job);
+    let p = JobProgress {
+        job: job_ref.clone(),
+        elapsed_ms: 1000,
+        tail: None,
+        tail_truncated: false,
+        stream: Some(stream),
+        offset: Some(offset),
+        data: Some(data.into()),
+        truncated: false,
+    };
+    seal_kind(s, runner, ItemKind::Progress, None, vec![job_ref], Payload::progress(p))
+}
+
+/// A runner that is online, approved and running a job.
+async fn running_job(
+    env: &Env,
+    s: &Sess,
+    owner: &Member,
+    sender: &Member,
+) -> (Member, SealedItem, RunnerStream) {
+    let runner = join_runner(env, s, "runner-01", &[]).await;
+    let stream = RunnerStream::open(env, s, &runner).await;
+    approve(env, s, owner, &runner).await;
+    let job = seal_job(s, sender, &Target::Any);
+    assert_eq!(submit(env, s, sender, &job).await.status(), StatusCode::CREATED);
+    assert_eq!(claim(env, s, &runner, &job.envelope.header.id).await, StatusCode::NO_CONTENT);
+    (runner, job, stream)
+}
+
+/// Post an output chunk; returns its item id and event id.
+async fn post_chunk(
+    env: &Env,
+    s: &Sess,
+    runner: &Member,
+    job: &SealedItem,
+    offset: u64,
+    data: &str,
+) -> (String, u64) {
+    let chunk = seal_chunk(s, runner, job, OutStream::Stdout, offset, data);
+    let r = post(env, s, runner, frame(&chunk)).await;
+    assert_eq!(r.status(), StatusCode::CREATED, "{}", r.text().await.unwrap());
+    let v: Value = r.json().await.unwrap();
+    (chunk.envelope.header.id.clone(), v["seq"].as_u64().unwrap())
+}
+
+fn mentions(evs: &[Value], id: &str) -> bool {
+    evs.iter().any(|e| e.to_string().contains(id))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn progress_is_not_history_and_leaves_no_trace() {
+    let (env, s, owner, sender) = execute_env(|c| {
+        c.max_items = 6;
+        c.blob_hold_ms = 1500;
+    })
+    .await;
+    let (runner, job, _stream) = running_job(&env, &s, &owner, &sender).await;
+    let mut ids = vec![];
+    for i in 0..5 {
+        ids.push(post_chunk(&env, &s, &runner, &job, i * 4, "out\n").await.0);
+    }
+
+    // Five chunks and the job: they do not fill a six-item session, which
+    // still takes five more items; the sixth is the session's limit.
+    for i in 0..5 {
+        let r = post(&env, &s, &sender, frame(&seal_text(&s, &sender, &format!("note {i}")))).await;
+        assert_eq!(r.status(), StatusCode::CREATED, "note {i}: {}", r.text().await.unwrap());
+    }
+    let r = post(&env, &s, &sender, frame(&seal_text(&s, &sender, "one too many"))).await;
+    assert_eq!(error_code(r).await, (StatusCode::TOO_MANY_REQUESTS, "session_full".into()));
+
+    // Held and listed like any item until delivered.
+    let evs = events(&env, &s, &owner).await;
+    assert!(ids.iter().all(|id| mentions(&evs, id)));
+    assert_eq!(blob(&env, &s, &sender, &ids[1]).await.status(), StatusCode::OK);
+
+    // Once every recipient has fetched one it goes at once (no grace
+    // period), and the live ones are told; nobody keeps its envelope.
+    let live = call(&env, &owner, reqwest::Method::GET, format!("/v1/sessions/{}/stream", s.id)).await;
+    ack(&env, &s, &sender, &ids[0]).await;
+    assert_eq!(blob(&env, &s, &owner, &ids[0]).await.status(), StatusCode::OK);
+    ack(&env, &s, &owner, &ids[0]).await;
+    let told = read_sse_until(live, "event: evicted").await;
+    assert!(told.contains(&ids[0]));
+    assert_eq!(blob(&env, &s, &owner, &ids[0]).await.status(), StatusCode::NOT_FOUND);
+    let evs = events(&env, &s, &owner).await;
+    assert!(!mentions(&evs, &ids[0]), "a delivered chunk left an event behind");
+    let on_disk = env.dir.path().join("sessions").join(&s.id).join("blobs");
+    assert!(!on_disk.join(&ids[0]).exists());
+    // Asking for it, or acking it late, is a plain "no such item".
+    assert_eq!(want(&env, &s, &owner, &ids[0]).await.status(), StatusCode::NOT_FOUND);
+    let late =
+        call(&env, &owner, reqwest::Method::POST, format!("/v1/sessions/{}/items/{}/ack", s.id, ids[0]));
+    assert_eq!(late.await.status(), StatusCode::NOT_FOUND);
+
+    // The others nobody fetched go when the blob hold ends.
+    assert!(
+        eventually(|| async { blob(&env, &s, &owner, &ids[4]).await.status() == StatusCode::NOT_FOUND })
+            .await
+    );
+    let evs = events(&env, &s, &owner).await;
+    assert!(ids.iter().all(|id| !mentions(&evs, id)));
+    assert!(ids.iter().all(|id| !on_disk.join(id).exists()));
+    // Everything else stays: the job and the notes.
+    assert!(mentions(&evs, &job.envelope.header.id));
+    assert_eq!(evs.iter().filter(|e| e["kind"] == "item").count(), 6);
+    let trail = audit(&env, &s, &owner).await;
+    assert_eq!(trail.status(), StatusCode::OK);
+    let trail = trail.text().await.unwrap();
+    assert!(ids.iter().all(|id| !trail.contains(id)), "progress is not in the audit trail");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn held_progress_has_its_own_limit() {
+    let (env, s, owner, sender) = execute_env(|c| c.max_items = 4).await;
+    let (runner, job, _stream) = running_job(&env, &s, &owner, &sender).await;
+    for i in 0..4 {
+        post_chunk(&env, &s, &runner, &job, i, "x").await;
+    }
+    let chunk = seal_chunk(&s, &runner, &job, OutStream::Stdout, 4, "x");
+    let r = post(&env, &s, &runner, frame(&chunk)).await;
+    assert_eq!(error_code(r).await, (StatusCode::TOO_MANY_REQUESTS, "session_full".into()));
+    // The session's history is untouched: the sender can still post.
+    let r = post(&env, &s, &sender, frame(&seal_text(&s, &sender, "hello"))).await;
+    assert_eq!(r.status(), StatusCode::CREATED);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn progress_event_ids_are_not_reused_after_a_restart() {
+    let (mut env, s, owner, sender) = execute_env(|_| {}).await;
+    let (runner, job, stream) = running_job(&env, &s, &owner, &sender).await;
+    let mut last = 0;
+    let mut ids = vec![];
+    for i in 0..3 {
+        let (id, seq) = post_chunk(&env, &s, &runner, &job, i, "x").await;
+        ids.push(id);
+        last = seq;
+    }
+    drop(stream);
+
+    // Chunks are not in the log, so a restart forgets them, but it must not
+    // hand their event ids out again.
+    env.restart(|_| {}).await;
+    let blobs = env.dir.path().join("sessions").join(&s.id).join("blobs");
+    assert!(ids.iter().all(|id| !blobs.join(id).exists()), "an orphaned chunk survived the restart");
+    let note = seal_text(&s, &sender, "after the restart");
+    let r = post(&env, &s, &sender, frame(&note)).await;
+    assert_eq!(r.status(), StatusCode::CREATED, "{}", r.text().await.unwrap());
+    let seq = r.json::<Value>().await.unwrap()["seq"].as_u64().unwrap();
+    assert!(seq > last, "event id {seq} was already used by a chunk ({last})");
+    let evs = events(&env, &s, &owner).await;
+    let seqs: Vec<u64> = evs.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+    assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+    assert_eq!(seqs.last(), Some(&seq));
+    // The job is still the runner's, and its chunks flow on after the restart.
+    let (_, next) = post_chunk(&env, &s, &runner, &job, 3, "x").await;
+    assert!(next > seq);
+    // Reserving ids is bookkeeping, not part of the trail.
+    let trail = audit(&env, &s, &owner).await.text().await.unwrap();
+    assert!(!trail.contains("reserve"));
+    // And another restart, now with the reserved block in the log, loads.
+    env.restart(|_| {}).await;
+    assert!(events(&env, &s, &owner).await.len() >= evs.len());
+}
+
+fn seal_shell_job(s: &Sess, author: &Member, code: &str) -> SealedItem {
+    let spec = JobSpec {
+        kind: Some(JobKind::Shell),
+        cwd: None,
+        tree: None,
+        fresh: false,
+        filename: "job.sh".into(),
+        code: code.into(),
+        runtime: "python3.12".into(),
+        timeout_s: 30,
+        memory_mb: None,
+        files: vec![],
+        requirements: vec![],
+        target: Target::Any,
+        progress_file: None,
+    };
+    seal_kind(s, author, ItemKind::Job, Some(ContentType::Sh), vec![], Payload::job(spec))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shell_jobs_route_like_python_ones() {
+    let env = Env::new().await;
+    let s = new_session_with(Mode::Execute, Some(3_600_000), |p| {
+        let limits = JobLimits { kinds: Some(vec![JobKind::Python, JobKind::Shell]), ..Default::default() };
+        p.job_limits = Some(limits);
+    });
+    assert_eq!(create(&env, &s).await.status(), StatusCode::CREATED);
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let sender = join(&env, &s, Role::Sender, "planner-agent").await;
+    let runner = join_runner(&env, &s, "runner-01", &["cpu"]).await;
+    let mut stream = RunnerStream::open(&env, &s, &runner).await;
+    approve(&env, &s, &owner, &runner).await;
+
+    let job = seal_shell_job(&s, &sender, "echo hi\n");
+    let id = job.envelope.header.id.clone();
+    let r = submit(&env, &s, &sender, &job).await;
+    assert_eq!(r.status(), StatusCode::CREATED, "{}", r.text().await.unwrap());
+    let assigned = stream.next("job_assigned").await;
+    assert_eq!(assigned["job"], id.as_str());
+    assert_eq!(assigned["envelope"].as_str().unwrap(), canon(&job.envelope));
+    assert_eq!(claim(&env, &s, &runner, &id).await, StatusCode::NO_CONTENT);
+    assert_eq!(job_state(&env, &s, &owner, &id).await["state"], "running");
+
+    let (chunk_id, _) = post_chunk(&env, &s, &runner, &job, 0, "hi\n").await;
+    assert_eq!(blob(&env, &s, &sender, &chunk_id).await.status(), StatusCode::OK);
+    let r = post(&env, &s, &runner, frame(&seal_result(&s, &runner, &job))).await;
+    assert_eq!(r.status(), StatusCode::CREATED, "{}", r.text().await.unwrap());
+    assert_eq!(job_state(&env, &s, &owner, &id).await["state"], "done");
+
+    // The relay learns the kind from the header, as it learns `py`.
+    let evs = events(&env, &s, &owner).await;
+    let ev = evs.iter().find(|e| e["kind"] == "item" && e["data"]["envelope"].to_string().contains(&id));
+    let env_json: Value = serde_json::from_str(ev.unwrap()["data"]["envelope"].as_str().unwrap()).unwrap();
+    assert_eq!(env_json["header"]["subkind"], "sh");
+
+    // Python jobs still go through, and a python-only session refuses shell.
+    let r = submit(&env, &s, &sender, &seal_job(&s, &sender, &Target::Any)).await;
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let (env2, s2, _owner2, sender2) = execute_env(|_| {}).await;
+    let r = submit(&env2, &s2, &sender2, &seal_shell_job(&s2, &sender2, "true")).await;
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test(flavor = "multi_thread")]
