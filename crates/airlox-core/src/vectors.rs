@@ -120,6 +120,7 @@ pub fn generate() -> Result<Value> {
                 python: None,
                 kinds: vec![JobKind::Python],
                 shell: None,
+                slots: 1,
             }),
             created_at_ms: params.created_at_ms + 2,
         },

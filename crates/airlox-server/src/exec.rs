@@ -4,9 +4,10 @@
 //! The relay cannot read a job, so the sender names its target in the
 //! `Airlox-Target` header next to the sealed job item. The relay routes on
 //! that copy; the runner refuses a job whose signed target does not match
-//! it. Routing is "no queue": a job either goes to an idle runner at once or
-//! fails with `runner_busy` (a matching runner is online but busy) or
-//! `no_runner_available`.
+//! it. Routing is "no queue": a job either goes to a runner with a free slot
+//! at once or fails with `runner_busy` (a matching runner is online but all
+//! its slots are taken) or `no_runner_available`. A runner declares its slots
+//! (how many jobs it runs at once) in its signed join.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -32,7 +33,7 @@ use crate::api::{
     auth, blocking, commit_upload, item_path_ok, read_json_body, receive_upload, session, uploader, AppState,
 };
 use crate::error::{ApiError, ApiResult};
-use crate::store::{Event, Inner, JobState, Rec, RunnerMsg, Session};
+use crate::store::{Event, Inner, JobState, Participant, Rec, RunnerMsg, Session};
 use crate::util::now_ms;
 
 /// Header carrying a job's routing target (the `target` JSON of protocol §7).
@@ -73,41 +74,54 @@ fn job_json(id: &str, g: &Inner) -> Option<Value> {
     Some(json!({"job": id, "state": j.state, "runner": j.runner, "reason": j.reason}))
 }
 
-/// Pick the runner for a job: eligible, online, idle and matching the
-/// target; the earliest joined wins.
-fn pick_runner(g: &Inner, target: &Target, now: u64, timeout_ms: u64) -> Option<String> {
-    let mut candidates: Vec<(u64, &String)> = g
+/// Eligible, online runners that match the target, earliest joined first.
+fn matching_runners<'a>(
+    g: &'a Inner,
+    target: &Target,
+    now: u64,
+    timeout_ms: u64,
+) -> Vec<(&'a String, &'a Participant)> {
+    let mut found: Vec<_> = g
         .participants
         .iter()
-        .filter(|(pk, p)| p.job.is_none() && g.runner_eligible(pk) && g.runner_online(pk, now, timeout_ms))
+        .filter(|(pk, _)| g.runner_eligible(pk) && g.runner_online(pk, now, timeout_ms))
         .filter(|(pk, p)| {
             let labels = p.runner.as_ref().map(|r| r.labels.as_slice()).unwrap_or_default();
             PublicKey::from_b64(pk).is_ok_and(|key| target_matches(target, key, labels))
         })
-        .map(|(pk, p)| (p.seq, pk))
         .collect();
-    candidates.sort();
-    candidates.first().map(|(_, pk)| (*pk).clone())
+    found.sort_by_key(|(_, p)| p.seq);
+    found
 }
 
-/// The name of a runner that would take the job if it were idle: eligible,
-/// online, matching, and busy with another job.
+/// Pick the runner for a job: eligible, online, matching the target and with
+/// a free slot. The least loaded (active jobs per slot) wins, so jobs spread
+/// over runners; ties go to the earliest joined.
+fn pick_runner(g: &Inner, target: &Target, now: u64, timeout_ms: u64) -> Option<String> {
+    // jobs/slots compared as a cross product, without division.
+    let fuller = |a: &(&String, &Participant), b: &(&String, &Participant)| {
+        (a.1.jobs.len() * g.runner_slots(b.0)).cmp(&(b.1.jobs.len() * g.runner_slots(a.0)))
+    };
+    matching_runners(g, target, now, timeout_ms)
+        .into_iter()
+        .filter(|(pk, _)| g.runner_has_room(pk))
+        .min_by(fuller)
+        .map(|(pk, _)| pk.clone())
+}
+
+/// The name of a runner that would take the job if it had a free slot:
+/// eligible, online, matching, and with every slot taken.
 fn busy_runner(g: &Inner, target: &Target, now: u64, timeout_ms: u64) -> Option<String> {
-    g.participants
-        .iter()
-        .filter(|(pk, p)| p.job.is_some() && g.runner_eligible(pk) && g.runner_online(pk, now, timeout_ms))
-        .filter(|(pk, p)| {
-            let labels = p.runner.as_ref().map(|r| r.labels.as_slice()).unwrap_or_default();
-            PublicKey::from_b64(pk).is_ok_and(|key| target_matches(target, key, labels))
-        })
+    matching_runners(g, target, now, timeout_ms)
+        .into_iter()
+        .find(|(pk, _)| !g.runner_has_room(pk))
         .map(|(_, p)| p.runner.as_ref().map(|r| r.name.clone()).unwrap_or_default())
-        .next()
 }
 
 /// `POST /v1/sessions/:id/jobs` — header `Airlox-Target`, body an upload
 /// frame holding a `job` item. `201` once a runner has it; otherwise the
 /// job is stored as failed (so the timeline shows it) and the answer is
-/// `409 runner_busy` when a matching runner is online but busy, otherwise
+/// `409 runner_busy` when a matching runner is online but has no free slot, otherwise
 /// `409 no_runner_available`. Jobs are never queued.
 pub async fn post_job(
     State(st): State<AppState>,
@@ -156,10 +170,10 @@ pub async fn post_job(
         )),
         Err(Some(name)) => Err(ApiError::conflict_code(
             "runner_busy",
-            format!("runner {name} matches job {job} but is busy with another job; it was not queued"),
+            format!("runner {name} matches job {job} but has no free slot; it was not queued"),
         )),
         Err(None) => Err(ApiError::no_runner(format!(
-            "no approved, online, idle runner matches job {job}; it was not queued"
+            "no approved, online runner with a free slot matches job {job}; it was not queued"
         ))),
     }
 }
@@ -246,7 +260,8 @@ pub async fn cancel_job(
 }
 
 /// `GET /v1/sessions/:id/runners` — runners that have not left, with the
-/// relay's view of approval and presence. Clients verify approvals
+/// relay's view of approval, presence and load (`jobs`, `slots`, `busy`: no
+/// free slot). Clients verify approvals
 /// themselves from the owner's signed `runner_approve` events.
 pub async fn runners(
     State(st): State<AppState>,
@@ -263,14 +278,19 @@ pub async fn runners(
     let out: Vec<Value> = list
         .into_iter()
         .map(|(pk, p)| {
+            let busy = !g.runner_has_room(pk);
             json!({
                 "participant_pub": pk,
                 "runner": p.runner,
                 "approved": p.approved,
                 "rejected": p.rejected,
                 "online": g.runner_online(pk, now, timeout_ms),
-                "job": p.job,
-                "busy": p.job.is_some(),
+                "jobs": p.jobs,
+                "slots": g.runner_slots(pk),
+                // No free slot. `job` (an active job, only when busy) is what
+                // clients from before slots read as "busy".
+                "busy": busy,
+                "job": p.jobs.iter().next().filter(|_| busy),
                 "state": g.presence.get(pk).and_then(|x| x.state.clone()),
                 "detail": g.presence.get(pk).and_then(|x| x.detail.clone()),
                 "signed_join": p.public["signed_join"],
@@ -336,7 +356,7 @@ pub async fn reject_runner(
         if runner_target(&g, &pk)?.rejected {
             return Ok(StatusCode::NO_CONTENT);
         }
-        s.fail_runner_job(&mut g, &pk, "runner_rejected")?;
+        s.fail_runner_jobs(&mut g, &pk, "runner_rejected")?;
         s.append(&mut g, Rec::Reject { who: pk.clone() })?;
         s.tell_runner(&pk, "rejected", json!({}));
         Ok(StatusCode::NO_CONTENT)
@@ -346,9 +366,9 @@ pub async fn reject_runner(
 
 #[derive(Deserialize, Default)]
 struct Heartbeat {
-    /// The job the runner is working on, if any.
+    /// The jobs the runner is working on.
     #[serde(default)]
-    job: Option<String>,
+    jobs: Vec<String>,
     /// The runner's setup: `preparing`, `ready` or `failed`. Kept until the
     /// next heartbeat that carries one.
     #[serde(default)]
@@ -359,12 +379,15 @@ struct Heartbeat {
 }
 
 pub const MAX_DETAIL_CHARS: usize = 300;
+/// Most job ids one heartbeat may name (a runner's slots, plus the jobs it
+/// still owes an answer for after a restart).
+pub const MAX_HEARTBEAT_JOBS: usize = 64;
 
-/// `POST /v1/sessions/:id/runners/me/heartbeat` — body `{"job": id|null,
-/// "state": "preparing"|"ready"|"failed", "detail": text}` (all optional). A
-/// runner that reports idle while the relay has it running a job has lost
-/// that job, which then fails. A runner that reports a job the relay failed
-/// as `runner_lost` (it was cut off, not gone) gets that job back.
+/// `POST /v1/sessions/:id/runners/me/heartbeat` — body `{"jobs": [id…],
+/// "state": "preparing"|"ready"|"failed", "detail": text}` (all optional).
+/// A running job the runner leaves out of `jobs` is lost: it fails. A job the
+/// relay failed as `runner_lost` (the runner was cut off, not gone) that the
+/// runner names again comes back, while the runner has a free slot for it.
 pub async fn heartbeat(
     State(st): State<AppState>,
     Path(id): Path<String>,
@@ -391,6 +414,12 @@ pub async fn heartbeat(
             format!("detail is over {MAX_DETAIL_CHARS} characters"),
         ));
     }
+    if hb.jobs.len() > MAX_HEARTBEAT_JOBS {
+        return Err(ApiError::bad_request(
+            "invalid",
+            format!("a heartbeat names at most {MAX_HEARTBEAT_JOBS} jobs"),
+        ));
+    }
     blocking(move || {
         let mut g = s.lock();
         let presence = g.presence.entry(who.clone()).or_default();
@@ -399,22 +428,24 @@ pub async fn heartbeat(
             presence.state = hb.state;
             presence.detail = hb.detail;
         }
-        let idle = g.participants.get(&who).is_some_and(|p| p.job.is_none());
-        if let Some(job) = hb.job.as_deref().filter(|j| idle && g.lost_by(j, &who)) {
-            tracing::info!(session = %s.id, job, "runner reconnected; its job is running again");
-            s.set_job(&mut g, job, JobState::Running, Some(who.clone()), None)?;
+        for job in &hb.jobs {
+            if g.lost_by(job, &who) && g.runner_has_room(&who) {
+                tracing::info!(session = %s.id, job, "runner reconnected; its job is running again");
+                s.set_job(&mut g, job, JobState::Running, Some(who.clone()), None)?;
+            }
         }
-        let current = g.participants.get(&who).and_then(|p| p.job.clone());
-        if let Some(job) = current {
+        let current: Vec<String> =
+            g.participants.get(&who).map(|p| p.jobs.iter().cloned().collect()).unwrap_or_default();
+        for job in current {
             let running = g.jobs.get(&job).is_some_and(|j| j.state == JobState::Running);
-            if running && hb.job.as_deref() != Some(job.as_str()) {
+            if running && !hb.jobs.contains(&job) {
                 s.set_job(&mut g, &job, JobState::Failed, Some(who.clone()), Some("runner_lost"))?;
             }
         }
         let p = g.participants.get(&who);
         Ok(Json(json!({
             "approved": p.is_some_and(|p| p.approved) || !g.approve_runners(),
-            "job": p.and_then(|p| p.job.clone()),
+            "jobs": p.map(|p| p.jobs.clone()).unwrap_or_default(),
         })))
     })
     .await
@@ -441,9 +472,9 @@ fn runner_event(m: &RunnerMsg) -> SseEvent {
 
 /// `GET /v1/sessions/:id/runners/me/stream` — SSE for one runner:
 /// `job_assigned {job, envelope}`, `job_cancel {job}` and `rejected {}`.
-/// On connect it repeats the runner's active assignment (and a pending
-/// cancel of it), so a runner that reconnects loses neither. Holding this stream (plus heartbeats) is
-/// what makes a runner online.
+/// On connect it repeats each of the runner's active assignments (and the
+/// pending cancel of each), oldest first, so a runner that reconnects loses
+/// none. Holding this stream (plus heartbeats) is what makes a runner online.
 pub async fn runner_stream(
     State(st): State<AppState>,
     Path(id): Path<String>,
@@ -462,9 +493,16 @@ pub async fn runner_stream(
         }
         p.streams += 1;
         p.last_seen_ms = now_ms();
-        let active = g.participants.get(&who).and_then(|p| p.job.clone());
+        let mut active: Vec<(u64, String)> = g
+            .participants
+            .get(&who)
+            .into_iter()
+            .flat_map(|p| p.jobs.iter())
+            .map(|j| (g.jobs.get(j).map_or(0, |r| r.since_ms), j.clone()))
+            .collect();
+        active.sort();
         let mut backlog = std::collections::VecDeque::new();
-        if let Some(job) = active {
+        for (_, job) in active {
             let envelope = g.item_event(&job).map(|e| e.data["envelope"].clone());
             let msg = |kind, data| Arc::new(RunnerMsg { runner: who.clone(), kind, data });
             backlog.push_back(msg("job_assigned", json!({"job": job, "envelope": envelope})));

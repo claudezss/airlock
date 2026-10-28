@@ -312,7 +312,8 @@ tokio process with **no LLM and no shell for anyone else**. Loop:
 6. Heartbeat every 10 s with `idle|busy:<job_id>`; the server fails a job whose
    runner misses 3 heartbeats.
 
-Concurrency: one job at a time per runner in v1 (`--concurrency N` later).
+Concurrency: one job at a time per runner by default; `--concurrency N`
+declares N slots (see `docs/protocol.md` §13).
 
 ### Backend interface
 

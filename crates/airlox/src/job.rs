@@ -25,6 +25,7 @@ mod workspace;
 
 pub use workspace::Workspaces;
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -86,6 +87,9 @@ pub struct Ctx {
     /// Kept work dirs, one per sender (`--workspace`); `None` for a fresh
     /// work dir every job.
     pub workspaces: Option<Workspaces>,
+    /// The workspaces running jobs hold, by work dir: a runner that runs
+    /// several jobs at once lets a sender's workspace serve one at a time.
+    pub workspaces_in_use: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
     /// Where finished jobs' answers wait until the relay has them.
     pub outbox: PathBuf,
     /// Tests: exit once an answer is saved, before posting any of it.
@@ -193,11 +197,34 @@ fn record_to(done_file: &Path, line: &str) -> Result<()> {
     Ok(())
 }
 
+/// A sender's workspace, held by a job until the lease is dropped.
+struct WorkspaceLease {
+    in_use: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
+    dir: PathBuf,
+}
+
+impl WorkspaceLease {
+    /// `None` while another job holds the workspace.
+    fn take(in_use: &Arc<std::sync::Mutex<HashSet<PathBuf>>>, ws: &Workspace) -> Option<Self> {
+        let dir = ws.work();
+        let fresh = in_use.lock().unwrap_or_else(|e| e.into_inner()).insert(dir.clone());
+        fresh.then(|| WorkspaceLease { in_use: in_use.clone(), dir })
+    }
+}
+
+impl Drop for WorkspaceLease {
+    fn drop(&mut self) {
+        self.in_use.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.dir);
+    }
+}
+
 /// A job that passed every check, with its inputs.
 struct Accepted {
     spec: JobSpec,
-    /// The sender's workspace on this runner, when the job gets one.
+    /// The sender's workspace on this runner, when the job gets one, and
+    /// the hold on it that lasts until the job is done with it.
     workspace: Option<Workspace>,
+    _lease: Option<WorkspaceLease>,
     /// (item ref, file name, subkind, plaintext) per input.
     inputs: Vec<(ItemRef, String, ContentType, Vec<u8>)>,
     input_sha256: String,
@@ -296,6 +323,22 @@ async fn verify(ctx: &Ctx, view: &mut View, job_id: &str) -> Result<(ItemRef, Ve
         .as_ref()
         .filter(|_| limits.workspace)
         .map(|w| (w.of(&view.manifest.session_id, &author), w.max_bytes));
+    // One job at a time uses a workspace; the sender's next one is refused,
+    // as a busy runner would refuse it, and may be sent again once this one
+    // has finished.
+    let lease = match &workspace {
+        Some((ws, _)) => match WorkspaceLease::take(&ctx.workspaces_in_use, ws) {
+            Some(lease) => Some(lease),
+            None => {
+                return refuse(
+                    "runner_busy: another job of yours is using your workspace on this runner, and a \
+                     workspace serves one job at a time; send this one again when that job has finished"
+                        .into(),
+                )
+            }
+        },
+        None => None,
+    };
     if let Some((ws, max)) = &workspace {
         let used = ws.size_bytes();
         if used > *max && !spec.fresh {
@@ -328,7 +371,7 @@ async fn verify(ctx: &Ctx, view: &mut View, job_id: &str) -> Result<(ItemRef, Ve
         inputs.push((r.clone(), name, subkind, opened.body));
     }
     let input_sha256 = hex(&hasher.finalize());
-    Ok((job_ref, Verdict::Run(Box::new(Accepted { spec, workspace, inputs, input_sha256 }))))
+    Ok((job_ref, Verdict::Run(Box::new(Accepted { spec, workspace, _lease: lease, inputs, input_sha256 }))))
 }
 
 fn create_new(path: &Path, data: &[u8]) -> Result<()> {
@@ -1143,6 +1186,24 @@ mod tests {
         assert!(open_failure(&e).starts_with("kind_not_supported: "), "{}", open_failure(&e));
         let e = anyhow::anyhow!("bad signature");
         assert!(open_failure(&e).starts_with("job did not verify: "));
+    }
+
+    #[test]
+    fn a_workspace_is_held_by_one_job_until_its_lease_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let sender = Keypair::generate().public();
+        let workspaces = Workspaces::new(dir.path(), 10, Duration::from_secs(60));
+        let in_use = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let mine = workspaces.of("ax_s", &sender);
+        let lease = WorkspaceLease::take(&in_use, &mine).expect("free");
+        assert!(WorkspaceLease::take(&in_use, &workspaces.of("ax_s", &sender)).is_none());
+        // Another sender, or the same sender in another session, is not blocked.
+        assert!(
+            WorkspaceLease::take(&in_use, &workspaces.of("ax_s", &Keypair::generate().public())).is_some()
+        );
+        assert!(WorkspaceLease::take(&in_use, &workspaces.of("ax_t", &sender)).is_some());
+        drop(lease);
+        assert!(WorkspaceLease::take(&in_use, &mine).is_some());
     }
 
     #[test]

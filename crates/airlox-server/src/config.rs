@@ -75,7 +75,7 @@ pub struct Config {
     /// How long a runner has to claim an assigned job before it fails.
     #[arg(long = "claim-timeout", env = "AIRLOX_CLAIM_TIMEOUT", default_value = "5s", value_parser = parse_duration_ms)]
     pub claim_timeout_ms: u64,
-    /// A runner without a heartbeat for this long is offline, and its job fails.
+    /// A runner without a heartbeat for this long is offline, and its jobs fail.
     #[arg(long = "runner-timeout", env = "AIRLOX_RUNNER_TIMEOUT", default_value = "30s", value_parser = parse_duration_ms)]
     pub runner_timeout_ms: u64,
     /// How long a running job outlives its runner's silence (at least

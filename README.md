@@ -374,7 +374,8 @@ only suitable for trusted code. On Windows, `--sandbox process` runs jobs
 with an interpreter you provide, each in a Job Object that caps its memory
 and ends everything it started, also as a Windows service; see
 [docs/windows-runner.md](docs/windows-runner.md). Runners take one job at a
-time (a busy one refuses new jobs with `runner_busy`), post progress while
+time unless started with `--concurrency N` (a runner whose slots are all
+taken refuses new jobs with `runner_busy`), post progress while
 long jobs run, and finish jobs across dropped connections. A complete
 example is in
 [examples/summarize](examples/summarize), and

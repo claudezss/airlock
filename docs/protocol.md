@@ -219,7 +219,8 @@ The join request is signed by the participant key the certificate names:
     "runner": null | { "name": "runner-01", "labels": ["cpu"], "host": "build-box",
                        "sandbox": "local|docker|kubernetes|process", "network_unblocked": false,
                        "version": "0.1.1", "python": "3.12.4",      // version, python optional
-                       "kinds": ["python", "shell"], "shell": "sh" },
+                       "kinds": ["python", "shell"], "shell": "sh",
+                       "slots": 4 },                                  // slots optional
     "created_at_ms": 0
   },
   "sig": "<participant signature, context join, over canonical(join)>"
@@ -258,6 +259,13 @@ the runner still refuses a job it cannot run. A runner that rejoins with a
 saved identity keeps the join it made, so after changing those flags, results'
 `env.kinds` is the current word. Joins before 0.2 have neither and are
 rejected (a breaking change).
+
+A runner's `slots` is how many jobs it runs at once (`--concurrency`), an
+integer from 1 to 16, signed with the rest of its join. The relay sends a
+runner no more active jobs than it has slots (§13). It is omitted when 1, so
+the canonical form of a one-job runner's join is unchanged; a relay or client
+from before slots rejects a join that has it. A runner that has joined keeps
+the slots it joined with: to change them it joins again as a new runner.
 
 `description` is optional (the rules above apply): text in which the
 participant says what it is or does (a receiving agent's purpose, a runner's
@@ -536,9 +544,14 @@ workspace first. A workspace over `--workspace-max-mb` (default 10 240) after
 a job refuses its sender's next job with a reason starting `workspace_full:`
 until one asks for `fresh`; workspaces idle for `--workspace-ttl` (default 14
 days) are removed, and closing the session removes them all. Two senders
-never share a workspace, and one sender's jobs run one at a time. A job can
-leave something for the next job of the same sender: the same trust domain as
-the job that planted it.
+never share a workspace, and one sender's jobs run one at a time: a runner
+with several slots (§13) that is given a second job while the sender's first
+still uses the workspace refuses it with a signed `refused` result whose
+reason starts `runner_busy:`, as a runner with no free slot would have been
+refused by the relay, and the sender may send it again once the first has
+finished. Jobs of other senders run beside it. A job can leave something for
+the next job of the same sender: the same trust domain as the job that planted
+it.
 
 ## 9. ZIP handling
 
@@ -800,7 +813,7 @@ purged with the session. The relay builds two exports at a time; more are
 | 403 | `forbidden`, `revoked` | role, author or content policy not allowed; a join with a revoked role's invite |
 | 404 | `not_found` | no such session or item |
 | 408 | `timeout` | request body stalled or upload too slow |
-| 409 | `conflict`, `duplicate`, `present`, `not_wanted`, `uploading`, `runner_busy` | duplicate session or participant key; a duplicate item id (`duplicate`), or one still being uploaded (`uploading`: retry); a want or re-seed for a blob the relay has; a re-seed nobody asked for; enough re-seeds of that blob already in flight; a job whose matching runner is busy |
+| 409 | `conflict`, `duplicate`, `present`, `not_wanted`, `uploading`, `runner_busy` | duplicate session or participant key; a duplicate item id (`duplicate`), or one still being uploaded (`uploading`: retry); a want or re-seed for a blob the relay has; a re-seed nobody asked for; enough re-seeds of that blob already in flight; a job whose matching runners have no free slot |
 | 410 | `closed`, `evicted` | session closed (or closed and not re-creatable), or blob already delivered |
 | 413 | `too_large`, `storage_wait`, `session_full` | body, envelope or item limit; the session's storage is full until deliveries free some (`storage_wait`: retry); the session history limit (`session_full`) |
 | 429 | `limit`, `session_full` | relay, address, participant, stream, want or re-seed limit, or two audit exports already being built (`limit`: retry later); the session's item or transfer limit (`session_full`: it will not lift). `progress` items also get `session_full` once a session has used nine tenths of its item or history limit, which is kept for results |
@@ -839,18 +852,18 @@ items stay the source of truth.
 | `GET /v1/sessions/{id}/jobs/{job}` | any | none | `200 {"job", "state", "runner", "reason"}` |
 | `POST /v1/sessions/{id}/jobs/{job}/claim` | the assigned runner | none | `204` |
 | `POST /v1/sessions/{id}/jobs/{job}/cancel` | owner, or the job's sender | none | `202 {"job", "state", "runner", "reason"}` |
-| `GET /v1/sessions/{id}/runners` | any | none | `200 {"runners": [runner…], "approval_required"}`; each runner has `busy` (it has an active job) |
+| `GET /v1/sessions/{id}/runners` | any | none | `200 {"runners": [runner…], "approval_required"}`; each runner has `jobs` (its active job ids), `slots` and `busy` (no free slot: `jobs` as many as `slots`); `job` is one of `jobs` while `busy`, else `null`, for clients from before slots that read it as "busy" |
 | `POST /v1/sessions/{id}/runners/{participant_pub}/approve` | owner | none | `204` |
 | `POST /v1/sessions/{id}/runners/{participant_pub}/reject` | owner | none | `204` |
 | `GET /v1/sessions/{id}/runners/me/stream` | runner | none | SSE, see below |
-| `POST /v1/sessions/{id}/runners/me/heartbeat` | runner | `{"job": id or null, "state", "detail"}` (all optional) | `200 {"approved", "job"}` |
+| `POST /v1/sessions/{id}/runners/me/heartbeat` | runner | `{"jobs": [id…], "state", "detail"}` (all optional; at most 64 ids) | `200 {"approved", "jobs"}` |
 
 **Approval.** When the manifest's `approve_runners` is true, a runner gets
 no jobs, and is not a recipient of new items, until the owner approves it.
 The owner does two things: posts a signed `runner_approve` event item (what
 runners and senders verify, §8) and calls `…/approve` (what the relay
 routes on). Rejecting is the same with `runner_reject` and `…/reject`; the
-relay then revokes the runner's token like `leave`, fails its active job
+relay then revokes the runner's token like `leave`, fails its active jobs
 with `runner_rejected` and ends its streams. When `approve_runners` is false
 every runner is eligible as soon as it joins.
 
@@ -865,14 +878,15 @@ show them, never act on them.
 **Submitting.** A sender seals a `job` item and posts its upload frame to
 `POST /jobs` with `Airlox-Target` set to the job's `target` JSON (§7). The
 relay routes on this copy; the runner refuses a job whose signed target does
-not match it. Candidates are runners that are eligible, online, idle and
-match the target (a `runner` target matches only that key; `labels` needs
-every label; `any` matches all). The earliest joined candidate gets the job.
-There is no queue: with no candidate the job item is still stored and its
-state becomes `failed`. If a runner that would have matched is online but
-busy with another job (runners take one job at a time) the reason is
-`runner_busy` and the answer `409 runner_busy`; otherwise the reason is
-`not_available` and the answer `409 no_runner_available`.
+not match it. Candidates are runners that are eligible, online, have a free
+slot (fewer active jobs, `assigned` or `running`, than the `slots` of their
+join) and match the target (a `runner` target matches only that key; `labels`
+needs every label; `any` matches all). The least loaded candidate (active jobs
+per slot) gets the job; ties go to the earliest joined. There is no queue:
+with no candidate the job item is still stored and its state becomes
+`failed`. If a runner that would have matched is online but all its slots are
+taken the reason is `runner_busy` and the answer `409 runner_busy`; otherwise
+the reason is `not_available` and the answer `409 no_runner_available`.
 
 **Job states** (relay view): `assigned` → `running` (claimed) → `done`
 (the assigned runner posted a `result` item whose `refs` include the job),
@@ -881,9 +895,9 @@ or `failed` with a reason:
 | reason | when |
 |---|---|
 | `not_available` | no candidate at submission |
-| `runner_busy` | no idle candidate at submission, but a matching one was busy |
+| `runner_busy` | no candidate with a free slot at submission, but a matching runner had every slot taken |
 | `runner_unresponsive` | not claimed within the claim timeout (default 5 s); the runner is offline until its next heartbeat |
-| `runner_lost` | an assigned job's runner sent no heartbeat within the runner timeout (default 30 s); a running job's within the job reconnect grace (default 15 min, at least the runner timeout); or a heartbeat reported a different job |
+| `runner_lost` | an assigned job's runner sent no heartbeat within the runner timeout (default 30 s); a running job's within the job reconnect grace (default 15 min, at least the runner timeout); or a heartbeat left it out of `jobs` |
 | `runner_left`, `runner_rejected`, `runner_revoked` | its runner left, was rejected, or its role was revoked |
 | `author_revoked` | the sender who submitted it had its role revoked |
 | `cancelled` | cancelled before it was claimed |
@@ -896,20 +910,24 @@ metadata, unsigned: clients decide what happened from signed items.
 **Runner stream.** `GET /runners/me/stream` is SSE without event ids:
 `job_assigned {job, envelope}`, `job_cancel {job}` and `rejected {}` (the
 stream then ends; it also ends when the runner's role is revoked or the
-session closes). On connect it repeats the runner's active assignment, so a
-runner that reconnects does not lose it. A runner is **online** while it
+session closes). On connect it repeats each of the runner's active
+assignments, oldest first, each followed by its pending cancel if there is
+one, so a runner that reconnects loses none of them. A runner is **online** while it
 holds this stream and has sent a heartbeat within the runner timeout;
 heartbeats go every 10 seconds. At most 2 streams per runner.
 
 **Reconnecting.** A runner that loses its connection goes offline after the
 runner timeout, but its running job stays `running` for the job reconnect
 grace: the job keeps running on the runner, which reconnects with backoff and
-posts the result when the relay answers. A runner that reports, in a
-heartbeat, a job the relay already failed as `runner_lost` gets it back as
-`running`, and such a job's result from its runner still makes it `done`.
-A runner that restarts names the job it still owes an answer for in its
-setup heartbeats (`preparing`, `ready`), so that job stays `running` until
-the answer arrives.
+posts the result when the relay answers. A heartbeat names every job the
+runner is working on (`jobs`), and one the relay has `running` for it that
+the heartbeat leaves out is lost alone: it fails with `runner_lost`, the
+runner's other jobs untouched. A runner that names, in a heartbeat, a job the
+relay already failed as `runner_lost` gets it back as `running` while it has a
+free slot for it, and such a job's result from its runner still makes it
+`done`. A runner that restarts names the jobs it still owes an answer for in
+its setup heartbeats (`preparing`, `ready`), so they stay `running` until the
+answers arrive.
 While a job runs, its runner may post signed `progress` items (§7) whose
 `refs` include it.
 

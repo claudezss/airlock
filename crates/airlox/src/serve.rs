@@ -298,13 +298,15 @@ mod tests {
             "--labels",
             "gpu",
             "--no-start",
+            "--concurrency",
+            "4",
             "--workspace",
         ]
         .iter()
         .map(OsString::from)
         .collect();
         let got: Vec<String> = passthrough(&raw).iter().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert_eq!(got, ["--name", "gpu-box", "--labels", "gpu", "--workspace"]);
+        assert_eq!(got, ["--name", "gpu-box", "--labels", "gpu", "--concurrency", "4", "--workspace"]);
     }
 
     #[test]

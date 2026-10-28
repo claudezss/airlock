@@ -32,7 +32,7 @@ pub const MAX_ENV_PACKAGES: usize = 256;
 pub enum Target {
     /// One specific runner, pinned by its participant key. `name` is for display.
     Runner { participant_pub: PublicKey, name: String },
-    /// Any idle runner carrying every listed label.
+    /// Any runner with a free slot carrying every listed label.
     Labels { labels: Vec<String> },
     /// Any idle approved runner.
     Any,
