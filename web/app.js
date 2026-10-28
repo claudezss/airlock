@@ -113,13 +113,21 @@ function announce(msg) {
 }
 
 // Only the owner of an ended session is offered a new one; a retry reloads the page.
+const DEAD_ICONS = {
+  ended: ["M3 12a9 9 0 1 0 18 0 9 9 0 1 0-18 0", "M5.6 5.6l12.8 12.8"],
+  offline: ["M2 9a15 15 0 0 1 20 0", "M5.5 12.5a10 10 0 0 1 13 0", "M9 16a5 5 0 0 1 6 0", "M12 19.5h.01", "M3 3l18 18"],
+};
 function deadEnd(title, cause, { newSession = false, retry = false } = {}) {
   document.title = `${title} · Airlox`;
-  show(el("div", { class: "panel stack dead-end", role: "alert" },
+  // Without a retry, there is always somewhere to go: a new session, or a
+  // transfer code for someone else's.
+  show(el("div", { class: "ncard dead-end", role: "alert" },
+    el("span", { class: "dead-icon" }, svg(DEAD_ICONS[retry ? "offline" : "ended"], 26)),
     el("h1", {}, title), el("p", { class: "muted" }, cause),
-    newSession || retry ? el("div", { class: "row" },
-      newSession ? el("a", { class: "button primary", href: "/new" }, "New session") : null,
-      retry ? el("button", { class: "primary", type: "button", onclick: () => location.reload() }, "Try again") : null) : null));
+    el("div", { class: "row" },
+      retry ? el("button", { class: "primary cta", type: "button", onclick: () => location.reload() }, "Try again")
+        : el("a", { class: `button cta${newSession ? " primary" : ""}`, href: "/new" }, "New session"),
+      retry ? null : el("a", { class: "button cta", href: "/receive" }, "Enter a transfer code"))));
 }
 
 // Plain-language reasons for items that fail verification.
@@ -144,9 +152,13 @@ const reducedMotion = () => matchMedia("(prefers-reduced-motion: reduce)").match
 const SAFE_URL = /^(https?:|mailto:)/i;
 // Past these sizes the renderer shows plain text instead: its regexes are
 // not meant for megabytes, and a sender should not be able to stall a reader.
+// Block rules are linear; the inline regexes can backtrack quadratically on
+// crafted input, so each paragraph and each message get a budget.
 const MD_MAX_CHARS = 200000;
-const MD_MAX_INLINE = 10000;
+const MD_MAX_INLINE = 4000;
+const MD_INLINE_BUDGET = 40000;
 const MD_MAX_DEPTH = 6;
+let mdBudget = MD_INLINE_BUDGET;
 const I_COPY = ["M9 9h10v10H9z", "M5 15V5h10"];
 const I_CHECK = ["M5 12l5 5 9-10"];
 const I_CODE = ["M8 6l-5 6 5 6", "M16 6l5 6-5 6"];
@@ -159,37 +171,78 @@ const I_REPLY = ["M9 14L4 9l5-5", "M4 9h10a6 6 0 0 1 6 6v5"];
 const I_AT = ["M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0z", "M16 12v1.5a2.5 2.5 0 0 0 5 0V12a9 9 0 1 0-3.5 7.1"];
 const I_PANEL = ["M5 4h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z", "M15 4v16"];
 
+// A URL may hold balanced parentheses one level deep, as in wiki/Foo_(bar).
+const MD_URL = "(?:[^()\\s]|\\([^()\\s]*\\))+";
 const MD_INLINE = new RegExp([
-  "(`+)([\\s\\S]*?[^`])\\1(?!`)", // 1,2 code span
-  "!\\[([^\\]]*)\\]\\(([^)\\s]+)\\)", // 3,4 image
-  "\\[([^\\]]+)\\]\\(([^)\\s]+)\\)", // 5,6 link
-  "\\*\\*(.+?)\\*\\*|__(.+?)__", // 7,8 strong
-  "~~(.+?)~~", // 9 strikethrough
-  "(?<![\\w*])\\*(?!\\s)(.+?)(?<!\\s)\\*(?![\\w*])", // 10 emphasis
-  "(?<!\\w)_(?!\\s)(.+?)(?<!\\s)_(?!\\w)", // 11 emphasis
-  "(https?:\\/\\/[^\\s<>()]+[^\\s<>().,:;!?\"'\\]])", // 12 bare link
-  "(\\n)", // 13 line break
+  `!\\[([^\\]]*)\\]\\((${MD_URL})\\)`, // 1,2 image
+  `\\[([^\\]]+)\\]\\((${MD_URL})\\)`, // 3,4 link
+  "\\*\\*(.+?)\\*\\*|__(.+?)__", // 5,6 strong
+  "~~(.+?)~~", // 7 strikethrough
+  "(?<![\\w*])\\*(?!\\s)(.+?)(?<!\\s)\\*(?![\\w*])", // 8 emphasis
+  "(?<!\\w)_(?!\\s)(.+?)(?<!\\s)_(?!\\w)", // 9 emphasis
+  "(https?:\\/\\/(?:[^\\s<>()]|\\([^\\s<>()]*\\))*(?:[^\\s<>().,:;!?\"'\\]]|\\([^\\s<>()]*\\)))", // 10 bare link
+  "(\\n)", // 11 line break
 ].join("|"), "g");
 
-function mdInline(text, depth = 0) {
-  if (depth > MD_MAX_DEPTH || text.length > MD_MAX_INLINE) return [text];
+// Code spans are cut out first by a linear scan, since a regex for them
+// backtracks on many unmatched backtick runs: a run closes at the next run of
+// the same length. Each span becomes a private-use placeholder so the other
+// inline rules still apply around it.
+const CODE_MARK = /\uE000(\d+)\uE001/g;
+function codeSpans(text) {
+  text = text.replace(/[\uE000\uE001]/g, "\uFFFD");
+  const runs = [];
+  const byLen = new Map();
+  for (let i = text.indexOf("`"); i >= 0; ) {
+    let j = i;
+    while (text[j] === "`") j++;
+    runs.push([i, j - i]);
+    if (!byLen.has(j - i)) byLen.set(j - i, []);
+    byLen.get(j - i).push(i);
+    i = text.indexOf("`", j);
+  }
+  const seen = new Map(); // run length → how far its list has been passed
+  const codes = [];
+  let out = "";
+  let last = 0;
+  for (const [start, n] of runs) {
+    if (start < last) continue;
+    const list = byLen.get(n);
+    let k = seen.get(n) ?? 0;
+    while (k < list.length && list[k] <= start) k++;
+    seen.set(n, k);
+    if (k === list.length) continue;
+    const end = list[k];
+    const body = text.slice(start + n, end);
+    out += text.slice(last, start) + `\uE000${codes.length}\uE001`;
+    codes.push({ body: body.replace(/^ ([\s\S]*) $/, "$1"), raw: text.slice(start, end + n) });
+    last = end + n;
+  }
+  return [out + text.slice(last), codes];
+}
+
+function mdInline(text, depth = 0, codes = null) {
+  if (!codes) [text, codes] = codeSpans(text);
+  const unmark = (s) => s.replace(CODE_MARK, (_, i) => codes[i].raw);
+  const plain = (s) => s.split(CODE_MARK).map((p, i) => (i % 2 ? el("code", {}, codes[p].body) : p)).filter((p) => p !== "");
+  mdBudget -= text.length;
+  if (depth > MD_MAX_DEPTH || text.length > MD_MAX_INLINE || mdBudget < 0) return plain(text);
   const out = [];
   const re = new RegExp(MD_INLINE);
   let last = 0;
   let m;
   while ((m = re.exec(text))) {
-    if (m.index > last) out.push(text.slice(last, m.index));
-    if (m[1]) out.push(el("code", {}, m[2].replace(/^ (.*) $/, "$1")));
-    else if (m[4] !== undefined) out.push(el("span", { class: "img-blocked", title: m[4] }, "Image: ", m[3] || "no description", " · not loaded"));
-    else if (m[6] !== undefined) out.push(...mdLink(m[6], mdInline(m[5], depth + 1)));
-    else if (m[7] !== undefined || m[8] !== undefined) out.push(el("strong", {}, mdInline(m[7] ?? m[8], depth + 1)));
-    else if (m[9] !== undefined) out.push(el("del", {}, mdInline(m[9], depth + 1)));
-    else if (m[10] !== undefined || m[11] !== undefined) out.push(el("em", {}, mdInline(m[10] ?? m[11], depth + 1)));
-    else if (m[12]) out.push(...mdLink(m[12], [m[12]], true));
-    else if (m[13]) out.push(el("br"));
+    if (m.index > last) out.push(...plain(text.slice(last, m.index)));
+    if (m[2] !== undefined) out.push(el("span", { class: "img-blocked", title: unmark(m[2]) }, "Image: ", unmark(m[1]) || "no description", " · not loaded"));
+    else if (m[4] !== undefined) out.push(...mdLink(unmark(m[4]), mdInline(m[3], depth + 1, codes)));
+    else if (m[5] !== undefined || m[6] !== undefined) out.push(el("strong", {}, mdInline(m[5] ?? m[6], depth + 1, codes)));
+    else if (m[7] !== undefined) out.push(el("del", {}, mdInline(m[7], depth + 1, codes)));
+    else if (m[8] !== undefined || m[9] !== undefined) out.push(el("em", {}, mdInline(m[8] ?? m[9], depth + 1, codes)));
+    else if (m[10]) out.push(...mdLink(unmark(m[10]), [unmark(m[10])], true));
+    else if (m[11]) out.push(el("br"));
     last = re.lastIndex;
   }
-  if (last < text.length) out.push(text.slice(last));
+  if (last < text.length) out.push(...plain(text.slice(last)));
   return out;
 }
 
@@ -214,6 +267,7 @@ function mdLink(href, kids, bare = false) {
 
 function markdown(src) {
   if (src.length > MD_MAX_CHARS) return [el("p", {}, src)];
+  mdBudget = MD_INLINE_BUDGET;
   try {
     return mdBlocks(src.replace(/\r\n?/g, "\n").split("\n"), 0);
   } catch {
@@ -243,11 +297,11 @@ function mdBlocks(lines, depth) {
       while (i < lines.length && !lines[i].trimStart().startsWith(fence)) body.push(lines[i++]);
       i++;
       out.push(codeBlock(body.join("\n"), m[2]));
-    } else if ((m = line.match(/^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/))) {
+    } else if ((m = mdHeading(line))) {
       flush();
-      out.push(el(`h${Math.min(m[1].length + 1, 4)}`, {}, mdInline(m[2])));
+      out.push(el(`h${Math.min(m[0] + 1, 4)}`, {}, mdInline(m[1])));
       i++;
-    } else if (/^\s{0,3}([-*_])(\s*\1){2,}\s*$/.test(line)) {
+    } else if (/^\s{0,3}[-*_]/.test(line) && /^(?:-{3,}|\*{3,}|_{3,})$/.test(line.replace(/\s+/g, ""))) {
       flush();
       out.push(el("hr"));
       i++;
@@ -256,7 +310,7 @@ function mdBlocks(lines, depth) {
       const q = [];
       while (i < lines.length && /^\s{0,3}>/.test(lines[i])) q.push(lines[i++].replace(/^\s{0,3}>\s?/, ""));
       out.push(el("blockquote", {}, depth < MD_MAX_DEPTH ? mdBlocks(q, depth + 1) : el("p", {}, q.join("\n"))));
-    } else if (line.includes("|") && i + 1 < lines.length && /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(lines[i + 1])) {
+    } else if (line.includes("|") && i + 1 < lines.length && mdTableRule(lines[i + 1])) {
       flush();
       const cells = (l) => l.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
       const head = cells(line);
@@ -279,6 +333,25 @@ function mdBlocks(lines, depth) {
   flush();
   return out;
 }
+
+// The block rules are written as scans, not one regex each: patterns such as
+// `\s*#*\s*$` backtrack quadratically on a long run of spaces.
+function mdHeading(line) {
+  const m = line.match(/^ {0,3}(#{1,6})[ \t]/);
+  if (!m) return null;
+  let s = line.slice(m[0].length).trim();
+  let e = s.length;
+  while (e > 0 && s[e - 1] === "#") e--;
+  // A closing run of #s goes when a space sets it apart (or it is all there is).
+  if (e === 0 || s[e - 1] === " " || s[e - 1] === "\t") s = s.slice(0, e).trimEnd();
+  return [m[1].length, s];
+}
+const mdTableRule = (line) => {
+  const t = line.trim();
+  if (!t.includes("-")) return false;
+  const cells = t.replace(/^\|/, "").replace(/\|$/, "").split("|");
+  return cells.every((c) => /^:?-{2,}:?$/.test(c.trim()));
+};
 
 function mdList(lines, i, depth) {
   const first = lines[i].match(/^(\s*)([-*+]|(\d{1,9})[.)])\s+/);
@@ -591,11 +664,14 @@ const RECEIVE_ERRORS = {
   expired: "This code expired. Ask for a new one.",
 };
 
+const RECEIVE_ICON = ["M7.5 15.5a4 4 0 1 1 3.9-4.9H21v4h-3v3h-3v-3h-3.6", "M7.5 11.5h.01"];
+const SEAL_ICON = ["M6 11h12v9H6z", "M8.5 11V8a3.5 3.5 0 0 1 7 0v3"];
+
 function receivePage() {
   const input = el("input", { type: "text", id: "code", class: "mono receive-input", placeholder: "7-guitar-orbit", autocomplete: "off",
     autocapitalize: "none", spellcheck: "false", enterkeyhint: "go", "aria-describedby": "code-err" });
   const err = el("p", { class: "error", id: "code-err", role: "alert" });
-  const go = el("button", { class: "primary", type: "submit" }, "Open session");
+  const go = el("button", { class: "primary cta", type: "submit" }, "Open session", svg(["M5 12h14", "M13 6l6 6-6 6"]));
   const fail = (msg) => {
     err.textContent = msg;
     input.setAttribute("aria-invalid", "true");
@@ -605,7 +681,7 @@ function receivePage() {
     err.textContent = "";
     input.removeAttribute("aria-invalid");
   });
-  const form = el("form", { class: "panel stack receive", onsubmit: async (ev) => {
+  const form = el("form", { class: "nform", onsubmit: async (ev) => {
     ev.preventDefault();
     const code = input.value.trim();
     if (!code) return fail("Enter the code first.");
@@ -639,12 +715,24 @@ function receivePage() {
         : `Could not receive the invite: ${e.message || e}`);
     }
   } },
-    el("h1", {}, "Receive an invite"),
-    el("p", { class: "muted" }, "Enter the code shown on the other machine, under Send to another machine."),
-    el("label", { for: "code", class: "receive-label" }, "Code"),
-    input, err, go,
-    el("p", { class: "muted hint-text" }, "The link is decrypted in this browser. The relay stores it only encrypted, for a few minutes, and gives it out once."));
-  show(form);
+    el("div", { class: "nfields" },
+      el("div", { class: "ncard" },
+        el("label", { for: "code", class: "codelabel" }, el("span", { class: "pick-icon" }, svg(RECEIVE_ICON, 22)),
+          el("span", {}, el("strong", {}, "Transfer code"), el("small", {}, "Shown on the other machine, under Send to another machine."))),
+        input, err,
+        el("p", { class: "seal muted" }, svg(SEAL_ICON, 16),
+          el("span", {}, "The link is decrypted in this browser. The relay stores it only encrypted, for a few minutes, and gives it out once.")))),
+    el("aside", { class: "nside" },
+      el("div", { class: "ncard sum" },
+        el("h2", {}, "What happens"),
+        el("dl", {}, el("dt", {}, "Opens in"), el("dd", {}, "This browser"), el("dt", {}, "Given out"), el("dd", {}, "Once"),
+          el("dt", {}, "Stored"), el("dd", {}, "Encrypted, minutes")),
+        el("p", { class: "sum-line mono" }, "One-time code · decrypted here"), go)));
+  show(el("div", { class: "new" },
+    el("div", { class: "nhead" },
+      el("div", {}, el("h1", {}, "Receive an invite"),
+        el("p", { class: "lede" }, "Enter the code shown on the other machine, under Send to another machine."))),
+    form));
   input.focus();
 }
 
@@ -655,12 +743,20 @@ function showRunnerCommand(link) {
   invitesShown = true;
   invitesCreated = true;
   const heading = el("h1", { tabindex: -1 }, "Runner invite received");
-  show(el("div", { class: "panel stack receive runner-cmd" },
-    heading,
-    el("p", { class: "muted" }, "Runners join from the command line. Run this on this machine; the code is used up, so copy it now."),
-    shown,
-    el("div", { class: "row" }, copyButton("Copy command", () => cmd(link), () => shown, "Runner command", "primary")),
-    el("p", { class: "muted hint-text" }, "Install the airlox runner first: ", el("a", { href: INSTALL_URL, target: "_blank", rel: "noopener noreferrer" }, "see the install guide"), ".")));
+  show(el("div", { class: "new" },
+    el("div", { class: "nhead" },
+      el("div", {}, heading,
+        el("p", { class: "lede" }, "Runners join from the command line. Run this on this machine; the code is used up, so copy it now."))),
+    el("div", { class: "nform" },
+      el("div", { class: "nfields" },
+        el("div", { class: "ncard runner-cmd" }, shown,
+          el("p", { class: "muted hint-text" }, "Install the airlox runner first: ", el("a", { href: INSTALL_URL, target: "_blank", rel: "noopener noreferrer" }, "see the install guide"), "."))),
+      el("aside", { class: "nside" },
+        el("div", { class: "ncard sum" },
+          el("h2", {}, "Runner command"),
+          el("p", { class: "sum-line mono" }, "Runner invite · code used up"),
+          copyButton("Copy command", () => cmd(link), () => shown, "Runner command", "primary cta"),
+          el("p", { class: "seal muted" }, svg(SEAL_ICON, 16), el("span", {}, "The link is masked on screen; Copy command copies the full one.")))))));
   heading.focus();
 }
 
@@ -753,23 +849,43 @@ function openOwnerSession(link) {
 }
 
 // ---------- new session (the create flow, at /new) ----------
+const NEW_ICONS = {
+  relay: ["M4 5h16v11H9l-5 4z", "M8 9.5h8M8 12.5h5"],
+  execute: ["M3 4h18v16H3z", "M7 9l3 3-3 3", "M12 15h5"],
+  text: ["M5 6h14M5 10h14M5 14h9M5 18h6"],
+  md: ["M3 6h18v12H3z", "M6.5 15V9l2.5 3 2.5-3v6", "M16 9v6M14 13l2 2 2-2"],
+  py: ["M9 8l-4 4 4 4", "M15 8l4 4-4 4", "M13 6l-2 12"],
+  zip: ["M5 3h14v18H5z", "M12 3v2M12 7v2M12 11v2", "M10.5 15h3v3h-3z"],
+  image: ["M3 5h18v14H3z", "M3 16l5-5 4 4 3-3 6 6", "M15 9h.01"],
+};
+const TTL_WORDS = { 900000: "15 minutes", 3600000: "1 hour", 86400000: "24 hours", never: "until closed" };
+
+// Configure → save the owner link → hand out invites.
+function newSteps(at) {
+  return el("ol", { class: "steps", "aria-label": "Progress" }, ["Configure", "Save owner link", "Invite agents"].map((label, i) =>
+    el("li", { class: i < at ? "done" : i === at ? "now" : null, "aria-current": i === at ? "step" : null },
+      el("span", { class: "n", "aria-hidden": "true" }, i < at ? "✓" : String(i + 1)), el("span", {}, label))));
+}
+
 function newSession() {
-  const radio = (name, value, label, checked, extra = {}) =>
-    el("label", { class: "option" }, el("input", { type: "radio", name, value, checked, ...extra }), label);
-  const mode = el("fieldset", { class: "stack" }, el("legend", {}, "Mode"),
-    el("div", { class: "mode" },
-      el("label", { class: "option" }, el("input", { type: "radio", name: "mode", value: "relay", checked: true }),
-        el("strong", {}, "Relay"), el("span", {}, "Share messages and files")),
-      el("label", { class: "option" }, el("input", { type: "radio", name: "mode", value: "execute" }),
-        el("strong", {}, "Execute"), el("span", {}, "Run Python on runners you approve"))));
-  const ttl = el("fieldset", {}, el("legend", {}, "Expires after"),
-    el("div", { class: "options" },
-      radio("ttl", 900000, "15 min", false), radio("ttl", 3600000, "1 hour", true), radio("ttl", 86400000, "24 hours", false),
-      radio("ttl", "never", "Never (until closed)", false)));
-  const types = el("fieldset", {}, el("legend", {}, "Allowed content"),
-    el("div", { class: "options" }, TYPE_LABELS.map(([v, label, ext]) =>
-      el("label", { class: "option" }, el("input", { type: "checkbox", name: "type", value: v, checked: true }),
-        label, el("span", { class: "ext" }, ext)))));
+  const card = (title, sub, ...kids) => el("fieldset", { class: "ncard" },
+    el("legend", {}, title), sub ? el("p", { class: "nsub" }, sub) : null, ...kids);
+  const mode = card("Mode", null,
+    el("div", { class: "modes" }, [["relay", "Relay", "Agents and people share messages and files."],
+      ["execute", "Execute", "Senders post Python; runners you approve run it and post the result."]].map(([v, name, desc]) =>
+      el("label", { class: "pick mode-pick" }, el("input", { type: "radio", name: "mode", value: v, checked: v === "relay" }),
+        el("span", { class: "pick-icon" }, svg(NEW_ICONS[v], 22)),
+        el("span", { class: "pick-text" }, el("strong", {}, name), el("span", {}, desc)),
+        el("span", { class: "tick", "aria-hidden": "true" })))));
+  const ttl = card("Expires after", "The relay deletes everything when the session ends. You can close it earlier.",
+    el("div", { class: "seg" }, [[900000, "15 min"], [3600000, "1 hour"], [86400000, "24 hours"], ["never", "Never"]].map(([v, label]) =>
+      el("label", {}, el("input", { type: "radio", name: "ttl", value: v, checked: v === 3600000 }), el("span", {}, label)))));
+  const types = card("Allowed content", "Every client refuses any other kind of item.",
+    el("div", { class: "tiles" }, TYPE_LABELS.map(([v, label, ext]) =>
+      el("label", { class: "pick tile" }, el("input", { type: "checkbox", name: "type", value: v, checked: true }),
+        el("span", { class: "pick-icon" }, svg(NEW_ICONS[v], 20)),
+        el("span", { class: "pick-text" }, el("strong", {}, label), el("span", { class: "mono" }, ext)),
+        el("span", { class: "tick", "aria-hidden": "true" })))));
   const size = el("input", { type: "number", id: "size", min: 1, max: MAX_ITEM_MB, step: 1, value: MAX_ITEM_MB,
     "aria-describedby": "size-hint" });
   const sizeHint = el("span", { class: "muted hint-text", id: "size-hint", "aria-live": "polite" }, "Checking this relay's limit…");
@@ -783,9 +899,11 @@ function newSession() {
     size.max = relayMb;
     if (!sizeTouched) size.value = Math.min(relayMb, MAX_DEFAULT_ITEM_MB);
     sizeHint.textContent = `1 to ${relayMb} MB on this relay`;
+    sync();
   }).catch(() => (sizeHint.textContent = `1 to ${MAX_ITEM_MB} MB (could not read this relay's limit)`));
-  const sizeField = el("div", { class: "stack field" }, el("label", { for: "size" }, el("strong", {}, "Max file size")),
-    el("div", { class: "size" }, size, el("span", { class: "muted" }, "MB")), sizeHint);
+  const sizeField = card("Max file size", null,
+    el("div", { class: "stack field" }, el("label", { for: "size", class: "sr-only" }, "Max file size in MB"),
+      el("div", { class: "unit" }, size, el("span", { "aria-hidden": "true" }, "MB")), sizeHint));
   const lim = {
     runtime: el("input", { type: "text", id: "j-runtime", value: "python3.12", autocomplete: "off" }),
     timeout: el("input", { type: "number", id: "j-timeout", min: 1, max: 86400, step: 1, value: 60 }),
@@ -795,17 +913,19 @@ function newSession() {
   };
   const field = (id, label, input, hint) => el("div", { class: "stack field" }, el("label", { for: id }, el("strong", {}, label)), input,
     hint ? el("span", { class: "muted hint-text" }, hint) : null);
-  const jobBox = el("fieldset", { class: "stack", hidden: true }, el("legend", {}, "Job limits"),
+  const jobBox = card("Job limits", "Jobs ask runners to run without network access. Runners that cannot block it are flagged before you approve them.",
     el("div", { class: "limits" },
-      field("j-runtime", "Runtime", lim.runtime), field("j-timeout", "Timeout (seconds)", lim.timeout, "1 to 86400 (24 h)"),
-      field("j-memory", "Memory (MB)", lim.memory, "32 to 65536")),
+      field("j-runtime", "Runtime", lim.runtime), field("j-timeout", "Timeout", lim.timeout, "seconds"),
+      field("j-memory", "Memory", lim.memory, "MB")),
     field("j-packages", "Packages", lim.packages, "Comma-separated. Only these can be requested by jobs."),
-    el("label", { class: "option check" }, lim.approve, "Require owner approval for runners"),
-    el("p", { class: "muted" }, "Jobs ask runners to run without network access. Runners that cannot block it are flagged before you approve them."));
+    el("label", { class: "switch" }, lim.approve, el("span", {}, el("strong", {}, "Require owner approval for runners"),
+      el("span", { class: "muted hint-text" }, "A runner can take jobs only after you approve it in the session."))));
+  jobBox.hidden = true;
   const pyBox = types.querySelector('input[value="py"]');
   const isExecute = () => form.elements.mode.value === "execute";
   const pyNote = el("p", { class: "muted hint-text", hidden: true, id: "py-note" }, "Python is always allowed in Execute sessions: jobs are Python.");
   pyBox.setAttribute("aria-describedby", "py-note");
+  types.append(pyNote);
   const syncMode = () => {
     jobBox.hidden = !isExecute();
     pyNote.hidden = !isExecute();
@@ -813,15 +933,38 @@ function newSession() {
     if (isExecute()) pyBox.checked = true;
   };
   mode.addEventListener("change", syncMode);
-  const err = el("p", { class: "error", role: "alert" });
-  const create = el("button", { class: "primary cta", type: "submit" }, "Create session");
-  const fields = el("fieldset", { class: "stack" }, mode, jobBox, ttl, types, pyNote, sizeField);
-  const aside = el("aside", { class: "panel stack" },
-    el("h2", {}, "Invites"),
-    el("p", { class: "muted" }, "Invite links appear here once the session exists. Each one carries a role and the session key."),
-    el("p", { class: "muted" }, "Joining a session someone else opened? Skip this page and open the invite link you were given, including the part after #."));
 
-  const form = el("form", { class: "stack", onsubmit: async (ev) => {
+  // The summary restates the choices next to the button, and on phones as a
+  // bar above it.
+  const sum = { mode: el("dd"), ttl: el("dd"), types: el("dd"), size: el("dd") };
+  const sumLine = el("p", { class: "sum-line mono" });
+  const summarize = () => {
+    const fd = new FormData(form);
+    const allowed = fd.getAll("type");
+    if (isExecute() && !allowed.includes("py")) allowed.push("py"); // a disabled box is not in the form data
+    const ttlWord = TTL_WORDS[fd.get("ttl")];
+    sum.mode.textContent = isExecute() ? `Execute${lim.approve.checked ? " · approval on" : ""}` : "Relay";
+    sum.ttl.textContent = fd.get("ttl") === "never" ? "Never (until closed)" : ttlWord;
+    sum.types.textContent = allowed.length ? TYPE_LABELS.filter(([t]) => allowed.includes(t)).map(([, label]) => label).join(", ") : "none";
+    sum.size.textContent = `${size.value || "?"} MB per file`;
+    sumLine.textContent = `${isExecute() ? "Execute" : "Relay"} · ${fd.get("ttl") === "never" ? "no expiry" : ttlWord} · ${allowed.length} type${allowed.length === 1 ? "" : "s"} · ${size.value || "?"} MB`;
+  };
+  const err = el("p", { class: "error", role: "alert" });
+  const create = el("button", { class: "primary cta", type: "submit" }, "Create session",
+    svg(["M5 12h14", "M13 6l6 6-6 6"]));
+  const fields = el("div", { class: "nfields" }, mode, jobBox, ttl, types, sizeField);
+  const aside = el("aside", { class: "nside" },
+    el("div", { class: "ncard sum" },
+      el("h2", {}, "Summary"),
+      el("dl", {}, el("dt", {}, "Mode"), sum.mode, el("dt", {}, "Expires"), sum.ttl, el("dt", {}, "Content"), sum.types,
+        el("dt", {}, "Files"), sum.size),
+      sumLine, err, create,
+      el("p", { class: "seal muted" }, svg(["M6 11h12v9H6z", "M8.5 11V8a3.5 3.5 0 0 1 7 0v3"], 16),
+        el("span", {}, "Keys are generated in this browser. The relay only stores ciphertext."))));
+  fields.append(el("p", { class: "muted hint-text njoin" }, "Joining a session someone else opened? Open the invite link you were given, or ",
+    el("a", { href: "/receive" }, "enter a transfer code"), "."));
+
+  const form = el("form", { class: "nform", onsubmit: async (ev) => {
     ev.preventDefault();
     err.textContent = "";
     const fd = new FormData(form);
@@ -854,73 +997,94 @@ function newSession() {
         max_item_bytes: mb * MB, job_limits };
       const s = ac.createSession(JSON.stringify(params), undefined);
       const { session_id } = await (await api("POST", "/v1/sessions", { body: s.signedManifest })).json();
-      fields.disabled = true;
-      const base = location.origin;
-      const owner = ac.ownerInvite(base, s.ownerSeed);
-      const heading = el("h2", { tabindex: -1 }, "Hand out invites");
-      const ownerRow = inviteRow("Owner", owner, "you · keep it private", "Copy", () => markSaved());
-      // Without the owner link nobody can approve runners, revoke or close:
-      // opening the session waits until it has been saved one way or another.
-      // A button, not a link: the owner key must not show in the status bar on hover.
-      const openBtn = el("button", { class: "primary cta", type: "button", disabled: true, "aria-describedby": "owner-gate",
-        onclick: () => openOwnerSession(owner) }, "Open session");
-      const gate = el("p", { class: "muted hint-text", id: "owner-gate" }, "Save the owner link first: copy it, download it, or send it to another machine and enter the code there.");
-      const saved = el("input", { type: "checkbox", id: "owner-saved" });
-      const markSaved = () => {
-        openBtn.disabled = false;
-        openBtn.removeAttribute("aria-describedby");
-        gate.hidden = true;
-        saved.checked = true;
-      };
-      saved.addEventListener("change", () => {
-        if (saved.checked) return markSaved();
-        openBtn.disabled = true;
-        openBtn.setAttribute("aria-describedby", "owner-gate");
-        gate.hidden = false;
-      });
-      const download = el("button", { class: "small", type: "button", onclick: () => {
-        const name = `airlox-owner-${session_id.slice(0, 7)}.txt`;
-        const body = `Airlox owner link for session ${session_id}\n\n${owner}\n\n` +
-          "Anyone with this link controls the session: keep it private. It cannot be shown again.\n";
-        const url = URL.createObjectURL(new Blob([body], { type: "text/plain" }));
-        const a = el("a", { href: url, download: name, hidden: true });
-        document.body.append(a);
-        a.click();
-        a.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 10000);
-        announce(`Downloaded ${name}`);
-        markSaved();
-      } }, "Download as .txt");
-      ownerRow.querySelector(".send-code").before(el("div", { class: "row" }, download));
-      aside.replaceChildren(
-        el("div", { class: "eyebrow" }, `Created · ${session_id.slice(0, 7)}`),
-        heading,
-        el("div", { class: "callout", role: "note" },
-          el("strong", {}, "Save your owner link now: it is shown only once."),
-          el("span", {}, "Without it you cannot approve runners, revoke access or close the session. Sender, observer and runner links stay available under Invites in the session.")),
-        el("p", { class: "muted hint-text" }, MASKED_NOTE),
-        ownerRow,
-        el("label", { class: "option check" }, saved, "I've saved it somewhere safe"),
-        senderInviteRow(ac.memberInvite(base, s.ownerSeed, "sender")),
-        inviteRow("Observer", ac.memberInvite(base, s.ownerSeed, "observer"), "can read everything and export the audit log"),
-        ...(execute ? [runnerInviteRow(ac.memberInvite(base, s.ownerSeed, "runner"))] : []),
-        el("div", { class: "row" },
-          // A button, not a link: the owner key must not show in the status bar on hover.
-          openBtn,
-          el("button", { type: "button", onclick: () => { invitesShown = false; location.reload(); } }, "Create another")),
-        gate);
-      heading.focus();
-      invitesShown = true;
-      invitesCreated = true;
+      summarize();
+      createdView(session_id, s, execute, aside.querySelector("dl"));
     } catch (e) {
       err.textContent = `Could not create the session: ${e.message || e}`;
       create.disabled = false;
     }
   } },
-    el("div", {}, el("h1", {}, "New session"),
-      el("p", { class: "lede" }, "Keys are generated in this browser. The relay never sees them.")),
-    fields, err, el("div", { class: "row" }, create));
-  show(el("div", { class: "layout" }, form, aside));
+    fields, aside);
+  const sync = () => summarize();
+  form.addEventListener("input", sync);
+  form.addEventListener("change", sync);
+  summarize();
+  show(el("div", { class: "new" },
+    el("div", { class: "nhead" },
+      el("div", {}, el("h1", {}, "New session"),
+        el("p", { class: "lede" }, "Pick what this session allows. Everything is end-to-end encrypted, and the rules are signed into the session so every client enforces them.")),
+      newSteps(0)),
+    form));
+}
+
+// Step two: the owner link, shown once, then the invites to hand out.
+function createdView(session_id, s, execute, summary) {
+  const base = location.origin;
+  const owner = ac.ownerInvite(base, s.ownerSeed);
+  let steps = newSteps(1);
+  const step = (n) => {
+    const next = newSteps(n);
+    steps.replaceWith(next);
+    steps = next;
+  };
+  const heading = el("h1", { tabindex: -1 }, "Save your owner link");
+  const ownerRow = inviteRow("Owner", owner, "you · keep it private", "Copy", () => markSaved());
+  // Without the owner link nobody can approve runners, revoke or close:
+  // opening the session waits until it has been saved one way or another.
+  // A button, not a link: the owner key must not show in the status bar on hover.
+  const openBtn = el("button", { class: "primary cta", type: "button", disabled: true, "aria-describedby": "owner-gate",
+    onclick: () => openOwnerSession(owner) }, "Open session", svg(["M5 12h14", "M13 6l6 6-6 6"]));
+  const gate = el("p", { class: "muted hint-text", id: "owner-gate" }, "Save the owner link first: copy it, download it, or send it to another machine and enter the code there.");
+  const saved = el("input", { type: "checkbox", id: "owner-saved" });
+  const markSaved = () => {
+    openBtn.disabled = false;
+    openBtn.removeAttribute("aria-describedby");
+    gate.hidden = true;
+    saved.checked = true;
+    step(2);
+  };
+  saved.addEventListener("change", () => {
+    if (saved.checked) return markSaved();
+    openBtn.disabled = true;
+    openBtn.setAttribute("aria-describedby", "owner-gate");
+    gate.hidden = false;
+    step(1);
+  });
+  const download = el("button", { class: "small", type: "button", onclick: () => {
+    const name = `airlox-owner-${session_id.slice(0, 7)}.txt`;
+    const body = `Airlox owner link for session ${session_id}\n\n${owner}\n\n` +
+      "Anyone with this link controls the session: keep it private. It cannot be shown again.\n";
+    const url = URL.createObjectURL(new Blob([body], { type: "text/plain" }));
+    const a = el("a", { href: url, download: name, hidden: true });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    announce(`Downloaded ${name}`);
+    markSaved();
+  } }, "Download as .txt");
+  ownerRow.querySelector(".send-code").before(el("div", { class: "row" }, download));
+  show(el("div", { class: "new created" },
+    el("div", { class: "nhead" },
+      el("div", {}, el("p", { class: "eyebrow" }, `Created · ${session_id.slice(0, 7)}`), heading,
+        el("p", { class: "lede" }, "It is shown only once. Without it you cannot approve runners, revoke access or close the session.")),
+      steps),
+    el("div", { class: "nform" },
+      el("div", { class: "nfields" },
+        el("section", { class: "ncard owner" }, ownerRow,
+          el("label", { class: "switch" }, saved, el("span", {}, el("strong", {}, "I've saved it somewhere safe"))),
+          el("p", { class: "muted hint-text" }, MASKED_NOTE)),
+        el("h2", { class: "nh2" }, "Invite agents and people"),
+        el("p", { class: "nsub" }, "These links stay available under Invites in the session, so you can hand them out later."),
+        el("section", { class: "ncard" }, senderInviteRow(ac.memberInvite(base, s.ownerSeed, "sender"))),
+        el("section", { class: "ncard" }, inviteRow("Observer", ac.memberInvite(base, s.ownerSeed, "observer"), "can read everything and export the audit log")),
+        ...(execute ? [el("section", { class: "ncard" }, runnerInviteRow(ac.memberInvite(base, s.ownerSeed, "runner")))] : [])),
+      el("aside", { class: "nside" },
+        el("div", { class: "ncard sum" }, el("h2", {}, "Session"), summary, openBtn, gate,
+          el("button", { type: "button", onclick: () => { invitesShown = false; location.reload(); } }, "Create another"))))));
+  heading.focus();
+  invitesShown = true;
+  invitesCreated = true;
 }
 
 // ---------- live session ----------
@@ -1038,12 +1202,16 @@ const DELIVERY_POLL_MS = 5000;
 const DELIVERY_WINDOW_MS = 30 * 60 * 1000;
 function deliveryLoop(s) {
   if (!["owner", "sender"].includes(s.inv.role)) return;
+  // Not in the last report: sent since (or too old for the report's 500 items).
+  const unknown = (it) => !s.delivery || it.created >= s.deliveryAt - DELIVERY_POLL_MS;
   const due = () => [...s.items.values()].some((it) => it.author === s.me && ["text", "file", "job"].includes(it.kind)
-    && Date.now() - it.created < DELIVERY_WINDOW_MS && (!s.delivery?.[it.id] || s.delivery[it.id].waiting?.length > 0));
+    && Date.now() - it.created < DELIVERY_WINDOW_MS && (s.delivery?.[it.id] ? s.delivery[it.id].waiting?.length > 0 : unknown(it)));
   const tick = async () => {
     if (s.closed || document.visibilityState !== "visible" || !due()) return;
     try {
+      const at = Date.now();
       s.delivery = (await (await api("GET", `/v1/sessions/${s.sid}/delivery`, { token: s.identity.token })).json()).items;
+      s.deliveryAt = at;
       s.render.delivery();
     } catch {
       // An older relay has no delivery report: items just say "sent".
@@ -1424,7 +1592,8 @@ function buildSessionLayout(s) {
 
   // header
   document.getElementById("title").hidden = false;
-  document.getElementById("title-name").textContent = `Session ${sid.slice(0, 7)}`;
+  // Phones drop the word "Session" (.tw) so the id fits beside the badges.
+  document.getElementById("title-name").replaceChildren(el("span", { class: "tw" }, "Session "), sid.slice(0, 7));
   document.getElementById("title-sub").textContent = `${manifest.mode} · ${inv.role}`;
   const setTitle = (state) => (document.title = `Session ${sid.slice(0, 7)} · ${state || inv.role} · Airlox`);
   setTitle();
@@ -1678,7 +1847,7 @@ function buildSessionLayout(s) {
       const at = s.lastEventAt ? new Date(s.lastEventAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : null;
       const where = s.lastSeq >= 0 ? `#${s.lastSeq}` : "nothing yet";
       fresh.textContent = s.closed ? `Ended · last event ${where}`
-        : `${s.connected && s.streaming ? "Live" : "Connecting…"} · latest ${where}${at ? ` · received ${at}` : ""}`;
+        : `${s.connected === false ? "Reconnecting…" : s.connected && s.streaming ? "Live" : "Connecting…"} · latest ${where}${at ? ` · received ${at}` : ""}`;
       conn.title = `Connected to the relay · latest event ${where}${at ? ` at ${at}` : ""}`;
     },
     // Your own items' delivery, as the relay reports it (see deliveryLoop).
@@ -2059,7 +2228,7 @@ function collapseLong(s, node) {
     const words = Number(c.dataset.words).toLocaleString();
     const what = c.dataset.what || "message";
     const btn = el("button", { class: "more", type: "button", "aria-expanded": "false" });
-    const label = (open) => btn.replaceChildren(svg(open ? I_UP : I_CHEV, 14), open ? "Show less" : `Show full ${what}`, open ? null : el("span", { class: "n" }, ` · ${words} words`));
+    const label = (open) => btn.replaceChildren(svg(open ? I_UP : I_CHEV, 14), open ? "Show less" : `Show full ${what}`, ...(open ? [] : [el("span", { class: "n" }, ` · ${words} words`)]));
     label(false);
     btn.addEventListener("click", () => {
       const open = c.classList.toggle("collapsed") === false;
@@ -2730,7 +2899,7 @@ function renderRunners(s, list, note) {
     const failed = r.setup === "failed" && !r.rejected;
     const canApprove = owner && !r.rejected && !failed && (!r.approved || !!err);
     const warn = r.networkUnblocked && !r.rejected
-      ? el("span", { class: "chip warn", title: "This runner's sandbox cannot block network access" }, sym("⚠ "), "network not blocked") : null;
+      ? el("span", { class: "chip warn", title: "This runner's sandbox cannot block network access" }, sym("⚠\u00a0"), "network not blocked") : null;
     // No isolation at all: "process", and "local" where it cannot sandbox (macOS, Windows).
     const plain = r.sandbox === "process" || (r.sandbox === "local" && r.networkUnblocked);
     const versions = [r.version && `airlox ${r.version}`, r.python && `Python ${r.python}`].filter(Boolean).join(" · ");
