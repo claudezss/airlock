@@ -269,7 +269,12 @@ fn shell_job_gets_the_sandbox_path_and_a_scrubbed_environment() {
     // What the shim itself runs with is what the sandbox gave it.
     let sandbox_path = format!("{}:/sandbox/tools", std::env::var("PATH").unwrap_or_default());
     let mut c = j.shell_cmd("echo \"$PATH\"; env | grep -c AWS || true; echo \"$TMPDIR\"", None, "10");
-    assert!(c.env("PATH", &sandbox_path).env("AWS_SECRET_ACCESS_KEY", "should-not-leak").status().unwrap().success());
+    assert!(c
+        .env("PATH", &sandbox_path)
+        .env("AWS_SECRET_ACCESS_KEY", "should-not-leak")
+        .status()
+        .unwrap()
+        .success());
     let r = j.result();
     assert_eq!(r.exit_code, Some(0), "{}", j.read("stderr.txt"));
     let out = j.read("stdout.txt");

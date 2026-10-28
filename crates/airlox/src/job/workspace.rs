@@ -220,7 +220,14 @@ impl Workspace {
     }
 
     /// Place a file or archive that is not the tree, replacing what is there.
-    pub fn put(&self, name: &str, body: &[u8], zipped: bool, limits: &ZipLimits, claimed: &mut HashSet<String>) -> Result<()> {
+    pub fn put(
+        &self,
+        name: &str,
+        body: &[u8],
+        zipped: bool,
+        limits: &ZipLimits,
+        claimed: &mut HashSet<String>,
+    ) -> Result<()> {
         let work = self.work();
         let mut known = HashSet::new();
         let mut claim = |path: &str| -> Result<()> {
@@ -310,7 +317,9 @@ fn unchanged(work: &Path, f: &TreeFile, size: u64) -> bool {
     let Some(parent) = real_parent(work, &f.path) else { return false };
     let path = parent.join(f.path.rsplit('/').next().unwrap_or(&f.path));
     let Some(mut file) = open_regular(&path) else { return false };
-    if file.metadata().ok().map(|m| m.len()) != Some(size) || sha256_reader(&mut file).ok().as_deref() != Some(&f.sha256) {
+    if file.metadata().ok().map(|m| m.len()) != Some(size)
+        || sha256_reader(&mut file).ok().as_deref() != Some(&f.sha256)
+    {
         return false;
     }
     #[cfg(unix)]
@@ -383,7 +392,8 @@ fn put_file(
         make_removable(&dest);
         fs::remove_dir_all(&dest)?;
     }
-    let tmp = parent.join(format!(".airlox-sync-{}-{}", std::process::id(), TMP.fetch_add(1, Ordering::Relaxed)));
+    let tmp =
+        parent.join(format!(".airlox-sync-{}-{}", std::process::id(), TMP.fetch_add(1, Ordering::Relaxed)));
     let written = (|| -> Result<()> {
         // create_new: fails on anything already at that name, links included.
         let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
@@ -454,7 +464,8 @@ mod tests {
 
     fn ws() -> (tempfile::TempDir, Workspace) {
         let d = tempfile::tempdir().unwrap();
-        let w = Workspaces::new(d.path(), 10, Duration::from_secs(86400)).of("ax_s", &airlox_core::keys::Keypair::generate().public());
+        let w = Workspaces::new(d.path(), 10, Duration::from_secs(86400))
+            .of("ax_s", &airlox_core::keys::Keypair::generate().public());
         (d, w)
     }
 
@@ -471,7 +482,8 @@ mod tests {
     #[test]
     fn a_tree_is_written_and_a_second_one_changes_only_the_difference() {
         let (_d, w) = ws();
-        sync(&w, &[("src/a.py", b"a1", MODE), ("src/b.py", b"b1", MODE), ("run.sh", b"#!/bin/sh\n", EXEC)]).unwrap();
+        sync(&w, &[("src/a.py", b"a1", MODE), ("src/b.py", b"b1", MODE), ("run.sh", b"#!/bin/sh\n", EXEC)])
+            .unwrap();
         assert_eq!(read(&w, "src/a.py"), "a1");
         #[cfg(unix)]
         {
@@ -491,7 +503,10 @@ mod tests {
         assert_eq!(read(&w, "src/b.py"), "b2");
         assert_eq!(read(&w, "new/c.py"), "c");
         #[cfg(unix)]
-        assert_eq!(before, std::os::unix::fs::MetadataExt::ino(&fs::metadata(w.work().join("src/a.py")).unwrap()));
+        assert_eq!(
+            before,
+            std::os::unix::fs::MetadataExt::ino(&fs::metadata(w.work().join("src/a.py")).unwrap())
+        );
         // run.sh left the tree: gone, with nothing else disturbed.
         assert!(!w.work().join("run.sh").exists());
         assert_eq!(read(&w, "node_modules/left-pad/index.js"), "x");
@@ -544,8 +559,16 @@ mod tests {
         std::os::unix::fs::symlink(outside.join("victim.txt"), work.join("gone.txt")).unwrap();
         std::os::unix::fs::symlink(&outside, work.join("deep")).unwrap();
 
-        sync(&w, &[("keep.txt", b"k", MODE), ("src/a.py", b"fresh", MODE), ("link.txt", b"mine", MODE), ("deep/x/y.txt", b"y", MODE)])
-            .unwrap();
+        sync(
+            &w,
+            &[
+                ("keep.txt", b"k", MODE),
+                ("src/a.py", b"fresh", MODE),
+                ("link.txt", b"mine", MODE),
+                ("deep/x/y.txt", b"y", MODE),
+            ],
+        )
+        .unwrap();
         // Nothing outside changed, and nothing new appeared there.
         assert_eq!(fs::read_to_string(outside.join("victim.txt")).unwrap(), "precious");
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 1, "wrote through a link");
@@ -652,7 +675,10 @@ mod tests {
     fn workspaces_are_per_sender_per_session_and_swept_when_idle() {
         let d = tempfile::tempdir().unwrap();
         let all = Workspaces::new(d.path(), 1, Duration::from_secs(3600));
-        let (a, b) = (airlox_core::keys::Keypair::generate().public(), airlox_core::keys::Keypair::generate().public());
+        let (a, b) = (
+            airlox_core::keys::Keypair::generate().public(),
+            airlox_core::keys::Keypair::generate().public(),
+        );
         let (wa, wb, wa2) = (all.of("ax_s", &a), all.of("ax_s", &b), all.of("ax_t", &a));
         assert!(wa.dir != wb.dir && wa.dir != wa2.dir);
         for w in [&wa, &wb, &wa2] {

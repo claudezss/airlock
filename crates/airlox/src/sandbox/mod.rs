@@ -171,7 +171,9 @@ impl PreparedJob {
         let mut a = vec!["--work".to_string(), work.into(), "--timeout".into(), self.timeout_s.to_string()];
         match self.kind {
             JobKind::Python => a.extend(["--entry".to_string(), self.entry.clone()]),
-            JobKind::Shell => a.extend(["--shell".to_string(), self.shell.into(), "--script".into(), script.into()]),
+            JobKind::Shell => {
+                a.extend(["--shell".to_string(), self.shell.into(), "--script".into(), script.into()])
+            }
         }
         if let Some(cwd) = &self.cwd {
             a.extend(["--cwd".to_string(), cwd.clone()]);
@@ -240,7 +242,9 @@ impl Backend {
     /// operator how to change that.
     pub fn no_shell_hint(&self) -> &'static str {
         match self {
-            Backend::Docker(_) => " (docker runs shell jobs in an image of the operator's: start the runner with --image)",
+            Backend::Docker(_) => {
+                " (docker runs shell jobs in an image of the operator's: start the runner with --image)"
+            }
             Backend::Local(_) if cfg!(windows) => " (start the runner with --shell pwsh to run them)",
             Backend::Local(_) => "",
         }
@@ -477,5 +481,37 @@ mod tests {
         let e = env("uv-runtime", &[("numpy", "2.1.0"), ("nover", ""), ("long", &"1".repeat(65))]);
         assert_eq!(e.packages.keys().collect::<Vec<_>>(), ["numpy"]);
         assert!(airlox_core::policy::check_env(&e).is_ok());
+    }
+
+    #[test]
+    fn a_running_jobs_file_is_read_from_an_offset() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("stdout.txt");
+        std::fs::write(&p, "hello world").unwrap();
+        assert_eq!(read_sandbox_range(&p, 6, 100).unwrap(), b"world");
+        assert_eq!(read_sandbox_range(&p, 0, 5).unwrap(), b"hello");
+        // Nothing new, or the job truncated the file under us.
+        assert!(read_sandbox_range(&p, 11, 100).unwrap().is_empty());
+        assert!(read_sandbox_range(&p, 50, 100).unwrap().is_empty());
+        assert!(read_sandbox_range(&d.path().join("missing"), 0, 1).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_running_jobs_file_cannot_be_a_link_or_a_pipe() {
+        let d = tempfile::tempdir().unwrap();
+        let fifo = d.path().join("stdout.txt");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let t = Instant::now();
+        assert!(read_sandbox_range(&fifo, 0, 10).is_err());
+        assert!(t.elapsed() < Duration::from_secs(1), "blocked on a pipe");
+        let secret = d.path().join("secret");
+        std::fs::write(&secret, "not for the stream").unwrap();
+        let link = d.path().join("stderr.txt");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        assert!(read_sandbox_range(&link, 0, 100).is_err());
+        let zero = d.path().join("zero");
+        std::os::unix::fs::symlink("/dev/zero", &zero).unwrap();
+        assert!(read_sandbox_range(&zero, 0, 100).is_err());
     }
 }

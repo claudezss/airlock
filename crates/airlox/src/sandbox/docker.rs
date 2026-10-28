@@ -331,15 +331,8 @@ impl Docker {
         }
         a.push(image.into());
         a.extend(
-            [
-                "python3",
-                "/airlox/shim.py",
-                "--result",
-                "/meta/result.json",
-                "--out",
-                "/out",
-            ]
-            .map(String::from),
+            ["python3", "/airlox/shim.py", "--result", "/meta/result.json", "--out", "/out"]
+                .map(String::from),
         );
         a.extend(job.shim_job_args("/work", &format!("/meta/{}", super::SCRIPT_FILE)));
         a
@@ -405,7 +398,8 @@ mod tests {
     fn an_image_is_pinned_by_the_digest_of_its_repository() {
         let digest = "0123456789abcdef".repeat(4);
         let id = format!("sha256:{}", "f".repeat(64));
-        let pulled = format!(r#"{id} ["other/ci@sha256:{}","ghcr.io/me/ci@sha256:{digest}"]"#, "a".repeat(64));
+        let pulled =
+            format!(r#"{id} ["other/ci@sha256:{}","ghcr.io/me/ci@sha256:{digest}"]"#, "a".repeat(64));
         let pin = Pin::parse("ghcr.io/me/ci:latest", &pulled).unwrap();
         assert_eq!(pin.run, format!("ghcr.io/me/ci@sha256:{digest}"));
         assert_eq!(pin.label, format!("docker:ghcr.io/me/ci@sha256:{digest}"));

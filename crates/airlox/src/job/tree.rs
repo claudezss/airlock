@@ -75,7 +75,8 @@ impl Tree {
         if raw.len() as u64 > MAX_TREE_JSON {
             bail!("{TREE_JSON} is over {} MiB", MAX_TREE_JSON >> 20);
         }
-        let json: TreeJson = serde_json::from_slice(&raw).with_context(|| format!("{TREE_JSON} is not valid"))?;
+        let json: TreeJson =
+            serde_json::from_slice(&raw).with_context(|| format!("{TREE_JSON} is not valid"))?;
         if json.count != json.files.len() as u64 {
             bail!("{TREE_JSON} says {} files but lists {}", json.count, json.files.len());
         }
@@ -123,9 +124,7 @@ pub(crate) mod tests {
     pub fn build(head: Option<&str>, files: &[(&str, &[u8], u32)]) -> Vec<u8> {
         let list: Vec<_> = files
             .iter()
-            .map(|(p, data, mode)| {
-                serde_json::json!({"path": p, "sha256": hex(&sha256(data)), "mode": mode})
-            })
+            .map(|(p, data, mode)| serde_json::json!({"path": p, "sha256": hex(&sha256(data)), "mode": mode}))
             .collect();
         let json = serde_json::json!({
             "root_name": "app", "head": head, "branch": "main", "dirty": true,
@@ -144,7 +143,10 @@ pub(crate) mod tests {
 
     #[test]
     fn a_tree_reports_what_results_say_about_it() {
-        let z = build(Some("AB12cd"), &[("src/a.py", b"print(1)\n", 0o100644), ("run.sh", b"#!/bin/sh\n", 0o100755)]);
+        let z = build(
+            Some("AB12cd"),
+            &[("src/a.py", b"print(1)\n", 0o100644), ("run.sh", b"#!/bin/sh\n", 0o100755)],
+        );
         let t = Tree::load(&z, &ZipLimits::default()).unwrap();
         assert_eq!(t.info.head.as_deref(), Some("ab12cd"));
         assert!(t.info.dirty);
@@ -167,7 +169,8 @@ pub(crate) mod tests {
         assert!(e.contains("no .airlox/tree.json"), "{e}");
         // Each way tree.json can be wrong.
         let good = [("a.py", &b"1"[..], 0o100644u32)];
-        let edits: [(&str, fn(&mut serde_json::Value)); 7] = [
+        type Edit = fn(&mut serde_json::Value);
+        let edits: [(&str, Edit); 7] = [
             ("head", |j: &mut serde_json::Value| j["head"] = "xyz".into()),
             ("lists 1", |j: &mut serde_json::Value| j["count"] = 5.into()),
             ("reserved", |j: &mut serde_json::Value| j["files"][0]["path"] = ".airlox/tree.json".into()),

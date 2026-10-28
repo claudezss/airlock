@@ -201,7 +201,12 @@ impl Streamer {
                 // Everything before the cap is out: say that this is where it stops.
                 (None, Some(s)) if self.pending.iter().all(|p| p.buf.is_empty()) => {
                     self.done = true;
-                    Chunk { stream: s, offset: self.pending[idx(s)].offset, data: String::new(), truncated: true }
+                    Chunk {
+                        stream: s,
+                        offset: self.pending[idx(s)].offset,
+                        data: String::new(),
+                        truncated: true,
+                    }
                 }
                 _ => break,
             };
@@ -293,7 +298,10 @@ mod tests {
         s.feed(Stream::Stdout, b"tests/test_a.py ..\n", at(t0, 950));
         let c = s.due(at(t0, 1010));
         assert_eq!(c.len(), 1);
-        assert_eq!((c[0].stream, c[0].offset, c[0].data.as_str()), (Stream::Stdout, 0, "collected 212 items\ntests/test_a.py ..\n"));
+        assert_eq!(
+            (c[0].stream, c[0].offset, c[0].data.as_str()),
+            (Stream::Stdout, 0, "collected 212 items\ntests/test_a.py ..\n")
+        );
         assert!(s.due(at(t0, 1020)).is_empty(), "sent bytes are not sent again");
         s.feed(Stream::Stdout, b"more\n", at(t0, 1100));
         assert!(s.due(at(t0, 2000)).is_empty());
@@ -415,11 +423,7 @@ mod tests {
         let kinds: Vec<_> = c.iter().map(|c| (c.stream, c.offset, c.data.len(), c.truncated)).collect();
         assert_eq!(
             kinds,
-            [
-                (Stream::Stdout, 0, 70, false),
-                (Stream::Stderr, 0, 30, false),
-                (Stream::Stdout, 70, 0, true)
-            ]
+            [(Stream::Stdout, 0, 70, false), (Stream::Stderr, 0, 30, false), (Stream::Stdout, 70, 0, true)]
         );
         assert!(s.finished());
         s.feed(Stream::Stdout, b"more", at(t0, 5000));
@@ -445,7 +449,10 @@ mod tests {
         let t0 = Instant::now();
         let mut s = Streamer::new(limits(120, 1 << 20));
         s.feed(Stream::Stdout, "é".repeat(MAX_CHUNK_BYTES).as_bytes(), t0);
-        let job = ItemRef { id: airlox_core::encoding::b64e(&[1; 16]), blob_sha256: airlox_core::encoding::b64e(&[1; 32]) };
+        let job = ItemRef {
+            id: airlox_core::encoding::b64e(&[1; 16]),
+            blob_sha256: airlox_core::encoding::b64e(&[1; 32]),
+        };
         for c in s.due(at(t0, 5000)).into_iter().chain([Chunk {
             stream: Stream::Stderr,
             offset: 3,

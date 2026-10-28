@@ -183,10 +183,10 @@ pub struct JoinArgs {
     pub workspace: bool,
     /// A workspace over this size (MB) after a job refuses its sender's next
     /// job (`workspace_full`) until that job asks for a fresh one.
-    #[arg(long, default_value_t = 10240, value_name = "MB")]
+    #[arg(long, default_value_t = 10240, value_name = "MB", requires = "workspace")]
     pub workspace_max_mb: u64,
     /// Remove workspaces unused for this long.
-    #[arg(long, default_value = "14d", value_parser = crate::cli::parse_duration)]
+    #[arg(long, default_value = "14d", value_parser = crate::cli::parse_duration, requires = "workspace")]
     pub workspace_ttl: Duration,
     /// Exit after this many jobs (for tests and one-shot use).
     #[arg(long, hide = true)]
@@ -346,9 +346,6 @@ fn check_args(args: &JoinArgs) -> Result<()> {
     }
     if args.image().is_some() && !docker {
         bail!("--image is for --sandbox docker");
-    }
-    if !args.workspace && (args.workspace_max_mb != 10240 || args.workspace_ttl != Duration::from_secs(14 * 86400)) {
-        bail!("--workspace-max-mb and --workspace-ttl are for runners started with --workspace");
     }
     if args.accept_network_gap && args.sandbox != SandboxArg::Process {
         bail!("--accept-network-gap is for --sandbox process");
@@ -664,7 +661,7 @@ pub async fn run(args: JoinArgs) -> Result<()> {
     }
     let ctx_env = job::checked_env(backend.env());
     let kinds: Vec<_> = backend.kinds().iter().map(JobKind::as_str).collect();
-    tracing::info!(kinds = ?kinds, "this runner runs these kinds of job");
+    tracing::info!(kinds = ?kinds, "this runner runs these kinds of job{}", if backend.shell().is_some() { "" } else { backend.no_shell_hint() });
     // A session that wants shell jobs, on a runner that cannot run them:
     // say so where the session can see it, not only in a refusal.
     let offered = limits.allows_kind(JobKind::Shell) && backend.shell().is_none();
@@ -719,9 +716,7 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         progress_tail: args.progress_tail as usize,
         progress_rate: args.progress_rate,
         stream_max_bytes: args.stream_max_mb.saturating_mul(1 << 20),
-        workspaces: args
-            .workspace
-            .then(|| Workspaces::new(&root, args.workspace_max_mb, args.workspace_ttl)),
+        workspaces: args.workspace.then(|| Workspaces::new(&root, args.workspace_max_mb, args.workspace_ttl)),
         outbox,
         exit_before_posting: args.exit_before_posting,
         env: ctx_env,

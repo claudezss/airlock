@@ -40,7 +40,7 @@ use airlox_core::payload::{
     MAX_PROGRESS_TAIL_BYTES, MAX_STDIO_BYTES,
 };
 use airlox_core::policy::{check_file_name, target_matches};
-use airlox_core::session::{ContentType, Role};
+use airlox_core::session::{ContentType, JobLimits, Role};
 use airlox_core::validate::zip::{check_entry_path, extract_zip, ZipLimits};
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -210,6 +210,32 @@ enum Verdict {
     Interrupted,
 }
 
+/// Why a job that did not open is refused. The core's policy check is what
+/// says the session does not allow its kind.
+fn open_failure(e: &anyhow::Error) -> String {
+    let why = format!("{e:#}");
+    if why.contains("jobs are not allowed in this session") {
+        format!("kind_not_supported: {why}")
+    } else {
+        format!("job did not verify: {why}")
+    }
+}
+
+/// Why this runner will not run a job of `kind`, if it will not: the session
+/// does not allow it, or this runner does not offer it.
+fn kind_refusal(kind: JobKind, limits: &JobLimits, backend: &Backend) -> Option<String> {
+    if !limits.allows_kind(kind) {
+        return Some(format!("kind_not_supported: this session does not allow {} jobs", kind.as_str()));
+    }
+    (!backend.kinds().contains(&kind)).then(|| {
+        format!(
+            "kind_not_supported: this runner does not run {} jobs{}",
+            kind.as_str(),
+            backend.no_shell_hint()
+        )
+    })
+}
+
 /// Fetch, verify and check a job and its inputs.
 async fn verify(ctx: &Ctx, view: &mut View, job_id: &str) -> Result<(ItemRef, Verdict)> {
     let job = view.open(job_id).await;
@@ -225,26 +251,15 @@ async fn verify(ctx: &Ctx, view: &mut View, job_id: &str) -> Result<(ItemRef, Ve
     let refuse = |why: String| Ok((job_ref.clone(), Verdict::Refuse(why)));
     let job = match job {
         Ok(j) => j,
-        // The core's policy check is what says the session does not allow a kind.
-        Err(e) if format!("{e:#}").contains("jobs are not allowed in this session") => {
-            return refuse(format!("kind_not_supported: {e:#}"));
-        }
-        Err(e) => return refuse(format!("job did not verify: {e:#}")),
+        Err(e) => return refuse(open_failure(&e)),
     };
     let Meta::Job(spec) = job.meta else { return refuse("not a job".into()) };
     if !matches!(job.role, Role::Sender | Role::Owner) {
         return refuse("jobs must come from the sender or owner role".into());
     }
     let limits = view.manifest.job_limits.clone().context("execute session without job limits")?;
-    if !limits.allows_kind(spec.kind()) {
-        return refuse(format!("kind_not_supported: this session does not allow {} jobs", spec.kind().as_str()));
-    }
-    if !ctx.backend.kinds().contains(&spec.kind()) {
-        return refuse(format!(
-            "kind_not_supported: this runner does not run {} jobs{}",
-            spec.kind().as_str(),
-            ctx.backend.no_shell_hint()
-        ));
+    if let Some(why) = kind_refusal(spec.kind(), &limits, &ctx.backend) {
+        return refuse(why);
     }
     match run_record(ctx, job_id) {
         Some(true) => bail!("job {job_id} already ran here; ignoring the duplicate"),
@@ -1091,6 +1106,44 @@ pub async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn docker(image: Option<&str>) -> Backend {
+        Backend::Docker(crate::sandbox::docker::Docker::new(
+            "docker".into(),
+            image.map(String::from),
+            "1".into(),
+            None,
+            Path::new("/nonexistent"),
+        ))
+    }
+
+    fn limits(kinds: Option<Vec<JobKind>>) -> JobLimits {
+        JobLimits { kinds, ..Default::default() }
+    }
+
+    #[test]
+    fn a_job_of_a_kind_the_runner_or_session_lacks_is_refused_with_a_stable_reason() {
+        let both = limits(Some(vec![JobKind::Python, JobKind::Shell]));
+        // A docker runner with no image offers python only, and says how to change that.
+        let why = kind_refusal(JobKind::Shell, &both, &docker(None)).unwrap();
+        assert!(why.starts_with("kind_not_supported: this runner does not run shell jobs"), "{why}");
+        assert!(why.contains("--image"), "{why}");
+        assert!(kind_refusal(JobKind::Python, &both, &docker(None)).is_none());
+        // With an image it offers both.
+        assert!(kind_refusal(JobKind::Shell, &both, &docker(Some("ci:latest"))).is_none());
+        // A session that allows python only (no `kinds` at all).
+        let why = kind_refusal(JobKind::Shell, &limits(None), &docker(Some("ci"))).unwrap();
+        assert_eq!(why, "kind_not_supported: this session does not allow shell jobs");
+        let shell_only = limits(Some(vec![JobKind::Shell]));
+        assert!(kind_refusal(JobKind::Python, &shell_only, &docker(Some("ci"))).unwrap().contains("session"));
+        // The core's own policy error for an unallowed kind gets the same prefix.
+        let e = anyhow::Error::from(airlox_core::Error::Policy(
+            "shell jobs are not allowed in this session".into(),
+        ));
+        assert!(open_failure(&e).starts_with("kind_not_supported: "), "{}", open_failure(&e));
+        let e = anyhow::anyhow!("bad signature");
+        assert!(open_failure(&e).starts_with("job did not verify: "));
+    }
 
     #[test]
     fn what_the_runner_wrote_names_no_directory_either() {
