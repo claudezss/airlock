@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from airlox import RunnerBusy, RunnerFailed, Session
+from airlox import PolicyError, Runner, RunnerBusy, RunnerFailed, Session
 
 from test_execute import LIMITS, wait_runner
 
@@ -210,3 +210,58 @@ def test_jobs_work_under_the_work_root_and_their_output_does_not_name_it(relay, 
     # The runner cleaned up after the job.
     time.sleep(0.5)
     assert not os.path.exists(where)
+
+
+SHELL_LIMITS = dict(PROCESS_LIMITS, kinds=["python", "shell"], workspace=True)
+posix_only = pytest.mark.skipif(os.name == "nt", reason="a Windows runner offers shell jobs only with --shell pwsh")
+
+
+@posix_only
+def test_shell_jobs_run_with_a_kept_workspace(relay, caches, start_runner):
+    owner = Session.create(relay.url, mode="execute", job_limits=SHELL_LIMITS, cache_dir=caches("owner"))
+    agent = Session.join(owner.invites["sender"], cache_dir=caches("agent"))
+    runner = start_process_runner(owner, start_runner, "proc-05", "--accept-network-gap", "--workspace")
+    r = wait_runner(owner, "proc-05", lambda r: r.online, proc=runner)
+    assert (r.kinds, r.shell) == (["python", "shell"], "sh")
+    owner.approve_runner("proc-05")
+    agent.wait_for_runner("proc-05", approved=True)
+
+    # What the browser and the CLI send: kind and subkind say shell, and `sh -e` stops at the first failure.
+    job = agent.run_shell("echo out; echo err >&2; false; echo not-reached", runner="proc-05")
+    assert job.meta["kind"] == "shell" and job.meta["filename"] == "job.sh"
+    res = job.wait(timeout=60)
+    assert (res.status, res.exit_code) == ("completed", 1), (res, runner.output())
+    assert (res.stdout.strip(), res.stderr.strip()) == ("out", "err")
+    assert res.env["shell"] == "sh" and "shell" in res.env["kinds"], res.env
+    # Output chunks are not heartbeats.
+    heartbeats = [i for i in agent._items.values() if i.kind == "progress" and not i.meta.get("stream")]
+    assert len(job.progress()) == len(heartbeats)
+
+    # The workspace outlives a job; `fresh` empties it; `cwd` starts a job in a folder of it.
+    ok = agent.run_shell("mkdir -p build && echo kept > build/f.txt", runner="proc-05", fresh=True).wait(timeout=60)
+    assert ok.ok, (ok, runner.output())
+    res = agent.run_shell("cat f.txt", runner="proc-05", cwd="build").wait(timeout=60)
+    assert res.ok and res.stdout.strip() == "kept", (res, runner.output())
+    res = agent.run_shell("ls build", runner="proc-05", fresh=True).wait(timeout=60)
+    assert res.status == "completed" and res.exit_code != 0, res
+
+    # A Python job still works in the same session.
+    res = agent.run_python("print(6 * 7)", runner="proc-05").wait(timeout=60)
+    assert res.ok and res.stdout.strip() == "42", (res, runner.output())
+
+
+def test_shell_jobs_are_refused_before_they_leave_the_sender(relay, caches):
+    # A session that names no kinds allows Python only.
+    owner = Session.create(relay.url, mode="execute", job_limits=PROCESS_LIMITS, cache_dir=caches("owner"))
+    with pytest.raises(PolicyError, match="does not allow shell jobs"):
+        owner.run_shell("echo hi")
+
+    owner = Session.create(relay.url, mode="execute", job_limits=SHELL_LIMITS, cache_dir=caches("owner2"))
+    with pytest.raises(ValueError, match="64 KiB"):
+        owner.run_shell("x" * (64 * 1024 + 1))
+    # A runner that did not declare shell is not asked to run it.
+    py_only = Runner(participant_pub="k", name="py-only", labels=[], host="h", sandbox="docker", network_unblocked=False,
+                     approved=True, rejected=False, online=True, job=None, kinds=["python"])
+    owner.runners = lambda: [py_only]
+    with pytest.raises(PolicyError, match="py-only does not run shell jobs"):
+        owner.run_shell("echo hi", runner="py-only")

@@ -191,3 +191,33 @@ def test_sanitize_image_rejects_garbage():
 
 def test_shim_source_is_embedded():
     assert "SHIM_VERSION = 1" in ac.shim_source()
+
+
+def shell_manifest():
+    """The vectors' session again (same owner seed), now allowing shell jobs and workspaces."""
+    params = json.loads(json.dumps(VEC["inputs"]["session_params"]))
+    params["job_limits"].update(kinds=["python", "shell"], workspace=True)
+    seed = b64d(VEC["inputs"]["owner_seed"])
+    return ac.create_session(json.dumps(params), seed)[1]
+
+
+SHELL_JOB = {
+    "type": "job", "kind": "shell", "filename": "job.sh", "code": "make test\n", "runtime": "python3.12",
+    "timeout_s": 30, "memory_mb": None, "files": [], "requirements": [], "cwd": "build", "fresh": True,
+    "target": {"type": "any"},
+}
+
+
+def test_shell_jobs_need_the_manifest_to_allow_them():
+    sender = CERTS["sender"]["signed_canonical"]
+    key, env, blob = seal("job", "sh", SHELL_JOB)
+    role, meta, _ = ac.open_checked(shell_manifest(), sender, key, env, blob)
+    assert role == "sender"
+    assert json.loads(meta)["kind"] == "shell" and json.loads(meta)["cwd"] == "build"
+    # The vectors' manifest names no kinds: Python only.
+    with pytest.raises(ac.PolicyError, match="shell jobs are not allowed"):
+        ac.open_checked(MANIFEST, sender, key, env, blob)
+    # The header's subkind must say which kind of job this is.
+    key, env, blob = seal("job", "py", SHELL_JOB)
+    with pytest.raises(ac.AirloxError):
+        ac.open_checked(shell_manifest(), sender, key, env, blob)

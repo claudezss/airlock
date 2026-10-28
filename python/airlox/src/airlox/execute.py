@@ -89,6 +89,11 @@ class Runner:
     #: its signed join (``None`` for runners that do not say).
     version: Optional[str] = None
     python: Optional[str] = None
+    #: The kinds of job it runs (``"python"``, ``"shell"``) and the shell for
+    #: shell jobs (``"sh"`` or ``"pwsh"``), from its signed join. A runner
+    #: that does not say runs Python only.
+    kinds: List[str] = field(default_factory=lambda: ["python"])
+    shell: Optional[str] = None
 
     @property
     def busy(self) -> bool:
@@ -131,8 +136,9 @@ class Result:
     #: the job): ``python`` (the interpreter's version), ``packages`` (the
     #: installed version of each allowlisted package, by normalized name),
     #: ``airlox`` (the runner's version), ``sandbox`` and ``interpreter``
-    #: (``"uv-runtime"``, ``"--python"`` or ``"docker:<image>"``). It holds no
-    #: file system paths. ``None`` for unsigned results and for runners that
+    #: (``"uv-runtime"``, ``"--python"`` or ``"docker:<image>"``); runners that
+    #: take shell jobs add ``kinds`` and ``shell``, and a job that sent a
+    #: working tree ``tree``. It holds no file system paths. ``None`` for unsigned results and for runners that
     #: do not report it.
     env: Optional[dict] = None
     #: The runner's key, and the name it joined with.
@@ -246,8 +252,8 @@ class Job:
             if item.kind != "progress" or item.status != "ok" or item.author_role != "runner":
                 continue
             m = item.meta
-            if m.get("job") != self.ref:
-                continue
+            if m.get("job") != self.ref or m.get("stream") is not None:
+                continue  # another job's; or an output chunk, which is not a heartbeat
             if target.get("type") == "runner" and item.author != target.get("participant_pub"):
                 continue
             if approved is not None and item.author not in approved:

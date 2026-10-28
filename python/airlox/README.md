@@ -28,6 +28,12 @@ runner first: `s.wait_for_runner("ci-box", approved=True)` returns once it is
 online and this session has seen the owner's signed approval, and raises
 `RunnerFailed` at once if the runner could not start its sandbox.
 
+If the session allows shell jobs (`job_limits={..., "kinds": ["python", "shell"]}`),
+`s.run_shell("make test", runner="ci-box")` runs a script with the runner's own
+tools, as `airlox run -- make test` does. Runners say which kinds they take in
+`Runner.kinds` and `Runner.shell`; `cwd=` and `fresh=True` are for sessions
+with `"workspace": True`.
+
 Creating a session returns its owner. **Save the owner invite
 (`session.invites["owner"]`) somewhere private right away**, such as a file
 only you can read (mode 0600, outside any repository): it is the only way to

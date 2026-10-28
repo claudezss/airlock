@@ -107,7 +107,10 @@ def test_results_say_where_the_job_ran_and_refusals_say_nothing(execute):
     assert res.ok, (res, runner.output())
     env = res.env
     sandbox = os.environ.get("AIRLOX_TEST_SANDBOX", "local")
-    assert set(env) == {"python", "packages", "airlox", "sandbox", "interpreter"}, env
+    # `shell` is there only when the runner offers shell jobs (a docker runner needs an image for them).
+    assert {"python", "packages", "airlox", "sandbox", "interpreter", "kinds"} <= set(env) <= {
+        "python", "packages", "airlox", "sandbox", "interpreter", "kinds", "shell"}, env
+    assert ("shell" in env) == ("shell" in env["kinds"]), env
     assert env["python"].startswith("3.12."), env
     assert (env["packages"], env["sandbox"]) == ({}, sandbox)
     assert env["interpreter"] == "uv-runtime" if sandbox == "local" else env["interpreter"].startswith("docker:")
