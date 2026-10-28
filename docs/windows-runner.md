@@ -110,8 +110,8 @@ file (for the service, `%ProgramData%\airlox\<service>\invite-runner.txt`,
 from an elevated prompt) and start it again (`sc.exe start <service>`).
 
 `--profile host-runner` stands for `--execute --ttl never --job-timeout 30m
---job-memory 4096`, with items as large as the relay allows (up to 100 MB)
-and runner approval on. Any flag you give wins, and `create` prints the
+--job-memory 4096 --kinds python,shell --workspace`, with items as large as
+the relay allows (up to 100 MB) and runner approval on. Any flag you give wins, and `create` prints the
 limits the session got.
 
 Items are capped per session when it is created: by default at the largest

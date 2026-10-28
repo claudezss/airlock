@@ -352,18 +352,24 @@ fn split_packages(value: &str) -> Vec<String> {
 
 /// One line about what jobs may do.
 pub(crate) fn jobs_line(l: &JobLimits) -> String {
-    let kinds: Vec<&str> = l.kinds().iter().map(|k| k.as_str()).collect();
-    format!(
-        "{} · {}{} · {} · {} MB · network {} · packages [{}] · approval {}",
-        kinds.join(", "),
+    let mut line = format!(
+        "{} · {} · {} MB · network {} · packages [{}] · approval {}",
         l.runtime,
-        if l.workspace { " · workspaces" } else { "" },
         human_secs(l.timeout_s as u64),
         l.memory_mb,
         if l.network { "on" } else { "off" },
         l.packages.join(", "),
         if l.approve_runners { "required" } else { "off" }
-    )
+    );
+    // Said only when not what sessions always were: python, no workspaces.
+    if l.kinds.is_some() {
+        let kinds: Vec<&str> = l.kinds().iter().map(|k| k.as_str()).collect();
+        line.push_str(&format!(" · kinds {}", kinds.join(", ")));
+    }
+    if l.workspace {
+        line.push_str(" · workspaces");
+    }
+    line
 }
 
 /// "850 ms", "41.2 s", "12 min 3 s".
