@@ -49,6 +49,7 @@
         <a class="button cta" href="/new">Open a session</a>
       </div>
       <p class="lp-install mono"><span class="accent" aria-hidden="true">$</span> <span class="sr-only">Install with </span>npm install -g airlox <span class="muted">· or</span> pip install airlox</p>
+      <p class="lp-live mono" id="live-stat" hidden><span class="dot" aria-hidden="true"></span><span><strong id="live-stat-n">0</strong> <span id="live-stat-label">sessions open on this relay right now</span></span></p>
       <p class="lp-join">Have an invite link? Open it in this browser to join that session. The key stays in the part of the link after the <code>#</code>, which is never sent to the relay. Have a code like <code>7-guitar-orbit</code> instead? <a href="/receive">Enter it here</a>.</p>
     </div>
 
@@ -101,12 +102,12 @@ FAILED test_median_even — assert 3.5 == 3
           <h3>Machine</h3>
         </div>
         <p>A box you own, paired once: the GPU workstation, the build server behind the firewall, the laptop with the licensed toolchain. Each job is one sandboxed process with the limits the session signed; the runner keeps a warm workspace per sender, so <code>node_modules</code> and <code>target/</code> survive between runs.</p>
-        <div class="lp-flow mono" role="img" aria-label="A coding agent sends pytest and its working tree to the machine gpu-box, and a signed result comes back">
-          <span class="node">coding agent</span>
+        <div class="lp-flow long mono" role="img" aria-label="An agent sends pytest and its working tree to the machine gpu-box, and a signed result comes back">
+          <span class="node">agent</span>
           <svg class="flow" width="28" height="16" viewBox="0 0 28 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2 8h22l-4-4M24 8l-4 4"></path></svg>
           <span class="node accent">pytest + tree</span>
           <svg class="flow" width="28" height="16" viewBox="0 0 28 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2 8h22l-4-4M24 8l-4 4"></path></svg>
-          <span class="nodes"><span class="node">gpu-box</span><span class="node">ci-box · pool</span></span>
+          <span class="node">gpu-box</span>
           <svg class="flow ok" width="28" height="16" viewBox="0 0 28 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M26 8H4l4-4M4 8l4 4"></path></svg>
           <span class="node ok">signed result</span>
         </div>

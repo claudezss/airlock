@@ -616,6 +616,9 @@ body.landing .top-right { display: none; }
 .lp-actions .cta { font-weight: 600; font-size: 17px; padding: 0 24px; }
 .lp-actions .cta:not(.primary) { font-weight: 500; padding: 0 20px; }
 .lp-install { font-size: 14px; color: var(--muted); }
+.lp-live { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); margin: 0; }
+.lp-live .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex: none; box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); }
+.lp-live strong { color: var(--soft); font-weight: 600; }
 .lp-join { font-size: 14px; color: var(--muted); max-width: 560px; }
 
 .lp-mock { margin: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; box-shadow: 0 30px 80px rgba(0, 0, 0, 0.45); }
@@ -653,7 +656,22 @@ body.landing .top-right { display: none; }
 .lp-ic { flex: none; width: 44px; height: 44px; border-radius: 10px; display: flex; align-items: center; justify-content: center; }
 .lp-ic.info { background: var(--info-bg); color: var(--link); }
 .lp-ic.tint { background: var(--accent-tint); color: var(--accent); }
-.lp-flow { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; font-size: 13px; }
+.lp-card.big { container-type: inline-size; }
+.lp-flow { display: flex; flex-wrap: nowrap; align-items: center; gap: 10px; font-size: 13px; }
+/* A card too narrow for its chain in one row shows it top to bottom instead
+   (the machine chain is the long one). */
+.lp-flow.long { gap: 6px; font-size: 12px; }
+.lp-flow.long .node { padding: 8px 10px; }
+@container (max-width: 479px) {
+  .lp-flow.long { flex-direction: column; align-items: flex-start; gap: 4px; }
+  .lp-flow.long .flow { margin: 10px 0 10px 24px; transform: rotate(90deg); }
+}
+@container (max-width: 359px) {
+  .lp-flow { flex-direction: column; align-items: flex-start; gap: 4px; }
+  .lp-flow .flow { margin: 10px 0 10px 24px; transform: rotate(90deg); }
+}
+.lp-flow .node { white-space: nowrap; flex: none; }
+.lp-flow .flow { flex: none; }
 .lp-flow .node { padding: 8px 12px; border: 1px solid var(--line-2); border-radius: 8px; }
 .lp-flow .nodes { display: flex; flex-direction: column; gap: 6px; }
 .lp-flow .node.info { border-color: var(--link); color: var(--link); }
