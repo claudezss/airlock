@@ -14,6 +14,7 @@ use airlox_core::cert::{is_runner_token, issue_cert, sign_join, ClientKind, Join
 use airlox_core::encoding::canonical_json;
 use airlox_core::invite::Invite;
 use airlox_core::keys::Keypair;
+use airlox_core::payload::JobKind;
 use airlox_core::session::{Mode, Role, SignedManifest};
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
@@ -23,7 +24,7 @@ use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::client::{self, status_of, Relay};
-use crate::job::{self, Ctx};
+use crate::job::{self, Ctx, Workspaces};
 use crate::sandbox::local::{probe_python, Local, LocalOpts};
 use crate::sandbox::{docker::Docker, Backend, RuntimeSpec};
 use crate::sse::SseParser;
@@ -47,6 +48,13 @@ pub enum SandboxArg {
     /// A plain process with the --python interpreter (or a uv runtime); on
     /// Windows each job runs in a Job Object. No network isolation.
     Process,
+}
+
+/// The shell that runs shell jobs on a Windows runner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ShellArg {
+    /// PowerShell 7 (`pwsh -NoProfile -Command`).
+    Pwsh,
 }
 
 #[derive(clap::Args, Debug)]
@@ -129,9 +137,15 @@ pub struct JoinArgs {
     /// $WORK and $AIRLOX_OUT before the result is signed.
     #[arg(long, env = "AIRLOX_WORK_ROOT")]
     pub work_root: Option<PathBuf>,
-    /// docker: use this image instead of building one from the allowlist.
-    #[arg(long)]
+    /// docker: run jobs in this image instead of building one from the
+    /// allowlist. The runner pins it by digest, and offers shell jobs in it.
+    /// The image needs python3 (the job shim is a Python script).
+    #[arg(long, visible_alias = "image")]
     pub docker_image: Option<String>,
+    /// Windows, local or process: also run shell jobs, with this shell.
+    /// Without it a Windows runner runs Python jobs only.
+    #[arg(long, value_enum)]
+    pub shell: Option<ShellArg>,
     /// docker: CPUs per job.
     #[arg(long, default_value = "1")]
     pub docker_cpus: String,
@@ -153,6 +167,27 @@ pub struct JoinArgs {
     /// Most bytes of a job's progress file sent each time.
     #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(0..=32768))]
     pub progress_tail: u32,
+    /// Most output chunks posted per minute while a job runs; more output
+    /// waits and goes out together. 0 turns streaming off.
+    #[arg(long, default_value_t = 120)]
+    pub progress_rate: u32,
+    /// Most output streamed per job, stdout and stderr together; the signed
+    /// result still carries the output.
+    #[arg(long, default_value_t = 16, value_name = "MB")]
+    pub stream_max_mb: u64,
+    /// Keep a work directory for each sender between their jobs, in sessions
+    /// that allow it: a working tree is synced into it, and dependencies and
+    /// build caches survive from one job to the next. Under
+    /// <cache-dir>/workspaces.
+    #[arg(long)]
+    pub workspace: bool,
+    /// A workspace over this size (MB) after a job refuses its sender's next
+    /// job (`workspace_full`) until that job asks for a fresh one.
+    #[arg(long, default_value_t = 10240, value_name = "MB")]
+    pub workspace_max_mb: u64,
+    /// Remove workspaces unused for this long.
+    #[arg(long, default_value = "14d", value_parser = crate::cli::parse_duration)]
+    pub workspace_ttl: Duration,
     /// Exit after this many jobs (for tests and one-shot use).
     #[arg(long, hide = true)]
     pub exit_after: Option<usize>,
@@ -278,6 +313,12 @@ fn save_invite(dir: &std::path::Path, invite: &Invite, link: &str) -> Result<Pat
     Ok(path)
 }
 
+impl JoinArgs {
+    fn image(&self) -> Option<&String> {
+        self.docker_image.as_ref()
+    }
+}
+
 /// Flags that only make sense with some sandboxes, and environment names a
 /// job must never get.
 fn check_args(args: &JoinArgs) -> Result<()> {
@@ -296,6 +337,18 @@ fn check_args(args: &JoinArgs) -> Result<()> {
         && !args.pass_env.is_empty()
     {
         bail!("--pass-env does not reach jobs in the Linux sandbox; use --sandbox process or --unsandboxed");
+    }
+    if args.shell.is_some() && (docker || !cfg!(windows)) {
+        bail!(
+            "--shell is for --sandbox local or process on Windows; shell jobs run under sh everywhere else \
+             (docker needs --image)"
+        );
+    }
+    if args.image().is_some() && !docker {
+        bail!("--image is for --sandbox docker");
+    }
+    if !args.workspace && (args.workspace_max_mb != 10240 || args.workspace_ttl != Duration::from_secs(14 * 86400)) {
+        bail!("--workspace-max-mb and --workspace-ttl are for runners started with --workspace");
     }
     if args.accept_network_gap && args.sandbox != SandboxArg::Process {
         bail!("--accept-network-gap is for --sandbox process");
@@ -477,6 +530,12 @@ pub async fn run(args: JoinArgs) -> Result<()> {
                 process: args.sandbox == SandboxArg::Process,
                 python: args.python.clone(),
                 pass_env: args.pass_env.clone(),
+                pwsh: match args.shell {
+                    Some(ShellArg::Pwsh) => Some(crate::sandbox::local::which("pwsh").context(
+                        "--shell pwsh: pwsh was not found on PATH; install PowerShell 7 (https://aka.ms/powershell)",
+                    )?),
+                    None => None,
+                },
             },
         )),
     };
@@ -604,7 +663,19 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         );
     }
     let ctx_env = job::checked_env(backend.env());
-    relay.report("ready", None, owed).await?;
+    let kinds: Vec<_> = backend.kinds().iter().map(JobKind::as_str).collect();
+    tracing::info!(kinds = ?kinds, "this runner runs these kinds of job");
+    // A session that wants shell jobs, on a runner that cannot run them:
+    // say so where the session can see it, not only in a refusal.
+    let offered = limits.allows_kind(JobKind::Shell) && backend.shell().is_none();
+    let note = offered.then(|| format!("shell jobs are not offered{}", backend.no_shell_hint()));
+    if let Some(n) = &note {
+        tracing::warn!("{n}");
+    }
+    if limits.workspace && !args.workspace {
+        tracing::info!("the session allows workspaces; start the runner with --workspace to keep them");
+    }
+    relay.report("ready", note.as_deref(), owed).await?;
 
     // Unsandboxed jobs see their real paths (in tracebacks, os.getcwd()):
     // under the system temp directory those do not say where the runner
@@ -646,17 +717,40 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         network: limits.network && !args.no_network,
         progress_interval: args.progress_interval,
         progress_tail: args.progress_tail as usize,
+        progress_rate: args.progress_rate,
+        stream_max_bytes: args.stream_max_mb.saturating_mul(1 << 20),
+        workspaces: args
+            .workspace
+            .then(|| Workspaces::new(&root, args.workspace_max_mb, args.workspace_ttl)),
         outbox,
         exit_before_posting: args.exit_before_posting,
         env: ctx_env,
     });
     job::report_interrupted(&ctx, &view).await;
+    // Idle workspaces go at startup and then every hour.
+    let sweeper = ctx.workspaces.clone().map(|w| {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(3600));
+            loop {
+                tick.tick().await;
+                let w = w.clone();
+                let _ = tokio::task::spawn_blocking(move || w.sweep()).await;
+            }
+        })
+    });
     let outcome = serve(&ctx, &view, &relay, args.exit_after).await;
+    if let Some(s) = sweeper {
+        s.abort();
+    }
     drop(temp_jobs);
     let closed = view.lock().await.closed;
     if closed {
         tracing::info!("the session has ended");
         let _ = std::fs::remove_dir_all(&dir);
+        // And everything kept for its senders.
+        if let Some(w) = &ctx.workspaces {
+            w.remove_session(&sid);
+        }
     }
     outcome
 }

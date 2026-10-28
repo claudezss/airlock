@@ -2,7 +2,9 @@
 //! `docker` CLI.
 //!
 //! `prepare` builds `airlox-rt:<hash>` once, with network, from
-//! `python:<version>-slim` plus the session's package allowlist. Each job then
+//! `python:<version>-slim` plus the session's package allowlist, or, with an
+//! operator's `--image`, pins that image by digest and offers shell jobs in
+//! it (the shim is Python, so the image needs `python3`). Each job then
 //! runs with no network, a read-only root, all capabilities dropped,
 //! `no-new-privileges`, memory, CPU and process limits, and only `/work`,
 //! `/out` and `/meta` mounted writable.
@@ -24,6 +26,50 @@ use tokio::sync::watch;
 
 use super::local::{PythonInfo, PROBE_PY};
 use super::{read_shim_result, supervise, PreparedJob, RawResult, RuntimeSpec, KILL_GRACE};
+
+/// An image as jobs run it: the reference `docker run` gets, and the label
+/// that goes in results.
+#[derive(Debug, PartialEq, Eq)]
+struct Pin {
+    run: String,
+    /// `docker:<repo>@sha256:<digest>`.
+    label: String,
+}
+
+impl Pin {
+    /// From `image` as the operator named it and `docker image inspect
+    /// --format '{{.Id}} {{json .RepoDigests}}'`.
+    fn parse(image: &str, inspected: &str) -> Result<Pin> {
+        let (id, digests) = inspected.trim().split_once(' ').context("unexpected answer from docker")?;
+        let digests: Vec<String> = serde_json::from_str(digests).unwrap_or_default();
+        let repo = image_repo(image);
+        // A tag is not a pin; the digest of this repository's pull is.
+        let digest = digests
+            .iter()
+            .find(|d| d.split('@').next() == Some(repo))
+            .or_else(|| digests.first())
+            .cloned()
+            .or_else(|| image.contains("@sha256:").then(|| image.to_string()));
+        Ok(match digest {
+            Some(d) => Pin { label: format!("docker:{d}"), run: d },
+            None => {
+                // Never pulled (built here): the content id still names it.
+                anyhow::ensure!(id.starts_with("sha256:"), "docker reported no image id");
+                Pin { label: format!("docker:{repo}@{id}"), run: id.to_string() }
+            }
+        })
+    }
+}
+
+/// `ghcr.io/me/ci` from `ghcr.io/me/ci:latest` or `ghcr.io/me/ci@sha256:…`
+/// (a registry's port colon is before the last slash, and stays).
+fn image_repo(image: &str) -> &str {
+    let image = image.split('@').next().unwrap_or(image);
+    match image.rsplit_once(':') {
+        Some((repo, tag)) if !tag.contains('/') => repo,
+        _ => image,
+    }
+}
 
 pub struct Docker {
     /// The docker CLI.
@@ -77,6 +123,12 @@ impl Docker {
         self.env.clone()
     }
 
+    /// Shell jobs run in the operator's image; the image built from the
+    /// allowlist has no toolchain to offer them.
+    pub fn shell(&self) -> Option<&'static str> {
+        self.image.as_ref().map(|_| "sh")
+    }
+
     pub fn dockerfile(spec: &RuntimeSpec) -> String {
         let mut f = format!("FROM python:{}-slim\n", spec.python_version());
         if !spec.packages.is_empty() {
@@ -107,6 +159,8 @@ impl Docker {
             if !docker_ok(&self.bin, &["image", "inspect", &img]).await? {
                 bail!("image {img} not found locally; pull it first");
             }
+            // Jobs run the image as it is now, however its tag moves later.
+            let pin = self.pin_image(&img).await.with_context(|| format!("pinning image {img}"))?;
             // The image is the operator's: nothing installs into it, so
             // check it against the session's pins like --python.
             let info = self.probe_image(&img, spec).await.with_context(|| format!("checking image {img}"))?;
@@ -119,12 +173,12 @@ impl Docker {
             let conflicts = spec.pin_conflicts("the image", &info.packages);
             if !conflicts.is_empty() {
                 bail!(
-                    "{}. Use an image with the pinned versions, or leave out --docker-image to build one",
+                    "{}. Use an image with the pinned versions, or leave out --image to build one",
                     conflicts.join("; ")
                 );
             }
-            self.set_env(&info, &img);
-            self.resolved_image = Some(img);
+            self.set_env(&info, &pin.label);
+            self.resolved_image = Some(pin.run);
             return Ok(());
         }
         let tag = format!("airlox-rt:{}", spec.hash());
@@ -145,19 +199,35 @@ impl Docker {
             }
         }
         match self.probe_image(&tag, spec).await {
-            Ok(info) => self.set_env(&info, &tag),
+            Ok(info) => self.set_env(&info, &format!("docker:{tag}")),
             Err(e) => tracing::warn!("could not read the installed versions from {tag}: {e:#}"),
         }
         self.resolved_image = Some(tag);
         Ok(())
     }
 
-    fn set_env(&mut self, info: &PythonInfo, image: &str) {
+    /// The image's digest, from docker: a pulled image's repo digest, else
+    /// (a locally built one) its content id.
+    async fn pin_image(&self, image: &str) -> Result<Pin> {
+        let out = Command::new(&self.bin)
+            .args(["image", "inspect", "--format", "{{.Id}} {{json .RepoDigests}}", image])
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .context("could not run docker")?;
+        if !out.status.success() {
+            bail!("docker image inspect failed:\n{}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Pin::parse(image, &String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// `interpreter` is the label results carry, such as `docker:repo@sha256:…`.
+    fn set_env(&mut self, info: &PythonInfo, interpreter: &str) {
         self.env = Some(super::job_env(
             &info.version,
             info.packages.iter().map(|p| (p.name.clone(), p.version.clone())),
             SandboxKind::Docker,
-            &format!("docker:{image}"),
+            interpreter,
         ));
     }
 
@@ -181,11 +251,15 @@ impl Docker {
         .context("python3 in the image did not answer within 120 s")?
         .context("could not run docker")?;
         if !out.status.success() {
-            bail!(
-                "python3 failed in the image ({}):\n{}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+            let said = String::from_utf8_lossy(&out.stderr);
+            if matches!(out.status.code(), Some(126 | 127)) || said.contains("executable file not found") {
+                bail!(
+                    "the image has no python3: airlox's job shim is a Python script, so every image it runs \
+                     needs python3 (3.8 or newer), shell jobs included. Add it to the image\n{}",
+                    said.trim()
+                );
+            }
+            bail!("python3 failed in the image ({}):\n{}", out.status, said.trim());
         }
         serde_json::from_slice(&out.stdout).context("unexpected answer from python3 in the image")
     }
@@ -260,12 +334,6 @@ impl Docker {
             [
                 "python3",
                 "/airlox/shim.py",
-                "--work",
-                "/work",
-                "--entry",
-                &job.entry,
-                "--timeout",
-                &job.timeout_s.to_string(),
                 "--result",
                 "/meta/result.json",
                 "--out",
@@ -273,6 +341,7 @@ impl Docker {
             ]
             .map(String::from),
         );
+        a.extend(job.shim_job_args("/work", &format!("/meta/{}", super::SCRIPT_FILE)));
         a
     }
 
@@ -331,6 +400,33 @@ impl Docker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_image_is_pinned_by_the_digest_of_its_repository() {
+        let digest = "0123456789abcdef".repeat(4);
+        let id = format!("sha256:{}", "f".repeat(64));
+        let pulled = format!(r#"{id} ["other/ci@sha256:{}","ghcr.io/me/ci@sha256:{digest}"]"#, "a".repeat(64));
+        let pin = Pin::parse("ghcr.io/me/ci:latest", &pulled).unwrap();
+        assert_eq!(pin.run, format!("ghcr.io/me/ci@sha256:{digest}"));
+        assert_eq!(pin.label, format!("docker:ghcr.io/me/ci@sha256:{digest}"));
+        // Built here, never pulled: the content id stands in for a digest.
+        let built = Pin::parse("localhost:5000/ci:dev", &format!("{id} []")).unwrap();
+        assert_eq!(built.run, id);
+        assert_eq!(built.label, format!("docker:localhost:5000/ci@{id}"));
+        // And it reads as a short digest in a result's env.
+        let env = super::super::job_env("3.12.4", [], SandboxKind::Docker, &built.label);
+        assert!(env.interpreter.ends_with("@sha256:ffffffffffff"), "{}", env.interpreter);
+        assert!(airlox_core::policy::check_env(&env).is_ok());
+        assert!(Pin::parse("ci", "garbage").is_err());
+    }
+
+    #[test]
+    fn image_names_lose_their_tag_not_their_registry_port() {
+        assert_eq!(image_repo("ci"), "ci");
+        assert_eq!(image_repo("ci:1.2"), "ci");
+        assert_eq!(image_repo("localhost:5000/team/ci"), "localhost:5000/team/ci");
+        assert_eq!(image_repo("localhost:5000/team/ci:1.2@sha256:abc"), "localhost:5000/team/ci");
+    }
 
     #[test]
     fn the_dockerfile_installs_pins_through_the_shell_unharmed() {
