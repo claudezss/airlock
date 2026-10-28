@@ -99,6 +99,8 @@ function fmtDuration(sec) {
 const sym = (c) => el("span", { "aria-hidden": "true" }, c);
 const initials = (name) => (name.split(/[^\p{L}\p{N}]+/u).filter(Boolean).slice(0, 2).map((w) => w[0]).join("") || "?").toUpperCase();
 
+const clip = (t, n) => (t.length > n ? `${t.slice(0, n)}…` : t);
+
 // One polite live region for job and runner transitions.
 let liveTimer;
 let liveQueue = [];
@@ -158,6 +160,8 @@ const MD_MAX_CHARS = 200000;
 const MD_MAX_INLINE = 4000;
 const MD_INLINE_BUDGET = 40000;
 const MD_MAX_DEPTH = 6;
+const MD_MAX_COLS = 50;
+const MD_MAX_CELLS = 5000;
 let mdBudget = MD_INLINE_BUDGET;
 const I_COPY = ["M9 9h10v10H9z", "M5 15V5h10"];
 const I_CHECK = ["M5 12l5 5 9-10"];
@@ -174,8 +178,8 @@ const I_PANEL = ["M5 4h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0
 // A URL may hold balanced parentheses one level deep, as in wiki/Foo_(bar).
 const MD_URL = "(?:[^()\\s]|\\([^()\\s]*\\))+";
 const MD_INLINE = new RegExp([
-  `!\\[([^\\]]*)\\]\\((${MD_URL})\\)`, // 1,2 image
-  `\\[([^\\]]+)\\]\\((${MD_URL})\\)`, // 3,4 link
+  `!\\[([^\\]\\n]{0,300})\\]\\((${MD_URL})\\)`, // 1,2 image
+  `\\[([^\\]\\n]{1,300})\\]\\((${MD_URL})\\)`, // 3,4 link
   "\\*\\*(.+?)\\*\\*|__(.+?)__", // 5,6 strong
   "~~(.+?)~~", // 7 strikethrough
   "(?<![\\w*])\\*(?!\\s)(.+?)(?<!\\s)\\*(?![\\w*])", // 8 emphasis
@@ -313,13 +317,20 @@ function mdBlocks(lines, depth) {
     } else if (line.includes("|") && i + 1 < lines.length && mdTableRule(lines[i + 1])) {
       flush();
       const cells = (l) => l.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
-      const head = cells(line);
+      const head = cells(line).slice(0, MD_MAX_COLS);
       i += 2;
+      // Every row gets one cell per column, so the cell count, not the
+      // source size, is what to bound: past it, rows are counted, not shown.
       const rows = [];
-      while (i < lines.length && lines[i].includes("|") && lines[i].trim()) rows.push(cells(lines[i++]));
+      let skipped = 0;
+      for (; i < lines.length && lines[i].includes("|") && lines[i].trim(); i++) {
+        if ((rows.length + 1) * head.length > MD_MAX_CELLS) skipped++;
+        else rows.push(cells(lines[i]));
+      }
       out.push(el("div", { class: "tbl", tabindex: 0, role: "region", "aria-label": "Table" }, el("table", {},
         el("thead", {}, el("tr", {}, head.map((h) => el("th", {}, mdInline(h))))),
-        el("tbody", {}, rows.map((r) => el("tr", {}, head.map((_, j) => el("td", {}, mdInline(r[j] ?? "")))))))));
+        el("tbody", {}, rows.map((r) => el("tr", {}, head.map((_, j) => el("td", {}, r[j] ? mdInline(r[j]) : null))))))));
+      if (skipped) out.push(el("p", { class: "muted" }, `… ${skipped} more row${skipped === 1 ? "" : "s"} not shown`));
     } else if (/^(\s*)([-*+]|\d{1,9}[.)])\s+/.test(line) && depth < MD_MAX_DEPTH) {
       flush();
       const [list, next] = mdList(lines, i, depth + 1);
@@ -386,25 +397,65 @@ const KEYWORDS = {
 };
 const LANGS = { py: "python", python: "python", js: "js", javascript: "js", ts: "js", typescript: "js", json: "js", sh: "sh", bash: "sh", shell: "sh", console: "sh" };
 const MD_MAX_HIGHLIGHT = 100000;
+// One pass, left to right: an unclosed string or comment runs to the end of
+// its line (or of the code, for the multi-line kinds) instead of being
+// retried from every quote, so the time is linear in the code's length.
 function highlight(code, lang) {
   const kind = LANGS[lang?.toLowerCase()];
   if (!kind || code.length > MD_MAX_HIGHLIGHT) return [code];
   const kws = new Set(KEYWORDS[kind].split(" "));
-  const comment = kind === "js" ? "\\/\\/[^\\n]*|\\/\\*[\\s\\S]*?\\*\\/" : "#[^\\n]*";
-  const re = new RegExp(`(${comment})|("""[\\s\\S]*?"""|'''[\\s\\S]*?'''|f?"(?:\\\\.|[^"\\\\\\n])*"|f?'(?:\\\\.|[^'\\\\\\n])*'|\`(?:\\\\.|[^\`\\\\])*\`)|\\b(\\d+(?:\\.\\d+)?)\\b|\\b([A-Za-z_]\\w*)(?=\\s*\\()|\\b([A-Za-z_]\\w*)\\b`, "g");
   const out = [];
-  let last = 0;
-  let m;
-  while ((m = re.exec(code))) {
-    if (m.index > last) out.push(code.slice(last, m.index));
-    if (m[1]) out.push(el("span", { class: "tk-com" }, m[1]));
-    else if (m[2]) out.push(el("span", { class: "tk-str" }, m[2]));
-    else if (m[3]) out.push(el("span", { class: "tk-num" }, m[3]));
-    else if (m[4]) out.push(kws.has(m[4]) ? el("span", { class: "tk-kw" }, m[4]) : el("span", { class: "tk-fn" }, m[4]));
-    else out.push(kws.has(m[5]) ? el("span", { class: "tk-kw" }, m[5]) : m[5]);
-    last = re.lastIndex;
+  let plain = "";
+  const tok = (cls, text) => {
+    if (plain) out.push(plain);
+    plain = "";
+    out.push(cls ? el("span", { class: cls }, text) : text);
+  };
+  const eol = (i) => (code.indexOf("\n", i) < 0 ? code.length : code.indexOf("\n", i));
+  const until = (close, from) => {
+    const j = code.indexOf(close, from);
+    return j < 0 ? code.length : j + close.length;
+  };
+  const isId = (c) => /[A-Za-z0-9_]/.test(c);
+  let i = 0;
+  while (i < code.length) {
+    const c = code[i];
+    const two = code.slice(i, i + 2);
+    const three = code.slice(i, i + 3);
+    let j = -1;
+    let cls = null;
+    if ((kind !== "js" && c === "#") || (kind === "js" && two === "//")) [j, cls] = [eol(i), "tk-com"];
+    else if (kind === "js" && two === "/*") [j, cls] = [until("*/", i + 2), "tk-com"];
+    else if (kind === "python" && (three === '"""' || three === "'''")) [j, cls] = [until(three, i + 3), "tk-str"];
+    else if (c === '"' || c === "'" || (kind === "js" && c === "`")) {
+      // Escapes skip a character; a plain quote string ends at its line.
+      const stop = c === "`" ? code.length : eol(i);
+      j = i + 1;
+      while (j < stop && code[j] !== c) j += code[j] === "\\" ? 2 : 1;
+      [j, cls] = [Math.min(j + 1, stop), "tk-str"];
+    } else if (/[0-9]/.test(c) && !isId(code[i - 1] ?? " ")) {
+      j = i;
+      while (j < code.length && /[0-9.]/.test(code[j])) j++;
+      cls = "tk-num";
+    } else if (/[A-Za-z_]/.test(c) && !isId(code[i - 1] ?? " ")) {
+      j = i;
+      while (j < code.length && isId(code[j])) j++;
+      const word = code.slice(i, j);
+      let k = j;
+      while (code[k] === " " || code[k] === "\t") k++;
+      cls = kws.has(word) ? "tk-kw" : code[k] === "(" ? "tk-fn" : null;
+      if (kind === "python" && word === "f" && (code[j] === '"' || code[j] === "'")) cls = "tk-str";
+    }
+    if (j < 0) {
+      plain += c;
+      i++;
+      continue;
+    }
+    if (cls) tok(cls, code.slice(i, j));
+    else plain += code.slice(i, j);
+    i = j;
   }
-  if (last < code.length) out.push(code.slice(last));
+  if (plain) out.push(plain);
   return out;
 }
 
@@ -1206,8 +1257,16 @@ function deliveryLoop(s) {
   const unknown = (it) => !s.delivery || it.created >= s.deliveryAt - DELIVERY_POLL_MS;
   const due = () => [...s.items.values()].some((it) => it.author === s.me && ["text", "file", "job"].includes(it.kind)
     && Date.now() - it.created < DELIVERY_WINDOW_MS && (s.delivery?.[it.id] ? s.delivery[it.id].waiting?.length > 0 : unknown(it)));
+  // Every 5 s while your newest item is fresh, then every 30 s: someone who
+  // has not fetched in minutes is probably not about to.
+  let lastAsk = 0;
+  const pace = () => {
+    const newest = Math.max(0, ...[...s.items.values()].filter((it) => it.author === s.me).map((it) => it.created));
+    return Date.now() - newest < 2 * 60 * 1000 ? DELIVERY_POLL_MS : 30000;
+  };
   const tick = async () => {
-    if (s.closed || document.visibilityState !== "visible" || !due()) return;
+    if (s.closed || document.visibilityState !== "visible" || !due() || Date.now() - lastAsk < pace() - 500) return;
+    lastAsk = Date.now();
     try {
       const at = Date.now();
       s.delivery = (await (await api("GET", `/v1/sessions/${s.sid}/delivery`, { token: s.identity.token })).json()).items;
@@ -1818,7 +1877,7 @@ function buildSessionLayout(s) {
       if (it.author === s.me && s.delivery !== undefined) s.render.delivery();
       if (it.kind === "job") announceJob(s, it);
       else if (!old && s.announce && it.status === "ok" && it.author !== s.me && (it.kind === "text" || it.kind === "file"))
-        announce(`${it.authorName}: ${it.kind === "text" ? it.meta.text : it.meta.name}`);
+        announce(`${it.authorName}: ${it.kind === "text" ? clip(it.meta.text, 140) : it.meta.name}`);
       jobUi?.refresh();
     },
     runners: () => {
