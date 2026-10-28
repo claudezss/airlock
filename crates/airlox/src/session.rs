@@ -214,7 +214,9 @@ impl Cache {
 
 /// Keeps a listener's cursor from stalling behind an item that never
 /// arrives (its blob evicted, no holder online): an item pending longer than
-/// the limit is skipped, with a warning on stderr.
+/// the limit is skipped, with a warning on stderr. One that arrives after
+/// all is reported once by [`PendingWatch::arrived_late`], since the cursor
+/// has gone past it.
 pub struct PendingWatch {
     limit: Duration,
     since: HashMap<u64, Instant>,
@@ -249,6 +251,20 @@ impl PendingWatch {
             Some(p) => p.checked_sub(1),
             None => items.iter().map(|i| i.seq).max(),
         }
+    }
+
+    /// The sequence numbers of skipped items that have arrived since, once
+    /// each, for the caller to wake for although its cursor is past them.
+    pub fn arrived_late(&mut self, items: &[Item]) -> Vec<u64> {
+        let arrived: Vec<u64> = items
+            .iter()
+            .filter(|i| i.status != Status::Pending && self.skipped.contains(&i.seq))
+            .map(|i| i.seq)
+            .collect();
+        for seq in &arrived {
+            self.skipped.remove(seq);
+        }
+        arrived
     }
 
     /// How long until the next pending item is given up on.
@@ -2028,6 +2044,25 @@ mod tests {
         // Nothing pending: everything settles.
         let items = [item(1, "a", None, None), item(2, "a", None, None)];
         assert_eq!(watch.settled_seq(&items, t0), Some(2));
+    }
+
+    #[test]
+    fn an_item_given_up_on_is_reported_once_when_it_arrives() {
+        let mut watch = PendingWatch::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        let held = [item(1, "a", None, None), pending(2), item(3, "a", None, None)];
+        assert_eq!(watch.settled_seq(&held, t0), Some(1));
+        assert_eq!(watch.settled_seq(&held, t0 + Duration::from_secs(60)), Some(3));
+        // Still not here.
+        assert!(watch.arrived_late(&held).is_empty());
+        let here = [item(1, "a", None, None), item(2, "a", None, None), item(3, "a", None, None)];
+        assert_eq!(watch.arrived_late(&here), [2]);
+        assert!(watch.arrived_late(&here).is_empty());
+        // One that arrives before it is given up on is just settled.
+        let mut watch = PendingWatch::new(Duration::from_secs(60));
+        assert_eq!(watch.settled_seq(&held, t0), Some(1));
+        assert_eq!(watch.settled_seq(&here, t0), Some(3));
+        assert!(watch.arrived_late(&here).is_empty());
     }
 
     fn participant(key: &str, name: &str, role: &str) -> Participant {

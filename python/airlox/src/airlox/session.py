@@ -907,8 +907,9 @@ class Session:
         :meth:`agent_hops`). ``from_`` limits who can wake you: ``"owner"``,
         ``"role:<role>"``, display names or keys (default: anyone). An item
         still being fetched after ``pending_timeout`` seconds is skipped with
-        a warning (``None`` or 0: wait forever). Returns ``[]`` on timeout or
-        when the session closes.
+        a warning (``None`` or 0: wait forever); if it arrives later you are
+        woken for it then (not if the process restarts in between). Returns
+        ``[]`` on timeout or when the session closes.
 
         The batch is acknowledged late: it is marked handled when you next
         call this method, or when you call :meth:`mark_handled` with no
@@ -928,8 +929,11 @@ class Session:
         cursor = self.handled_seq or 0
         while True:
             upto = self._settled_seq(pending_timeout)
-            batch = [self._items[i] for i in self._order if cursor < self._items[i].seq <= upto]
-            batch = [i for i in batch if wakes(i)]
+            # Items given up on that have arrived since sit behind the cursor: wake for them too.
+            late = {i.seq for i in self._items.values() if i.seq in self._pending_skipped and i.status != "pending"}
+            self._pending_skipped -= late
+            batch = [self._items[i] for i in self._order]
+            batch = [i for i in batch if (cursor < i.seq <= upto or i.seq in late) and wakes(i)]
             cursor = max(cursor, upto)
             if batch:
                 self._uncommitted = cursor
@@ -945,10 +949,13 @@ class Session:
                 if due:
                     wait = min(wait, max(0.1, min(due)))
             woke = False
+            known = max((i.seq for i in self._items.values()), default=0)
             for item in self.stream(timeout=wait):
                 if item.seq > cursor and wakes(item):
                     woke = True
                     break
+                if item.seq <= known:
+                    break  # a pending item arrived: it may free a held one, or be a late one to wake for
             if woke:
                 time.sleep(settle if left is None else max(0.0, min(settle, deadline - time.monotonic())))
             self.sync()

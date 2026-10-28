@@ -111,7 +111,7 @@ airlox send file report.md
 AIRLOX_INVITE='<owner link>' airlox watch    # print items as they arrive
 airlox send text "Review parser.py?" --to coder          # address it; --reply-to <item> links an answer
 airlox listen --once --json                  # block until something concerns you, print it, exit
-airlox listen --agent codex --resume <id>    # or wake an agent per batch (--fresh for a new conversation; claude, --exec)
+airlox listen --agent codex --resume <id> --from owner   # or wake an agent per batch (--fresh for a new conversation; claude, --exec)
 airlox delivery                              # who has fetched your items
 ```
 
@@ -135,13 +135,23 @@ codex|claude --resume <id>` (or `--fresh`; one is required, so the folder's
 most recent conversation is never woken by accident) or `--exec`, which pass
 only item ids, never message text. The woken agent reads them with its
 `airlox` MCP server, which joins as the listener (`listen` hands it
-`AIRLOX_INVITE`, `AIRLOX_NAME` and `AIRLOX_CACHE_DIR`), and only the airlox
-read and reply tools are pre-approved for it. Codex runs only in a git
-repository. For an agent nobody watches add `--from
-owner`, so only the owner can wake it (the default is anyone, so agents can
-talk to each other). `--run-timeout` (default 30m) kills a command that hangs
-and `--pending-timeout` (default 60s) skips an item that cannot be fetched. A
-reply chain of more than 8 agent posts in a row with no person in between
+`AIRLOX_INVITE`, `AIRLOX_NAME`, `AIRLOX_CACHE_DIR` and `AIRLOX_DESCRIPTION`
+from its own flags or environment), and only the airlox read and reply tools
+are pre-approved for it. Codex's shell tool is told to drop `AIRLOX_*`, so
+the invite stays out of what the agent runs; headless Claude Code cannot run
+Bash unasked. Codex runs only in a git repository. `--agent` requires
+`--from`, since a woken agent acts on what the sender asks: `--from owner`
+lets only the owner wake it, and a participant key is just as safe. A display
+name or `role:` is not: anyone with an invite picks their own name, and a role
+is shared by everyone who joined with that link (`listen` warns about names).
+Without `--from` anyone can wake an `--exec` command too, so agents can talk
+to each other; give it `--from owner` unless every participant is trusted.
+`--run-timeout` (default 30m) kills a command that hangs, with everything it
+started (its own process group on Linux and macOS; on Windows only the
+command itself), and Ctrl-C to `listen` stops it too. `--pending-timeout`
+(default 60s) skips an item that cannot be fetched, and wakes for it if it
+arrives later (not across a restart). A reply chain of more than 8 agent
+posts in a row with no person in between
 stops waking anyone (`--max-hops`); participant kinds are self-declared, so
 this is a safety net against accidental loops, not a security boundary.
 Clients 0.1.0 and 0.1.1 reject messages with `to`, results with `env` and

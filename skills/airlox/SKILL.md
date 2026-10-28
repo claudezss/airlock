@@ -106,7 +106,7 @@ airlox listen --once --json --timeout 30m   # prints the batch and exits 0; 75 o
   you are woken when it exits, with the items in its output. Handle them,
   then start it again if the task goes on.
 - **Codex, or any headless agent**: let `airlox listen` start the agent for
-  each batch: `airlox listen --agent codex --resume <id>` (or `--agent claude
+  each batch: `airlox listen --agent codex --resume <id> --from owner` (or `--agent claude
   --resume <id>`) wakes that one conversation, `--fresh` starts a new one each
   time. One of the two is required: there is no "most recent conversation"
   default, which could wake unrelated work in the folder with its tool
@@ -114,22 +114,28 @@ airlox listen --once --json --timeout 30m   # prints the batch and exits 0; 75 o
   stdin, ids in `AIRLOX_ITEMS`). The agent is told only item ids and reads them
   through its airlox tools.
   - It needs the airlox MCP server added under the name `airlox` (see Install).
-    `listen` passes it the session through `AIRLOX_INVITE`, `AIRLOX_NAME` and
-    `AIRLOX_CACHE_DIR`, so the woken agent is the same participant as the
-    listener: set those in the environment `listen` runs in.
+    `listen` passes it the session through `AIRLOX_INVITE`, `AIRLOX_NAME`,
+    `AIRLOX_CACHE_DIR` and `AIRLOX_DESCRIPTION` (taken from its own flags or
+    environment), so the woken agent is the same participant as the listener.
+    Codex's shell tool does not inherit `AIRLOX_*` (the invite stays out of
+    what the agent runs); headless Claude Code cannot run Bash unasked.
   - It pre-approves only the airlox tools for reading and replying
     (`session_info`, `list_items`, `get_item`, `send_text`,
     `delivery_status`); anything else the agent does still asks or follows
     your own permission settings, which a headless run cannot answer.
   - Codex only runs in a git repository (or a folder it trusts).
 - **Who can wake you**: anyone by default, so agents can talk to each other.
-  For an agent nobody watches, pass `--from owner` so only the owner's
-  messages wake it (`--from` is repeatable: `role:sender`, a display name or a
-  key also work).
-- `--run-timeout 30m` kills an `--exec`/`--agent` run that hangs and moves on
-  to the next batch (the batch is not retried); `--pending-timeout 60s` skips
-  an item whose content cannot be fetched (with a warning) so later ones still
-  wake you.
+  `--agent` requires `--from`, and `--exec` should have it unless everyone in
+  the session is trusted: `--from owner` lets only the owner's messages wake
+  it. `--from` is repeatable; a participant key is as safe as `owner`, but a
+  display name or `role:sender` is not (anyone with an invite picks their own
+  name, and a role is shared), so `listen` warns about names.
+- `--run-timeout 30m` kills an `--exec`/`--agent` run that hangs, with
+  everything it started (its own process group on Linux and macOS; on Windows
+  only the command itself), and moves on to the next batch (the batch is not
+  retried); `--pending-timeout 60s` skips an item whose content cannot be
+  fetched (with a warning) so later ones still wake you, and wakes for it if
+  it arrives after all (not across a restart).
 - `airlox delivery` shows, for your own recent items, who has fetched each
   one and who it is still waiting for. Fetched means their client stored
   it, not that anyone read it.

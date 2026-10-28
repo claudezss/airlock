@@ -33,6 +33,20 @@ fn spellings(path: &Path, min_len: usize) -> Vec<String> {
             _ => real,
         });
     }
+    // Git Bash and MSYS spell `C:\Users\x` as `/c/Users/x`, and back.
+    for b in bases.clone() {
+        let fwd = b.replace('\\', "/");
+        let mut chars = fwd.chars();
+        match (chars.next(), chars.next(), chars.next()) {
+            (Some(d), Some(':'), Some('/')) if d.is_ascii_alphabetic() => {
+                bases.push(format!("/{}/{}", d.to_ascii_lowercase(), &fwd[3..]));
+            }
+            (Some('/'), Some(d), Some('/')) if d.is_ascii_alphabetic() => {
+                bases.push(format!("{}:/{}", d.to_ascii_uppercase(), &fwd[3..]));
+            }
+            _ => {}
+        }
+    }
     let mut out = Vec::new();
     for b in bases {
         let back = b.replace('/', "\\");
@@ -47,18 +61,31 @@ fn spellings(path: &Path, min_len: usize) -> Vec<String> {
     out
 }
 
+/// Whether `c` could continue a file name: `/home/ann` is not at the start
+/// of `/home/annabelle`, but is of `/home/ann.` at the end of a sentence.
+fn name_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '-'
+}
+
+/// `text` with each `from` that ends at a path boundary (the end, a slash,
+/// or anything a name cannot contain) replaced by `to`.
 fn replace_all(text: &str, from: &str, to: &str, ignore_case: bool) -> String {
-    if !ignore_case {
-        return text.replace(from, to);
-    }
     // ASCII lowercasing keeps every byte offset, so matches in the folded
     // copy index the original.
-    let (folded, needle) = (text.to_ascii_lowercase(), from.to_ascii_lowercase());
+    let (folded, needle) = if ignore_case {
+        (text.to_ascii_lowercase(), from.to_ascii_lowercase())
+    } else {
+        (text.to_string(), from.to_string())
+    };
     let (mut out, mut last) = (String::with_capacity(text.len()), 0);
     for (i, _) in folded.match_indices(&needle) {
+        let end = i + from.len();
+        if text[end..].chars().next().is_some_and(name_char) {
+            continue;
+        }
         out.push_str(&text[last..i]);
         out.push_str(to);
-        last = i + from.len();
+        last = end;
     }
     out.push_str(&text[last..]);
     out
@@ -99,9 +126,19 @@ pub fn hide(text: &str, dirs: &[(PathBuf, &'static str)]) -> String {
     paths(text, &dirs)
 }
 
-/// The user's home directory, when the environment names one.
-pub fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)
+/// The user's home directory as the environment names it: `HOME` and
+/// `USERPROFILE` both, since under Git Bash the first is `/c/Users/x` and the
+/// second `C:\Users\x`, and a job may print either.
+pub fn home_dirs() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for var in ["HOME", "USERPROFILE"] {
+        if let Some(h) = std::env::var_os(var).filter(|h| !h.is_empty()).map(PathBuf::from) {
+            if !out.contains(&h) {
+                out.push(h);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -199,6 +236,38 @@ mod tests {
         let home = Path::new(r"C:\Users\jdoe");
         let text = r"cwd c:\users\JDOE\proj repr 'C:\\Users\\jdoe\\x' uri file:///C:/Users/jdoe/y";
         assert_eq!(redact(text, &[(home, HOME)], true), r"cwd ~\proj repr '~\\x' uri file:///~/y");
+    }
+
+    #[test]
+    fn git_bash_and_windows_spellings_of_a_path_both_go() {
+        let text = r"a /c/Users/jdoe/x b C:\Users\jdoe\y c C:/Users/jdoe/z d C:\Users\jdoe";
+        for home in [r"C:\Users\jdoe", "/c/Users/jdoe"] {
+            assert_eq!(redact(text, &[(Path::new(home), HOME)], true), r"a ~/x b ~\y c ~/z d ~", "{home}");
+        }
+        // Windows case rules reach the drive letter in the other spelling too.
+        assert_eq!(redact("/C/users/JDOE/x", &[(Path::new(r"C:\Users\jdoe"), HOME)], true), "~/x");
+    }
+
+    #[test]
+    fn a_longer_name_is_not_cut_at_a_shorter_one() {
+        let dirs = [(Path::new("/home/ann"), HOME)];
+        let text =
+            "/home/annabelle/x /home/ann_b /home/ann-2/y /home/ann.old /home/ann, /home/ann/ /home/ann";
+        assert_eq!(redact(text, &dirs, false), "/home/annabelle/x /home/ann_b /home/ann-2/y ~.old ~, ~/ ~");
+        let root = Path::new("/tmp/airlox-jobs-a1b2c3/job-x9");
+        assert_eq!(
+            redact(
+                "/tmp/airlox-jobs-a1b2c3/job-x9 /tmp/airlox-jobs-a1b2c3/job-x90/work",
+                &[(root, "$JOB")],
+                false
+            ),
+            "$JOB /tmp/airlox-jobs-a1b2c3/job-x90/work"
+        );
+        // Case-folded matching checks the boundary in the original text.
+        assert_eq!(
+            redact(r"C:\Users\JDOEx C:\Users\JDOE\x", &[(Path::new(r"C:\Users\jdoe"), HOME)], true),
+            r"C:\Users\JDOEx ~\x"
+        );
     }
 
     #[test]

@@ -499,3 +499,29 @@ def test_an_item_that_never_arrives_stops_holding_up_later_ones(relay, caches, c
         f"skipping #{stuck.seq}: still not fetched after 0.3s; waking for later items"
     ]
     assert [i.text for i in coder.wait_for_messages(timeout=10, settle=0, pending_timeout=0.3)] == ["later"]
+
+
+def test_an_item_given_up_on_wakes_you_when_it_arrives_after_all(relay, caches):
+    owner = Session.create(relay.url, display_name="lead", cache_dir=caches("owner"))
+    coder = Session.join(owner.invites["sender"], display_name="coder", cache_dir=caches("coder"))
+    lost = owner.send_text("lost", to=["coder"])
+    owner.send_text("later", to=["coder"])
+    coder.sync()
+    stuck = coder._items[lost["id"]]
+    stuck.status = "pending"  # as if its blob could not be fetched
+    coder._retry = lambda only=None: []
+    apply, gone = coder._apply, [True]
+
+    def still_missing(ev, **kw):  # the relay says it is evicted: here it stays unfetched
+        got = apply(ev, **kw)
+        if gone[0]:
+            stuck.status = "pending"
+        return got
+
+    coder._apply = still_missing
+    assert [i.text for i in coder.wait_for_messages(timeout=10, settle=0, pending_timeout=0.3)] == ["later"]
+    coder.mark_handled()
+    # It turns up after the cursor went past it: it is not lost.
+    gone[0], stuck.status = False, "ok"
+    assert [i.text for i in coder.wait_for_messages(timeout=10, settle=0, pending_timeout=0.3)] == ["lost"]
+    assert coder.wait_for_messages(timeout=1, settle=0, pending_timeout=0.3) == []

@@ -369,7 +369,8 @@ the owner's message to everyone: a message without `to` wakes every listener
 when the owner sent it and otherwise only the author of the item it replies
 to). `to` is advice, not access control: every participant can read every
 item. A listener may limit who can wake it to chosen authors (`airlox listen
---from`), and stops waking for a long run of posts from non-web
+--from`; only `owner` and a key cannot be imitated, since display names are
+self-chosen and a role is shared by everyone holding that invite), and stops waking for a long run of posts from non-web
 participants, counted up the reply chain or, for an addressed message that
 replies to nothing, over the text items just before it since a web participant
 last posted. A participant's `kind` is self-declared, so that count is a

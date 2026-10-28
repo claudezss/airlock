@@ -46,8 +46,12 @@ pub struct Conn {
 }
 
 impl Conn {
+    fn cache_root(&self) -> PathBuf {
+        self.cache_dir.clone().unwrap_or_else(default_cache_root)
+    }
+
     async fn join(&self) -> Result<Session> {
-        let root = self.cache_dir.clone().unwrap_or_else(default_cache_root);
+        let root = self.cache_root();
         let me = Profile::new(&self.display_name, self.description.as_deref());
         let mut s = Session::join(&client::http()?, &self.invite, &me, &root).await?;
         if !s.joined_now && me.description.is_some() && s.my_description().is_none() {
@@ -1448,7 +1452,9 @@ pub struct ListenArgs {
     pub once: bool,
     /// Run this shell command for each batch of items for you, with the
     /// items as JSON lines on stdin and their ids in AIRLOX_ITEMS. Message
-    /// text never goes on the command line.
+    /// text never goes on the command line. The command runs with your
+    /// permissions on whatever the items say: pass `--from owner` (or a
+    /// participant key) unless every participant is trusted.
     #[arg(long, value_name = "COMMAND", conflicts_with = "agent")]
     pub exec: Option<String>,
     /// Wake this coding agent for each batch: pass --resume ID (an existing
@@ -1457,10 +1463,17 @@ pub struct ListenArgs {
     /// directory with its tool permissions. It gets a fixed prompt naming the
     /// item ids, never the items' text, and reads them through its MCP server
     /// named `airlox`, which joins as this listener (it is handed
-    /// AIRLOX_INVITE, AIRLOX_NAME and AIRLOX_CACHE_DIR). Only the airlox read
-    /// and reply tools are pre-approved for it. For an unattended agent also
-    /// pass `--from owner`.
-    #[arg(long, value_enum, conflicts_with = "once", requires = "agent_session")]
+    /// AIRLOX_INVITE, AIRLOX_NAME, AIRLOX_CACHE_DIR and AIRLOX_DESCRIPTION).
+    /// Only the airlox read and reply tools are pre-approved for it; Codex's
+    /// shell tool does not inherit AIRLOX_*, and headless Claude Code cannot
+    /// run Bash unasked. Requires --from, because a woken agent acts on what
+    /// the sender asks.
+    #[arg(
+        long,
+        value_enum,
+        conflicts_with = "once",
+        requires_all = ["agent_session", "from"]
+    )]
     pub agent: Option<WakeAgent>,
     /// With --agent: start a new conversation each time instead of resuming.
     #[arg(long, requires = "agent", group = "agent_session")]
@@ -1474,9 +1487,12 @@ pub struct ListenArgs {
     #[arg(long)]
     pub all: bool,
     /// Only wake for items from this participant (repeatable): `owner`,
-    /// `role:<sender|observer|runner>`, a display name or a key. Default:
-    /// anyone, so agents can talk to each other; use `--from owner` for an
-    /// agent nobody watches, so only the owner's words can wake it.
+    /// `role:<sender|observer|runner>`, a display name or a key. Only `owner`
+    /// and a key cannot be imitated: anyone holding an invite picks their
+    /// own display name, and a role is shared by everyone who joined with
+    /// that invite. Default: anyone, so agents can talk to each other; use
+    /// `--from owner` for an agent nobody watches, so only the owner's words
+    /// can wake it. Required with --agent.
     #[arg(long = "from", value_name = "SPEC")]
     pub from: Vec<String>,
     /// Stop waking for a reply chain once this many items in a row came
@@ -1532,10 +1548,24 @@ pub async fn listen(a: ListenArgs) -> Result<i32> {
             "warning: --from {spec:?} matches no participant yet; it will wake for them once they join"
         );
     }
+    for spec in a.from.iter().filter(|f| is_display_name(f)) {
+        eprintln!(
+            "warning: --from {spec:?} is a display name, which anyone with an invite can pick; \
+             only `owner` or a participant key cannot be imitated"
+        );
+    }
+    #[cfg(unix)]
+    if a.exec.is_some() || a.agent.is_some() {
+        forward_signals();
+    }
     loop {
-        let upto = pending.settled_seq(s.items(), std::time::Instant::now()).unwrap_or(0);
+        let now = std::time::Instant::now();
+        let upto = pending.settled_seq(s.items(), now).unwrap_or(0);
+        // Items given up on that arrived since: wake for them too. This is
+        // kept in memory only, so a restart in between loses them.
+        let late = pending.arrived_late(s.items());
         let mut batch = Vec::new();
-        for i in s.items().iter().filter(|i| i.seq > cursor && i.seq <= upto) {
+        for i in s.items().iter().filter(|i| (i.seq > cursor && i.seq <= upto) || late.contains(&i.seq)) {
             if !wakes(&s, i, a.all, &a.from) {
                 continue;
             }
@@ -1573,6 +1603,9 @@ pub async fn listen(a: ListenArgs) -> Result<i32> {
         // then give a burst a moment to land before taking the batch.
         let mut woke = false;
         let (all, max_hops, from) = (a.all, a.max_hops, &a.from);
+        // Items already here: one that shows up again was pending and has
+        // arrived, which may free a held item or be a late one to wake for.
+        let known = s.items().iter().map(|i| i.seq).max().unwrap_or(0);
         let mut wait = left().unwrap_or(Duration::from_secs(300)).min(Duration::from_secs(300));
         // Come back when a pending item is due to be skipped.
         if let Some(due) = pending.next_check(std::time::Instant::now()) {
@@ -1580,7 +1613,7 @@ pub async fn listen(a: ListenArgs) -> Result<i32> {
         }
         s.stream(Some(wait), &mut |s, i| {
             woke = i.seq > cursor && wakes(s, i, all, from) && (max_hops == 0 || s.agent_hops(i) <= max_hops);
-            Ok(!woke)
+            Ok(!woke && i.seq > known)
         })
         .await?;
         if woke {
@@ -1597,6 +1630,15 @@ fn wakes(s: &Session, i: &Item, all: bool, from: &[String]) -> bool {
         s.wake_reason(i).is_some()
     };
     concerns && s.author_in(i, from)
+}
+
+/// Whether a `--from` spec is a display name: not `owner`, a `role:` or a
+/// participant key (43 base64url characters), which are the only ones nobody
+/// else can pick for themselves.
+fn is_display_name(spec: &str) -> bool {
+    let spec = spec.trim();
+    let key = spec.len() == 43 && spec.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    !(spec == "owner" || spec.starts_with("role:") || key)
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -1627,6 +1669,10 @@ fn agent_command(agent: WakeAgent, resume: Option<&str>) -> (&'static str, Vec<S
             let vars: Vec<String> = WAKE_ENV.iter().map(|v| format!("{v:?}")).collect();
             let mut args = own(&["exec", "-c"]);
             args.push(format!("mcp_servers.airlox.env_vars=[{}]", vars.join(",")));
+            // The MCP server gets those through `env_vars`; the shell tool,
+            // whose default filter only drops *KEY*, *SECRET* and *TOKEN*,
+            // must not see the invite it would let the agent join with.
+            args.extend(own(&["-c", r#"shell_environment_policy.exclude=["AIRLOX_*"]"#]));
             // Headless Codex refuses a tool that needs approval (send_text does).
             for t in WAKE_TOOLS {
                 args.extend([
@@ -1670,13 +1716,105 @@ fn wake_prompt(s: &Session, batch: &[&Item]) -> String {
     )
 }
 
+/// What the woken agent's airlox MCP server joins with: this listener's own
+/// settings, as the flags or the environment gave them, so it is the same
+/// participant whichever way listen was configured. AIRLOX_RELAY is not here:
+/// a joined session needs no relay, and one set in the environment is
+/// inherited (and, for Codex, listed in `env_vars`).
+fn agent_env(conn: &Conn) -> Vec<(&'static str, std::ffi::OsString)> {
+    let root = conn.cache_root();
+    let root = std::path::absolute(&root).unwrap_or(root);
+    let mut env: Vec<(&'static str, std::ffi::OsString)> = vec![
+        ("AIRLOX_INVITE", conn.invite.clone().into()),
+        ("AIRLOX_NAME", conn.display_name.clone().into()),
+        ("AIRLOX_CACHE_DIR", root.into_os_string()),
+    ];
+    env.extend(conn.description.iter().map(|d| ("AIRLOX_DESCRIPTION", d.clone().into())));
+    env
+}
+
+/// Where `name` is on `path`, trying each extension in turn per directory.
+fn find_program(
+    name: &str,
+    path: &std::ffi::OsStr,
+    exts: &[&str],
+    exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .flat_map(|d| exts.iter().map(move |e| d.join(format!("{name}.{e}"))))
+        .find(|p| exists(p))
+}
+
+/// The program to run for `name`. Windows only finds `.exe` itself, and the
+/// npm-installed `codex` and `claude` are `.cmd` shims.
+fn resolve_program(name: &str) -> std::ffi::OsString {
+    if cfg!(windows) {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        if let Some(p) = find_program(name, &path, &["exe", "cmd"], |p| p.is_file()) {
+            return p.into_os_string();
+        }
+    }
+    name.into()
+}
+
+/// Run `c` in a process group of its own, so a timeout (or Ctrl-C to listen)
+/// can end what it started too. Windows has no such group here: only the
+/// command itself is killed.
+fn own_group(c: &mut tokio::process::Command) {
+    #[cfg(unix)]
+    c.process_group(0);
+    #[cfg(not(unix))]
+    let _ = c;
+}
+
+/// Unix: the process group of the command listen is waiting for, or 0.
+#[cfg(unix)]
+static RUNNING_GROUP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// A command in its own process group does not get the terminal's Ctrl-C,
+/// so pass SIGINT and SIGTERM on to it, give it a moment, then end it and
+/// listen. The batch is not marked handled, so it wakes again next time.
+#[cfg(unix)]
+fn forward_signals() {
+    use std::sync::atomic::Ordering;
+
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+    use tokio::signal::unix::{signal, SignalKind};
+    let (Ok(mut int), Ok(mut term)) = (signal(SignalKind::interrupt()), signal(SignalKind::terminate()))
+    else {
+        return;
+    };
+    tokio::spawn(async move {
+        let (sig, code) = tokio::select! {
+            _ = int.recv() => (Signal::SIGINT, 130),
+            _ = term.recv() => (Signal::SIGTERM, 143),
+        };
+        let group = RUNNING_GROUP.load(Ordering::SeqCst);
+        if group > 0 {
+            let group = Pid::from_raw(group);
+            let _ = killpg(group, sig);
+            // Until the whole group is gone, or five seconds.
+            for _ in 0..50 {
+                if killpg(group, None).is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let _ = killpg(group, Signal::SIGKILL);
+        }
+        std::process::exit(code);
+    });
+}
+
 async fn deliver(s: &Session, batch: &[&Item], a: &ListenArgs) -> Result<()> {
     if let Some(agent) = a.agent {
         let prompt = wake_prompt(s, batch);
         let (program, args) = agent_command(agent, a.resume.as_deref());
-        let mut c = tokio::process::Command::new(program);
-        c.args(args);
+        let mut c = tokio::process::Command::new(resolve_program(program));
+        c.args(args).envs(agent_env(&a.conn));
         c.arg(&prompt).stdin(std::process::Stdio::null()).kill_on_drop(true);
+        own_group(&mut c);
         let name = format!("{agent:?}").to_lowercase();
         let child = c.spawn().with_context(|| format!("could not run {name}; is it on PATH?"))?;
         match run_limited(child, a.run_timeout).await? {
@@ -1705,28 +1843,14 @@ async fn deliver(s: &Session, batch: &[&Item], a: &ListenArgs) -> Result<()> {
     }
     let ids: Vec<&str> = batch.iter().map(|i| i.id.as_str()).collect();
     let reasons: Vec<&str> = batch.iter().filter_map(|i| s.wake_reason(i)).collect();
-    let mut c = if cfg!(windows) {
-        let mut c = tokio::process::Command::new("cmd");
-        c.arg("/C").arg(cmd);
-        c
-    } else {
-        let mut c = tokio::process::Command::new("sh");
-        c.arg("-c").arg(cmd);
-        c
-    };
-    c.env("AIRLOX_ITEMS", ids.join(","))
-        .env("AIRLOX_WAKE", reasons.join(","))
-        .env("AIRLOX_SESSION", &s.session_id)
-        .stdin(std::process::Stdio::piped());
-    let mut child = c.spawn().with_context(|| format!("could not run {cmd:?}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        use tokio::io::AsyncWriteExt;
-        // A command that does not read its stdin is fine.
-        let _ = stdin.write_all(lines.as_bytes()).await;
-    }
+    let env = [
+        ("AIRLOX_ITEMS", ids.join(",")),
+        ("AIRLOX_WAKE", reasons.join(",")),
+        ("AIRLOX_SESSION", s.session_id.clone()),
+    ];
     // Not retried either way: an agent that keeps failing (or hanging) on the
     // same message would otherwise be woken for it forever.
-    match run_limited(child, a.run_timeout).await? {
+    match run_exec(cmd, lines.into_bytes(), &env, a.run_timeout).await? {
         Some(status) if !status.success() => {
             eprintln!("{cmd:?} exited with {status} for items {}; moving on", ids.join(","))
         }
@@ -1740,22 +1864,76 @@ async fn deliver(s: &Session, batch: &[&Item], a: &ListenArgs) -> Result<()> {
     Ok(())
 }
 
-/// Wait for `child`; kill it if it runs longer than `limit` (zero: no limit)
-/// and return `None`.
+/// Run the shell command `cmd` with `stdin` fed to it and `env` set, under
+/// `limit` (see [`run_limited`]; the feeding is cut short with it, so a
+/// command that never reads a big batch cannot hold listen up).
+async fn run_exec(
+    cmd: &str,
+    stdin: Vec<u8>,
+    env: &[(&str, String)],
+    limit: Duration,
+) -> Result<Option<std::process::ExitStatus>> {
+    let mut c = if cfg!(windows) {
+        let mut c = tokio::process::Command::new("cmd");
+        c.arg("/C").arg(cmd);
+        c
+    } else {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c").arg(cmd);
+        c
+    };
+    c.envs(env.iter().map(|(k, v)| (*k, v))).stdin(std::process::Stdio::piped()).kill_on_drop(true);
+    own_group(&mut c);
+    let mut child = c.spawn().with_context(|| format!("could not run {cmd:?}"))?;
+    let feeder = child.stdin.take().map(|mut pipe| {
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            // A command that does not read its stdin is fine.
+            let _ = pipe.write_all(&stdin).await;
+        })
+    });
+    let status = run_limited(child, limit).await;
+    if let Some(f) = feeder {
+        f.abort();
+    }
+    status
+}
+
+/// Wait for `child`; kill it (and, on Unix, everything in its process group,
+/// see [`own_group`]) if it runs longer than `limit` (zero: no limit) and
+/// return `None`.
 async fn run_limited(
     mut child: tokio::process::Child,
     limit: Duration,
 ) -> Result<Option<std::process::ExitStatus>> {
-    if limit.is_zero() {
-        return Ok(Some(child.wait().await?));
-    }
-    match tokio::time::timeout(limit, child.wait()).await {
-        Ok(status) => Ok(Some(status?)),
-        Err(_) => {
-            let _ = child.kill().await;
-            Ok(None)
+    #[cfg(unix)]
+    let group = child.id().and_then(|p| i32::try_from(p).ok()).unwrap_or(0);
+    #[cfg(unix)]
+    RUNNING_GROUP.store(group, std::sync::atomic::Ordering::SeqCst);
+    let timer = async {
+        if limit.is_zero() {
+            std::future::pending::<()>().await
+        } else {
+            tokio::time::sleep(limit).await
+        }
+    };
+    let out = tokio::select! {
+        status = child.wait() => Some(status?),
+        _ = timer => None,
+    };
+    #[cfg(unix)]
+    {
+        RUNNING_GROUP.store(0, std::sync::atomic::Ordering::SeqCst);
+        if out.is_none() && group > 0 {
+            // Not after an exit: the group id may be someone else's by now.
+            use nix::sys::signal::{killpg, Signal};
+            let _ = killpg(nix::unistd::Pid::from_raw(group), Signal::SIGKILL);
         }
     }
+    if out.is_none() {
+        let _ = child.kill().await;
+    }
+    Ok(out)
 }
 
 /// Text inlined per item when listening: enough to decide, not a whole report.
@@ -1944,23 +2122,26 @@ mod tests {
         let (_, codex) = agent_command(WakeAgent::Codex, Some("t"));
         assert_eq!(&codex[..2], ["exec", "-c"]);
         assert!(codex[2].starts_with("mcp_servers.airlox.env_vars=[\"AIRLOX_INVITE\","));
+        assert!(codex.contains(&r#"shell_environment_policy.exclude=["AIRLOX_*"]"#.to_string()));
         assert!(codex.contains(&r#"mcp_servers.airlox.tools.send_text.approval_mode="approve""#.to_string()));
         assert!(codex
             .iter()
             .filter(|a| a.contains("approval_mode"))
             .all(|a| a.starts_with("mcp_servers.airlox.tools.")));
+        // The shell policy is not the MCP server's env_vars: the server still gets the invite.
+        assert!(codex[2].contains("\"AIRLOX_INVITE\"") && !codex[2].contains("shell_environment_policy"));
         assert_eq!(&codex[codex.len() - 2..], ["resume", "t"]);
-        assert_eq!(agent_command(WakeAgent::Codex, None).1.len(), 3 + 2 * WAKE_TOOLS.len());
+        assert_eq!(agent_command(WakeAgent::Codex, None).1.len(), 5 + 2 * WAKE_TOOLS.len());
     }
 
     #[test]
     fn an_agent_needs_a_named_conversation_or_a_fresh_one() {
         let e = listen_args(&["--agent", "claude"]).unwrap_err().to_string();
         assert!(e.contains("--fresh") && e.contains("--resume"), "{e}");
-        assert!(listen_args(&["--agent", "codex", "--resume", "thread-1"]).is_ok());
+        assert!(listen_args(&["--agent", "codex", "--resume", "thread-1", "--from", "owner"]).is_ok());
         assert!(listen_args(&["--agent", "claude", "--fresh", "--from", "owner", "--from", "role:sender"])
             .is_ok());
-        assert!(listen_args(&["--agent", "claude", "--fresh", "--resume", "x"]).is_err());
+        assert!(listen_args(&["--agent", "claude", "--fresh", "--resume", "x", "--from", "owner"]).is_err());
         assert!(listen_args(&["--fresh"]).is_err(), "--fresh is for --agent");
         let a = listen_args(&["--once"]).unwrap();
         assert_eq!(
@@ -1971,11 +2152,136 @@ mod tests {
         assert_eq!((a.run_timeout, a.pending_timeout), (Duration::from_secs(5), Duration::ZERO));
     }
 
+    #[test]
+    fn an_agent_must_say_who_may_wake_it() {
+        let e = listen_args(&["--agent", "claude", "--fresh"]).unwrap_err().to_string();
+        assert!(e.contains("--from"), "{e}");
+        assert!(listen_args(&["--agent", "claude", "--fresh", "--from", "owner"]).is_ok());
+        // --exec is not held to it.
+        assert!(listen_args(&["--exec", "true"]).is_ok());
+    }
+
+    #[test]
+    fn only_display_names_can_be_imitated() {
+        let key = "A".repeat(43);
+        for spec in ["lead", "@lead", "coder 2", "short-key", "A".repeat(44).as_str()] {
+            assert!(is_display_name(spec), "{spec}");
+        }
+        for spec in ["owner", " owner ", "role:sender", key.as_str()] {
+            assert!(!is_display_name(spec), "{spec}");
+        }
+    }
+
+    #[test]
+    fn the_agent_is_handed_the_listeners_connection() {
+        let conn = |args: &[&str]| {
+            #[derive(clap::Parser)]
+            struct T {
+                #[command(flatten)]
+                c: Conn,
+            }
+            <T as clap::Parser>::try_parse_from(std::iter::once("t").chain(args.iter().copied())).unwrap().c
+        };
+        let get = |env: &[(&str, std::ffi::OsString)], k: &str| {
+            env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string_lossy().into_owned())
+        };
+        let env = agent_env(&conn(&[
+            "--invite",
+            "https://r/#inv",
+            "--as",
+            "lead",
+            "--description",
+            "reviews",
+            "--cache-dir",
+            "/tmp/ax-cache",
+        ]));
+        assert_eq!(get(&env, "AIRLOX_INVITE").as_deref(), Some("https://r/#inv"));
+        assert_eq!(get(&env, "AIRLOX_NAME").as_deref(), Some("lead"));
+        assert_eq!(get(&env, "AIRLOX_DESCRIPTION").as_deref(), Some("reviews"));
+        assert_eq!(
+            get(&env, "AIRLOX_CACHE_DIR").as_deref(),
+            Some(Path::new("/tmp/ax-cache").to_str().unwrap())
+        );
+        // Defaults are spelled out too: the cache the listener really uses.
+        let env = agent_env(&conn(&["--invite", "i"]));
+        assert_eq!(get(&env, "AIRLOX_NAME").as_deref(), Some("cli"));
+        assert!(get(&env, "AIRLOX_DESCRIPTION").is_none());
+        let root = default_cache_root();
+        assert_eq!(get(&env, "AIRLOX_CACHE_DIR").as_deref(), Some(root.to_str().unwrap()));
+    }
+
+    #[test]
+    fn windows_npm_shims_are_found_by_their_cmd_name() {
+        let dir = |n: &str| PathBuf::from(n);
+        let path = std::env::join_paths([dir("bin1"), dir("bin2")]).unwrap();
+        let has = |files: &'static [&'static str]| move |p: &Path| files.iter().any(|f| p == Path::new(f));
+        let exts = ["exe", "cmd"];
+        assert_eq!(
+            find_program("codex", &path, &exts, has(&["bin2/codex.cmd"])),
+            Some(PathBuf::from("bin2/codex.cmd"))
+        );
+        // The first directory wins, then .exe before .cmd.
+        assert_eq!(
+            find_program("codex", &path, &exts, has(&["bin2/codex.exe", "bin1/codex.cmd"])),
+            Some(PathBuf::from("bin1/codex.cmd"))
+        );
+        assert_eq!(
+            find_program("codex", &path, &exts, has(&["bin1/codex.cmd", "bin1/codex.exe"])),
+            Some(PathBuf::from("bin1/codex.exe"))
+        );
+        assert_eq!(find_program("claude", &path, &exts, has(&["bin1/codex.cmd"])), None);
+        assert_eq!(resolve_program("surely-not-a-program"), std::ffi::OsString::from("surely-not-a-program"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_that_ignores_a_big_batch_on_stdin_is_still_killed() {
+        let t = std::time::Instant::now();
+        // Far more than a pipe holds, and `sleep` never reads it.
+        let big = vec![b'x'; 4 << 20];
+        let env = [("AIRLOX_ITEMS", "a".to_string())];
+        let out = run_exec("sleep 30", big, &env, Duration::from_millis(300)).await.unwrap();
+        assert!(out.is_none() && t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+        // The environment and stdin reach a command that reads them.
+        let out = run_exec(
+            "test \"$AIRLOX_ITEMS\" = a && test \"$(cat)\" = hi",
+            b"hi".to_vec(),
+            &env,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(out.success());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_that_runs_too_long_is_killed_with_what_it_started() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("pid");
+        let script = format!("sleep 47 & echo $! > {}; wait", pidfile.display());
+        let out = run_exec(&script, vec![], &[], Duration::from_millis(1500)).await.unwrap();
+        assert!(out.is_none());
+        let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        let alive = || nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok();
+        for _ in 0..50 {
+            if !alive() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(!alive(), "the sleep it started outlived the timeout");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_command_that_runs_too_long_is_killed() {
         let spawn = |script: &str| {
-            tokio::process::Command::new("sh").args(["-c", script]).kill_on_drop(true).spawn().unwrap()
+            let mut c = tokio::process::Command::new("sh");
+            c.args(["-c", script]).kill_on_drop(true);
+            own_group(&mut c);
+            c.spawn().unwrap()
         };
         let t = std::time::Instant::now();
         let killed = run_limited(spawn("sleep 30"), Duration::from_millis(200)).await.unwrap();

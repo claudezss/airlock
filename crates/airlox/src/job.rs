@@ -666,8 +666,15 @@ fn hidden_dirs(ctx: &Ctx, job: &PreparedJob) -> Vec<(PathBuf, &'static str)> {
     let mut dirs =
         vec![(job.work_dir(), "$WORK"), (job.out_dir(), "$AIRLOX_OUT"), (job.root.clone(), "$JOB")];
     dirs.extend(ctx.backend.runtime_dirs().into_iter().map(|d| (d, redact::RUNTIME)));
-    dirs.extend(redact::home_dir().map(|h| (h, redact::HOME)));
+    dirs.extend(redact::home_dirs().into_iter().map(|h| (h, redact::HOME)));
     dirs
+}
+
+/// Take the directories in `hidden` out of everything a result says in text.
+fn hide_dirs(result: &mut JobResult, hidden: &[(PathBuf, &'static str)]) {
+    result.stdout = redact::hide(&result.stdout, hidden);
+    result.stderr = redact::hide(&result.stderr, hidden);
+    result.reason = result.reason.take().map(|r| redact::hide(&r, hidden));
 }
 
 fn read_progress_file(roots: &[PathBuf], file: &str, max: usize) -> (Option<String>, bool) {
@@ -852,9 +859,6 @@ pub async fn handle(
                 result.peak_mem_mb = (peak_kb / 1024) as u32;
                 (result.stdout, result.stdout_truncated) = stdio(&job.meta_dir().join("stdout.txt"));
                 (result.stderr, result.stderr_truncated) = stdio(&job.meta_dir().join("stderr.txt"));
-                result.stdout = redact::hide(&result.stdout, &hidden);
-                result.stderr = redact::hide(&result.stderr, &hidden);
-                result.reason = result.reason.take().map(|r| redact::hide(&r, &hidden));
                 let mut notes = Vec::new();
                 if limits.return_out {
                     // The payload adds a few hundred bytes of meta to the file.
@@ -887,6 +891,10 @@ pub async fn handle(
                     }
                 }
             }
+            // One pass over everything that leaves: the job's own output,
+            // and the reason and notes the runner wrote, whose errors name
+            // the work directories. (Redacting never lengthens text.)
+            hide_dirs(&mut result, &hidden);
             crate::sandbox::make_removable(dir.path());
             drop(dir);
         }
@@ -910,6 +918,41 @@ pub async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_the_runner_wrote_names_no_directory_either() {
+        let (root, home) = ("/tmp/airlox-jobs-a1b2c3/job-x9", "/home/ann");
+        let hidden = vec![
+            (PathBuf::from(format!("{root}/work")), "$WORK"),
+            (PathBuf::from(root), "$JOB"),
+            (PathBuf::from(home), redact::HOME),
+        ];
+        let r#ref = ItemRef { id: "i".into(), blob_sha256: "h".into() };
+        let mut result = JobResult {
+            job: r#ref,
+            exit_code: None,
+            status: JobStatus::Failed,
+            reason: Some(format!("could not stage inputs: {root}/work/a.csv: File exists (os error 17)")),
+            wall_ms: 0,
+            peak_mem_mb: 0,
+            stdout: format!("in {home}/x"),
+            // A note the runner appended, with its error.
+            stderr: format!("\n[airlox] could not keep out/a.png for upload: {root}/out/a.png: disk full"),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            out_files: vec![],
+            code_sha256: String::new(),
+            input_sha256: String::new(),
+            env: None,
+        };
+        hide_dirs(&mut result, &hidden);
+        let said = format!("{:?} {} {}", result.reason, result.stdout, result.stderr);
+        assert!(!said.contains("airlox-jobs") && !said.contains("ann"), "{said}");
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("could not stage inputs: $WORK/a.csv: File exists (os error 17)")
+        );
+    }
 
     #[test]
     fn an_env_clients_would_reject_is_dropped_not_the_result() {
