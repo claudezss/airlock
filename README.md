@@ -140,7 +140,8 @@ refuses files named like credentials, such as `.env` or `*.pem`, unless
 out), and the job starts in your current directory within it. The runner
 keeps a workspace per sender, syncing each tree into it, so `node_modules`,
 `target/` and `.venv` survive and the second run of the afternoon is fast
-(`--fresh` starts over). Output streams as it happens; the signed result is
+(`--fresh` starts over); after the first run, only the files that changed
+are uploaded. Output streams as it happens; the signed result is
 the authority. `airlox run --shell ci.sh` sends a script, and `airlox run
 file.py` still sends Python.
 

@@ -10,7 +10,12 @@
 //! A tree is *synced* into `work/`: files already there with the same
 //! SHA-256 are left alone, others are written, and files the previous tree
 //! placed that this one lacks are deleted. Nothing else is touched, so
-//! directories a tree never lists (`node_modules`, `target`) survive.
+//! directories a tree never lists (`node_modules`, `target`) survive. A
+//! delta tree leaves out of its zip the files its sender believes are here;
+//! each must be, byte for byte, before anything is written, or the sync
+//! fails with [`TreeStale`]. After the job, [`Workspace::changed`] says
+//! which of the tree's files are no longer as listed, so the sender knows
+//! what to send next time.
 //!
 //! The previous job controlled everything in `work/`. Every step here
 //! therefore looks at what is on disk without following links (`lstat`,
@@ -196,18 +201,30 @@ impl Workspace {
     }
 
     /// Make the work dir hold `tree`: write what differs, delete what the
-    /// previous tree placed and this one lacks, touch nothing else.
+    /// previous tree placed and this one lacks, touch nothing else. A file a
+    /// delta tree left out must already be here, or nothing is touched and
+    /// the error is a [`TreeStale`].
     pub fn sync_tree(&self, tree: &Tree, zip: &[u8]) -> Result<()> {
         let work = self.work();
+        let mut ar = zip::ZipArchive::new(std::io::Cursor::new(zip))?;
+        let stale: Vec<String> = tree
+            .files
+            .iter()
+            .filter(|f| ar.index_for_name(&f.path).is_none() && !unchanged(&work, f, None))
+            .map(|f| f.path.clone())
+            .collect();
+        if !stale.is_empty() {
+            return Err(TreeStale { missing: stale }.into());
+        }
         let old = self.placed();
         let new: HashSet<&str> = tree.files.iter().map(|f| f.path.as_str()).collect();
         // Until the sync is done, every path of both trees may be on disk.
         self.set_placed(old.iter().cloned().chain(tree.files.iter().map(|f| f.path.clone())))?;
-        let mut ar = zip::ZipArchive::new(std::io::Cursor::new(zip))?;
         let mut known = HashSet::new();
         for f in &tree.files {
-            let mut entry = ar.by_name(&f.path)?;
-            if unchanged(&work, f, entry.size()) {
+            // Left out of a delta tree, and checked above.
+            let Ok(mut entry) = ar.by_name(&f.path) else { continue };
+            if unchanged(&work, f, Some(entry.size())) {
                 continue;
             }
             let size = entry.size();
@@ -217,6 +234,23 @@ impl Workspace {
             remove_placed(&work, p);
         }
         self.set_placed(tree.files.iter().map(|f| f.path.clone()))
+    }
+
+    /// After a job: the files of `tree` that are no longer as it listed them
+    /// (edited, replaced or removed); `None` if more than the result can
+    /// carry. Modes are not compared: a sync puts those right without a copy.
+    pub fn changed(&self, tree: &Tree) -> Option<Vec<String>> {
+        let work = self.work();
+        let mut out = Vec::new();
+        for f in &tree.files {
+            if same_bytes(&work, f, None).is_none() {
+                out.push(f.path.clone());
+                if out.len() > airlox_core::payload::MAX_TREE_CHANGED {
+                    return None;
+                }
+            }
+        }
+        Some(out)
     }
 
     /// Place a file or archive that is not the tree, replacing what is there.
@@ -311,17 +345,46 @@ fn real_parent(work: &Path, rel: &str) -> Option<PathBuf> {
     Some(cur)
 }
 
-/// The file `f` is already on disk, with the right bytes (hashed, not
-/// trusted); a wrong executable bit is put right.
-fn unchanged(work: &Path, f: &TreeFile, size: u64) -> bool {
-    let Some(parent) = real_parent(work, &f.path) else { return false };
+/// A delta tree left out files the workspace does not hold as listed.
+#[derive(Debug)]
+pub struct TreeStale {
+    pub missing: Vec<String>,
+}
+
+impl std::fmt::Display for TreeStale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let shown: Vec<_> = self.missing.iter().take(3).map(String::as_str).collect();
+        write!(
+            f,
+            "tree_stale: the tree left out {} file(s) this workspace does not hold as listed ({}{}); send the \
+             whole tree",
+            self.missing.len(),
+            shown.join(", "),
+            if self.missing.len() > shown.len() { ", …" } else { "" }
+        )
+    }
+}
+
+impl std::error::Error for TreeStale {}
+
+/// The file `f` on disk, opened, if it holds the listed bytes (hashed, not
+/// trusted) and, when given, is `size` long.
+fn same_bytes(work: &Path, f: &TreeFile, size: Option<u64>) -> Option<fs::File> {
+    let parent = real_parent(work, &f.path)?;
     let path = parent.join(f.path.rsplit('/').next().unwrap_or(&f.path));
-    let Some(mut file) = open_regular(&path) else { return false };
-    if file.metadata().ok().map(|m| m.len()) != Some(size)
+    let mut file = open_regular(&path)?;
+    if size.is_some_and(|size| file.metadata().ok().map(|m| m.len()) != Some(size))
         || sha256_reader(&mut file).ok().as_deref() != Some(&f.sha256)
     {
-        return false;
+        return None;
     }
+    Some(file)
+}
+
+/// The file `f` is already on disk, with the right bytes (hashed, not
+/// trusted); a wrong executable bit is put right.
+fn unchanged(work: &Path, f: &TreeFile, size: Option<u64>) -> bool {
+    let Some(file) = same_bytes(work, f, size) else { return false };
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -457,7 +520,7 @@ fn remove_placed(work: &Path, rel: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::tree::tests::build;
+    use crate::job::tree::tests::{build, build_delta};
 
     const MODE: u32 = 0o100644;
     const EXEC: u32 = 0o100755;
@@ -517,6 +580,50 @@ mod tests {
         assert!(!w.work().join("new").exists(), "an emptied directory goes with its files");
         assert!(!w.work().join("src/b.py").exists());
         assert_eq!(read(&w, "src/untracked.log"), "log");
+    }
+
+    fn sync_delta(w: &Workspace, files: &[(&str, &[u8], u32)], left_out: &[&str]) -> Result<()> {
+        let z = build_delta(Some("abc"), files, left_out);
+        w.prepare(false)?;
+        w.sync_tree(&Tree::load(&z, &ZipLimits::default())?, &z)
+    }
+
+    #[test]
+    fn a_delta_tree_relies_on_what_is_there_and_is_refused_when_it_is_not() {
+        let (_d, w) = ws();
+        sync(&w, &[("a.py", b"a1", MODE), ("b.py", b"b1", MODE), ("gone.py", b"g", MODE)]).unwrap();
+        // a.py unchanged and left out; b.py changed; c.py new; gone.py dropped.
+        let next = [("a.py", &b"a1"[..], MODE), ("b.py", &b"b2"[..], MODE), ("c.py", &b"c"[..], MODE)];
+        sync_delta(&w, &next, &["a.py"]).unwrap();
+        assert_eq!(
+            (read(&w, "a.py"), read(&w, "b.py"), read(&w, "c.py")),
+            ("a1".into(), "b2".into(), "c".into())
+        );
+        assert!(!w.work().join("gone.py").exists());
+
+        // The job edits a.py and deletes c.py: both are reported.
+        fs::write(w.work().join("a.py"), "edited").unwrap();
+        fs::remove_file(w.work().join("c.py")).unwrap();
+        let t = Tree::load(&build(Some("abc"), &next), &ZipLimits::default()).unwrap();
+        assert_eq!(w.changed(&t), Some(vec!["a.py".to_string(), "c.py".to_string()]));
+
+        // A delta that counts on them is refused, and writes nothing.
+        let then = [("a.py", &b"a1"[..], MODE), ("b.py", &b"b3"[..], MODE), ("c.py", &b"c"[..], MODE)];
+        let e = sync_delta(&w, &then, &["a.py", "c.py"]).unwrap_err();
+        let stale = e.downcast_ref::<TreeStale>().expect("a TreeStale");
+        assert_eq!(stale.missing, ["a.py", "c.py"]);
+        assert!(stale.to_string().starts_with("tree_stale: "), "{stale}");
+        assert_eq!(read(&w, "b.py"), "b2");
+        // The whole tree puts everything right.
+        sync(&w, &then).unwrap();
+        assert_eq!(
+            (read(&w, "a.py"), read(&w, "b.py"), read(&w, "c.py")),
+            ("a1".into(), "b3".into(), "c".into())
+        );
+        assert_eq!(
+            w.changed(&Tree::load(&build(Some("abc"), &then), &ZipLimits::default()).unwrap()),
+            Some(vec![])
+        );
     }
 
     #[test]

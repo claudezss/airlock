@@ -10,7 +10,14 @@
 //! with a well-known credential name is refused unless `--tree-allow` names
 //! it; `--tree-exclude` and `.airloxignore` drop files. The list is a seat
 //! belt, not a scanner.
+//!
+//! To a runner that keeps the sender's workspace, a tree can go as a
+//! *delta* ([`Tree::delta`]): `tree.json` still lists every file, but the
+//! zip holds only those that differ from what the sender last left there.
+//! The runner checks the rest on disk and refuses the job (`tree_stale`)
+//! if any is not as listed; the sender then sends the whole tree.
 
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -52,6 +59,9 @@ pub struct TreeJson {
     pub files: Vec<TreeFile>,
     pub count: u64,
     pub bytes: u64,
+    /// The zip leaves out files the runner's workspace should hold.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub delta: bool,
 }
 
 pub struct Tree {
@@ -296,6 +306,7 @@ pub fn build(dir: &Path, opts: &TreeOpts) -> Result<Tree> {
         count: entries.len() as u64,
         bytes: total,
         files: entries,
+        delta: false,
     };
     w.start_file(
         TREE_JSON,
@@ -324,6 +335,87 @@ pub fn build(dir: &Path, opts: &TreeOpts) -> Result<Tree> {
 }
 
 impl Tree {
+    /// The tree as a delta against `held` (path to hex SHA-256 of what the
+    /// workspace should hold): a zip of the files that differ, and how many
+    /// that is. `None` when nothing would be left out.
+    pub fn delta(&self, held: &HashMap<String, String>) -> Result<Option<(Vec<u8>, usize)>> {
+        let send: HashSet<&str> = self
+            .json
+            .files
+            .iter()
+            .filter(|f| held.get(&f.path) != Some(&f.sha256))
+            .map(|f| f.path.as_str())
+            .collect();
+        if send.len() == self.json.files.len() {
+            return Ok(None);
+        }
+        let mut ar = zip::ZipArchive::new(std::io::Cursor::new(&self.zip))?;
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for i in 0..ar.len() {
+            let f = ar.by_index_raw(i)?;
+            if send.contains(f.name()) {
+                w.raw_copy_file(f)?;
+            }
+        }
+        let json = TreeJson { delta: true, ..self.json.clone() };
+        w.start_file(
+            TREE_JSON,
+            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated),
+        )?;
+        w.write_all(&serde_json::to_vec(&json)?)?;
+        Ok(Some((w.finish()?.into_inner(), send.len())))
+    }
+
+    /// The zip to send for a job to `target`: only the files that differ
+    /// from what this client's workspace on that runner should hold, when the
+    /// session keeps workspaces, one runner can take the job (it names one,
+    /// or only one approved runner matches, as on a machine), the job does
+    /// not ask for a fresh workspace, and this client knows what it left
+    /// there. The second value is how many files a delta holds.
+    pub async fn zip_for(
+        &self,
+        s: &mut crate::session::Session,
+        target: &crate::session::Target,
+        fresh: bool,
+    ) -> Result<(Vec<u8>, Option<usize>)> {
+        use crate::session::Target;
+        if fresh || !s.limits().is_ok_and(|l| l.workspace) {
+            return Ok((self.zip.clone(), None));
+        }
+        let runner = match target {
+            Target::Runner(which) => Some(s.runner(which).await?.participant_pub),
+            Target::Labels(_) | Target::Any => {
+                let fits: Vec<String> = s
+                    .runners()
+                    .await?
+                    .into_iter()
+                    .filter(|r| r.approved && !r.rejected)
+                    .filter(|r| match target {
+                        Target::Labels(want) => want.iter().all(|l| r.labels.contains(l)),
+                        _ => true,
+                    })
+                    .map(|r| r.participant_pub)
+                    .collect();
+                // If the relay routes it elsewhere after all, that runner
+                // refuses the delta and the whole tree follows.
+                (fits.len() == 1).then(|| fits[0].clone())
+            }
+        };
+        if let Some(runner) = runner {
+            if let Some(held) = s.held_tree(&runner) {
+                if let Some((zip, n)) = self.delta(&held)? {
+                    return Ok((zip, Some(n)));
+                }
+            }
+        }
+        Ok((self.zip.clone(), None))
+    }
+
+    /// Path to hex SHA-256 of every file in the tree.
+    pub fn listing(&self) -> HashMap<String, String> {
+        self.json.files.iter().map(|f| (f.path.clone(), f.sha256.clone())).collect()
+    }
+
     /// "tree 412 files, 3.1 MB (18 changed)".
     pub fn summary(&self) -> String {
         let changed = match self.changed {

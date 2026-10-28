@@ -430,6 +430,10 @@ fn stage(job: &PreparedJob, a: &Accepted, tree: Option<&Tree>) -> Result<()> {
             ws.prepare(a.spec.fresh)?;
             stage_workspace(ws, a, tree)?;
         }
+        None if tree.is_some_and(|t| t.delta) => {
+            let missing = tree.map(|t| t.files.iter().map(|f| f.path.clone()).collect()).unwrap_or_default();
+            return Err(workspace::TreeStale { missing }.into());
+        }
         None => stage_inputs(&job.root, &job.work_dir(), a)?,
     }
     if a.spec.kind() == JobKind::Shell {
@@ -1005,7 +1009,7 @@ pub async fn handle(
             if let (Ok(Some(t)), Some(env)) = (&tree, &mut result.env) {
                 env.tree = Some(t.info.clone());
             }
-            let staged = tree.and_then(|tree| {
+            let staged = tree.as_ref().map_err(|e| anyhow::anyhow!("{e:#}")).and_then(|tree| {
                 stage(&job, &a, tree.as_ref())?;
                 // Container users own what they will write to.
                 #[cfg(unix)]
@@ -1015,7 +1019,12 @@ pub async fn handle(
                 Ok(())
             });
             if let Err(e) = staged {
-                result.reason = Some(format!("could not stage inputs: {e:#}"));
+                // Nothing ran: a refused result says nothing of where.
+                result.env = None;
+                result.reason = Some(match e.downcast_ref::<workspace::TreeStale>() {
+                    Some(stale) => stale.to_string(),
+                    None => format!("could not stage inputs: {e:#}"),
+                });
             } else {
                 tracing::info!(job = %job_id, kind = job.kind.as_str(), "running");
                 let progress = spawn_progress(
@@ -1079,8 +1088,19 @@ pub async fn handle(
             // the work directories. (Redacting never lengthens text.)
             hide_dirs(&mut result, &hidden);
             if let Some(ws) = a.workspace {
-                // Measured now, so the sender's next job knows if it may run.
-                let size = tokio::task::spawn_blocking(move || ws.finish()).await.unwrap_or(0);
+                // Measured now, so the sender's next job knows if it may run,
+                // and what of its tree it need not send again.
+                let ran = result.status != JobStatus::Refused;
+                let tree = tree.ok().flatten().filter(|_| ran);
+                let (size, changed) = tokio::task::spawn_blocking(move || {
+                    let changed = tree.as_ref().and_then(|t| ws.changed(t));
+                    (ws.finish(), changed)
+                })
+                .await
+                .unwrap_or((0, None));
+                if let Some(t) = result.env.as_mut().and_then(|e| e.tree.as_mut()) {
+                    t.changed = changed;
+                }
                 tracing::info!(job = %job_id, workspace_mb = size >> 20, "workspace kept");
             }
             crate::sandbox::make_removable(dir.path());

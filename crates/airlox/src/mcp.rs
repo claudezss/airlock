@@ -1089,51 +1089,54 @@ stderr, exit code, env with the tree and image it ran against) is returned at th
             None => p.session.clone(),
         };
         let (_, slot) = tool_try!(self.slot(&session).await);
-        let (job, runner) = {
+        let target = match (&p.runner, labels.is_empty()) {
+            (Some(r), _) => Target::Runner(r.clone()),
+            (None, false) => Target::Labels(labels),
+            (None, true) => Target::Any,
+        };
+        let mut inputs = Vec::new();
+        let spec = |files: Vec<Value>, tree_ref: Option<Value>| JobSpec {
+            kind: JobKind::Shell,
+            code: code.clone(),
+            filename: filename.clone(),
+            files: tree_ref.iter().cloned().chain(files).collect(),
+            target: target.clone(),
+            timeout_s: p.timeout_s,
+            memory_mb: p.memory_mb,
+            requirements: vec![],
+            progress_file: None,
+            cwd: tree.as_ref().and_then(|t| t.cwd.clone()),
+            tree: tree_ref,
+            fresh: p.fresh,
+        };
+        let mut delta = None;
+        let (mut job, runner) = {
             let mut g = slot.lock().await;
             let s = &mut g.s;
             tool_try!(s.sync().await);
-            let mut files = Vec::new();
+            // Whole, or only what differs from what this client last left in
+            // its workspace on the runner.
             let tree_ref = match &tree {
                 Some(t) => {
+                    let (zip, sent) = tool_try!(t.zip_for(s, &target, p.fresh).await);
                     let max = s.manifest.max_item_bytes.saturating_sub(4096);
-                    if t.zip.len() as u64 > max {
+                    if zip.len() as u64 > max {
                         return fail(json!({"error": "the tree is over the session's item limit",
-                            "zip_bytes": t.zip.len(), "limit": max, "largest": t.largest,
+                            "zip_bytes": zip.len(), "limit": max, "largest": t.largest,
                             "hint": "leave files out with tree_exclude"}));
                     }
-                    let r = tool_try!(s.send_file_reply(t.zip.clone(), crate::tree::TREE_ZIP, None).await);
-                    files.push(r.clone());
-                    Some(r)
+                    delta = sent;
+                    Some(tool_try!(s.send_file_reply(zip, crate::tree::TREE_ZIP, None).await))
                 }
                 None => None,
             };
             for id in &p.files {
                 match s.get(id).filter(|i| i.kind == "file" && i.status == Status::Ok) {
-                    Some(i) => files.push(i.item_ref.clone()),
+                    Some(i) => inputs.push(i.item_ref.clone()),
                     None => return fail(format!("{id} is not an available file item; send_file it first")),
                 }
             }
-            let target = match (&p.runner, labels.is_empty()) {
-                (Some(r), _) => Target::Runner(r.clone()),
-                (None, false) => Target::Labels(labels),
-                (None, true) => Target::Any,
-            };
-            let spec = JobSpec {
-                kind: JobKind::Shell,
-                code,
-                filename,
-                files,
-                target,
-                timeout_s: p.timeout_s,
-                memory_mb: p.memory_mb,
-                requirements: vec![],
-                progress_file: None,
-                cwd: tree.as_ref().and_then(|t| t.cwd.clone()),
-                tree: tree_ref,
-                fresh: p.fresh,
-            };
-            match s.run_job(spec).await {
+            let submitted = match s.run_job(spec(inputs.clone(), tree_ref)).await {
                 Ok(j) => j,
                 Err(e) => match e.downcast_ref::<NoRunnerAvailable>() {
                     Some(n) => {
@@ -1143,7 +1146,13 @@ stderr, exit code, env with the tree and image it ran against) is returned at th
                     }
                     None => return fail(format!("{e:#}")),
                 },
+            };
+            if let (Some(t), Some(r)) = (&tree, &submitted.1) {
+                if s.limits().is_ok_and(|l| l.workspace) {
+                    s.sent_tree(r, &submitted.0, t.listing());
+                }
             }
+            submitted
         };
         let tree_info = tree
             .as_ref()
@@ -1171,6 +1180,24 @@ stderr, exit code, env with the tree and image it ran against) is returned at th
                     // Display only, and best effort: the result is the authority.
                     let _ = context.peer.notify_progress(note).await;
                 }
+            }
+            // The workspace was not as this client left it: send the whole
+            // tree, once.
+            let stale = polled
+                .as_ref()
+                .and_then(|r| r.reason.as_deref())
+                .is_some_and(|r| r.starts_with("tree_stale"));
+            if let (true, Some(t), Some(_)) = (stale, &tree, delta.take()) {
+                let mut g = slot.lock().await;
+                let s = &mut g.s;
+                let r = tool_try!(s.send_file_reply(t.zip.clone(), crate::tree::TREE_ZIP, None).await);
+                let (again, runner) = tool_try!(s.run_job(spec(inputs.clone(), Some(r))).await);
+                if let Some(runner) = &runner {
+                    s.sent_tree(runner, &again, t.listing());
+                }
+                job = again;
+                cursor = crate::session::ChunkCursor::default();
+                continue;
             }
             if polled.is_some() || Instant::now() >= deadline {
                 break polled;

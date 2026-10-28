@@ -90,6 +90,17 @@ struct Cache {
     dir: PathBuf,
 }
 
+/// What this client believes its workspace on one runner holds: the tree
+/// its last job there sent, less what that job's result said changed. Only
+/// a hint for sending less: the runner checks every file it relies on.
+#[derive(Serialize, Deserialize)]
+struct Held {
+    /// The job that sent the tree; only its result updates this.
+    job: String,
+    /// Path to hex SHA-256.
+    files: HashMap<String, String>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct Identity {
     participant_seed: String,
@@ -189,6 +200,29 @@ impl Cache {
             bail!("not an item id: {id:?}");
         }
         write_atomic(&self.dir.join("blobs").join(id), blob, 0o600)
+    }
+
+    /// Where what this client believes its workspace on `runner` holds is
+    /// kept; `None` for a key that is not one.
+    fn tree_file(&self, runner: &str) -> Option<PathBuf> {
+        let key = airlox_core::keys::PublicKey::from_b64(runner).ok()?;
+        Some(self.dir.join("trees").join(format!("{}.json", airlox_core::encoding::hex(&key.to_bytes()))))
+    }
+
+    fn load_held(&self, runner: &str) -> Option<Held> {
+        serde_json::from_slice(&fs::read(self.tree_file(runner)?).ok()?).ok()
+    }
+
+    fn save_held(&self, runner: &str, held: &Held) -> Result<()> {
+        let path = self.tree_file(runner).context("not a runner key")?;
+        fs::create_dir_all(path.parent().expect("under trees/"))?;
+        write_atomic(&path, &serde_json::to_vec(held)?, 0o600)
+    }
+
+    fn forget_held(&self, runner: &str) {
+        if let Some(p) = self.tree_file(runner) {
+            let _ = fs::remove_file(p);
+        }
     }
 
     /// Delete caches of sessions whose manifest has expired.
@@ -1142,7 +1176,7 @@ impl Session {
 
     // ------------------------------------------------------ execute mode --
 
-    fn limits(&self) -> Result<&JobLimits> {
+    pub fn limits(&self) -> Result<&JobLimits> {
         if self.manifest.mode != Mode::Execute {
             bail!("this session is in relay mode; it has no runners");
         }
@@ -1196,7 +1230,39 @@ impl Session {
         Ok(out)
     }
 
-    async fn runner(&mut self, which: &str) -> Result<Runner> {
+    /// What this client's workspace on `runner` (a key) should hold, path to
+    /// hex SHA-256; `None` when it does not know.
+    pub fn held_tree(&self, runner: &str) -> Option<HashMap<String, String>> {
+        self.cache.load_held(runner).map(|h| h.files)
+    }
+
+    /// `job`, which carries a tree of `files`, went to `runner`: once it
+    /// runs, that is what the workspace holds.
+    pub fn sent_tree(&self, runner: &str, job: &str, files: HashMap<String, String>) {
+        if let Err(e) = self.cache.save_held(runner, &Held { job: job.into(), files }) {
+            tracing::debug!("could not remember the tree sent: {e:#}");
+        }
+    }
+
+    /// Learn from a job's result what its runner's workspace now holds: the
+    /// tree less the files the result says changed. A result that does not
+    /// say (refused, too many changes, no workspace) forgets it, so the
+    /// next tree goes whole.
+    pub fn tree_result(&self, o: &Outcome) {
+        let Some(runner) = o.runner.as_deref().filter(|_| o.signed) else { return };
+        let Some(mut held) = self.cache.load_held(runner).filter(|h| h.job == o.job) else { return };
+        match o.env.as_ref().and_then(|e| e.tree.as_ref()).and_then(|t| t.changed.as_ref()) {
+            Some(changed) => {
+                for p in changed {
+                    held.files.remove(p);
+                }
+                let _ = self.cache.save_held(runner, &held);
+            }
+            None => self.cache.forget_held(runner),
+        }
+    }
+
+    pub async fn runner(&mut self, which: &str) -> Result<Runner> {
         let matches: Vec<Runner> = self
             .runners()
             .await?
@@ -1459,6 +1525,7 @@ impl Session {
             r => r?,
         };
         if let Some(r) = self.result(job) {
+            self.tree_result(&r);
             return Ok(Some(r));
         }
         if self.closed.is_some() {
@@ -1475,6 +1542,7 @@ impl Session {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let _ = self.sync().await;
         if let Some(r) = self.result(job) {
+            self.tree_result(&r);
             return Ok(Some(r));
         }
         let reason = st["reason"].as_str().map(String::from);

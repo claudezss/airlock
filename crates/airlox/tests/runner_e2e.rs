@@ -164,15 +164,20 @@ fn seal(
 
 /// A tree zip as the CLI builds it: the files plus `.airlox/tree.json`.
 fn tree_zip(head: &str, files: &[(&str, &str, u32)]) -> Vec<u8> {
+    delta_zip(head, files, &[])
+}
+
+/// A delta tree: every file listed, those in `left_out` not in the zip.
+fn delta_zip(head: &str, files: &[(&str, &str, u32)], left_out: &[&str]) -> Vec<u8> {
     let list: Vec<_> = files
         .iter()
         .map(|(p, data, mode)| serde_json::json!({"path": p, "sha256": hex(&sha256(data.as_bytes())), "mode": mode}))
         .collect();
     let json = serde_json::json!({"root_name": "app", "head": head, "branch": "main", "dirty": true,
-        "files": list, "count": files.len(), "bytes": 0});
+        "files": list, "count": files.len(), "bytes": 0, "delta": !left_out.is_empty()});
     let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let opts = zip::write::SimpleFileOptions::default();
-    for (p, data, _) in files {
+    for (p, data, _) in files.iter().filter(|f| !left_out.contains(&f.0)) {
         w.start_file(*p, opts).unwrap();
         w.write_all(data.as_bytes()).unwrap();
     }
@@ -407,6 +412,65 @@ async fn a_full_workspace_refuses_the_next_job_until_fresh() {
     let r = rig.run(&rig.sender, Job { fresh: true, ..shell("ls | wc -l | tr -d ' '\n") }).await;
     assert_eq!((r.status, r.stdout.as_str()), (JobStatus::Completed, "0\n"), "{:?}", r.reason);
     assert_eq!(rig.run(&rig.sender, shell("echo again\n")).await.stdout, "again\n");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delta_tree_sends_only_what_changed_and_is_refused_when_the_workspace_differs() {
+    let Some(rig) = rig(&["--workspace"]).await else { return };
+    let v1 = [("a.txt", "one\n", 0o100644), ("b.txt", "two\n", 0o100644)];
+    let r = rig
+        .run(&rig.sender, Job { tree: Some(tree_zip("abc", &v1)), ..shell("echo edited > b.txt\n") })
+        .await;
+    assert_eq!(r.status, JobStatus::Completed, "{:?} {}", r.reason, r.stderr);
+    // The job changed b.txt, and the result says so.
+    assert_eq!(r.env.unwrap().tree.unwrap().changed, Some(vec!["b.txt".to_string()]));
+
+    // a.txt is left out (it is there as listed); c.txt is new.
+    let v2 = [("a.txt", "one\n", 0o100644), ("b.txt", "two\n", 0o100644), ("c.txt", "three\n", 0o100644)];
+    let r = rig
+        .run(
+            &rig.sender,
+            Job { tree: Some(delta_zip("abc", &v2, &["a.txt"])), ..shell("cat a.txt b.txt c.txt\n") },
+        )
+        .await;
+    assert_eq!(
+        (r.status, r.stdout.as_str()),
+        (JobStatus::Completed, "one\ntwo\nthree\n"),
+        "{:?} {}",
+        r.reason,
+        r.stderr
+    );
+    assert_eq!(r.env.unwrap().tree.unwrap().changed, Some(vec![]));
+
+    // A delta that leaves out a file the workspace does not hold is refused
+    // before anything runs, and a new sender has no workspace to rely on.
+    rig.run(&rig.sender, shell("rm c.txt\n")).await;
+    let r = rig
+        .run(
+            &rig.sender,
+            Job { tree: Some(delta_zip("abc", &v2, &["a.txt", "c.txt"])), ..shell("echo ran\n") },
+        )
+        .await;
+    assert_eq!((r.status, r.stdout.as_str()), (JobStatus::Refused, ""));
+    let why = r.reason.unwrap();
+    assert!(why.starts_with("tree_stale: ") && why.contains("c.txt"), "{why}");
+    assert!(r.env.is_none(), "a refused job reports no env");
+    let other = join(&rig.env, &rig.s, Role::Sender, "agent-2").await;
+    let r =
+        rig.run(&other, Job { tree: Some(delta_zip("abc", &v2, &["a.txt"])), ..shell("echo ran\n") }).await;
+    assert_eq!(r.status, JobStatus::Refused);
+    assert!(r.reason.unwrap().starts_with("tree_stale: "));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delta_tree_without_a_workspace_is_refused() {
+    let Some(rig) = rig(&[]).await else { return };
+    let files = [("a.txt", "one\n", 0o100644), ("b.txt", "two\n", 0o100644)];
+    let r = rig
+        .run(&rig.sender, Job { tree: Some(delta_zip("abc", &files, &["a.txt"])), ..shell("echo ran\n") })
+        .await;
+    assert_eq!(r.status, JobStatus::Refused);
+    assert!(r.reason.unwrap().starts_with("tree_stale: "));
 }
 
 #[tokio::test(flavor = "multi_thread")]

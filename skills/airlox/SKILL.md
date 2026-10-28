@@ -48,7 +48,8 @@ you, e.g. in a hosted agent) does the same: `airlox run --tree -- pytest`.
 - The job runs in the same directory relative to the repository root as
   you are. The runner keeps a workspace per sender, so installed
   dependencies and build output stay warm between runs; install them in the
-  job (`-- sh -c 'npm ci && npm test'`) and later runs reuse them. The words
+  job (`-- sh -c 'npm ci && npm test'`) and later runs reuse them. Later
+  runs also upload only the files that changed. The words
   after `--` are quoted for the runner's shell, so `&&`, pipes and
   redirections go inside `sh -c '…'` (or a script sent with `--shell`).
 - Output streams while the job runs; the signed result at the end is the

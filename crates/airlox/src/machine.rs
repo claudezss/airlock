@@ -327,8 +327,15 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
-/// The `runner join` line to run on the machine.
-fn join_line(a: &AddArgs, code: &str, relay: &str) -> String {
+/// The sandbox the printed command names.
+fn sandbox_of(a: &AddArgs) -> String {
+    a.sandbox.clone().unwrap_or_else(|| if a.image.is_some() { "docker" } else { "local" }.into())
+}
+
+/// The `runner join` line to run on the machine. `network`: the session
+/// lets jobs reach it; otherwise a process sandbox must be told to accept
+/// that it cannot stop them, or the runner refuses to start.
+fn join_line(a: &AddArgs, code: &str, relay: &str, network: bool) -> String {
     let mut line = format!("airlox runner join --code {code}");
     if relay != crate::runner::DEFAULT_RELAY {
         line.push_str(&format!(" --relay {}", shell_quote(relay)));
@@ -337,9 +344,11 @@ fn join_line(a: &AddArgs, code: &str, relay: &str) -> String {
     if !a.labels.is_empty() {
         line.push_str(&format!(" --labels {}", shell_quote(&a.labels.join(","))));
     }
-    let sandbox =
-        a.sandbox.clone().unwrap_or_else(|| if a.image.is_some() { "docker" } else { "local" }.into());
+    let sandbox = sandbox_of(a);
     line.push_str(&format!(" --sandbox {sandbox}"));
+    if sandbox == "process" && !network {
+        line.push_str(" --accept-network-gap");
+    }
     if let Some(img) = &a.image {
         line.push_str(&format!(" --image {}", shell_quote(img)));
     }
@@ -359,8 +368,8 @@ async fn add(a: AddArgs) -> Result<()> {
     let http = client::http()?;
     let invites = s.invites()?;
     let code = client::send_code(&http, &s.base_url, &invites["runner"]).await?;
-    let line = join_line(&a, &code.code, &s.base_url);
     let limits = s.manifest.job_limits.clone().context("execute session without job limits")?;
+    let line = join_line(&a, &code.code, &s.base_url, limits.network);
     if a.common.json {
         println!(
             "{}",
@@ -370,9 +379,17 @@ async fn add(a: AddArgs) -> Result<()> {
     } else {
         if created {
             eprintln!("Machine {} · {}", a.name, jobs_line(&limits));
-            if !limits.network {
+            if !limits.network && sandbox_of(&a) != "process" {
                 eprintln!("Jobs have no network; add the machine with --network if they need it.");
             }
+        }
+        if sandbox_of(&a) == "process" {
+            eprintln!(
+                "Warning: --sandbox process runs jobs as plain processes of the runner's user: they can read \
+                 that user's files and reach the network{}. Send it only code you trust, or use --sandbox \
+                 docker (or local, where it isolates).",
+                if limits.network { "" } else { ", whatever the session says" }
+            );
         }
         eprintln!("On {}, run (the code works once, for a few minutes):\n\n  {line}\n", a.name);
     }
@@ -783,15 +800,22 @@ mod tests {
             common: Common { cache_dir: None, display_name: "owner".into(), json: false },
         };
         assert_eq!(
-            join_line(&a, "7-guitar-orbit", "https://airlox.app"),
+            join_line(&a, "7-guitar-orbit", "https://airlox.app", false),
             "airlox runner join --code 7-guitar-orbit --name gpu-box --labels gpu,cuda12 --sandbox docker \
              --image ghcr.io/me/ci:latest --workspace"
         );
         let local = AddArgs { image: None, labels: vec![], ..a };
         assert_eq!(
-            join_line(&local, "7-a-b", "http://127.0.0.1:8080"),
+            join_line(&local, "7-a-b", "http://127.0.0.1:8080", false),
             "airlox runner join --code 7-a-b --relay http://127.0.0.1:8080 --name gpu-box --sandbox local --workspace"
         );
+        // A process sandbox cannot keep jobs off the network: the command
+        // says it accepts that, or the runner would not start.
+        let process = AddArgs { sandbox: Some("process".into()), ..local };
+        assert!(join_line(&process, "7-a-b", "https://airlox.app", false)
+            .ends_with("--sandbox process --accept-network-gap --workspace"));
+        assert!(join_line(&process, "7-a-b", "https://airlox.app", true)
+            .ends_with("--sandbox process --workspace"));
     }
 
     #[test]

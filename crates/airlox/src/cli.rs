@@ -970,28 +970,48 @@ pub async fn run(a: RunArgs) -> Result<i32> {
         None
     };
     let mut s = a.conn.join().await?;
-    if let Some(t) = &tree {
-        // The payload adds a few hundred bytes of meta to the file.
-        let max = s.manifest.max_item_bytes.saturating_sub(4096);
-        if t.zip.len() as u64 > max {
-            let largest: Vec<String> =
-                t.largest.iter().map(|(p, n)| format!("{} ({})", clean_line(p), human_bytes(*n))).collect();
-            bail!(
-                "the tree zips to {}, over the session's item limit of {}. Largest files: {}. Leave some out \
-                 with --tree-exclude <glob> or a line in .airloxignore",
-                human_bytes(t.zip.len() as u64),
-                human_bytes(max),
-                largest.join(", ")
-            );
-        }
+    let mut labels = a.label.clone();
+    if let Some(l) = a.conn.on_label() {
+        labels.push(l.to_string());
     }
+    let target = match (&a.runner, labels.is_empty()) {
+        (Some(r), _) => Target::Runner(r.clone()),
+        (None, false) => Target::Labels(labels),
+        (None, true) => Target::Any,
+    };
+    // The tree goes whole, or as a delta against what this client last left
+    // in its workspace on the runner.
+    let sending = match &tree {
+        Some(t) => {
+            let (zip, delta) = t.zip_for(&mut s, &target, a.fresh).await?;
+            // The payload adds a few hundred bytes of meta to the file.
+            let max = s.manifest.max_item_bytes.saturating_sub(4096);
+            if zip.len() as u64 > max {
+                let largest: Vec<String> = t
+                    .largest
+                    .iter()
+                    .map(|(p, n)| format!("{} ({})", clean_line(p), human_bytes(*n)))
+                    .collect();
+                bail!(
+                    "the tree zips to {}, over the session's item limit of {}. Largest files: {}. Leave some out \
+                     with --tree-exclude <glob> or a line in .airloxignore",
+                    human_bytes(zip.len() as u64),
+                    human_bytes(max),
+                    largest.join(", ")
+                );
+            }
+            Some((zip, delta))
+        }
+        None => None,
+    };
     let target_name = a.conn.on.as_deref().map(|on| crate::machine::split_on(on).0.to_string());
     let what = match kind {
         JobKind::Python => filename.clone(),
         JobKind::Shell if a.shell.is_none() => clean_line(code.trim_end()),
         JobKind::Shell => format!("sh {filename}"),
     };
-    let summary = |runner: Option<&str>, job: &str| {
+    // `delta`: the files and bytes a delta tree sent.
+    let summary = |runner: Option<&str>, job: &str, delta: Option<(usize, u64)>| {
         let mut parts = vec![];
         if let Some(r) = runner.or(target_name.as_deref()) {
             parts.push(clean_line(r));
@@ -1000,6 +1020,9 @@ pub async fn run(a: RunArgs) -> Result<i32> {
         parts.push(what.clone());
         if let Some(t) = &tree {
             parts.push(t.summary());
+        }
+        if let (Some(t), Some((n, bytes))) = (&tree, delta) {
+            parts.push(format!("sent {n} of {} files, {}", t.json.count, human_bytes(bytes)));
         }
         parts.join(" · ")
     };
@@ -1018,33 +1041,20 @@ pub async fn run(a: RunArgs) -> Result<i32> {
             eprintln!("{}", clean_text(&code).trim_end());
         }
     }
-    let mut files = Vec::new();
-    let tree_ref = match &tree {
-        Some(t) => {
-            let r = s.send_file_reply(t.zip.clone(), tree::TREE_ZIP, None).await?;
-            files.push(r.clone());
-            Some(r)
-        }
+    let tree_ref = match &sending {
+        Some((zip, _)) => Some(s.send_file_reply(zip.clone(), tree::TREE_ZIP, None).await?),
         None => None,
     };
+    let mut inputs = Vec::new();
     for p in &a.inputs {
-        files.push(send_path(&mut s, p, None).await?);
+        inputs.push(send_path(&mut s, p, None).await?);
     }
-    let mut labels = a.label.clone();
-    if let Some(l) = a.conn.on_label() {
-        labels.push(l.to_string());
-    }
-    let target = match (&a.runner, labels.is_empty()) {
-        (Some(r), _) => Target::Runner(r.clone()),
-        (None, false) => Target::Labels(labels),
-        (None, true) => Target::Any,
-    };
-    let spec = JobSpec {
+    let spec = |tree_ref: Option<Value>| JobSpec {
         kind,
-        code,
+        code: code.clone(),
         filename: filename.clone(),
-        files,
-        target,
+        files: tree_ref.iter().cloned().chain(inputs.iter().cloned()).collect(),
+        target: target.clone(),
         timeout_s: a.timeout.map(|t| t.as_secs().max(1) as u32),
         memory_mb: a.memory,
         requirements: a.requirements.clone(),
@@ -1053,7 +1063,7 @@ pub async fn run(a: RunArgs) -> Result<i32> {
         tree: tree_ref,
         fresh: a.fresh,
     };
-    let (job, runner) = match s.run_job(spec).await {
+    let (job, runner) = match s.run_job(spec(tree_ref)).await {
         Ok(j) => j,
         Err(e) => {
             if let Some(n) = e.downcast_ref::<NoRunnerAvailable>() {
@@ -1067,6 +1077,11 @@ pub async fn run(a: RunArgs) -> Result<i32> {
             return Err(e);
         }
     };
+    if let (Some(t), Some(r)) = (&tree, &runner) {
+        if s.limits().is_ok_and(|l| l.workspace) {
+            s.sent_tree(r, &job, t.listing());
+        }
+    }
     let runner_name = runner.as_deref().and_then(|k| s.participant_name(k));
     if a.no_wait {
         if json_out {
@@ -1080,7 +1095,11 @@ pub async fn run(a: RunArgs) -> Result<i32> {
         return Ok(0);
     }
     if !json_out {
-        eprintln!("{}", summary(runner_name.as_deref(), &job));
+        let delta = match &sending {
+            Some((zip, Some(n))) => Some((*n, zip.len() as u64)),
+            _ => None,
+        };
+        eprintln!("{}", summary(runner_name.as_deref(), &job, delta));
     }
     let mode = if a.stream_json {
         Stream::Json
@@ -1089,7 +1108,33 @@ pub async fn run(a: RunArgs) -> Result<i32> {
     } else {
         Stream::Text
     };
-    finish(&mut s, &job, a.wait, a.out_dir.as_deref(), a.conn.json || a.stream_json, mode).await
+    let mut job = job;
+    let mut waited = wait_outcome(&mut s, &job, a.wait, mode).await?;
+    // The workspace was not as this client left it (another client of the
+    // same identity, a job that changed files, a runner that lost it): send
+    // the whole tree once.
+    let stale = |w: &(Option<Outcome>, Shown)| {
+        w.0.as_ref().and_then(|r| r.reason.as_deref()).is_some_and(|r| r.starts_with("tree_stale"))
+    };
+    if let (Some(t), Some((_, Some(_)))) = (&tree, &sending) {
+        if stale(&waited) {
+            if !json_out {
+                eprintln!("the runner's workspace is not as this client left it; sending the whole tree");
+            }
+            let r = s.send_file_reply(t.zip.clone(), tree::TREE_ZIP, None).await?;
+            let (again, runner) = s.run_job(spec(Some(r))).await?;
+            if let Some(runner) = &runner {
+                s.sent_tree(runner, &again, t.listing());
+            }
+            if !json_out {
+                let name = runner.as_deref().and_then(|k| s.participant_name(k));
+                eprintln!("{}", summary(name.as_deref(), &again, None));
+            }
+            job = again;
+            waited = wait_outcome(&mut s, &job, a.wait, mode).await?;
+        }
+    }
+    report(&job, waited, a.out_dir.as_deref(), a.conn.json || a.stream_json)
 }
 
 /// The flags that name the session again in a printed command: `--on`, or
@@ -1131,7 +1176,8 @@ pub struct ResultArgs {
 pub async fn result(a: ResultArgs) -> Result<i32> {
     let mut s = a.conn.join().await?;
     let mode = if a.conn.json { Stream::Off } else { Stream::Text };
-    finish(&mut s, &a.job, a.wait, a.out_dir.as_deref(), a.conn.json, mode).await
+    let waited = wait_outcome(&mut s, &a.job, a.wait, mode).await?;
+    report(&a.job, waited, a.out_dir.as_deref(), a.conn.json)
 }
 
 /// What a wait has already printed of each stream, contiguous from the start.
@@ -1170,16 +1216,24 @@ impl Shown {
     }
 }
 
-async fn finish(
+/// Wait for a job's outcome, showing its output as it streams.
+async fn wait_outcome(
     s: &mut Session,
     job: &str,
     wait: Duration,
-    out_dir: Option<&Path>,
-    json_out: bool,
     mode: Stream,
-) -> Result<i32> {
+) -> Result<(Option<Outcome>, Shown)> {
     let mut shown = Shown::default();
     let waited = s.wait_streaming(job, Some(wait), |c| shown.show(c, mode)).await?;
+    Ok((waited, shown))
+}
+
+fn report(
+    job: &str,
+    (waited, shown): (Option<Outcome>, Shown),
+    out_dir: Option<&Path>,
+    json_out: bool,
+) -> Result<i32> {
     let Some(r) = waited else {
         if json_out {
             print_json(&json!({"job": job, "status": "running"}));
@@ -2759,6 +2813,7 @@ mod tests {
                 dirty: true,
                 count: 412,
                 sha256: "c".repeat(64),
+                changed: None,
             }),
             ..env
         };

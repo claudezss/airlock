@@ -8,9 +8,13 @@
 //!  "count": 1, "bytes": 123}
 //! ```
 //!
-//! The runner reads `head`, `dirty`, `files` (path, sha256, mode) and `count`;
-//! the rest is for people. `files` lists every file the tree consists of,
-//! each of which must be in the zip: that list is what a workspace syncs to.
+//! The runner reads `head`, `dirty`, `files` (path, sha256, mode), `count`
+//! and `delta`; the rest is for people. `files` lists every file the tree
+//! consists of: that list is what a workspace syncs to. Each must be in the
+//! zip, unless the tree says `"delta": true`: then the zip holds only what
+//! the sender believes differs from the sender's workspace here, and the
+//! rest must already be there, byte for byte, or the job is refused
+//! (`tree_stale`) and the sender sends the whole tree.
 
 use std::collections::HashSet;
 use std::io::{Cursor, Read};
@@ -47,11 +51,15 @@ struct TreeJson {
     dirty: bool,
     files: Vec<TreeFile>,
     count: u64,
+    #[serde(default)]
+    delta: bool,
 }
 
 #[derive(Debug)]
 pub struct Tree {
     pub files: Vec<TreeFile>,
+    /// The zip leaves out files the workspace should already hold.
+    pub delta: bool,
     /// What a result's `env` says about the tree.
     pub info: TreeInfo,
 }
@@ -95,7 +103,7 @@ impl Tree {
             if !is_hex(&f.sha256, 64) {
                 bail!("{TREE_JSON}: the sha256 of {:?} is not 64 lowercase hex digits", f.path);
             }
-            if !in_zip.contains(f.path.as_str()) {
+            if !json.delta && !in_zip.contains(f.path.as_str()) {
                 bail!("{TREE_JSON} lists {:?}, which is not in the zip", f.path);
             }
             if !seen.insert(f.path.as_str()) {
@@ -108,8 +116,10 @@ impl Tree {
                 dirty: json.dirty,
                 count: json.count,
                 sha256: hex(&sha256(zip)),
+                changed: None,
             },
             files: json.files,
+            delta: json.delta,
         })
     }
 }
@@ -122,6 +132,12 @@ pub(crate) mod tests {
     /// A tree zip as the CLI would build it: `files` (path, content, mode)
     /// plus `.airlox/tree.json`.
     pub fn build(head: Option<&str>, files: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        build_delta(head, files, &[])
+    }
+
+    /// A delta tree: `files` are listed, but those named in `left_out` are
+    /// not in the zip.
+    pub fn build_delta(head: Option<&str>, files: &[(&str, &[u8], u32)], left_out: &[&str]) -> Vec<u8> {
         let list: Vec<_> = files
             .iter()
             .map(|(p, data, mode)| serde_json::json!({"path": p, "sha256": hex(&sha256(data)), "mode": mode}))
@@ -130,9 +146,13 @@ pub(crate) mod tests {
             "root_name": "app", "head": head, "branch": "main", "dirty": true,
             "files": list, "count": files.len(), "bytes": files.iter().map(|f| f.1.len()).sum::<usize>(),
         });
+        let mut json = json;
+        if !left_out.is_empty() {
+            json["delta"] = true.into();
+        }
         let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
         let opts = zip::write::SimpleFileOptions::default();
-        for (p, data, _) in files {
+        for (p, data, _) in files.iter().filter(|f| !left_out.contains(&f.0)) {
             w.start_file(*p, opts).unwrap();
             w.write_all(data).unwrap();
         }
@@ -156,6 +176,15 @@ pub(crate) mod tests {
         // Outside a repository there is no commit.
         let z = build(None, &[("a", b"x", 0o100644)]);
         assert_eq!(Tree::load(&z, &ZipLimits::default()).unwrap().info.head, None);
+    }
+
+    #[test]
+    fn a_delta_tree_may_leave_listed_files_out() {
+        let files = [("a", &b"x"[..], 0o100644), ("b", &b"y"[..], 0o100644)];
+        let t = Tree::load(&build_delta(None, &files, &["a"]), &ZipLimits::default()).unwrap();
+        assert!(t.delta);
+        assert_eq!(t.info.count, 2);
+        assert!(!Tree::load(&build(None, &files), &ZipLimits::default()).unwrap().delta);
     }
 
     #[test]

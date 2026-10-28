@@ -1,7 +1,6 @@
 # Machines: a job slot on your own hardware, for any agent
 
-Status: implemented (M-A to M-D) in 0.2; M-E (delta trees, beyond `job ls`)
-remains. Where the implementation differs: a sender invite cannot be rotated
+Status: implemented (M-A to M-E) in 0.2. Where the implementation differs: a sender invite cannot be rotated
 in place, because revoking a role is permanent and its invite is derived from
 the owner seed, so there is no `machine invite --rotate` (`machine rm` and
 `machine add` start over); and runners declare their `kinds` and shell in their
@@ -288,10 +287,20 @@ from each other by directory and, in the sandbox, by the bind; the runner
 operator's own files are as far from a workspace as they are from a temp
 dir today.
 
-Delta upload (sending only changed files) is a later milestone (§13): the
-runner would post a signed `workspace` event with the `sha256` list it holds,
-and the CLI would send only what differs. Full trees first; they are small
-for most repositories once ignored paths are out.
+Delta upload (sending only changed files) shipped as M-E, a little
+differently from first proposed. Instead of a separate signed `workspace`
+event listing every `sha256` the runner holds (one more item per job, as
+long as the tree's file list), the result the runner signs anyway carries
+`env.tree.changed`: the tree's files the job left different. The client
+remembers the tree it last sent to that runner, drops what the result says
+changed, and sends a zip of only the files that differ, with the full list
+in `tree.json` and `"delta": true`. The runner checks every file it is told
+to keep before writing anything, and refuses the job with `tree_stale` when
+one is not as listed (another client of the same identity, a lost
+workspace, a guess at the wrong runner); the client then sends the whole
+tree once. The client's memory is only a hint: correctness rests on the
+runner's check. Deltas go to a runner the job names, or to the only
+approved runner that matches (a machine's), never with `--fresh`.
 
 ## 8. Machines
 
@@ -411,7 +420,7 @@ working for what 0.1.x could do, and a 0.2 runner accepts 0.1.x jobs.
 | M-B | streamed chunks in `progress`, `run`/`result` printing, relay retention rules, web UI append | runner + relay + two clients |
 | M-C | `--tree` with checks, `cwd`, `env.tree`; workspaces with sync, limits, `--fresh` | CLI + runner; no protocol change beyond fields in M-A |
 | M-D | `machine add/ls/invite/approve/rm`, `--on`, drop-claim `participant_pub`, `runner serve`, `install-service`; README and skill rewritten around it | CLI + relay (small) + docs |
-| M-E | delta trees via signed `workspace` events; `job ls` | later, driven by use |
+| M-E | delta trees (via `env.tree.changed` in results, §7); `job ls` | done |
 
 M-A through M-D are each one to two weeks for one person familiar with the
 code. M-D is the one users see first and should not wait for M-E.

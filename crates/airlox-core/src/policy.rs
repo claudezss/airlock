@@ -495,6 +495,20 @@ pub fn check_env(env: &JobEnv) -> Result<()> {
         if !is_hex64(&t.sha256) {
             return Err(Error::policy("env tree sha256 must be 64 lowercase hex characters"));
         }
+        if let Some(changed) = &t.changed {
+            if changed.len() > crate::payload::MAX_TREE_CHANGED {
+                return Err(Error::policy("env tree changed lists too many paths"));
+            }
+            let limits = crate::validate::zip::ZipLimits::default();
+            let mut seen = std::collections::HashSet::new();
+            for p in changed {
+                crate::validate::zip::check_entry_path(p, &limits)
+                    .map_err(|_| Error::policy("env tree changed holds a bad path"))?;
+                if p.ends_with('/') || !seen.insert(p.as_str()) {
+                    return Err(Error::policy("env tree changed holds a bad path"));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -911,9 +925,18 @@ mod tests {
                 dirty: true,
                 count: 412,
                 sha256: "c".repeat(64),
+                changed: Some(vec!["src/a.py".into()]),
             }),
         });
         check_result(&r).unwrap();
+        for bad_path in ["../x", "a/", "/abs"] {
+            let mut bad = r.clone();
+            bad.env.as_mut().unwrap().tree.as_mut().unwrap().changed = Some(vec![bad_path.into()]);
+            assert!(check_result(&bad).is_err(), "{bad_path}");
+        }
+        let mut bad = r.clone();
+        bad.env.as_mut().unwrap().tree.as_mut().unwrap().changed = Some(vec!["a".into(), "a".into()]);
+        assert!(check_result(&bad).is_err());
         let mut bad = r.clone();
         bad.env.as_mut().unwrap().tree.as_mut().unwrap().head = Some("not hex".into());
         assert!(check_result(&bad).is_err());

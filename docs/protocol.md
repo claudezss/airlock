@@ -377,7 +377,21 @@ hex of each file; `mode` `0o100644` or `0o100755`). A runner without a
 workspace unpacks it like any zip; one with a workspace syncs it (§8). A
 result's `env.tree` is `{head, dirty, count, sha256}`, copied from
 `tree.json` with `sha256` the hex SHA-256 of `tree.zip`, so an observer sees
-which tree each result ran against without opening the job.
+which tree each result ran against without opening the job. A job that ran
+in a workspace adds `changed`: the tree's paths that were no longer as
+listed when it finished (edited or removed by the job or by its other
+inputs), at most 256, each under the rules of §9; it is absent when there is
+no workspace or more changed.
+
+**Delta trees.** `tree.json` may say `"delta": true` (absent otherwise).
+`files` still lists every file of the tree, but the zip holds only some of
+them: those the sender believes differ from its workspace on the runner,
+which it knows from the tree its last job there sent less that job's
+`env.tree.changed`. A runner with a workspace checks, before writing
+anything, that each listed file missing from the zip is on disk with its
+`sha256`; if any is not, or the runner keeps no workspace for the job, the
+job is refused with a reason starting `tree_stale:` and nothing runs. A
+client that sees `tree_stale` for a delta sends the whole tree, once.
 
 A result's `env` says where the job ran, as its runner measured it once for
 the runtime (not per job), so a sender can check it without trusting the
@@ -526,7 +540,7 @@ job that ends within a second may stream nothing; its result has the output.
 the runner, a runner keeps one work directory per session and sender
 participant key (`<cache-dir>/workspaces/<session_id>/<hex key>/work`) instead
 of a fresh one per job; `/out` and the meta directory stay fresh. A job's
-tree is synced into it, not unpacked: files whose `sha256` in `tree.json`
+tree is synced into it, not unpacked (a delta tree as in §7): files whose `sha256` in `tree.json`
 matches what is on disk are left alone, others are written (with the exec
 bit from `mode`), paths the previous tree placed but this one lacks are
 deleted, and nothing else is touched, so ignored directories such as

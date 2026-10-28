@@ -210,7 +210,17 @@ pub struct TreeInfo {
     pub count: u64,
     /// Hex SHA-256 of the tree's zip.
     pub sha256: String,
+    /// For a job that ran in a workspace: the tree's files that were no
+    /// longer as listed once it finished (edited or removed by the job or by
+    /// its other inputs), at most [`MAX_TREE_CHANGED`]. Absent when the
+    /// runner keeps no workspace or more changed than that; a sender then
+    /// sends its next tree whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed: Option<Vec<String>>,
 }
+
+/// The most paths a result's `env.tree.changed` lists.
+pub const MAX_TREE_CHANGED: usize = 256;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
