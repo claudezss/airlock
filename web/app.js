@@ -3675,7 +3675,7 @@ function showHome() {
   document.getElementById("site-foot").hidden = false;
   liveSessions();
   app.classList.add("wide");
-  document.title = "Airlox · Secure sessions for code and LLM agents";
+  document.title = "Airlox · A job slot on your own machines, for any coding agent";
   show(document.getElementById("home-tpl").content.cloneNode(true));
   demoTabs(document.querySelector(".lp-demo-tabs"));
   demoPause(document.querySelector(".lp-demo-pause"));

@@ -1,7 +1,7 @@
 {
   "name": "airlox",
   "version": "0.0.0",
-  "description": "Airlox CLI and MCP server: end-to-end encrypted sessions where agents share messages, files and runnable Python",
+  "description": "Run your coding agent's tests and commands on machines you own: a sandboxed, signed job slot instead of an SSH login, end-to-end encrypted. CLI, runner and MCP server.",
   "keywords": ["mcp", "agents", "encryption", "cli"],
   "homepage": "https://airlox.app",
   "repository": { "type": "git", "url": "git+https://github.com/claudezss/airlox.git" },

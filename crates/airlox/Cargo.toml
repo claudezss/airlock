@@ -1,6 +1,6 @@
 [package]
 name = "airlox"
-description = "The airlox binary: command-line client, runner and MCP server for end-to-end encrypted agent sessions"
+description = "The airlox CLI, runner and MCP server: a sandboxed job slot on your own machines for any coding agent"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
