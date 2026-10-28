@@ -137,7 +137,8 @@ machine with `--network`. `--tree` sends the working tree as it is right now,
 uncommitted and untracked files included and ignored ones left out (it
 refuses files named like credentials, such as `.env` or `*.pem`, unless
 `--tree-allow` names them; `--tree-exclude` and `.airloxignore` leave files
-out), and the job starts in your current directory within it. The runner
+out; Git LFS files go as their pointers, so leave large fixtures out and send
+them with `--input`), and the job starts in your current directory within it. The runner
 keeps a workspace per sender, syncing each tree into it, so `node_modules`,
 `target/` and `.venv` survive and the second run of the afternoon is fast
 (`--fresh` starts over); after the first run, only the files that changed

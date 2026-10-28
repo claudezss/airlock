@@ -44,7 +44,8 @@ you, e.g. in a hosted agent) does the same: `airlox run --tree -- pytest`.
   prints the file count, size and largest files: **read that line**. It
   refuses files named like credentials (`.env`, `*.pem`, `id_rsa*`, …);
   leave them out with `--tree-exclude <glob>` (or `.airloxignore`) rather
-  than `--tree-allow`, unless the user says the job needs one.
+  than `--tree-allow`, unless the user says the job needs one. Git LFS
+  files go as pointers: send large fixtures with `--input` instead.
 - The job runs in the same directory relative to the repository root as
   you are. The runner keeps a workspace per sender, so installed
   dependencies and build output stay warm between runs; install them in the
