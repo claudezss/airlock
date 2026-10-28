@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use airlox_core::api;
-use airlox_core::session::{JobLimits, Manifest, Mode, Role, SessionParams, SignedManifest};
+use airlox_core::session::{JobKind, JobLimits, Manifest, Mode, Role, SessionParams, SignedManifest};
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -443,6 +443,8 @@ pub enum Target {
 }
 
 pub struct JobSpec {
+    /// `python`, or `shell` for a script run by the runner's shell.
+    pub kind: JobKind,
     pub code: String,
     pub filename: String,
     /// Item references from `send_file`.
@@ -453,6 +455,32 @@ pub struct JobSpec {
     pub requirements: Vec<String>,
     /// A file in the work dir whose tail the runner reports while the job runs.
     pub progress_file: Option<String>,
+    /// Where in the work dir the job starts (relative); `None` for the work dir.
+    pub cwd: Option<String>,
+    /// The reference (one of `files`) of the working tree sent with the job.
+    pub tree: Option<Value>,
+    /// Empty the sender's workspace on the runner before the job runs.
+    pub fresh: bool,
+}
+
+/// A piece of a running job's output, as its runner streamed it. Display
+/// only: the signed result's stdout and stderr are the authority.
+#[derive(Clone, Debug, Serialize)]
+pub struct Chunk {
+    /// `stdout` or `stderr`.
+    pub stream: String,
+    pub offset: u64,
+    pub data: String,
+    /// The runner stopped streaming after this chunk; the result has the rest.
+    pub truncated: bool,
+}
+
+/// Where a job's streamed output has been read up to, per stream.
+#[derive(Clone, Debug, Default)]
+pub struct ChunkCursor {
+    next: HashMap<String, u64>,
+    /// Items already looked at, so each poll only reads new ones.
+    seen: HashSet<String>,
 }
 
 /// No approved, online, idle runner matched; jobs are never queued.
@@ -604,6 +632,52 @@ impl Outcome {
     pub fn runner_lost(&self) -> bool {
         !self.signed && self.reason.as_deref() == Some("runner_lost")
     }
+}
+
+/// [`Session::chunks`], over a list of items.
+fn chunks_in(items: &[Item], job: &str, cursor: &mut ChunkCursor) -> Vec<Chunk> {
+    let mut fresh: Vec<Chunk> = Vec::new();
+    for item in items {
+        if item.kind != "progress" || item.status != Status::Ok || cursor.seen.contains(&item.id) {
+            continue;
+        }
+        let Some(m) = item.meta.as_ref() else { continue };
+        if m["job"]["id"] != job || item.author_role.as_deref() != Some("runner") {
+            continue;
+        }
+        cursor.seen.insert(item.id.clone());
+        let (Some(stream), Some(offset), Some(data)) =
+            (m["stream"].as_str(), m["offset"].as_u64(), m["data"].as_str())
+        else {
+            continue;
+        };
+        fresh.push(Chunk {
+            stream: stream.into(),
+            offset,
+            data: data.into(),
+            truncated: m["truncated"].as_bool().unwrap_or(false),
+        });
+    }
+    fresh.sort_by_key(|c| c.offset);
+    let mut out = Vec::new();
+    for mut c in fresh {
+        let next = cursor.next.entry(c.stream.clone()).or_insert(0);
+        let end = c.offset + c.data.len() as u64;
+        if end <= *next && !c.truncated {
+            continue;
+        }
+        if c.offset < *next {
+            let mut skip = (*next - c.offset) as usize;
+            while skip < c.data.len() && !c.data.is_char_boundary(skip) {
+                skip += 1;
+            }
+            c.data.drain(..skip.min(c.data.len()));
+            c.offset = *next;
+        }
+        *next = (*next).max(end);
+        out.push(c);
+    }
+    out
 }
 
 // -------------------------------------------------------------- session --
@@ -1152,10 +1226,19 @@ impl Session {
         Ok(r)
     }
 
-    /// Submit Python to a runner. Returns the job's item id and the runner
+    /// Submit a job to a runner. Returns the job's item id and the runner
     /// the relay assigned, or `NoRunnerAvailable` at once if none matched.
-    pub async fn run_python(&mut self, spec: JobSpec) -> Result<(String, Option<String>)> {
+    pub async fn run_job(&mut self, spec: JobSpec) -> Result<(String, Option<String>)> {
         let limits = self.limits()?.clone();
+        if !limits.allows_kind(spec.kind) {
+            let kinds: Vec<&str> = limits.kinds().iter().map(|k| k.as_str()).collect();
+            bail!(
+                "this session does not allow {} jobs (it allows {}); the owner sets job kinds when creating it \
+                 (--kinds, or --profile host-runner)",
+                spec.kind.as_str(),
+                kinds.join(", ")
+            );
+        }
         let target = match &spec.target {
             Target::Runner(which) => {
                 let r = self.runner(which).await?;
@@ -1185,11 +1268,25 @@ impl Session {
             "requirements": spec.requirements,
             "target": target,
         });
-        // Absent rather than null: the canonical form leaves it out.
+        // Absent rather than null or false: the canonical form leaves them
+        // out, so a plain Python job is what older runners accept.
         if let Some(p) = &spec.progress_file {
             meta["progress_file"] = json!(p);
         }
-        let (id, _, _, frame) = self.seal("job", Some("py"), &meta, b"", vec![])?;
+        if spec.kind != JobKind::Python {
+            meta["kind"] = json!(spec.kind.as_str());
+        }
+        if let Some(c) = &spec.cwd {
+            meta["cwd"] = json!(c);
+        }
+        if let Some(t) = &spec.tree {
+            meta["tree"] = t.clone();
+        }
+        if spec.fresh {
+            meta["fresh"] = json!(true);
+        }
+        let subkind = spec.kind.subkind().as_str();
+        let (id, _, _, frame) = self.seal("job", Some(subkind), &meta, b"", vec![])?;
         match self.relay.post_raw("/jobs", frame, &[("Airlox-Target", target.to_string())]).await {
             Ok(resp) => {
                 let v: Value = client::read_capped(resp, 64 << 10)
@@ -1310,16 +1407,35 @@ impl Session {
         None
     }
 
-    /// Wait for a job's outcome. A job that failed on the relay (no runner,
-    /// runner lost, cancelled before it started) gives an unsigned outcome
-    /// with the relay's reason. `None` if `timeout` passes first. A
-    /// `runner_lost` outcome ([`Outcome::runner_lost`]) is not final: a
-    /// late signed result still completes the job.
-    pub async fn wait(&mut self, job: &str, timeout: Option<Duration>) -> Result<Option<Outcome>> {
+    /// The output chunks of `job` that arrived since `cursor` last looked,
+    /// in stream order. A chunk that overlaps what was already shown is cut
+    /// to its new part; one after a gap (a chunk the relay dropped before
+    /// this client fetched it) is shown anyway.
+    pub fn chunks(&self, job: &str, cursor: &mut ChunkCursor) -> Vec<Chunk> {
+        chunks_in(&self.items, job, cursor)
+    }
+
+    /// Wait for a job's outcome, calling `each` with the output chunks that
+    /// arrive meanwhile (see [`Session::chunks`]). A job that failed on the
+    /// relay (no runner, runner lost, cancelled before it started) gives an
+    /// unsigned outcome with the relay's reason. `None` if `timeout` passes
+    /// first. A `runner_lost` outcome ([`Outcome::runner_lost`]) is not
+    /// final: a late signed result still completes the job.
+    pub async fn wait_streaming(
+        &mut self,
+        job: &str,
+        timeout: Option<Duration>,
+        mut each: impl FnMut(&Chunk),
+    ) -> Result<Option<Outcome>> {
         let deadline = timeout.map(|t| Instant::now() + t);
+        let mut cursor = ChunkCursor::default();
         loop {
-            if let Some(r) = self.poll_job(job).await? {
-                return Ok(Some(r));
+            let polled = self.poll_job(job).await?;
+            for c in self.chunks(job, &mut cursor) {
+                each(&c);
+            }
+            if polled.is_some() {
+                return Ok(polled);
             }
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 return Ok(None);
@@ -1977,6 +2093,41 @@ mod tests {
             status: Status::Ok,
             error: None,
         }
+    }
+
+    fn chunk(seq: u64, job: &str, stream: &str, offset: u64, data: &str) -> Item {
+        let mut i = item(seq, "runner", None, None);
+        i.kind = "progress".into();
+        i.author_role = Some("runner".into());
+        i.meta = Some(json!({"job": {"id": job}, "elapsed_ms": 1, "tail": null, "tail_truncated": false,
+            "stream": stream, "offset": offset, "data": data}));
+        i
+    }
+
+    #[test]
+    fn chunks_come_once_in_stream_order_whatever_order_they_arrive_in() {
+        let mut items = vec![chunk(2, "j", "stdout", 6, "world\n"), chunk(1, "j", "stdout", 0, "hello ")];
+        items.push(chunk(3, "other", "stdout", 0, "not this job"));
+        let mut beat = item(4, "runner", None, None);
+        beat.kind = "progress".into();
+        beat.author_role = Some("runner".into());
+        beat.meta = Some(json!({"job": {"id": "j"}, "elapsed_ms": 1, "tail": "x", "tail_truncated": false}));
+        items.push(beat);
+        let mut c = ChunkCursor::default();
+        let got: Vec<_> = chunks_in(&items, "j", &mut c).into_iter().map(|c| c.data).collect();
+        assert_eq!(got, ["hello ", "world\n"]);
+        assert!(chunks_in(&items, "j", &mut c).is_empty(), "nothing new");
+        // A late chunk overlapping what was shown is cut to its new part;
+        // stderr counts on its own.
+        items.push(chunk(5, "j", "stdout", 9, "ld\nmore"));
+        items.push(chunk(6, "j", "stderr", 0, "warn"));
+        let got: Vec<_> = chunks_in(&items, "j", &mut c).into_iter().map(|c| (c.stream, c.data)).collect();
+        assert_eq!(got, [("stderr".to_string(), "warn".to_string()), ("stdout".into(), "more".into())]);
+        // Not from a runner: ignored.
+        let mut forged = chunk(7, "j", "stdout", 16, "forged");
+        forged.author_role = Some("sender".into());
+        items.push(forged);
+        assert!(chunks_in(&items, "j", &mut c).is_empty());
     }
 
     fn hops_of(items: &[Item], seq: u64) -> usize {

@@ -13,9 +13,9 @@ use crate::cert::{is_runner_token, SignedRoleCert};
 use crate::item::{ItemHeader, ItemKind, ItemRef};
 use crate::keys::PublicKey;
 use crate::payload::{
-    Event, JobEnv, JobKind, JobProgress, JobResult, JobSpec, JobStatus, Meta, Payload, Target, MAX_CHUNK_BYTES,
-    MAX_ENV_PACKAGES, MAX_OUT_FILES, MAX_PROGRESS_TAIL_BYTES, MAX_REASON_CHARS, MAX_RECIPIENTS,
-    MAX_SHELL_CODE_BYTES, MAX_STDIO_BYTES,
+    Event, JobEnv, JobKind, JobProgress, JobResult, JobSpec, JobStatus, Meta, Payload, Target,
+    MAX_CHUNK_BYTES, MAX_ENV_PACKAGES, MAX_OUT_FILES, MAX_PROGRESS_TAIL_BYTES, MAX_REASON_CHARS,
+    MAX_RECIPIENTS, MAX_SHELL_CODE_BYTES, MAX_STDIO_BYTES,
 };
 use crate::pep440::SpecifierSet;
 use crate::session::{ContentType, Manifest, Mode, Role};
@@ -391,7 +391,9 @@ pub fn check_job(m: &Manifest, job: &JobSpec) -> Result<()> {
                 return Err(Error::policy("a shell job's script exceeds 64 KiB"));
             }
             if !job.requirements.is_empty() {
-                return Err(Error::policy("requirements are for python jobs; a shell job uses the sandbox's tools"));
+                return Err(Error::policy(
+                    "requirements are for python jobs; a shell job uses the sandbox's tools",
+                ));
             }
         }
     }
@@ -825,7 +827,10 @@ mod tests {
             ..Default::default()
         });
         let json = String::from_utf8(canonical_json(&m).unwrap()).unwrap();
-        assert!(json.contains(r#""kinds":["python","shell"]"#) && json.contains(r#""workspace":true"#), "{json}");
+        assert!(
+            json.contains(r#""kinds":["python","shell"]"#) && json.contains(r#""workspace":true"#),
+            "{json}"
+        );
         for kinds in [vec![], vec![JobKind::Shell, JobKind::Shell]] {
             let r = secrets().manifest(&SessionParams {
                 mode: Mode::Execute,
@@ -901,7 +906,12 @@ mod tests {
             interpreter: "docker:ci@sha256:0123456789ab".into(),
             kinds: Some(vec![JobKind::Python, JobKind::Shell]),
             shell: Some("sh".into()),
-            tree: Some(TreeInfo { head: Some("ab12".into()), dirty: true, count: 412, sha256: "c".repeat(64) }),
+            tree: Some(TreeInfo {
+                head: Some("ab12".into()),
+                dirty: true,
+                count: 412,
+                sha256: "c".repeat(64),
+            }),
         });
         check_result(&r).unwrap();
         let mut bad = r.clone();

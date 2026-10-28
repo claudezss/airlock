@@ -6,6 +6,7 @@ mod cli;
 mod client;
 mod files;
 mod job;
+mod machine;
 mod mcp;
 mod runner;
 mod sandbox;
@@ -13,6 +14,7 @@ mod sandbox;
 mod service;
 mod session;
 mod sse;
+mod tree;
 mod view;
 
 use clap::{Parser, Subcommand};
@@ -32,12 +34,20 @@ enum Cmd {
     /// Send a message or files.
     #[command(subcommand)]
     Send(cli::SendCmd),
-    /// Run a Python file on a runner and print its result.
+    /// Run a command, a shell script or a Python file on a runner, streaming
+    /// its output: `airlox run --on gpu-box --tree -- pytest -x`.
     Run(cli::RunArgs),
     /// Get a job's result.
     Result(cli::ResultArgs),
     /// Stop a running job.
     Cancel(cli::CancelArgs),
+    /// Jobs: list them with their state, runner and age.
+    #[command(subcommand)]
+    Job(cli::JobCmd),
+    /// Machines: pair one with a single command on each side, then
+    /// `airlox run --on <name>`.
+    #[command(subcommand)]
+    Machine(machine::MachineCmd),
     /// Print the session's items so far.
     Items(cli::ItemsArgs),
     /// Print items as they arrive.
@@ -154,6 +164,8 @@ fn main() -> std::process::ExitCode {
             Cmd::Run(a) => cli::run(a).await,
             Cmd::Result(a) => cli::result(a).await,
             Cmd::Cancel(a) => cli::cancel(a).await.map(|()| 0),
+            Cmd::Job(cli::JobCmd::Ls(a)) => cli::job_ls(a).await.map(|()| 0),
+            Cmd::Machine(c) => machine::machine(c).await.map(|()| 0),
             Cmd::Items(a) => cli::items(a).await.map(|()| 0),
             Cmd::Watch(a) => cli::watch(a).await.map(|()| 0),
             Cmd::Listen(a) => cli::listen(a).await,
