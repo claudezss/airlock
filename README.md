@@ -155,7 +155,8 @@ run --no-wait` hands back a job id; `airlox result --wait 2h -- <job>` or
 `airlox machine approve` adds a second box to a pool (`--on pool/gpu` targets
 a label); `airlox machine rm` closes it. On the machine, `airlox runner serve`
 restarts the runner after failures, and `airlox runner install-service --code
-…` installs it as a systemd user unit or a launchd agent.
+…` installs it as a systemd user unit or a launchd agent, with the PATH you
+install it from.
 
 Machines are sessions underneath (below), with their invites kept under
 `~/.cache/airlox/machines/`. A machine is a job slot, not a login: jobs run

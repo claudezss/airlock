@@ -126,29 +126,46 @@ fn systemd_quote(s: &str) -> String {
     }
 }
 
+/// `s` as one value for a systemd `Environment=` line, which expands `%`
+/// specifiers but not `$`.
+fn systemd_env_quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('%', "%%"))
+}
+
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
-/// A `systemd --user` unit running `argv`.
-pub fn systemd_unit(name: &str, argv: &[String]) -> String {
+/// A `systemd --user` unit running `argv` with `PATH` set to `path`: a user
+/// manager's own PATH leaves out `~/.local/bin` and the like, where `uv`
+/// and a job's tools often are.
+pub fn systemd_unit(name: &str, argv: &[String], path: Option<&str>) -> String {
     let exec: Vec<String> = argv.iter().map(|a| systemd_quote(a)).collect();
+    let env =
+        path.map_or(String::new(), |p| format!("Environment={}\n", systemd_env_quote(&format!("PATH={p}"))));
     format!(
         "[Unit]\nDescription=Airlox runner {name}\nWants=network-online.target\nAfter=network-online.target\n\n\
-         [Service]\nExecStart={}\nRestart=on-failure\nRestartSec=10\n\n[Install]\nWantedBy=default.target\n",
+         [Service]\n{env}ExecStart={}\nRestart=on-failure\nRestartSec=10\n\n[Install]\nWantedBy=default.target\n",
         exec.join(" ")
     )
 }
 
-/// A launchd agent running `argv`, kept alive while it fails.
-pub fn launchd_plist(label: &str, argv: &[String], log: &Path) -> String {
+/// A launchd agent running `argv` with `PATH` set to `path` (launchd's is
+/// `/usr/bin:/bin:/usr/sbin:/sbin`), kept alive while it fails.
+pub fn launchd_plist(label: &str, argv: &[String], path: Option<&str>, log: &Path) -> String {
     let args: String = argv.iter().map(|a| format!("    <string>{}</string>\n", xml_escape(a))).collect();
+    let env = path.map_or(String::new(), |p| {
+        format!(
+            "<key>EnvironmentVariables</key>\n  <dict>\n    <key>PATH</key>\n    <string>{}</string>\n  </dict>\n  ",
+            xml_escape(p)
+        )
+    });
     let log = xml_escape(&log.display().to_string());
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
          <plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>{}</string>\n  \
-         <key>ProgramArguments</key>\n  <array>\n{args}  </array>\n  <key>RunAtLoad</key>\n  <true/>\n  \
+         <key>ProgramArguments</key>\n  <array>\n{args}  </array>\n  {env}<key>RunAtLoad</key>\n  <true/>\n  \
          <key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key>\n    <false/>\n  </dict>\n  \
          <key>ThrottleInterval</key>\n  <integer>10</integer>\n  <key>StandardOutPath</key>\n  <string>{log}</string>\n  \
          <key>StandardErrorPath</key>\n  <string>{log}</string>\n</dict>\n</plist>\n",
@@ -229,11 +246,13 @@ pub async fn install(a: InstallArgs) -> Result<()> {
         let raw: Vec<OsString> = std::env::args_os().collect();
         argv.extend(passthrough(&raw).into_iter().map(|a| a.to_string_lossy().into_owned()));
         let home = std::env::var_os("HOME").map(PathBuf::from).context("HOME is not set")?;
+        // The service finds `uv`, `docker` and a job's tools where this shell does.
+        let env_path = std::env::var("PATH").ok().filter(|p| !p.is_empty());
         if cfg!(target_os = "macos") {
             let label = format!("app.airlox.{service}");
             let path = home.join("Library/LaunchAgents").join(format!("{label}.plist"));
             std::fs::create_dir_all(path.parent().expect("has a parent"))?;
-            std::fs::write(&path, launchd_plist(&label, &argv, &log))?;
+            std::fs::write(&path, launchd_plist(&label, &argv, env_path.as_deref(), &log))?;
             eprintln!("Wrote {}.", path.display());
             if !a.no_start {
                 let uid = nix::unistd::getuid().as_raw();
@@ -253,11 +272,14 @@ pub async fn install(a: InstallArgs) -> Result<()> {
             let path = dir.join(format!("{service}.service"));
             let mut argv = argv;
             argv.extend(["--log-file".into(), log.display().to_string()]);
-            std::fs::write(&path, systemd_unit(&a.join.name, &argv))?;
+            std::fs::write(&path, systemd_unit(&a.join.name, &argv, env_path.as_deref()))?;
             eprintln!("Wrote {}.", path.display());
             if !a.no_start {
+                let unit = format!("{service}.service");
                 run_ok("systemctl", &["--user", "daemon-reload"])?;
-                run_ok("systemctl", &["--user", "enable", "--now", &format!("{service}.service")])?;
+                run_ok("systemctl", &["--user", "enable", &unit])?;
+                // Restart, not start: a copy already running keeps its old flags otherwise.
+                run_ok("systemctl", &["--user", "restart", &unit])?;
                 eprintln!(
                     "Started {service}. To keep it running after you log out: loginctl enable-linger $USER"
                 );
@@ -317,14 +339,36 @@ mod tests {
             "--description".into(),
             "A100 $5 \"x\"".into(),
         ];
-        let unit = systemd_unit("gpu-box", &argv);
+        let unit = systemd_unit("gpu-box", &argv, None);
         assert!(
             unit.contains(r#"ExecStart=/usr/bin/airlox runner --description "A100 $$5 \"x\"""#),
             "{unit}"
         );
         assert!(unit.contains("Restart=on-failure"));
-        let plist = launchd_plist("app.airlox.r", &argv, Path::new("/tmp/r.log"));
+        assert!(!unit.contains("Environment="), "{unit}");
+        let plist = launchd_plist("app.airlox.r", &argv, None, Path::new("/tmp/r.log"));
         assert!(plist.contains("<string>A100 $5 &quot;x&quot;</string>"), "{plist}");
         assert!(plist.contains("<key>SuccessfulExit</key>\n    <false/>"), "{plist}");
+        assert!(!plist.contains("EnvironmentVariables"), "{plist}");
+    }
+
+    #[test]
+    fn services_keep_the_installers_path() {
+        let argv = vec!["/usr/bin/airlox".to_string(), "runner".into(), "serve".into()];
+        let path = "/home/me/.local/bin:/opt/50%/bin:/usr/bin";
+        let unit = systemd_unit("gpu-box", &argv, Some(path));
+        assert!(
+            unit.contains(
+                "[Service]\nEnvironment=\"PATH=/home/me/.local/bin:/opt/50%%/bin:/usr/bin\"\nExecStart="
+            ),
+            "{unit}"
+        );
+        let plist = launchd_plist("app.airlox.r", &argv, Some("/a&b:/usr/bin"), Path::new("/tmp/r.log"));
+        assert!(
+            plist.contains(
+                "<key>EnvironmentVariables</key>\n  <dict>\n    <key>PATH</key>\n    <string>/a&amp;b:/usr/bin</string>\n  </dict>\n  <key>RunAtLoad</key>"
+            ),
+            "{plist}"
+        );
     }
 }

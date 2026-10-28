@@ -76,7 +76,8 @@ enum RunnerCmd {
     Serve(Box<serve::ServeArgs>),
     /// Run the runner as a service of this user that starts at login and
     /// after failures: a systemd --user unit (Linux) or a launchd agent
-    /// (macOS) running `serve`. Takes the `join` flags.
+    /// (macOS) running `serve`, with the PATH it is installed from. Takes the
+    /// `join` flags.
     InstallService(Box<serve::InstallArgs>),
     /// Run a runner as a Windows service: install or uninstall it.
     #[cfg(windows)]
