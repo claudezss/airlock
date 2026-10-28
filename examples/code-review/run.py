@@ -55,23 +55,27 @@ def review(source: str) -> list:
 
 
 def review_bot(invite: str, cache: pathlib.Path, ready: threading.Event, step=quiet, timeout: float = 120) -> None:
-    """The reviewer: answers the first .py file sent to it, then leaves."""
+    """The reviewer: answers the first review request addressed to it, then leaves."""
     step("review-bot", "Joins with the sender link, on another machine",
          'Session.join(invite, display_name="review-bot",\n             description="Reviews Python changes …")')
     bot = Session.join(invite, display_name="review-bot", cache_dir=cache,
                        description="Reviews Python changes for injection risks; send a .py file")
     ready.set()
     for item in bot.stream(timeout=timeout):
-        if item.kind != "file" or not item.name.endswith(".py") or item.mine:
+        # Act on a request addressed to the bot that replies to a .py file.
+        if item.kind != "text" or bot.participant_pub not in (item.to or []):
             continue
-        findings = review(item.body.decode())
+        file = next((i for i in bot.items() if i.id == item.reply_to), None)
+        if file is None or file.kind != "file" or not file.name.endswith(".py"):
+            continue
+        findings = review(file.body.decode())
         verdict = "changes requested" if findings else "approved"
-        step("review-bot", f"Reviews {item.name} and replies", f'send_file("review-{item.name[:-3]}.md", refs=[item.ref])\n'
-             f'send_text("{verdict}: {len(findings)} finding(s)")')
-        report = [f"# Review of {item.name}", ""]
+        step("review-bot", f"Is asked about {file.name}; reviews it and replies", f'send_file("review-{file.name[:-3]}.md", reply_to=file)\n'
+             f'send_text("{verdict}: {len(findings)} finding(s)",\n          to=[item.author], reply_to=item)')
+        report = [f"# Review of {file.name}", ""]
         report += [f"- line {line}: {msg}" for line, msg in findings] or ["No findings."]
-        bot.send_file("\n".join(report).encode() + b"\n", name=f"review-{item.name[:-3]}.md", refs=[item.ref])
-        bot.send_text(f"{verdict}: {len(findings)} finding(s) in {item.name}", refs=[item.ref])
+        bot.send_file("\n".join(report).encode() + b"\n", name=f"review-{file.name[:-3]}.md", reply_to=file)
+        bot.send_text(f"{verdict}: {len(findings)} finding(s) in {file.name}", to=[item.author], reply_to=item)
         return
 
 
@@ -98,10 +102,11 @@ async def author(relay: str, workdir: pathlib.Path, step=quiet) -> dict:
         ready.wait(30)
         lead = Session.join(invites["observer"], display_name="tech-lead", cache_dir=cache / "lead")
 
-        step("ide-agent", "Sends the changed file and asks for a review",
-             'send_file(path="billing/discounts.py")\nsend_text("Please review … before I merge it.")')
-        await tools.call("send_file", path="billing/discounts.py")
-        await tools.call("send_text", text="Please review billing/discounts.py before I merge it.")
+        step("ide-agent", "Sends the changed file and asks the reviewer about it",
+             'f = send_file(path="billing/discounts.py")\nsend_text("Please review … before I merge it.",\n          to=["review-bot"], reply_to=f)')
+        sent = await tools.call("send_file", path="billing/discounts.py")
+        await tools.call("send_text", text="Please review billing/discounts.py before I merge it.",
+                         to=["review-bot"], reply_to=sent["sent"])
 
         # Wait for the verdict, as a model would: list_items with after/wait_s.
         after, verdict, report_id = None, None, None

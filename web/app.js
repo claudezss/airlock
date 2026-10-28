@@ -1940,7 +1940,8 @@ function buildSessionLayout(s) {
     closed: (reason) => {
       s.closed ||= "closed";
       gone(`This session is closed: ${reason}. Its history stays in this browser until you clear it.`);
-      lock(canSend ? "This session is closed." : "This session is closed. You can still read what this browser received.");
+      // The banner says why; the composer's place says only what that means here.
+      lock("Read only: nothing more can be sent.");
       if (auditBtn) auditBtn.textContent = "Audit log deleted with the session";
       if (invites) invites.hidden = true;
       setTitle("closed");
@@ -1951,7 +1952,7 @@ function buildSessionLayout(s) {
       s.closed ||= "removed";
       s.removed = true;
       gone(msg);
-      lock("Your access was removed. You can still read what this browser received.");
+      lock("Read only: nothing more can be sent.");
       if (auditBtn) auditBtn.textContent = "Audit log unavailable";
       badge.classList.add("off");
       document.getElementById("badge-text").textContent = "access removed";

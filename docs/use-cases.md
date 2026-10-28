@@ -1,6 +1,6 @@
 # Use cases
 
-Four complete scenarios, each a runnable script in [`examples/`](../examples)
+Five complete scenarios, each a runnable script in [`examples/`](../examples)
 and an end-to-end test in
 [`python/airlox/tests/test_use_cases.py`](../python/airlox/tests/test_use_cases.py),
 so the code on this page is code that passes CI.
@@ -11,6 +11,7 @@ so the code on this page is code that passes CI.
 | [Remote CI](#remote-ci) | Coding agent → someone else's build box | CLI, runner | Jobs with inputs, exit codes, out files, a fix-and-rerun loop |
 | [Fan-out](#fan-out) | Planner → a pool of runners | Python SDK, runners | Approving only expected runners, labels, parallel jobs |
 | [Live agent](#live-agent) | Data team → a real Claude Code or Codex agent | MCP in a real agent, runner | A model doing delegated work on a runner, end to end |
+| [Agent conversation](#agent-conversation) | Lead → Claude Code ↔ Codex | `airlox listen`, MCP in two real agents | Agents woken by messages for them, addressing and replies |
 
 ## Running them
 
@@ -29,8 +30,8 @@ Each script narrates its steps (who does what, with the call or command) on
 stderr and prints the outcome as JSON. Pass a relay URL to use another
 one, for example `python examples/fan-out/run.py http://127.0.0.1:8080`.
 From a checkout, `make test-sdk` runs all of them as tests against a local
-relay; the live agent runs only with `AIRLOX_LIVE_AGENT=1`, because it calls
-a real model:
+relay; the live agent and the agent conversation run only with
+`AIRLOX_LIVE_AGENT=1`, because they call real models:
 
 ```bash
 AIRLOX_LIVE_AGENT=1 AIRLOX_AGENT=codex .venv/bin/python -m pytest -q python/airlox/tests/test_use_cases.py
@@ -66,8 +67,9 @@ tool call a model would make:
 async with mcp_server("--relay", relay, "--allow-dir", str(repo), "--as", "ide-agent", cwd=repo) as tools:
     s = await tools.call("create_session", ttl_minutes=30, description="Working on the billing service")
     invites = s["invites"]            # sender, observer; the owner link is never shown to the model
-    await tools.call("send_file", path="billing/discounts.py")
-    await tools.call("send_text", text="Please review billing/discounts.py before I merge it.")
+    sent = await tools.call("send_file", path="billing/discounts.py")
+    await tools.call("send_text", text="Please review billing/discounts.py before I merge it.",
+                     to=["review-bot"], reply_to=sent["sent"])
     listed = await tools.call("list_items", for_me=True, wait_s=30)  # then after=listed["next_after"]
     saved = await tools.call("save_file", item=report_id, dir="reviews")
 ```
@@ -78,10 +80,13 @@ The reviewer is a few lines of SDK code:
 bot = Session.join(invite, display_name="review-bot",
                    description="Reviews Python changes for injection risks; send a .py file")
 for item in bot.stream(timeout=120):
-    if item.kind == "file" and item.name.endswith(".py") and not item.mine:
-        findings = review(item.body.decode())
-        bot.send_file(report, name=f"review-{item.name[:-3]}.md", refs=[item.ref])
-        bot.send_text(f"changes requested: {len(findings)} finding(s) in {item.name}", refs=[item.ref])
+    # A request addressed to the bot, replying to the .py file it is about.
+    if item.kind == "text" and bot.participant_pub in (item.to or []):
+        file = next(i for i in bot.items() if i.id == item.reply_to)
+        findings = review(file.body.decode())
+        bot.send_file(report, name=f"review-{file.name[:-3]}.md", reply_to=file)
+        bot.send_text(f"changes requested: {len(findings)} finding(s) in {file.name}",
+                      to=[item.author], reply_to=item)
 ```
 
 What the test checks:
@@ -217,6 +222,41 @@ The test checks the work, not the wording: at least one job from the agent
 with a signed result that exited 0, and an `ANSWER {...}` reply equal to the
 totals the data team computes itself. A run takes about 20 seconds with
 Codex.
+
+## Agent conversation
+
+[`examples/agent-conversation/run.py`](../examples/agent-conversation/run.py)
+
+![Claude Code and Codex talking in one session, recorded](../web/demos/agent-conversation.gif)
+
+Two real agents, each started by its own `airlox listen` when a message is
+for it, and nothing scripted on their side. The lead posts `discounts.py` and
+asks `@claude-agent` to review it and to ask `@codex-agent` for a fix:
+
+```bash
+airlox listen --agent claude --fresh --from owner --from <codex-agent key>
+airlox listen --agent codex  --fresh --from owner --from <claude-agent key>
+```
+
+```python
+f = lead.send_file(PATCH.encode(), name="discounts.py")
+lead.send_text("@claude-agent please review discounts.py. Ask @codex-agent for a safe replacement …",
+               to=["claude-agent"], reply_to=f["id"])
+```
+
+The message is addressed to Claude, so only Claude's listener wakes. Claude
+reads the thread through its airlox tools and sends Codex a message addressed
+to it, which wakes Codex. Codex's answer is a reply to Claude's message, which
+wakes Claude again, and Claude answers the lead in the original thread. Each
+agent is told only the item ids that woke it, never the text, and only the
+airlox read and reply tools are pre-approved for it.
+
+Each listener takes wakes only from the owner and the other agent, by key:
+display names are chosen by whoever joins, so `--from <name>` could be
+anyone. The script joins each agent once with the SDK to learn its key; the
+listener and the agent's MCP server share that cache, so they are the same
+participant. The test checks the shape, not the wording: three participants,
+Claude addressing Codex, Codex answering Claude, and a summary for the lead.
 
 ## The recordings
 

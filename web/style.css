@@ -273,6 +273,9 @@ details[open] > summary::before { transform: rotate(45deg); margin-bottom: 4px; 
 .msg { display: grid; grid-template-columns: 28px minmax(0, 1fr); column-gap: 12px; margin-top: 18px; position: relative; scroll-margin-top: 12px; }
 .msg.cont { margin-top: 4px; }
 .msg.cont .av, .msg.cont .mhead { display: none; }
+/* A grouped message still says who it is addressed to. */
+.msg.cont .mhead:has(> .to) { display: block; margin-bottom: 2px; }
+.msg.cont .mhead:has(> .to) > :not(.to) { display: none; }
 .msg.cont .mbody { grid-column: 2; }
 .msg:focus-visible { outline-offset: 4px; border-radius: 8px; }
 .mhead { display: flex; align-items: baseline; gap: 8px; min-height: 28px; flex-wrap: wrap; }
@@ -727,6 +730,7 @@ body.landing .top-right { display: none; }
   .lp-actions .cta { flex: 1 1 100%; }
   .lp-demo-bar { display: block; }
   .lp-demo-tabs { display: grid; grid-template-columns: 1fr 1fr; }
+  .lp-demo-tabs button:last-child:nth-child(odd) { grid-column: 1 / -1; }
   .lp-demo-tabs button { padding: 0 12px; }
   .lp-demo-pause { width: 100%; margin-top: 12px; }
   .lp-demo-hint { display: block; }
