@@ -14,7 +14,8 @@
 //!    `/proc` and a `/tmp` tmpfs, pivots into it and detaches the old root.
 //!    It then sets `no_new_privs`, applies a Landlock ruleset (best effort,
 //!    depending on the kernel), drops every capability including the
-//!    bounding set, and execs the shim.
+//!    bounding set, and execs the shim. A shell job sees the host's tools
+//!    through the same read-only binds.
 //!
 //! The network namespace has no interfaces but a down loopback, so
 //! `network: false` holds. When the shim (PID 1's replacement) exits, the
@@ -51,8 +52,8 @@ pub struct SandboxSpec {
     pub shim: PathBuf,
     pub python: PathBuf,
     pub runtime_dirs: Vec<PathBuf>,
-    pub entry: String,
-    pub timeout_s: u32,
+    /// The shim arguments that name the job and its timeout.
+    pub job_args: Vec<String>,
     pub memory_mb: u32,
     /// Keep the host network (the session allows network access).
     pub network: bool,
@@ -262,7 +263,7 @@ fn stage2(spec: &SandboxSpec) -> Result<Infallible> {
 
     let err = std::process::Command::new(&spec.python)
         .arg("/airlox/shim.py")
-        .args(["--work", "/work", "--entry", &spec.entry, "--timeout", &spec.timeout_s.to_string()])
+        .args(&spec.job_args)
         .args(["--result", "/meta/result.json", "--out", "/out"])
         .args(["--memory-mb", &spec.memory_mb.to_string()])
         .env_clear()

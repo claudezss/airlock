@@ -2,10 +2,13 @@
 //! (protocol §11) on a prepared job directory:
 //!
 //! ```text
-//! <root>/work   code and inputs; the job's cwd        (/work in containers)
+//! <work>        code and inputs; the job's cwd        (/work in containers)
 //! <root>/out    files the job wants returned          (/out, also $AIRLOX_OUT)
 //! <root>/meta   result.json, stdout.txt, stderr.txt   (/meta)
+//!               and a shell job's script
 //! ```
+//!
+//! `<work>` is `<root>/work`, or a kept workspace's directory (protocol §7).
 //!
 //! The runner enforces the wall clock itself as well: if the shim does not
 //! finish within the job timeout plus a grace period, the sandbox is killed.
@@ -23,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use airlox_core::cert::SandboxKind;
 use airlox_core::encoding::{hex, sha256};
-use airlox_core::payload::JobEnv;
+use airlox_core::payload::{JobEnv, JobKind};
 use airlox_core::shim::ShimResult;
 use anyhow::{Context, Result};
 use tokio::sync::watch;
@@ -137,7 +140,15 @@ impl RuntimeSpec {
 pub struct PreparedJob {
     pub id: String,
     pub root: PathBuf,
+    /// The job's work dir: `<root>/work`, or a workspace's.
+    pub work: PathBuf,
+    pub kind: JobKind,
+    /// A Python job's entry file in the work dir.
     pub entry: String,
+    /// A shell job's shell, `sh` or `pwsh`.
+    pub shell: &'static str,
+    /// Where the job starts: a relative path inside the work dir.
+    pub cwd: Option<String>,
     pub timeout_s: u32,
     pub memory_mb: u32,
     /// Jobs may reach the network (the manifest allows it and the runner
@@ -145,9 +156,29 @@ pub struct PreparedJob {
     pub network: bool,
 }
 
+/// A shell job's script, in the meta dir: out of the work dir, so a
+/// workspace is not polluted by it.
+pub const SCRIPT_FILE: &str = "job-script";
+
 impl PreparedJob {
     pub fn work_dir(&self) -> PathBuf {
-        self.root.join("work")
+        self.work.clone()
+    }
+
+    /// The shim arguments that name the job: `work` and `script` as the
+    /// shim will see them (a container's `/work`, `/meta/job-script`).
+    pub fn shim_job_args(&self, work: &str, script: &str) -> Vec<String> {
+        let mut a = vec!["--work".to_string(), work.into(), "--timeout".into(), self.timeout_s.to_string()];
+        match self.kind {
+            JobKind::Python => a.extend(["--entry".to_string(), self.entry.clone()]),
+            JobKind::Shell => {
+                a.extend(["--shell".to_string(), self.shell.into(), "--script".into(), script.into()])
+            }
+        }
+        if let Some(cwd) = &self.cwd {
+            a.extend(["--cwd".to_string(), cwd.clone()]);
+        }
+        a
     }
     pub fn out_dir(&self) -> PathBuf {
         self.root.join("out")
@@ -198,6 +229,34 @@ impl Backend {
         }
     }
 
+    /// The shell `shell` jobs run under (`sh`, or `pwsh` on Windows), if
+    /// this backend offers them.
+    pub fn shell(&self) -> Option<&'static str> {
+        match self {
+            Backend::Local(l) => l.shell(),
+            Backend::Docker(d) => d.shell(),
+        }
+    }
+
+    /// What to tell a sender whose shell job this backend cannot run, and the
+    /// operator how to change that.
+    pub fn no_shell_hint(&self) -> &'static str {
+        match self {
+            Backend::Docker(_) => {
+                " (docker runs shell jobs in an image of the operator's: start the runner with --image)"
+            }
+            Backend::Local(_) if cfg!(windows) => " (start the runner with --shell pwsh to run them)",
+            Backend::Local(_) => "",
+        }
+    }
+
+    /// The kinds of job this backend runs.
+    pub fn kinds(&self) -> Vec<JobKind> {
+        let mut kinds = vec![JobKind::Python];
+        kinds.extend(self.shell().map(|_| JobKind::Shell));
+        kinds
+    }
+
     /// The runner's own runtime and cache directories, which job output
     /// must not name (none for Docker, whose jobs see the image).
     pub fn runtime_dirs(&self) -> Vec<PathBuf> {
@@ -217,10 +276,11 @@ impl Backend {
     /// Where jobs run, as measured when the runtime was prepared (not per
     /// job); `None` if it could not be.
     pub fn env(&self) -> Option<JobEnv> {
-        match self {
+        let env = match self {
             Backend::Local(b) => b.env(),
             Backend::Docker(b) => b.env(),
-        }
+        };
+        env.map(|e| JobEnv { kinds: Some(self.kinds()), shell: self.shell().map(String::from), ..e })
     }
 
     /// What importing the allowlist takes, where it can be measured without
@@ -305,6 +365,32 @@ pub fn read_sandbox_file(path: &std::path::Path, max: u64) -> Result<(Vec<u8>, b
     let more = buf.len() as u64 > max;
     buf.truncate(max as usize);
     Ok((buf, more))
+}
+
+/// Up to `max` bytes of a file the sandbox is writing, from byte `start`,
+/// under the same rules as [`read_sandbox_file`]. Empty when the file is not
+/// longer than `start` (or the job truncated it).
+pub fn read_sandbox_range(path: &std::path::Path, start: u64, max: u64) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut o,
+        (nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK).bits(),
+    );
+    let mut f = o.open(path)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        anyhow::bail!("{} is not a regular file", path.display());
+    }
+    if meta.len() <= start {
+        return Ok(Vec::new());
+    }
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::new();
+    f.take(max).read_to_end(&mut buf)?;
+    Ok(buf)
 }
 
 /// Read the shim's result.json, if it wrote a valid one.
@@ -395,5 +481,37 @@ mod tests {
         let e = env("uv-runtime", &[("numpy", "2.1.0"), ("nover", ""), ("long", &"1".repeat(65))]);
         assert_eq!(e.packages.keys().collect::<Vec<_>>(), ["numpy"]);
         assert!(airlox_core::policy::check_env(&e).is_ok());
+    }
+
+    #[test]
+    fn a_running_jobs_file_is_read_from_an_offset() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("stdout.txt");
+        std::fs::write(&p, "hello world").unwrap();
+        assert_eq!(read_sandbox_range(&p, 6, 100).unwrap(), b"world");
+        assert_eq!(read_sandbox_range(&p, 0, 5).unwrap(), b"hello");
+        // Nothing new, or the job truncated the file under us.
+        assert!(read_sandbox_range(&p, 11, 100).unwrap().is_empty());
+        assert!(read_sandbox_range(&p, 50, 100).unwrap().is_empty());
+        assert!(read_sandbox_range(&d.path().join("missing"), 0, 1).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_running_jobs_file_cannot_be_a_link_or_a_pipe() {
+        let d = tempfile::tempdir().unwrap();
+        let fifo = d.path().join("stdout.txt");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let t = Instant::now();
+        assert!(read_sandbox_range(&fifo, 0, 10).is_err());
+        assert!(t.elapsed() < Duration::from_secs(1), "blocked on a pipe");
+        let secret = d.path().join("secret");
+        std::fs::write(&secret, "not for the stream").unwrap();
+        let link = d.path().join("stderr.txt");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        assert!(read_sandbox_range(&link, 0, 100).is_err());
+        let zero = d.path().join("zero");
+        std::os::unix::fs::symlink("/dev/zero", &zero).unwrap();
+        assert!(read_sandbox_range(&zero, 0, 100).is_err());
     }
 }
