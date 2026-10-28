@@ -407,20 +407,17 @@ async fn a_shell_job_syncs_its_tree_into_a_workspace_and_streams() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_full_workspace_refuses_the_next_job_until_fresh() {
+async fn a_workspace_over_its_limit_is_emptied_when_the_job_ends() {
     let Some(rig) = rig(&["--workspace", "--workspace-max-mb", "1"]).await else { return };
+    let other = join(&rig.env, &rig.s, Role::Sender, "agent-2").await;
+    assert_eq!(rig.run(&other, shell("echo kept > mine; echo ok\n")).await.stdout, "ok\n");
     let r = rig.run(&rig.sender, shell("head -c 2000000 /dev/zero > big; echo wrote\n")).await;
     assert_eq!((r.status, r.stdout.as_str()), (JobStatus::Completed, "wrote\n"), "{:?}", r.reason);
-    let r = rig.run(&rig.sender, shell("echo should not run\n")).await;
-    assert_eq!(r.status, JobStatus::Refused);
-    assert!(r.reason.as_deref().unwrap().starts_with("workspace_full: "), "{:?}", r.reason);
-    assert_eq!(r.stdout, "");
-    // Another sender is not affected, and `fresh` empties this one.
-    let other = join(&rig.env, &rig.s, Role::Sender, "agent-2").await;
-    assert_eq!(rig.run(&other, shell("echo ok\n")).await.stdout, "ok\n");
-    let r = rig.run(&rig.sender, Job { fresh: true, ..shell("ls | wc -l | tr -d ' '\n") }).await;
+    assert!(r.stderr.contains("over its 1 MB limit, so the runner emptied it"), "{}", r.stderr);
+    // Gone at once, not held until the next job; another sender's is untouched.
+    let r = rig.run(&rig.sender, shell("ls | wc -l | tr -d ' '\n")).await;
     assert_eq!((r.status, r.stdout.as_str()), (JobStatus::Completed, "0\n"), "{:?}", r.reason);
-    assert_eq!(rig.run(&rig.sender, shell("echo again\n")).await.stdout, "again\n");
+    assert_eq!(rig.run(&other, shell("cat mine\n")).await.stdout, "kept\n");
 }
 
 #[tokio::test(flavor = "multi_thread")]

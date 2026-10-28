@@ -100,6 +100,11 @@ struct Held {
     job: String,
     /// Path to hex SHA-256.
     files: HashMap<String, String>,
+    /// That job's result has been seen: until then `files` is only what was
+    /// sent, and a job that never ran (or ran on a runner that keeps no
+    /// workspace) leaves nothing.
+    #[serde(default)]
+    seen: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -678,14 +683,21 @@ impl Outcome {
 }
 
 /// [`Session::chunks`], over a list of items.
-fn chunks_in(items: &[Item], job: &str, cursor: &mut ChunkCursor) -> Vec<Chunk> {
+/// Only items `from_runner` accepts count: chunks are display, but they reach
+/// terminals and agents.
+fn chunks_in(
+    items: &[Item],
+    job: &str,
+    cursor: &mut ChunkCursor,
+    from_runner: impl Fn(&Item) -> bool,
+) -> Vec<Chunk> {
     let mut fresh: Vec<Chunk> = Vec::new();
     for item in items {
         if item.kind != "progress" || item.status != Status::Ok || cursor.seen.contains(&item.id) {
             continue;
         }
         let Some(m) = item.meta.as_ref() else { continue };
-        if m["job"]["id"] != job || item.author_role.as_deref() != Some("runner") {
+        if m["job"]["id"] != job || item.author_role.as_deref() != Some("runner") || !from_runner(item) {
             continue;
         }
         cursor.seen.insert(item.id.clone());
@@ -1245,14 +1257,23 @@ impl Session {
 
     /// What this client's workspace on `runner` (a key) should hold, path to
     /// hex SHA-256; `None` when it does not know.
-    pub fn held_tree(&self, runner: &str) -> Option<HashMap<String, String>> {
-        self.cache.load_held(runner).map(|h| h.files)
+    /// What this client's workspace on `runner` holds, as far as a result
+    /// has said. A tree sent without waiting for its result (`--no-wait`) is
+    /// checked first.
+    pub async fn held_tree(&mut self, runner: &str) -> Option<HashMap<String, String>> {
+        let held = self.cache.load_held(runner)?;
+        if held.seen {
+            return Some(held.files);
+        }
+        // Learns the result, if it is in (poll_job calls tree_result).
+        let _ = self.poll_job(&held.job).await;
+        self.cache.load_held(runner).filter(|h| h.seen).map(|h| h.files)
     }
 
     /// `job`, which carries a tree of `files`, went to `runner`: once it
     /// runs, that is what the workspace holds.
     pub fn sent_tree(&self, runner: &str, job: &str, files: HashMap<String, String>) {
-        if let Err(e) = self.cache.save_held(runner, &Held { job: job.into(), files }) {
+        if let Err(e) = self.cache.save_held(runner, &Held { job: job.into(), files, seen: false }) {
             tracing::debug!("could not remember the tree sent: {e:#}");
         }
     }
@@ -1269,6 +1290,7 @@ impl Session {
                 for p in changed {
                     held.files.remove(p);
                 }
+                held.seen = true;
                 let _ = self.cache.save_held(runner, &held);
             }
             None => self.cache.forget_held(runner),
@@ -1497,7 +1519,24 @@ impl Session {
     /// to its new part; one after a gap (a chunk the relay dropped before
     /// this client fetched it) is shown anyway.
     pub fn chunks(&self, job: &str, cursor: &mut ChunkCursor) -> Vec<Chunk> {
-        chunks_in(&self.items, job, cursor)
+        let Some(job_item) = self.get(job).filter(|i| i.kind == "job" && i.status == Status::Ok) else {
+            return Vec::new();
+        };
+        let target = job_item.meta.as_ref().map(|m| &m["target"]);
+        let target = target.filter(|t| t["type"] == "runner").and_then(|t| t["participant_pub"].as_str());
+        let approved: Option<HashSet<String>> = match self.manifest.job_limits.as_ref() {
+            Some(l) if l.approve_runners => {
+                Some(self.signed_approvals().into_iter().filter(|(_, ok)| *ok).map(|(k, _)| k).collect())
+            }
+            _ => None,
+        };
+        // As for a result: about this exact job, from its target if it named
+        // one, and from an approved runner where approval is required.
+        chunks_in(&self.items, job, cursor, |item| {
+            item.meta.as_ref().is_some_and(|m| m["job"] == job_item.item_ref)
+                && target.is_none_or(|t| t == item.author)
+                && approved.as_ref().is_none_or(|a| a.contains(&item.author))
+        })
     }
 
     /// Wait for a job's outcome, calling `each` with the output chunks that
@@ -2202,20 +2241,21 @@ mod tests {
         beat.meta = Some(json!({"job": {"id": "j"}, "elapsed_ms": 1, "tail": "x", "tail_truncated": false}));
         items.push(beat);
         let mut c = ChunkCursor::default();
-        let got: Vec<_> = chunks_in(&items, "j", &mut c).into_iter().map(|c| c.data).collect();
+        let got: Vec<_> = chunks_in(&items, "j", &mut c, |_| true).into_iter().map(|c| c.data).collect();
         assert_eq!(got, ["hello ", "world\n"]);
-        assert!(chunks_in(&items, "j", &mut c).is_empty(), "nothing new");
+        assert!(chunks_in(&items, "j", &mut c, |_| true).is_empty(), "nothing new");
         // A late chunk overlapping what was shown is cut to its new part;
         // stderr counts on its own.
         items.push(chunk(5, "j", "stdout", 9, "ld\nmore"));
         items.push(chunk(6, "j", "stderr", 0, "warn"));
-        let got: Vec<_> = chunks_in(&items, "j", &mut c).into_iter().map(|c| (c.stream, c.data)).collect();
+        let got: Vec<_> =
+            chunks_in(&items, "j", &mut c, |_| true).into_iter().map(|c| (c.stream, c.data)).collect();
         assert_eq!(got, [("stderr".to_string(), "warn".to_string()), ("stdout".into(), "more".into())]);
         // Not from a runner: ignored.
         let mut forged = chunk(7, "j", "stdout", 16, "forged");
         forged.author_role = Some("sender".into());
         items.push(forged);
-        assert!(chunks_in(&items, "j", &mut c).is_empty());
+        assert!(chunks_in(&items, "j", &mut c, |_| true).is_empty());
     }
 
     fn hops_of(items: &[Item], seq: u64) -> usize {

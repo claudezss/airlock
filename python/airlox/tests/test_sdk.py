@@ -540,10 +540,22 @@ def test_tree_globs_match_the_cli():
     assert pattern_matches("tests/fixtures", "tests/fixtures/big.bin")
     assert not pattern_matches("tests/fixtures", "other/tests/fixtures/big.bin")
     assert pattern_matches("/build/", "build/out.o") and not pattern_matches("/build/", "src/build/out.o")
-    for p in [".env", "app/.env.production", "deploy/key.pem", "id_rsa", ".netrc", "x/credentials.json"]:
+    for p in [".env", "app/.env.production", "deploy/key.pem", "id_rsa", ".netrc", "x/credentials.json",
+              ".ENV", "keys/ID_ED25519", "home/.aws/credentials", ".npmrc", "infra/prod.tfvars",
+              "u/.docker/config.json", ".kube/config"]:
         assert _credential_name(p), p
-    for p in ["env.py", "README.md", "src/pem.rs", "credentials.json.example"]:
+    for p in ["env.py", "README.md", "src/pem.rs", "credentials.json.example", "app/config.json", "kube/config"]:
         assert not _credential_name(p), p
+
+
+def test_a_home_directory_outside_git_is_not_a_tree(tmp_path, monkeypatch):
+    from airlox.tree import TreeRefused, build
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows
+    (tmp_path / ".npmrc").write_text("//registry/:_authToken=x\n")
+    with pytest.raises(TreeRefused, match="home directory"):
+        build(tmp_path)
 
 
 def test_a_plain_directory_becomes_a_tree_and_a_delta_lists_everything(tmp_path):

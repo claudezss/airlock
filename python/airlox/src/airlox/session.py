@@ -871,14 +871,17 @@ class Session:
                     if r.approved and not r.rejected and kind in r.kinds and all(l in r.labels for l in want)
                 ]
             held = self._cache.load_held(pubs[0]) if len(pubs) == 1 else None
-            got = tree.delta(held["files"]) if held is not None else None
+            # Only what a result confirmed: a job never waited for may not have run.
+            got = tree.delta(held["files"]) if held is not None and held.get("seen") else None
             if got is not None:
                 data, delta = got[0], True
+        # Whole, even when a delta goes: a stale workspace is answered by
+        # sending the tree whole.
         limit = self.manifest["max_item_bytes"] - 4096
-        if len(data) > limit:
+        if len(tree.zip) > limit:
             largest = ", ".join(f"{p} ({n} bytes)" for p, n in tree.largest)
             raise ValueError(
-                f"the tree zips to {len(data)} bytes, over the session's item limit of {limit}. "
+                f"the tree zips to {len(tree.zip)} bytes, over the session's item limit of {limit}. "
                 f"Largest files: {largest}. Leave some out with tree_exclude or a line in .airloxignore"
             )
         return data, delta
@@ -896,7 +899,7 @@ class Session:
         changed = ((result.env or {}).get("tree") or {}).get("changed")
         if isinstance(changed, list):
             files = {p: h for p, h in held["files"].items() if p not in changed}
-            self._cache.save_held(result.runner, job.id, files)
+            self._cache.save_held(result.runner, job.id, files, seen=True)
         else:
             self._cache.forget_held(result.runner)
 

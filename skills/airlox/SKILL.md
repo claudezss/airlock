@@ -42,7 +42,9 @@ you, e.g. in a hosted agent) does the same: `airlox run --tree -- pytest`.
 - `--tree` sends what git would commit or add: tracked and untracked files,
   ignored ones left out, uncommitted changes included. Before it sends, it
   prints the file count, size and largest files: **read that line**. It
-  refuses files named like credentials (`.env`, `*.pem`, `id_rsa*`, …);
+  refuses files named like credentials (`.env`, `*.pem`, `id_rsa*`,
+  `.npmrc`, …, ignoring case), and a directory outside git that is your
+  home directory;
   leave them out with `--tree-exclude <glob>` (or `.airloxignore`) rather
   than `--tree-allow`, unless the user says the job needs one. Git LFS
   files go as pointers: send large fixtures with `--input` instead.

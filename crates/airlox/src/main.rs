@@ -164,7 +164,7 @@ fn main() -> std::process::ExitCode {
     };
     match log_file {
         Some(path) => {
-            let f = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let f = match serve::open_log(&path) {
                 Ok(f) => f,
                 Err(e) => {
                     eprintln!("airlox: could not open --log-file {}: {e}", path.display());

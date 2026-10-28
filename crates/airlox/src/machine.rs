@@ -10,6 +10,7 @@
 //! Everything lives under the cache directory, which the MCP server's file
 //! tools refuse, so neither invite is readable through them.
 
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -118,6 +119,10 @@ pub struct AddArgs {
     /// approve it later with `airlox machine approve`.
     #[arg(long)]
     pub no_wait: bool,
+    /// Approve the runner that used the code without asking first (at a
+    /// terminal, `machine add` shows it and asks).
+    #[arg(long, short = 'y')]
+    pub yes: bool,
     /// How long to wait for the runner to join.
     #[arg(long, default_value = "30m", value_parser = parse_duration)]
     pub wait: Duration,
@@ -341,10 +346,10 @@ fn sandbox_of(a: &AddArgs) -> String {
     a.sandbox.clone().unwrap_or_else(|| if a.image.is_some() { "docker" } else { "local" }.into())
 }
 
-/// The `runner join` line to run on the machine. `network`: the session
-/// lets jobs reach it; otherwise a process sandbox must be told to accept
-/// that it cannot stop them, or the runner refuses to start.
-fn join_line(a: &AddArgs, code: &str, relay: &str, network: bool) -> String {
+/// The `runner join` line to run on the machine. It never says
+/// `--accept-network-gap`: whoever runs it on the machine adds that, knowing
+/// what it accepts.
+fn join_line(a: &AddArgs, code: &str, relay: &str) -> String {
     let mut line = format!("airlox runner join --code {code}");
     if relay != crate::runner::DEFAULT_RELAY {
         line.push_str(&format!(" --relay {}", shell_quote(relay)));
@@ -355,9 +360,6 @@ fn join_line(a: &AddArgs, code: &str, relay: &str, network: bool) -> String {
     }
     let sandbox = sandbox_of(a);
     line.push_str(&format!(" --sandbox {sandbox}"));
-    if sandbox == "process" && !network {
-        line.push_str(" --accept-network-gap");
-    }
     if let Some(img) = &a.image {
         line.push_str(&format!(" --image {}", shell_quote(img)));
     }
@@ -381,7 +383,7 @@ async fn add(a: AddArgs) -> Result<()> {
     let invites = s.invites()?;
     let code = client::send_code(&http, &s.base_url, &invites["runner"]).await?;
     let limits = s.manifest.job_limits.clone().context("execute session without job limits")?;
-    let line = join_line(&a, &code.code, &s.base_url, limits.network);
+    let line = join_line(&a, &code.code, &s.base_url);
     if a.common.json {
         println!(
             "{}",
@@ -400,7 +402,12 @@ async fn add(a: AddArgs) -> Result<()> {
                 "Warning: --sandbox process runs jobs as plain processes of the runner's user: they can read \
                  that user's files and reach the network{}. Send it only code you trust, or use --sandbox \
                  docker (or local, where it isolates).",
-                if limits.network { "" } else { ", whatever the session says" }
+                if limits.network {
+                    ""
+                } else {
+                    ", whatever the session says. The runner starts only with --accept-network-gap added to \
+                     the command below, by whoever runs it there"
+                }
             );
         }
         eprintln!("On {}, run (the code works once, for a few minutes):\n\n  {line}\n", a.name);
@@ -466,6 +473,39 @@ async fn add(a: AddArgs) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     };
+    // The code went to one machine under this name; a runner that joined as
+    // something else is not the one this command set up.
+    let leave = |why: String| -> Result<()> {
+        bail!(
+            "{why}; it is not approved. If it is yours, approve it with: airlox machine approve {} (or remove              the machine with airlox machine rm {})",
+            a.name,
+            a.name
+        )
+    };
+    if runner.name != a.name {
+        return leave(format!(
+            "the runner that used the code joined as {:?}, not {:?}",
+            clean_line(&runner.name),
+            a.name
+        ));
+    }
+    // A code is a secret on a screen: at a terminal, show who used it
+    // before approving.
+    if !a.yes && !a.common.json && std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        eprint!(
+            "Runner {} on host {} ({} sandbox), key {}, used the code.\nCheck the key against the one the \
+             runner printed when it joined. Approve it? [y/N] ",
+            clean_line(&runner.name),
+            clean_line(&runner.host),
+            clean_line(&runner.sandbox),
+            fingerprint(&runner.participant_pub)
+        );
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            return leave("you did not approve it".into());
+        }
+    }
     let runner = s.approve_runner(&runner.participant_pub).await?;
     let mut m = m;
     m.runner_pub = Some(runner.participant_pub.clone());
@@ -817,32 +857,30 @@ mod tests {
             image: Some("ghcr.io/me/ci:latest".into()),
             concurrency: 1,
             no_wait: false,
+            yes: false,
             wait: Duration::from_secs(60),
             common: Common { cache_dir: None, display_name: "owner".into(), json: false },
         };
         assert_eq!(
-            join_line(&a, "7-guitar-orbit", "https://airlox.app", false),
+            join_line(&a, "7-guitar-orbit", "https://airlox.app"),
             "airlox runner join --code 7-guitar-orbit --name gpu-box --labels gpu,cuda12 --sandbox docker \
              --image ghcr.io/me/ci:latest --workspace"
         );
         let local = AddArgs { image: None, labels: vec![], ..a };
         assert_eq!(
-            join_line(&local, "7-a-b", "http://127.0.0.1:8080", false),
+            join_line(&local, "7-a-b", "http://127.0.0.1:8080"),
             "airlox runner join --code 7-a-b --relay http://127.0.0.1:8080 --name gpu-box --sandbox local --workspace"
         );
         // Slots go in the command only when there is more than one.
         let shared = AddArgs { concurrency: 4, ..local };
         assert_eq!(
-            join_line(&shared, "7-a-b", "https://airlox.app", false),
+            join_line(&shared, "7-a-b", "https://airlox.app"),
             "airlox runner join --code 7-a-b --name gpu-box --sandbox local --concurrency 4 --workspace"
         );
-        // A process sandbox cannot keep jobs off the network: the command
-        // says it accepts that, or the runner would not start.
+        // Accepting that a process sandbox cannot keep jobs off the network
+        // is for whoever runs the command on the machine, not this one.
         let process = AddArgs { sandbox: Some("process".into()), concurrency: 1, ..shared };
-        assert!(join_line(&process, "7-a-b", "https://airlox.app", false)
-            .ends_with("--sandbox process --accept-network-gap --workspace"));
-        assert!(join_line(&process, "7-a-b", "https://airlox.app", true)
-            .ends_with("--sandbox process --workspace"));
+        assert!(join_line(&process, "7-a-b", "https://airlox.app").ends_with("--sandbox process --workspace"));
     }
 
     #[test]

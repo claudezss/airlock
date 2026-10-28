@@ -35,9 +35,36 @@ pub const TREE_JSON: &str = ".airlox/tree.json";
 pub const IGNORE_FILE: &str = ".airloxignore";
 
 /// File names that usually hold credentials (matched against the name, not
-/// the path).
-const CREDENTIAL_NAMES: &[&str] =
-    &[".env", ".env.*", "*.pem", "id_rsa*", "*.keystore", ".netrc", "credentials.json"];
+/// the path, ignoring case).
+pub const CREDENTIAL_NAMES: &[&str] = &[
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "*.keystore",
+    "*.jks",
+    "id_rsa*",
+    "id_dsa*",
+    "id_ecdsa*",
+    "id_ed25519*",
+    ".netrc",
+    "_netrc",
+    ".npmrc",
+    ".pypirc",
+    ".pgpass",
+    ".git-credentials",
+    "credentials",
+    "credentials.json",
+    "*.tfstate",
+    "*.tfstate.*",
+    "*.tfvars",
+    "kubeconfig",
+];
+/// Paths that hold credentials although their names are common: the end of
+/// the path, ignoring case.
+pub const CREDENTIAL_PATHS: &[&str] = &[".docker/config.json", ".kube/config"];
 
 #[derive(Serialize, Debug, Clone)]
 pub struct TreeFile {
@@ -129,8 +156,10 @@ pub fn pattern_matches(pattern: &str, path: &str) -> bool {
 }
 
 fn credential_name(path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
+    let path = path.to_lowercase();
+    let name = path.rsplit('/').next().unwrap_or(&path);
     CREDENTIAL_NAMES.iter().any(|p| glob_match(p, name))
+        || CREDENTIAL_PATHS.iter().any(|p| path == *p || path.ends_with(&format!("/{p}")))
 }
 
 /// The root of the repository holding `dir`, if there is one.
@@ -182,8 +211,8 @@ fn file_mode(_meta: &std::fs::Metadata) -> u32 {
 }
 
 fn ignore_patterns(root: &Path) -> Vec<String> {
-    std::fs::read_to_string(root.join(IGNORE_FILE))
-        .unwrap_or_default()
+    let text = std::fs::read(root.join(IGNORE_FILE)).unwrap_or_default();
+    String::from_utf8_lossy(&text)
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
@@ -198,6 +227,19 @@ pub fn build(dir: &Path, opts: &TreeOpts) -> Result<Tree> {
     let git_top = git_root(&dir);
     let in_git = git_top.is_some();
     let root = git_top.map(|r| r.canonicalize().unwrap_or(r)).unwrap_or_else(|| dir.clone());
+    // Outside a repository a tree is every file under the directory: not a
+    // home directory's dotfiles, nor a whole disk.
+    if !in_git {
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from);
+        let home = home.and_then(|h| h.canonicalize().ok());
+        if root.parent().is_none() || home.as_deref() == Some(root.as_path()) {
+            bail!(
+                "{} is {}, not a project: build a tree from a project's directory",
+                root.display(),
+                if root.parent().is_none() { "the root of a disk" } else { "your home directory" }
+            );
+        }
+    }
     let listed: Vec<String> = if in_git {
         let out = Command::new("git")
             .arg("-C")
@@ -376,6 +418,7 @@ impl Tree {
         &self,
         s: &mut crate::session::Session,
         target: &crate::session::Target,
+        kind: airlox_core::session::JobKind,
         fresh: bool,
     ) -> Result<(Vec<u8>, Option<usize>)> {
         use crate::session::Target;
@@ -389,7 +432,7 @@ impl Tree {
                     .runners()
                     .await?
                     .into_iter()
-                    .filter(|r| r.approved && !r.rejected)
+                    .filter(|r| r.approved && !r.rejected && r.kinds.iter().any(|k| *k == kind.as_str()))
                     .filter(|r| match target {
                         Target::Labels(want) => want.iter().all(|l| r.labels.contains(l)),
                         _ => true,
@@ -402,7 +445,7 @@ impl Tree {
             }
         };
         if let Some(runner) = runner {
-            if let Some(held) = s.held_tree(&runner) {
+            if let Some(held) = s.held_tree(&runner).await {
                 if let Some((zip, n)) = self.delta(&held)? {
                     return Ok((zip, Some(n)));
                 }
@@ -451,10 +494,31 @@ mod tests {
 
     #[test]
     fn credential_names_are_recognised_by_name() {
-        for p in [".env", "app/.env.production", "deploy/key.pem", "id_rsa", ".netrc", "x/credentials.json"] {
+        for p in [
+            ".env",
+            "app/.env.production",
+            "deploy/key.pem",
+            "id_rsa",
+            ".netrc",
+            "x/credentials.json",
+            ".ENV",
+            "keys/ID_ED25519",
+            "home/.aws/credentials",
+            ".npmrc",
+            "infra/prod.tfvars",
+            "u/.docker/config.json",
+            ".kube/config",
+        ] {
             assert!(credential_name(p), "{p}");
         }
-        for p in ["env.py", "README.md", "src/pem.rs", "credentials.json.example"] {
+        for p in [
+            "env.py",
+            "README.md",
+            "src/pem.rs",
+            "credentials.json.example",
+            "app/config.json",
+            "kube/config",
+        ] {
             assert!(!credential_name(p), "{p}");
         }
     }

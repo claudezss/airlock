@@ -88,8 +88,9 @@ const STREAMS: [Stream; 2] = [Stream::Stdout, Stream::Stderr];
 /// The text at the start of `buf`, at most `max` bytes, and how many bytes of
 /// `buf` it covers. Cut at a character boundary: a sequence still arriving at
 /// the end of `buf` waits for more bytes, unless `last` says there are none,
-/// and bytes that are not UTF-8 at all become U+FFFD (so a chunk's length can
-/// exceed the bytes it covers, never `max`).
+/// and each byte that is not UTF-8 at all becomes `?`, so a chunk's `data` is
+/// exactly as long as the bytes it covers and `offset` plus its length is
+/// where the next chunk starts.
 fn utf8_chunk(buf: &[u8], max: usize, last: bool) -> (String, usize) {
     let (mut out, mut used) = (String::new(), 0);
     while used < buf.len() {
@@ -117,10 +118,10 @@ fn utf8_chunk(buf: &[u8], max: usize, last: bool) -> (String, usize) {
         match bad {
             Some(0) | None => break,
             Some(n) => {
-                if out.len() + '\u{fffd}'.len_utf8() > max {
+                if out.len() + n > max {
                     break;
                 }
-                out.push('\u{fffd}');
+                out.extend(std::iter::repeat_n('?', n));
                 used += n;
             }
         }
@@ -355,20 +356,20 @@ mod tests {
     }
 
     #[test]
-    fn bytes_that_are_not_utf8_become_replacement_characters_keeping_offsets() {
+    fn bytes_that_are_not_utf8_become_question_marks_keeping_offsets() {
         let t0 = Instant::now();
         let mut s = Streamer::new(limits(120, 1 << 20));
         s.feed(Stream::Stdout, b"ok\xff\xfeend", t0);
         let c = s.due(at(t0, 1100));
-        assert_eq!(c[0].data, "ok\u{fffd}\u{fffd}end");
+        assert_eq!(c[0].data, "ok??end");
         s.feed(Stream::Stdout, b"x", at(t0, 1200));
         let c = s.due(at(t0, 2300));
         assert_eq!((c[0].offset, c[0].data.as_str()), (7, "x"));
-        // A chunk stays within 64 KiB even when every byte expands to three.
+        // A chunk covers as many bytes as its data holds, so offsets add up.
         let mut s = Streamer::new(limits(120, 1 << 20));
         s.feed(Stream::Stdout, &vec![0xff; MAX_CHUNK_BYTES], t0);
         let c = s.due(at(t0, 1));
-        assert!(c[0].data.len() <= MAX_CHUNK_BYTES && c[0].data.chars().all(|ch| ch == '\u{fffd}'));
+        assert!(c[0].data.len() == MAX_CHUNK_BYTES && c[0].data.chars().all(|ch| ch == '?'));
         assert_eq!(c[0].offset, 0);
         assert_eq!(s.read_from(Stream::Stdout), Some(MAX_CHUNK_BYTES as u64));
     }
@@ -378,7 +379,7 @@ mod tests {
         let (out, used) = utf8_chunk(&"a€".as_bytes()[..3], 100, false);
         assert_eq!((out.as_str(), used), ("a", 1));
         let (out, used) = utf8_chunk(&"a€".as_bytes()[..3], 100, true);
-        assert_eq!((out.as_str(), used), ("a\u{fffd}", 3));
+        assert_eq!((out.as_str(), used), ("a??", 3));
     }
 
     #[test]

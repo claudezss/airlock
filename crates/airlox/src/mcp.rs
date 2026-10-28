@@ -486,15 +486,13 @@ pub struct ShellRunParams {
     pub script: Option<String>,
     /// Send this checkout (a directory inside an allowed directory) as the
     /// job's input, and start the job in it: the files git would commit or
-    /// add, ignored ones left out. Files whose names usually mean
-    /// credentials (.env, *.pem, ...) are refused unless `tree_allow` names them.
+    /// add, ignored ones left out. A tree holding files whose names usually
+    /// mean credentials (.env, *.pem, ...) is refused: leave them out with
+    /// `tree_exclude` (sending them takes the CLI's --tree-allow).
     pub tree_dir: Option<String>,
     /// Globs of files to leave out of the tree.
     #[serde(default)]
     pub tree_exclude: Vec<String>,
-    /// Globs of credential-named files to send anyway.
-    #[serde(default)]
-    pub tree_allow: Vec<String>,
     /// Start from an empty workspace on the runner.
     #[serde(default)]
     pub fresh: bool,
@@ -1067,7 +1065,7 @@ stderr, exit code, env with the tree and image it ran against) is returned at th
                 let dir = tool_try!(self.allowed(d, true));
                 let t = tool_try!(crate::tree::build(
                     &dir,
-                    &crate::tree::TreeOpts { allow: &p.tree_allow, exclude: &p.tree_exclude }
+                    &crate::tree::TreeOpts { allow: &[], exclude: &p.tree_exclude }
                 ));
                 // The repository root may be above the directory named: all
                 // of it must be somewhere these tools may read.
@@ -1118,11 +1116,13 @@ stderr, exit code, env with the tree and image it ran against) is returned at th
             // its workspace on the runner.
             let tree_ref = match &tree {
                 Some(t) => {
-                    let (zip, sent) = tool_try!(t.zip_for(s, &target, p.fresh).await);
+                    let (zip, sent) =
+                        tool_try!(t.zip_for(s, &target, airlox_core::session::JobKind::Shell, p.fresh).await);
+                    // Whole, as a stale workspace would need it.
                     let max = s.manifest.max_item_bytes.saturating_sub(4096);
-                    if zip.len() as u64 > max {
+                    if t.zip.len() as u64 > max {
                         return fail(json!({"error": "the tree is over the session's item limit",
-                            "zip_bytes": zip.len(), "limit": max, "largest": t.largest,
+                            "zip_bytes": t.zip.len(), "limit": max, "largest": t.largest,
                             "hint": "leave files out with tree_exclude"}));
                     }
                     delta = sent;
@@ -1187,7 +1187,10 @@ stderr, exit code, env with the tree and image it ran against) is returned at th
                 .as_ref()
                 .and_then(|r| r.reason.as_deref())
                 .is_some_and(|r| r.starts_with("tree_stale"));
-            if let (true, Some(t), Some(_)) = (stale, &tree, delta.take()) {
+            // `delta` is taken only here: a poll that finds nothing yet must
+            // not use up the one resend.
+            if let (true, Some(t), true) = (stale, &tree, delta.is_some()) {
+                delta = None;
                 let mut g = slot.lock().await;
                 let s = &mut g.s;
                 let r = tool_try!(s.send_file_reply(t.zip.clone(), crate::tree::TREE_ZIP, None).await);

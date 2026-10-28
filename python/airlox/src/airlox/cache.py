@@ -132,12 +132,14 @@ class Cache:
             return None
         return held if isinstance(held, dict) and isinstance(held.get("files"), dict) else None
 
-    def save_held(self, runner: str, job: str, files: dict) -> None:
+    def save_held(self, runner: str, job: str, files: dict, seen: bool = False) -> None:
+        """``seen``: the job's result said what the workspace holds; until
+        then ``files`` is only what was sent."""
         p = self._tree_file(runner)
         if p is None:
             return
         p.parent.mkdir(exist_ok=True)
-        _write_atomic(p, json.dumps({"job": job, "files": files}).encode())
+        _write_atomic(p, json.dumps({"job": job, "files": files, "seen": seen}).encode())
 
     def forget_held(self, runner: str) -> None:
         p = self._tree_file(runner)

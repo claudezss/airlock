@@ -226,9 +226,12 @@ upload; `--progress-rate 0` turns streaming off for a runner.
   `airlox run --tree -- pytest` from `services/api` runs there.
 - Before sending, the CLI prints the count and size and the names of up to
   five of the largest files. It refuses, by default, a tree that contains a
-  file matching a short built-in list of credential names (`.env`, `.env.*`,
-  `*.pem`, `id_rsa*`, `*.keystore`, `.netrc`, `credentials.json`) unless
-  `--tree-allow <glob>` names it, and `--tree-exclude <glob>` (repeatable,
+  file matching a built-in list of credential names, ignoring case (`.env`,
+  `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`, `*.keystore`,
+  `.netrc`, `.npmrc`, `.pypirc`, `credentials`, `credentials.json`,
+  `*.tfvars`, `.docker/config.json`, and a few more) unless
+  `--tree-allow <glob>` names it (the MCP tool cannot: an agent leaves such
+  files out), and `--tree-exclude <glob>` (repeatable,
   also read from `.airloxignore`) drops files. Untracked files are the usual
   home of secrets, which is why the default is to send them with a check
   rather than to leave them out: a test that needs a generated fixture
@@ -268,9 +271,9 @@ one directory per `(session, sender participant key)`:
   `--fresh` on `airlox run` asks for an empty workspace first.
 - `HOME` is the work dir, so tool caches accumulate there too.
 - Limits: `--workspace-max-mb` (default 10240) per workspace; a job that
-  leaves the workspace over the limit gets `status: completed` and the next
-  job from that sender is refused with `workspace_full` until it runs with
-  `--fresh`. `--workspace-ttl` (default 14 days idle) removes unused ones;
+  leaves the workspace over the limit gets `status: completed`, a note in
+  its stderr, and its workspace emptied, so the disk is not held until the
+  sender's next job. Nothing bounds a job's writes while it runs. `--workspace-ttl` (default 14 days idle) removes unused ones;
   closing the session removes all of it. A runner restart keeps workspaces.
 - Docker: the workspace is bind-mounted as `/work` rw in place of the
   per-job temp dir; the root stays read-only. Linux local: the pivoted root
@@ -328,7 +331,10 @@ claim (`POST /v1/drops/{nameplate}/claim`, §4.1) gains an optional
 `participant_pub`, which `runner join --code` sets to the key it will join
 with; the relay reports it to the code's creator (`session code --wait`
 already streams how a code ended). `machine add` approves exactly that key
-when it joins and leaves approval on for everyone else. This trusts the
+when it joins under the machine's name, and leaves approval on for everyone
+else. At a terminal it first shows the runner's name, host and key fingerprint
+and asks (`--yes` skips this), since a code on a screen can be read and used
+first by someone else. This trusts the
 relay to report the claimant honestly, which is the trust a code already
 places in it (it could recover the invite); it does not trust the relay with
 anything a link would not. A person who wants no such trust uses `--invite`

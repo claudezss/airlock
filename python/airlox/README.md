@@ -42,7 +42,7 @@ result = job.wait(timeout=None, on_output=lambda c: print(c.data, end=""))
 ```
 
 The tree is the repository's tracked and untracked files (ignored ones left
-out), and files named like credentials (`.env`, `*.pem`) are refused unless
+out), and files named like credentials (`.env`, `*.pem`, `.npmrc`, any case) are refused unless
 `tree_allow=` names them. The job starts in the directory you gave, within
 the tree. In a session with workspaces, later jobs to the same runner send
 only the files that changed. `on_output` sees output as it streams;

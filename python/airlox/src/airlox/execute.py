@@ -281,9 +281,10 @@ class Job:
         return out
 
     def chunks(self) -> List[Chunk]:
-        """The job's streamed output so far (after a ``sync``), each stream
-        contiguous from its start: a chunk that repeats what came before is
-        trimmed, and nothing after a gap is shown until the gap fills."""
+        """The job's streamed output so far (after a ``sync``), in order of
+        offset per stream: a chunk that repeats what came before is trimmed.
+        A chunk the relay lost leaves a gap (as ``airlox run`` shows it); the
+        signed result has all of the output."""
         got = []
         for item in self._from_runner():
             m = item.meta
@@ -296,8 +297,6 @@ class Job:
             # Offsets count UTF-8 bytes; data was cut at a character boundary.
             raw = c.data.encode("utf-8")
             nxt = upto.get(c.stream, 0)
-            if c.offset > nxt:
-                continue  # a gap: wait for what comes before
             end = c.offset + len(raw)
             if end <= nxt and not c.truncated:
                 continue

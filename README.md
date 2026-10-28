@@ -111,7 +111,8 @@ airlox machine add gpu-box --image ghcr.io/me/ci:latest
 ```
 
 It prints one command to run on the machine, waits for that runner to join,
-and approves exactly it:
+and approves exactly it (at a terminal it shows the runner's key first and
+asks; `--yes` skips that):
 
 ```bash
 airlox runner join --code 7-guitar-orbit --name gpu-box --sandbox docker --image ghcr.io/me/ci:latest --workspace

@@ -40,8 +40,16 @@ TREE_JSON = ".airlox/tree.json"
 #: Read from the tree's root: one glob per line, like ``exclude``.
 IGNORE_FILE = ".airloxignore"
 
-#: File names that usually hold credentials (matched against the name, not the path).
-CREDENTIAL_NAMES = (".env", ".env.*", "*.pem", "id_rsa*", "*.keystore", ".netrc", "credentials.json")
+#: File names that usually hold credentials (matched against the name, not
+#: the path, ignoring case).
+CREDENTIAL_NAMES = (
+    ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "*.keystore", "*.jks", "id_rsa*", "id_dsa*",
+    "id_ecdsa*", "id_ed25519*", ".netrc", "_netrc", ".npmrc", ".pypirc", ".pgpass", ".git-credentials",
+    "credentials", "credentials.json", "*.tfstate", "*.tfstate.*", "*.tfvars", "kubeconfig",
+)
+#: Paths that hold credentials although their names are common: the end of
+#: the path, ignoring case.
+CREDENTIAL_PATHS = (".docker/config.json", ".kube/config")
 
 #: A job input holds at most this many entries (tree.json is one of them).
 _MAX_ENTRIES = 10_000
@@ -98,8 +106,11 @@ def pattern_matches(pattern: str, path: str) -> bool:
 
 
 def _credential_name(path: str) -> bool:
+    path = path.lower()
     name = path.rsplit("/", 1)[-1]
-    return any(glob_match(p, name) for p in CREDENTIAL_NAMES)
+    return any(glob_match(p, name) for p in CREDENTIAL_NAMES) or any(
+        path == p or path.endswith("/" + p) for p in CREDENTIAL_PATHS
+    )
 
 
 def _git(root: Path, *args: str) -> Optional[str]:
@@ -110,11 +121,20 @@ def _git(root: Path, *args: str) -> Optional[str]:
     return out.stdout.decode("utf-8", "replace") if out.returncode == 0 else None
 
 
-def _walk(root: Path) -> List[str]:
+def _walk(root: Path, notes: List[str]) -> List[str]:
     out = []
     for d, dirs, files in os.walk(root):
-        dirs[:] = [x for x in dirs if x != ".git"]
         rel = Path(d).relative_to(root).as_posix()
+        keep = []
+        for x in dirs:
+            p = x if rel == "." else f"{rel}/{x}"
+            if x == ".git":
+                continue
+            if (Path(d) / x).is_symlink():
+                notes.append(f"left out {p}: a symbolic link")
+                continue
+            keep.append(x)
+        dirs[:] = keep
         for f in files:
             out.append(f if rel == "." else f"{rel}/{f}")
     return sorted(out)
@@ -196,6 +216,11 @@ def build(
     top = _git(directory, "rev-parse", "--show-toplevel")
     in_git = bool(top and top.strip())
     root = Path(top.strip()).resolve() if in_git else directory
+    # Outside a repository a tree is every file under the directory: not a
+    # home directory's dotfiles, nor a whole disk.
+    if not in_git and (root.parent == root or root == Path.home().resolve()):
+        where = "the root of a disk" if root.parent == root else "your home directory"
+        raise TreeRefused(f"{root} is {where}, not a project: build a tree from a project's directory")
     if in_git:
         out = subprocess.run(
             ["git", "-C", str(root), "ls-files", "-z", "-co", "--exclude-standard"], capture_output=True
@@ -204,11 +229,12 @@ def build(
             raise RuntimeError(f"git ls-files failed: {out.stderr.decode('utf-8', 'replace').strip()}")
         listed = sorted({p.decode("utf-8", "replace") for p in out.stdout.split(b"\0") if p})
     else:
-        listed = _walk(root)
+        listed = _walk(root, notes)
     allow = list(allow)
     excludes = list(exclude)
     try:
-        excludes += [l for l in (root / IGNORE_FILE).read_text().splitlines() if l.strip() and not l.lstrip().startswith("#")]
+        text = (root / IGNORE_FILE).read_bytes().decode("utf-8", "replace")
+        excludes += [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
     except OSError:
         pass
     files, flagged = [], []

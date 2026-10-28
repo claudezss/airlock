@@ -319,7 +319,7 @@ async fn join(
     Ok((kp, token))
 }
 
-fn private_dir(dir: &std::path::Path) -> Result<()> {
+pub fn private_dir(dir: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
@@ -517,6 +517,29 @@ pub(crate) async fn invite_link(
         (None, Some(link)) => Ok(link.clone()),
         (None, None) => bail!("pass --invite, --invite-file or --code"),
     }
+}
+
+/// The runner ended because the session will not take it back: the owner
+/// rejected it, or revoked its role. Starting it again cannot help.
+#[derive(Debug)]
+pub struct TurnedAway(pub &'static str);
+
+impl std::fmt::Display for TurnedAway {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for TurnedAway {}
+
+/// Whether `e` says the runner cannot rejoin: turned away while running, or
+/// refused at join because its role was revoked or the session closed.
+pub fn turned_away(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.is::<TurnedAway>()
+            || c.downcast_ref::<crate::client::RelayError>()
+                .is_some_and(|r| matches!(r.code.as_str(), "revoked" | "closed"))
+    })
 }
 
 pub async fn run(args: JoinArgs) -> Result<()> {
@@ -813,13 +836,14 @@ pub async fn run(args: JoinArgs) -> Result<()> {
     });
     job::report_interrupted(&ctx, &view).await;
     // Idle workspaces go at startup and then every hour.
+    let in_use = ctx.workspaces_in_use.clone();
     let sweeper = ctx.workspaces.clone().map(|w| {
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(3600));
             loop {
                 tick.tick().await;
-                let w = w.clone();
-                let _ = tokio::task::spawn_blocking(move || w.sweep()).await;
+                let (w, in_use) = (w.clone(), in_use.clone());
+                let _ = tokio::task::spawn_blocking(move || w.sweep(&in_use)).await;
             }
         })
     });
@@ -1091,9 +1115,9 @@ async fn serve(
                     }
                     pending.retain(|j| *j != job);
                 }
-                Some(Msg::Rejected) => break Err(anyhow::anyhow!("the owner rejected this runner")),
+                Some(Msg::Rejected) => break Err(TurnedAway("the owner rejected this runner").into()),
                 Some(Msg::Unauthorized) => {
-                    break Err(anyhow::anyhow!("the relay no longer accepts this runner (rejected, revoked or left)"))
+                    break Err(TurnedAway("the relay no longer accepts this runner (rejected, revoked or left)").into())
                 }
                 Some(Msg::Gone) | None => {
                     view.lock().await.closed = true;

@@ -30,6 +30,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use airlox_core::encoding::hex;
@@ -71,16 +72,22 @@ impl Workspaces {
     }
 
     /// Remove the workspaces unused for longer than the TTL; returns how many.
-    pub fn sweep(&self) -> usize {
+    /// `in_use` holds the work directories jobs have leased: one leased is
+    /// left alone however old its state, and one being removed is leased
+    /// meanwhile, so no job starts in it.
+    pub fn sweep(&self, in_use: &Mutex<HashSet<PathBuf>>) -> usize {
         let mut removed = 0;
+        let lock = || in_use.lock().unwrap_or_else(|e| e.into_inner());
         for session in fs::read_dir(&self.root).into_iter().flatten().flatten() {
             for ws in fs::read_dir(session.path()).into_iter().flatten().flatten() {
                 let ws = Workspace { dir: ws.path() };
-                if ws.idle().is_some_and(|idle| idle > self.ttl) {
-                    tracing::info!(workspace = %ws.dir.display(), "removing a workspace unused for {} days", self.ttl.as_secs() / 86400);
-                    ws.remove();
-                    removed += 1;
+                if ws.idle().is_none_or(|idle| idle <= self.ttl) || !lock().insert(ws.work()) {
+                    continue;
                 }
+                tracing::info!(workspace = %ws.dir.display(), "removing a workspace unused for {} days", self.ttl.as_secs() / 86400);
+                ws.remove();
+                lock().remove(&ws.work());
+                removed += 1;
             }
             // Gone with its last workspace.
             let _ = fs::remove_dir(session.path());
@@ -792,11 +799,17 @@ mod tests {
         for w in [&wa, &wb, &wa2] {
             w.prepare(false).unwrap();
         }
-        assert_eq!(all.sweep(), 0, "just used");
+        let in_use = Mutex::new(HashSet::new());
+        assert_eq!(all.sweep(&in_use), 0, "just used");
         // Backdate one: only it goes, and its emptied session directory with it.
         let old = SystemTime::now() - Duration::from_secs(7200);
         fs::File::options().write(true).open(wa2.meta("state.json")).unwrap().set_modified(old).unwrap();
-        assert_eq!(all.sweep(), 1);
+        // Not while a job holds it.
+        in_use.lock().unwrap().insert(wa2.work());
+        assert_eq!(all.sweep(&in_use), 0, "in use");
+        in_use.lock().unwrap().clear();
+        assert_eq!(all.sweep(&in_use), 1);
+        assert!(in_use.lock().unwrap().is_empty());
         assert!(!wa2.dir.exists() && !all.root.join("ax_t").exists());
         assert!(wa.dir.exists() && wb.dir.exists());
         all.remove_session("ax_s");

@@ -66,8 +66,14 @@ pub async fn serve(a: ServeArgs) -> Result<()> {
     loop {
         let started = Instant::now();
         match runner::run(args.clone()).await {
-            // The session ended, the runner was turned away, or it was told to stop.
+            // The session ended, or the runner was told to stop.
             Ok(()) => return Ok(()),
+            // Rejected or revoked: a new start would only join again as a
+            // stranger. A clean exit, so the service manager leaves it stopped.
+            Err(e) if runner::turned_away(&e) => {
+                tracing::error!("the runner stopped: {e:#}; not starting again");
+                return Ok(());
+            }
             Err(e) => {
                 if *stop.borrow() {
                     return Err(e);
@@ -122,14 +128,29 @@ fn systemd_quote(s: &str) -> String {
     if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:@=+,".contains(c)) {
         s.to_string()
     } else {
-        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('%', "%%").replace('$', "$$"))
+        format!("\"{}\"", c_escape(s).replace('%', "%%").replace('$', "$$"))
     }
+}
+
+/// Backslash, quote and line breaks escaped as systemd reads a quoted word,
+/// so no value can end the line it is on.
+fn c_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r")
+}
+
+/// Open (creating it readable by this user only) the log a runner service appends to.
+pub fn open_log(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).append(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    o.open(path)
 }
 
 /// `s` as one value for a systemd `Environment=` line, which expands `%`
 /// specifiers but not `$`.
 fn systemd_env_quote(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('%', "%%"))
+    format!("\"{}\"", c_escape(s).replace('%', "%%"))
 }
 
 fn xml_escape(s: &str) -> String {
@@ -227,9 +248,11 @@ pub async fn install(a: InstallArgs) -> Result<()> {
                 path
             }
         };
+        // Runner logs name jobs, paths and errors: for this user only.
         let logs = root.join("runner").join("logs");
-        std::fs::create_dir_all(&logs)?;
+        runner::private_dir(&logs)?;
         let log = logs.join(format!("{service}.log"));
+        open_log(&log)?;
         let exe = std::env::current_exe()?;
         let exe_text = exe.display().to_string();
         if exe_text.contains("/_npx/") || exe_text.contains("/.cache/uv/") || exe_text.contains("/target/") {

@@ -983,10 +983,12 @@ pub async fn run(a: RunArgs) -> Result<i32> {
     // in its workspace on the runner.
     let sending = match &tree {
         Some(t) => {
-            let (zip, delta) = t.zip_for(&mut s, &target, a.fresh).await?;
-            // The payload adds a few hundred bytes of meta to the file.
+            let (zip, delta) = t.zip_for(&mut s, &target, kind, a.fresh).await?;
+            // The payload adds a few hundred bytes of meta to the file. The
+            // whole tree must fit even when a delta goes: a stale workspace
+            // is answered by sending it whole.
             let max = s.manifest.max_item_bytes.saturating_sub(4096);
-            if zip.len() as u64 > max {
+            if t.zip.len() as u64 > max {
                 let largest: Vec<String> = t
                     .largest
                     .iter()
@@ -995,7 +997,7 @@ pub async fn run(a: RunArgs) -> Result<i32> {
                 bail!(
                     "the tree zips to {}, over the session's item limit of {}. Largest files: {}. Leave some out \
                      with --tree-exclude <glob> or a line in .airloxignore",
-                    human_bytes(zip.len() as u64),
+                    human_bytes(t.zip.len() as u64),
                     human_bytes(max),
                     largest.join(", ")
                 );

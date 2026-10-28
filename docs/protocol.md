@@ -369,7 +369,9 @@ path under the rules of `progress_file`.
 **Output chunks.** While a job runs, its runner may stream its output as
 `progress` items carrying `stream` (`stdout` or `stderr`), `offset` (the
 byte position of `data` in that stream) and `data` (at most 64 KiB of the
-stream as text, cut at a UTF-8 boundary); such a chunk has `tail: null` and
+stream as text, cut at a UTF-8 boundary, with each byte that is not UTF-8
+replaced by `?`, so `offset` plus the byte length of `data` is where the
+next chunk starts); such a chunk has `tail: null` and
 `tail_truncated: false`. A runner caps what it streams; the chunk where it
 stops says `truncated: true` (its `data` may be empty). Chunks pass through
 the same path replacement as results, one at a time, so a path split across
@@ -555,8 +557,10 @@ deleted, and nothing else is touched, so ignored directories such as
 `node_modules/` survive. The sync never follows a link or writes through a
 non-directory parent the previous job left. `fresh: true` empties the
 workspace first. A workspace over `--workspace-max-mb` (default 10 240) after
-a job refuses its sender's next job with a reason starting `workspace_full:`
-until one asks for `fresh`; workspaces idle for `--workspace-ttl` (default 14
+a job is emptied there and then, and the result's `stderr` says so (should
+emptying fail, the sender's next job is refused with a reason starting
+`workspace_full:` until one asks for `fresh`); idle workspaces are swept, never
+one a job holds; workspaces idle for `--workspace-ttl` (default 14
 days) are removed, and closing the session removes them all. Two senders
 never share a workspace, and one sender's jobs run one at a time: a runner
 with several slots (§13) that is given a second job while the sender's first

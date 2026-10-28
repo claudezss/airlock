@@ -1135,16 +1135,34 @@ pub async fn handle(
                 // and what of its tree it need not send again.
                 let ran = result.status != JobStatus::Refused;
                 let tree = tree.ok().flatten().filter(|_| ran);
-                let (size, changed) = tokio::task::spawn_blocking(move || {
+                let max = ctx.workspaces.as_ref().map_or(u64::MAX, |w| w.max_bytes);
+                // Over the limit, it goes now rather than holding the disk
+                // until the sender's next job: nothing bounds a job's writes
+                // while it runs.
+                let (size, changed, emptied) = tokio::task::spawn_blocking(move || {
                     let changed = tree.as_ref().and_then(|t| ws.changed(t));
-                    (ws.finish(), changed)
+                    let size = ws.finish();
+                    let emptied = size > max && ws.prepare(true).is_ok();
+                    (size, changed, emptied)
                 })
                 .await
-                .unwrap_or((0, None));
+                .unwrap_or((0, None, false));
                 if let Some(t) = result.env.as_mut().and_then(|e| e.tree.as_mut()) {
                     t.changed = changed;
                 }
-                tracing::info!(job = %job_id, workspace_mb = size >> 20, "workspace kept");
+                if emptied {
+                    let line = format!(
+                        "\n[airlox] your workspace on this runner grew to {} MB, over its {} MB limit, so the runner emptied it",
+                        size.div_ceil(1 << 20),
+                        max >> 20
+                    );
+                    if result.stderr.len() + line.len() <= MAX_STDIO_BYTES {
+                        result.stderr.push_str(&line);
+                    }
+                    tracing::warn!(job = %job_id, workspace_mb = size >> 20, "workspace over its limit: emptied");
+                } else {
+                    tracing::info!(job = %job_id, workspace_mb = size >> 20, "workspace kept");
+                }
             }
             crate::sandbox::make_removable(dir.path());
             drop(dir);
