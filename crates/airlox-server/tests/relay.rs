@@ -773,10 +773,12 @@ async fn sessions_that_never_expire_have_their_own_idle_limit() {
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert_eq!(info(&env, &brief.id).await, StatusCode::NOT_FOUND);
     assert_eq!(info(&env, &forever.id).await, StatusCode::OK);
-    // It survives a restart, and goes once idle for its own, longer limit.
+    // It survives a restart, and goes once idle for its own, longer limit
+    // (with no reconnect grace, the restart does not move its idle clock).
     env.restart(|c| {
         c.idle_ttl_ms = 300;
         c.idle_ttl_unexpiring_ms = 1_500;
+        c.job_reconnect_grace_ms = 0;
     })
     .await;
     assert_eq!(info(&env, &forever.id).await, StatusCode::OK);
@@ -784,6 +786,67 @@ async fn sessions_that_never_expire_have_their_own_idle_limit() {
     assert_eq!(info(&env, &forever.id).await, StatusCode::NOT_FOUND);
     // A closed or purged session that never expires cannot be re-created.
     assert_eq!(create(&env, &forever).await.status(), StatusCode::GONE);
+}
+
+async fn open_stream(env: &Env, s: &Sess, m: &Member) -> reqwest::Response {
+    let r = env
+        .http
+        .get(env.url(&format!("/v1/sessions/{}/stream", s.id)))
+        .bearer_auth(&m.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    r
+}
+
+async fn info(env: &Env, id: &str) -> StatusCode {
+    env.http.get(env.url(&format!("/v1/sessions/{id}"))).send().await.unwrap().status()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_with_an_open_stream_is_not_idle() {
+    let env = Env::with(|c| c.idle_ttl_ms = 600).await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let stream = open_stream(&env, &s, &owner).await;
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    // Well past the idle limit with nothing posted: the open stream keeps it.
+    assert_eq!(info(&env, &s.id).await, StatusCode::OK);
+    // Closing it starts the idle clock: the session gets the full limit from
+    // then, not from its last post.
+    drop(stream);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(info(&env, &s.id).await, StatusCode::OK);
+    assert!(eventually(|| async { info(&env, &s.id).await == StatusCode::NOT_FOUND }).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_gives_streams_time_to_reconnect() {
+    let cfg = |c: &mut airlox_server::Config| {
+        c.idle_ttl_unexpiring_ms = 1_000;
+        c.job_reconnect_grace_ms = 1_000;
+    };
+    let mut env = Env::with(cfg).await;
+    let s = new_session_ttl(Mode::Relay, None);
+    create(&env, &s).await;
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let stream = open_stream(&env, &s, &owner).await;
+    // Held past the idle limit by its stream, then the relay restarts. Streams
+    // are not logged, so it comes back looking idle since the join.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    drop(stream);
+    env.restart(cfg).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(info(&env, &s.id).await, StatusCode::OK);
+    // Reconnecting keeps it.
+    let stream = open_stream(&env, &s, &owner).await;
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    assert_eq!(info(&env, &s.id).await, StatusCode::OK);
+    // Once that stream closes too, it goes after the idle limit.
+    drop(stream);
+    assert!(eventually(|| async { info(&env, &s.id).await == StatusCode::NOT_FOUND }).await);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -962,4 +1025,47 @@ async fn health_counts_open_sessions_and_nothing_more() {
         .await;
     assert_eq!(r.unwrap().status(), StatusCode::NO_CONTENT);
     assert_eq!(health().await["sessions"], 1);
+}
+
+async fn health(env: &Env) -> Value {
+    env.http.get(env.url("/v1/health")).send().await.unwrap().json::<Value>().await.unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn health_active_counts_sessions_someone_is_in() {
+    // With no activity window, only an open stream makes a session active.
+    let env = Env::with(|c| c.active_window_ms = 0).await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    // The count is taken at each sweep.
+    assert!(eventually(|| async { health(&env).await["sessions"] == 1 }).await);
+    assert_eq!(health(&env).await["active"], 0);
+    let stream = open_stream(&env, &s, &owner).await;
+    assert!(eventually(|| async { health(&env).await["active"] == 1 }).await);
+    drop(stream);
+    // The stream's slot is released when the connection goes.
+    assert!(
+        eventually(|| async { health(&env).await["active"] == 0 }).await,
+        "a closed stream still counted the session as active"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn health_active_counts_recent_activity() {
+    let env = Env::with(|c| c.active_window_ms = 60_000).await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    // Creating it is activity.
+    assert!(eventually(|| async { health(&env).await["active"] == 1 }).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn health_can_leave_out_the_active_count() {
+    let env = Env::with(|c| c.hide_active = true).await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let h = health(&env).await;
+    assert_eq!(h["sessions"], 1);
+    assert!(h.get("active").is_none(), "{h}");
 }

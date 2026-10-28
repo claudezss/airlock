@@ -43,7 +43,9 @@ pub struct Config {
     /// Session log size (joins and item envelopes). Bounds per-session memory.
     #[arg(long, env = "AIRLOX_MAX_LOG_BYTES", default_value = "4MiB", value_parser = parse_size)]
     pub max_log_bytes: u64,
-    /// Purge a session after this long without joins, items, acks or downloads.
+    /// Purge a session after this long without joins, items, acks or
+    /// downloads, while nobody holds a stream to it. Closing the last stream
+    /// starts the clock again.
     #[arg(long = "idle-ttl", env = "AIRLOX_IDLE_TTL", default_value = "2h", value_parser = parse_duration_ms)]
     pub idle_ttl_ms: u64,
     /// The same, for sessions that never expire; `never` keeps them until
@@ -51,10 +53,20 @@ pub struct Config {
     #[arg(
         long = "idle-ttl-unexpiring",
         env = "AIRLOX_IDLE_TTL_UNEXPIRING",
-        default_value = "30d",
+        default_value = "3d",
         value_parser = parse_duration_or_never
     )]
     pub idle_ttl_unexpiring_ms: u64,
+    /// A session counts as active (`/v1/health` `active`) while a participant
+    /// holds a stream to it, or for this long after its last join, item, ack,
+    /// download or closed stream.
+    #[arg(long = "active-window", env = "AIRLOX_ACTIVE_WINDOW", default_value = "15m", value_parser = parse_duration_ms)]
+    pub active_window_ms: u64,
+    /// Leave `active` out of `/v1/health`. It tells anyone who polls it when
+    /// someone connects, which on a small relay can say when one person's
+    /// machine is online.
+    #[arg(long, env = "AIRLOX_HIDE_ACTIVE")]
+    pub hide_active: bool,
     /// Ciphertext the uploads from one address may have held on the relay at
     /// once, over all sessions (an IPv6 address counts by its /64).
     #[arg(long, env = "AIRLOX_MAX_BYTES_PER_IP", default_value = "unlimited", value_parser = parse_size_or_unlimited)]
@@ -80,7 +92,8 @@ pub struct Config {
     pub runner_timeout_ms: u64,
     /// How long a running job outlives its runner's silence (at least
     /// `--runner-timeout`): a runner that reconnects within it carries on,
-    /// and its result still finishes the job.
+    /// and its result still finishes the job. After a restart, sessions get
+    /// as long for their streams to reconnect before they can go idle.
     #[arg(long = "job-reconnect-grace", env = "AIRLOX_JOB_RECONNECT_GRACE", default_value = "15m", value_parser = parse_duration_ms)]
     pub job_reconnect_grace_ms: u64,
     /// How long a one-time transfer code stays claimable.
@@ -103,6 +116,15 @@ impl Config {
         let mut c = Config::parse_from(["airlox-server"]);
         c.data = data.into();
         c
+    }
+
+    /// The idle limit for a session that expires (`--idle-ttl`) or not
+    /// (`--idle-ttl-unexpiring`).
+    pub fn idle_ttl_for(&self, expires_at_ms: Option<u64>) -> u64 {
+        match expires_at_ms {
+            Some(_) => self.idle_ttl_ms,
+            None => self.idle_ttl_unexpiring_ms,
+        }
     }
 }
 

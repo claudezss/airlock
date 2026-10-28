@@ -471,6 +471,8 @@ impl Drop for RunnerSlot {
         if let Some(p) = g.presence.get_mut(&self.who) {
             p.streams = p.streams.saturating_sub(1);
         }
+        // A machine idle between jobs counts as idle from when it drops off.
+        g.last_activity_ms = g.last_activity_ms.max(now_ms());
     }
 }
 

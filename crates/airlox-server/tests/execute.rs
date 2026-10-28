@@ -1012,6 +1012,23 @@ async fn runners_need_execute_mode_and_approval_survives_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_connected_runner_keeps_an_idle_session() {
+    let (env, s, _owner, _sender) = execute_env(|c| c.idle_ttl_ms = 600).await;
+    let runner = join_runner(&env, &s, "runner-01", &[]).await;
+    let info =
+        || async { env.http.get(env.url(&format!("/v1/sessions/{}", s.id))).send().await.unwrap().status() };
+    // A paired machine waits on its stream between jobs: no posts, not idle.
+    let stream = RunnerStream::open(&env, &s, &runner).await;
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert_eq!(info().await, StatusCode::OK);
+    // Dropping off starts the idle clock; it goes a full limit later.
+    drop(stream);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(info().await, StatusCode::OK);
+    assert!(eventually(|| async { info().await == StatusCode::NOT_FOUND }).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn only_the_assigned_approved_runner_posts_results() {
     let (env, s, owner, sender) = execute_env(|_| {}).await;
     let runner = join_runner(&env, &s, "runner-01", &[]).await;

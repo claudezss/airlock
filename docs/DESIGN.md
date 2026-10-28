@@ -614,11 +614,13 @@ refuses a manifest or an upload that exceeds a limit.
 | `AIRLOX_BLOB_GRACE` | 5 min | How long a blob stays after its last recipient acked. It absorbs a recipient that acks and then immediately re-fetches; late joiners need re-seeding (M4). |
 | `AIRLOX_MAX_SESSION_BYTES` | 1 GiB | Ciphertext a session may have held on the relay at once; uploads past it get `413`. |
 | `AIRLOX_MAX_SESSION_TRANSFER` | 4 GiB | Total bytes uploaded plus downloaded per session, the bandwidth cap; past it, `429`. |
-| `AIRLOX_JOB_RECONNECT_GRACE` | 15 min | How long a running job outlives its runner's silence before it fails as `runner_lost`; a runner that reconnects meanwhile carries on. |
+| `AIRLOX_JOB_RECONNECT_GRACE` | 15 min | How long a running job outlives its runner's silence before it fails as `runner_lost`; a runner that reconnects meanwhile carries on. After a relay restart, sessions get as long for their streams to reconnect before they can be purged as idle (streams are not logged, so a session a runner held open looks idle since its last logged activity). |
 | `AIRLOX_MAX_ITEMS` | 5 000 | Items per session. |
 | `AIRLOX_MAX_LOG_BYTES` | 4 MiB | Session log size (joins and envelopes). It bounds the per-session memory index; past it, joins and items get `413`. |
-| `AIRLOX_IDLE_TTL` | 2 h | Purges a session early after this long with no joins, items, acks or downloads, and no upload in progress. |
-| `AIRLOX_IDLE_TTL_UNEXPIRING` | 30 d | The same for sessions that never expire; `never` keeps them until they are closed. Without it, an abandoned session would hold its slot under the session limits for good. |
+| `AIRLOX_IDLE_TTL` | 2 h | Purges a session early after this long with no joins, items, acks or downloads, no upload in progress, and nobody holding a stream to it. The clock starts again when the last stream closes. |
+| `AIRLOX_IDLE_TTL_UNEXPIRING` | 3 d | The same for sessions that never expire; `never` keeps them until they are closed. Without it, an abandoned session would hold its slot under the session limits for good. A paired machine's runner holds a stream between jobs, and the idle clock starts when it drops off, so only a machine that is off (or unreachable) for this long is purged. |
+| `AIRLOX_ACTIVE_WINDOW` | 15 m | How long after its last join, item, ack, download or closed stream a session still counts in `/v1/health`'s `active` (a session with an open stream always counts). The count is taken at each sweep. `sessions` is every session held; the landing page shows `active`. |
+| `AIRLOX_HIDE_ACTIVE` | off | Leaves `active` out of `/v1/health` (and so off the landing page). On a small relay, the count tells anyone who polls it when someone connects. |
 | `AIRLOX_MAX_BYTES_PER_IP` | unlimited | Ciphertext the uploads from one address may have held on the relay at once, across all its sessions (IPv4 address, IPv6 /64); past it, `413`. Each held blob counts against the address that uploaded it (or re-seeded it) until it is evicted or its session ends. |
 | `AIRLOX_MAX_SESSIONS_PER_IP` | 20 | Active sessions per creator address: per IPv4 address, per IPv6 /64. With `--trust-proxy`, the address is the last `X-Forwarded-For` hop, the one the proxy appended. |
 | `AIRLOX_MAX_SESSIONS` | 1 000 | Active sessions in total. |
@@ -851,6 +853,7 @@ and smoke-tested by
 | A participant abusing re-seeding (M4) | Upload bytes for an item id, or make holders re-upload | Accepted only from a participant, while a `want` is open, if SHA-256 matches the author-signed envelope; `want` rate-limited; counted against the session transfer cap |
 | Someone who saw a closed session's manifest | Re-create the session so old invites work again | Tombstones refuse re-creation until the manifest would have expired, or for good if it never expires |
 | Abusive clients of a public relay | Exhaust disk, memory, bandwidth or connections | Per-session caps on bytes, log size, items, transfer and streams; per-address session limit keyed on the proxy's hop and IPv6 /64; body timeouts; disk watermark; slow headers and request rates left to the reverse proxy |
+| Anyone polling `/v1/health` | Learn when someone connects, e.g. when the one machine on a personal relay is online | Counts only, never ids, taken once per sweep; `--hide-active` leaves `active` out |
 
 Out of scope for v1: side channels on shared hosts, a compromised sender
 machine, and metadata privacy from the relay (who talks to whom and when).

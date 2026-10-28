@@ -142,13 +142,18 @@ pub(crate) async fn read_json_body(body: Body) -> ApiResult<String> {
 /// `GET /v1/health`: liveness, and the largest `max_item_bytes` a manifest
 /// may set here, so clients can default to it.
 pub async fn health(State(st): State<AppState>) -> Json<Value> {
-    Json(json!({
+    let mut v = json!({
         "ok": true,
         "protocol": airlox_core::PROTOCOL_VERSION,
         "max_item_bytes": st.store.cfg.max_item_bytes,
-        // How many sessions the relay holds: a count, never which.
+        // How many sessions the relay holds, and how many someone is in
+        // right now: counts, never which.
         "sessions": st.store.count(),
-    }))
+    });
+    if !st.store.cfg.hide_active {
+        v["active"] = st.store.count_active().into();
+    }
+    Json(v)
 }
 
 /// `POST /v1/sessions` — body: canonical signed manifest.
@@ -404,6 +409,8 @@ impl Drop for StreamSlot {
                 g.streams.remove(&self.who);
             }
         }
+        // The idle clock starts when someone leaves, not at their last post.
+        g.last_activity_ms = g.last_activity_ms.max(now_ms());
     }
 }
 

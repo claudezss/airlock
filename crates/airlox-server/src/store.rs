@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use airlox_core::cert::{RunnerInfo, SignedJoinRequest};
@@ -679,6 +680,11 @@ impl Inner {
             .is_some_and(|p| p.streams > 0 && now.saturating_sub(p.last_seen_ms) <= timeout_ms)
     }
 
+    /// Whether a participant or runner holds a stream to the session.
+    pub fn has_open_stream(&self) -> bool {
+        !self.streams.is_empty() || self.presence.values().any(|p| p.streams > 0)
+    }
+
     /// How many jobs a runner runs at once (its signed `slots`).
     pub fn runner_slots(&self, pk: &str) -> usize {
         self.participants.get(pk).and_then(|p| p.runner.as_ref()).map_or(1, |r| r.slots as usize)
@@ -864,8 +870,14 @@ impl Session {
         if inner.last_activity_ms == 0 {
             inner.last_activity_ms = signed.manifest.created_at_ms;
         }
-        // Runners with an active job get one timeout from now to reconnect.
         let now = now_ms();
+        // Streams are not logged, so a session a runner held open before the
+        // restart looks idle since its last logged activity. Its streams get
+        // the reconnect grace before it can go idle.
+        let idle_ttl = cfg.idle_ttl_for(signed.manifest.expires_at_ms);
+        let grace = cfg.job_reconnect_grace_ms.min(idle_ttl);
+        inner.last_activity_ms = inner.last_activity_ms.max(now.saturating_sub(idle_ttl) + grace);
+        // Runners with an active job get one timeout from now to reconnect.
         let busy: Vec<String> =
             inner.jobs.values().filter(|j| j.state.active()).filter_map(|j| j.runner.clone()).collect();
         for r in busy {
@@ -1183,6 +1195,8 @@ pub struct Store {
     tombstones: Mutex<HashMap<String, u64>>,
     /// Held and in-flight bytes per uploader address, over all sessions.
     pub usage: Arc<IpUsage>,
+    /// Active sessions as of the last sweep, so `/v1/health` locks none.
+    active: AtomicUsize,
     ip_key: [u8; 32],
     #[cfg(unix)]
     _lock: nix::fcntl::Flock<File>,
@@ -1249,6 +1263,7 @@ impl Store {
             sessions: RwLock::new(HashMap::new()),
             tombstones: Mutex::new(HashMap::new()),
             usage: Arc::default(),
+            active: AtomicUsize::new(0),
             ip_key,
             #[cfg(unix)]
             _lock: lock,
@@ -1305,6 +1320,13 @@ impl Store {
 
     pub fn count(&self) -> usize {
         self.sessions.read().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Sessions someone is in, as of the last sweep: a participant or runner
+    /// holds a stream, or something happened within `--active-window`. A
+    /// session merely held until it expires or goes idle is not active.
+    pub fn count_active(&self) -> usize {
+        self.active.load(Ordering::Relaxed)
     }
 
     pub fn count_for_ip(&self, ip_hash: &str) -> usize {
@@ -1423,25 +1445,33 @@ impl Store {
         }
     }
 
-    /// Expire, idle-close and evict. Called periodically from a blocking thread.
+    /// Expire, idle-close, evict, and count the active sessions. Called
+    /// periodically from a blocking thread.
     pub fn sweep(&self, now: u64) {
+        let mut active = 0;
         for s in self.all() {
             if s.signed.manifest.is_expired(now) {
                 self.purge(&s.id, "expired");
                 continue;
             }
-            let idle_ttl = match s.signed.manifest.expires_at_ms {
-                Some(_) => self.cfg.idle_ttl_ms,
-                None => self.cfg.idle_ttl_unexpiring_ms,
-            };
-            let idle = {
+            let idle_ttl = self.cfg.idle_ttl_for(s.signed.manifest.expires_at_ms);
+            // Idle: no upload in progress, nobody holding a stream (a paired
+            // machine's runner waits on one between jobs), and nothing done
+            // for the idle limit.
+            let (idle, is_active) = {
                 let g = s.lock();
-                g.pending.is_empty() && now.saturating_sub(g.last_activity_ms) >= idle_ttl
+                let quiet = now.saturating_sub(g.last_activity_ms);
+                let open = g.has_open_stream();
+                (
+                    g.pending.is_empty() && !open && quiet >= idle_ttl,
+                    !g.closed && (open || quiet <= self.cfg.active_window_ms),
+                )
             };
             if idle {
                 self.purge(&s.id, "idle");
                 continue;
             }
+            active += usize::from(is_active);
             if let Err(e) = s.sweep_evictions(now) {
                 tracing::error!(session = %s.id, "eviction failed: {e}");
             }
@@ -1451,6 +1481,7 @@ impl Store {
                 tracing::error!(session = %s.id, "job sweep failed: {e}");
             }
         }
+        self.active.store(active, Ordering::Relaxed);
         self.tombstones.lock().unwrap_or_else(|e| e.into_inner()).retain(|id, until| {
             let keep = *until > now;
             if !keep {

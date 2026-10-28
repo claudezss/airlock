@@ -104,7 +104,11 @@ airlox session create --profile host-runner --job-timeout 6h --package numpy
 ```
 
 A relay purges a session that sees no activity (joins, items, downloads) for
-`--idle-ttl-unexpiring`, 30 days by default; jobs and their progress count.
+`--idle-ttl-unexpiring`, 3 days by default; jobs and their progress count,
+and a session is never idle while a runner or participant holds a stream to
+it, so a runner that stays connected keeps its session. The idle clock starts
+when the last stream closes, and after a relay restart runners get
+`--job-reconnect-grace` (15 minutes) to reconnect before it counts.
 To move a runner to a new session, put the new runner invite in its invite
 file (for the service, `%ProgramData%\airlox\<service>\invite-runner.txt`,
 from an elevated prompt) and start it again (`sc.exe start <service>`).
