@@ -85,6 +85,11 @@ function mcpb(version, bins, out) {
 // The PyPI package runs the same binary, so it takes the same arguments.
 function serverJson(version, bundle, out) {
   const s = readJson(join(here, "server.json"));
+  // The registry refuses a longer one, and only at publish time.
+  if (s.description.length > 100) {
+    console.error(`stage.mjs: server.json description is ${s.description.length} characters; the MCP registry allows 100`);
+    process.exit(1);
+  }
   s.version = version;
   const [npmPkg, pypiPkg, mcpbPkg] = s.packages;
   npmPkg.version = pypiPkg.version = version;
