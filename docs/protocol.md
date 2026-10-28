@@ -174,7 +174,11 @@ box    = nonce(12) || AES-256-GCM(key, nonce, invite_link, aad = "airlox transfe
   `POST /v1/drops` (§12) and shows `{nameplate}-{secret}` with the nameplate
   the relay assigns.
 - The receiver posts `{claim: b64url(claim)}` to `POST /v1/drops/{nameplate}/claim`
-  and opens the box. The relay hands it out once.
+  and opens the box. The relay hands it out once. A runner may add
+  `participant_pub`, the key it will join with; the relay reports it to the
+  code's creator, which can then approve exactly that runner (`airlox
+  machine add`). That trusts the relay to report the claimant honestly, the
+  trust a code already places in it.
 - Codes are lowercased, and spaces or underscores read as `-`.
 - The secret has 16 bits. Against outsiders the relay's limits protect it:
   three wrong claims burn a drop, a drop lives for minutes, and one address
@@ -673,7 +677,17 @@ signed `event` items up to 16 KiB (runner approvals and rejections, close)
 are never evicted, so a participant that joins later can always verify which
 runners the owner approved. After that
 `GET …/blob` is `410 evicted`, and clients show the item as delivered but
-unavailable until it is re-seeded. A download that fails for any other
+unavailable until it is re-seeded. `progress` items are the exception in
+the other direction: display data that leaves no trace. They do not count
+toward the session's item or history limits (a session holds at most
+`--max-items` of them at once; past that a post is `429 session_full`), their
+blob goes at the next sweep once every recipient has acked (no grace) or at
+the hold limit, and then the envelope and its `item` event go too: the
+`evicted` event is sent live but not kept, `GET …/events` no longer lists
+the item, and its blob and ack answer `404`. Clients never `want` one. The
+relay keeps them in memory only and records a `{"type":"reserve","count":N}`
+line in the session log for each block of event ids they use, so ids are not
+reused after a restart; a restart forgets progress items in flight. A download that fails for any other
 reason (network, `429`, `5xx`) is retried; clients must not record the item
 as received or ack it until its blob is stored.
 
@@ -763,8 +777,8 @@ Only open drops count toward the limits.
 | Request | Body / auth | Answer |
 | --- | --- | --- |
 | `POST /v1/drops` | `{claim_hash, box}`; `box` at most 4096 bytes decoded | `201 {nameplate, token, expires_at_ms, ttl_ms}`; `429` over `--max-drops` or `--max-drops-per-ip` open drops |
-| `POST /v1/drops/{n}/claim` | `{claim}` | `200 {box}` once; `403` wrong claim; `410` with `error` `used`, `burned` (third wrong claim), `cancelled` or `expired`; `404` unknown; `429` once the address has ten wrong claims this TTL |
-| `GET /v1/drops/{n}` | `Authorization: Bearer {token}` | `{state: waiting \| picked_up \| burned \| cancelled \| expired, picked_up_at_ms, expires_at_ms}` |
+| `POST /v1/drops/{n}/claim` | `{claim, participant_pub?}`: optionally the participant key the claimant will join with (a malformed one is `400 invalid` and spends nothing) | `200 {box}` once; `403` wrong claim; `410` with `error` `used`, `burned` (third wrong claim), `cancelled` or `expired`; `404` unknown; `429` once the address has ten wrong claims this TTL |
+| `GET /v1/drops/{n}` | `Authorization: Bearer {token}` | `{state: waiting \| picked_up \| burned \| cancelled \| expired, picked_up_at_ms, expires_at_ms, participant_pub}`; `participant_pub` is what the claim said, or `null` |
 | `DELETE /v1/drops/{n}` | `Authorization: Bearer {token}` | `204`; the code stops working (`410 cancelled`) |
 
 ## 13. Execute HTTP binding
