@@ -58,6 +58,8 @@ fn runner_join_body(s: &Sess, name: &str, labels: &[&str]) -> (Keypair, String) 
                 network_unblocked: false,
                 version: None,
                 python: None,
+                kinds: vec![JobKind::Python],
+                shell: None,
             }),
             created_at_ms: now_ms(),
         },

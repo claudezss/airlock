@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::encoding::canonical_json;
 use crate::keys::{ctx, Keypair, PublicKey, Sig};
-use crate::session::{Manifest, Role};
+use crate::session::{JobKind, Manifest, Role};
 use crate::{Error, Result, PROTOCOL_VERSION};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -107,6 +107,13 @@ pub struct RunnerInfo {
     /// the runner knows it at join.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub python: Option<String>,
+    /// The kinds of job this runner runs: `python`, and `shell` when its
+    /// sandbox has a shell for them (an operator's image under docker; a
+    /// Windows runner given `--shell pwsh`).
+    pub kinds: Vec<JobKind>,
+    /// The shell `shell` jobs run under (`sh` or `pwsh`); `null` exactly
+    /// when `kinds` has no `shell`.
+    pub shell: Option<String>,
 }
 
 /// Longest `version` or `python` string in a runner's join.
@@ -260,6 +267,22 @@ impl SignedJoinRequest {
                         ));
                     }
                 }
+                let distinct =
+                    r.kinds.iter().collect::<std::collections::HashSet<_>>().len() == r.kinds.len();
+                if r.kinds.is_empty() || r.kinds.len() > 2 || !distinct {
+                    return Err(Error::invalid("runner kinds", "1 or 2 distinct job kinds"));
+                }
+                let shell_ok = match (&r.shell, r.kinds.contains(&JobKind::Shell)) {
+                    (Some(sh), true) => matches!(sh.as_str(), "sh" | "pwsh"),
+                    (None, false) => true,
+                    _ => false,
+                };
+                if !shell_ok {
+                    return Err(Error::invalid(
+                        "runner shell",
+                        "sh or pwsh, given exactly when kinds has shell",
+                    ));
+                }
             }
             (ClientKind::Runner, _, _) | (_, Some(_), _) | (_, _, true) => {
                 return Err(Error::invalid(
@@ -329,6 +352,8 @@ mod tests {
                 network_unblocked: false,
                 version: None,
                 python: None,
+                kinds: vec![JobKind::Python],
+                shell: None,
             }),
             created_at_ms: 3,
         };
@@ -340,6 +365,21 @@ mod tests {
         let mut no_info = join.clone();
         no_info.runner = None;
         assert!(sign_join(&p, no_info).unwrap().verify(&m).is_err());
+
+        // Kinds: one or two, and a shell exactly when shell jobs are among them.
+        let with = |kinds: Vec<JobKind>, shell: Option<&str>| {
+            let mut j = join.clone();
+            let r = j.runner.as_mut().unwrap();
+            (r.kinds, r.shell) = (kinds, shell.map(String::from));
+            sign_join(&p, j).unwrap().verify(&m)
+        };
+        with(vec![JobKind::Python, JobKind::Shell], Some("sh")).unwrap();
+        with(vec![JobKind::Shell], Some("pwsh")).unwrap();
+        assert!(with(vec![], None).is_err());
+        assert!(with(vec![JobKind::Python, JobKind::Python], None).is_err());
+        assert!(with(vec![JobKind::Python, JobKind::Shell], None).is_err());
+        assert!(with(vec![JobKind::Python], Some("sh")).is_err());
+        assert!(with(vec![JobKind::Shell], Some("bash")).is_err());
 
         // A description is signed, bounded and absent from joins without one.
         assert!(!String::from_utf8(canonical_json(&join).unwrap()).unwrap().contains("description"));

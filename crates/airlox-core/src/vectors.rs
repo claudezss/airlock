@@ -15,7 +15,7 @@ use crate::invite::Invite;
 use crate::item::{item_key, seal_with_nonce, ItemKind, ItemRef, NewItem, SealedItem};
 use crate::keys::Keypair;
 use crate::payload::{JobResult, JobSpec, JobStatus, OutFile, Payload, Target};
-use crate::session::{ContentType, JobLimits, Mode, Role, SessionParams, SessionSecrets};
+use crate::session::{ContentType, JobKind, JobLimits, Mode, Role, SessionParams, SessionSecrets};
 use crate::Result;
 
 pub const BASE_URL: &str = "https://airlox.example";
@@ -118,6 +118,8 @@ pub fn generate() -> Result<Value> {
                 network_unblocked: false,
                 version: None,
                 python: None,
+                kinds: vec![JobKind::Python],
+                shell: None,
             }),
             created_at_ms: params.created_at_ms + 2,
         },

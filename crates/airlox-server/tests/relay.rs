@@ -6,7 +6,7 @@ use airlox_core::cert::{issue_cert, sign_join, ClientKind, JoinRequest};
 use airlox_core::item::SealedItem;
 use airlox_core::keys::Keypair;
 use airlox_core::payload::Payload;
-use airlox_core::session::{Mode, Role};
+use airlox_core::session::{JobKind, Mode, Role};
 use airlox_server::start;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
@@ -125,6 +125,8 @@ async fn auth_and_policy_are_enforced() {
                 network_unblocked: false,
                 version: None,
                 python: None,
+                kinds: vec![JobKind::Python],
+                shell: None,
             }),
             created_at_ms: now_ms(),
         },

@@ -519,8 +519,8 @@ fn runner_json(r: &Runner, env: Option<&Value>) -> Value {
         "state": r.state,
         "labels": r.labels,
         "sandbox": r.sandbox,
-        "kinds": env.map(|e| e["kinds"].clone()).unwrap_or(Value::Null),
-        "shell": env.map(|e| e["shell"].clone()).unwrap_or(Value::Null),
+        "kinds": r.kinds,
+        "shell": r.shell,
         "interpreter": env.map(|e| e["interpreter"].clone()).unwrap_or(Value::Null),
         "job": r.job,
     })
@@ -599,7 +599,11 @@ async fn ls(a: LsArgs) -> Result<()> {
                 .as_array()
                 .map(|k| k.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(","))
                 .filter(|k| !k.is_empty())
-                .unwrap_or_else(|| "kinds unknown until its first job".into());
+                .unwrap_or_else(|| "kinds unknown".into());
+            let kinds = match r["shell"].as_str() {
+                Some(sh) => format!("{kinds} ({sh})"),
+                None => kinds,
+            };
             let mut parts = vec![
                 clean_line(r["name"].as_str().unwrap_or_default()),
                 if r["online"] == true { "online".into() } else { "offline".into() },

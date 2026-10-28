@@ -284,6 +284,8 @@ async fn join(
                 network_unblocked: backend.network_unblocked(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 python: python.map(String::from),
+                kinds: backend.kinds(),
+                shell: backend.shell().map(String::from),
             }),
             created_at_ms: now_ms(),
         },

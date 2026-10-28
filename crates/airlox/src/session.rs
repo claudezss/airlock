@@ -432,6 +432,10 @@ pub struct Runner {
     /// signed join, when it said.
     pub version: Option<String>,
     pub python: Option<String>,
+    /// The kinds of job it runs and the shell for `shell` jobs, from its
+    /// signed join.
+    pub kinds: Vec<String>,
+    pub shell: Option<String>,
 }
 
 /// Which runner a job goes to.
@@ -1184,6 +1188,8 @@ impl Session {
                 }),
                 version: info["version"].as_str().map(String::from),
                 python: info["python"].as_str().map(String::from),
+                kinds: serde_json::from_value(info["kinds"].clone()).unwrap_or_default(),
+                shell: info["shell"].as_str().map(String::from),
                 participant_pub: public,
             });
         }

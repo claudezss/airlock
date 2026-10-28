@@ -218,7 +218,8 @@ The join request is signed by the participant key the certificate names:
     "kind": "sdk|cli|web|runner",
     "runner": null | { "name": "runner-01", "labels": ["cpu"], "host": "build-box",
                        "sandbox": "local|docker|kubernetes|process", "network_unblocked": false,
-                       "version": "0.1.1", "python": "3.12.4" },   // version, python optional
+                       "version": "0.1.1", "python": "3.12.4",      // version, python optional
+                       "kinds": ["python", "shell"], "shell": "sh" },
     "created_at_ms": 0
   },
   "sig": "<participant signature, context join, over canonical(join)>"
@@ -247,6 +248,16 @@ interpreter version its jobs get) are optional, up to 32 characters of
 `version` always. Relays and clients from before these fields (and before the
 `process` sandbox) reject such joins as malformed, so upgrade the relay
 before its runners.
+
+A runner's `kinds` (required) lists the kinds of job it runs, one or two of
+`python` and `shell`, and `shell` (required, possibly `null`) names the shell
+for `shell` jobs, `sh` or `pwsh`, given exactly when `kinds` has `shell`. A
+docker runner offers `shell` only with an operator's image; a Windows runner
+only when started with `--shell pwsh`. They are the runner's own word, signed;
+the runner still refuses a job it cannot run. A runner that rejoins with a
+saved identity keeps the join it made, so after changing those flags, results'
+`env.kinds` is the current word. Joins before 0.2 have neither and are
+rejected (a breaking change).
 
 `description` is optional (the rules above apply): text in which the
 participant says what it is or does (a receiving agent's purpose, a runner's

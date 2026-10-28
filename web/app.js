@@ -2785,17 +2785,11 @@ function envLine(env, job) {
     el("span", { class: "muted" }, "ran on "), parts.join(" · "));
 }
 
-// What a runner says it runs, from its newest accepted result (signed by the runner).
-function runnerJobs(s, pub) {
-  let best = null;
-  for (const list of s.results.values()) {
-    for (const r of list) {
-      if (r.author !== pub || r.status !== "ok" || !r.meta?.env?.kinds || (best && r.seq < best.seq) || !resultCheck(s, r).ok) continue;
-      best = r;
-    }
-  }
-  if (!best) return null;
-  const { kinds, shell } = best.meta.env;
+// What a runner says it runs, from its signed join.
+function runnerJobs(info) {
+  const kinds = Array.isArray(info.kinds) ? info.kinds.filter((k) => typeof k === "string") : [];
+  if (!kinds.length) return null;
+  const shell = typeof info.shell === "string" ? info.shell : null;
   return `${kinds.join(", ")}${kinds.includes("shell") && shell ? ` (${shell})` : ""}`;
 }
 
@@ -2970,7 +2964,7 @@ async function pollRunners(s) {
           version: typeof j.runner.version === "string" ? j.runner.version : null,
           python: typeof j.runner.python === "string" ? j.runner.python : null,
           networkUnblocked: !!j.runner.network_unblocked, online: !!e.online, job: e.job, busy: !!(e.busy ?? e.job),
-          jobs: runnerJobs(s, e.participant_pub),
+          jobs: runnerJobs(j.runner),
           setup: e.state || null, detail: typeof e.detail === "string" ? (e.detail.length > 300 ? `${e.detail.slice(0, 300)}…` : e.detail) : null,
           ...runnerStatus(s, e) });
       } catch (err) {
