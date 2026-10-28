@@ -192,7 +192,7 @@ def test_cli_runs_jobs(relay, caches, tmp_path, start_runner, runner_cache):
     assert "2 orders, total 42" in p.stdout
     assert "signed by runner runner-01" in p.stderr
     # Where it ran, from the runner and not the job: on one line.
-    assert re.search(r"^   ran on Python 3\.12\.\d+ \(\S+\) · \w+ sandbox · airlox \S+$", p.stderr, re.M), p.stderr
+    assert re.search(r"^   ran on Python 3\.12\.\d+ \(\S+\)(?: · shell \w+)? · \w+ sandbox · airlox \S+$", p.stderr, re.M), p.stderr
     assert sorted(f.name for f in out.iterdir()) == ["chart.png", "out", "out.zip"]
     # A job does not learn where the runner keeps its files, or whose they are.
     where = tmp_path / "where.py"

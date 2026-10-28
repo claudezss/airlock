@@ -837,7 +837,7 @@ function copyButton(label, text, shown, name, cls = "small") {
 
 // Runner invites come with the command that uses them. The shown command
 // carries the masked link; Copy command always copies the full one.
-function runnerInviteRow(url) {
+function runnerInviteRow(url, shell = false) {
   const cmd = (link) => `airlox runner join --invite '${link}' --name my-runner --sandbox docker`;
   // Only the link part may break mid-word; the rest wraps at spaces.
   const shown = el("code", {}, "airlox runner join --invite '", el("span", { class: "link" }, maskInvite(url)), "' --name my-runner --sandbox docker");
@@ -847,7 +847,9 @@ function runnerInviteRow(url) {
     el("p", { class: "muted hint-text" },
       "Install the airlox runner first: ", el("a", { href: INSTALL_URL, target: "_blank", rel: "noopener noreferrer" }, "see the install guide"), "."),
     el("p", { class: "muted hint-text" }, "Then run this on the runner host. Change ", el("code", {}, "my-runner"), " to a name senders will recognise."),
-    shown, el("div", { class: "row" }, btn)));
+    shown, el("div", { class: "row" }, btn),
+    shell ? el("p", { class: "muted hint-text" }, "This session allows shell jobs. A docker runner offers them only with ", el("code", {}, "--image IMAGE"),
+      " (an image with python3 and the tools your scripts need); ", el("code", {}, "--sandbox process"), " runs them on the host itself.") : null));
   return row;
 }
 
@@ -923,7 +925,7 @@ function newSession() {
     el("legend", {}, title), sub ? el("p", { class: "nsub" }, sub) : null, ...kids);
   const mode = card("Mode", null,
     el("div", { class: "modes" }, [["relay", "Relay", "Agents and people share messages and files."],
-      ["execute", "Execute", "Senders post Python; runners you approve run it and post the result."]].map(([v, name, desc]) =>
+      ["execute", "Execute", "Senders post Python or shell scripts; runners you approve run them and post the result."]].map(([v, name, desc]) =>
       el("label", { class: "pick mode-pick" }, el("input", { type: "radio", name: "mode", value: v, checked: v === "relay" }),
         el("span", { class: "pick-icon" }, svg(NEW_ICONS[v], 22)),
         el("span", { class: "pick-text" }, el("strong", {}, name), el("span", {}, desc)),
@@ -961,6 +963,8 @@ function newSession() {
     memory: el("input", { type: "number", id: "j-memory", min: 32, max: 65536, step: 1, value: 2048 }),
     packages: el("input", { type: "text", id: "j-packages", placeholder: "numpy, pandas", autocomplete: "off" }),
     approve: el("input", { type: "checkbox", id: "j-approve", checked: true }),
+    shell: el("input", { type: "checkbox", id: "j-shell" }),
+    workspace: el("input", { type: "checkbox", id: "j-workspace" }),
   };
   const field = (id, label, input, hint) => el("div", { class: "stack field" }, el("label", { for: id }, el("strong", {}, label)), input,
     hint ? el("span", { class: "muted hint-text" }, hint) : null);
@@ -969,12 +973,19 @@ function newSession() {
       field("j-runtime", "Runtime", lim.runtime), field("j-timeout", "Timeout", lim.timeout, "seconds"),
       field("j-memory", "Memory", lim.memory, "MB")),
     field("j-packages", "Packages", lim.packages, "Comma-separated. Only these can be requested by jobs."),
+    el("fieldset", { class: "stack kinds" }, el("legend", {}, "Job kinds"),
+      el("label", { class: "switch" }, el("input", { type: "checkbox", checked: true, disabled: true }), el("span", {}, el("strong", {}, "Python"),
+        el("span", { class: "muted hint-text" }, "Always allowed: runs in the runtime above with the packages you list."))),
+      el("label", { class: "switch" }, lim.shell, el("span", {}, el("strong", {}, "Shell scripts"),
+        el("span", { class: "muted hint-text" }, "Runs a script with the runner's own tools (make, pytest, a compiler…), so it can do far more than Python with a package list. A docker runner offers it only with an image its operator chooses."))),
+      el("label", { class: "switch" }, lim.workspace, el("span", {}, el("strong", {}, "Keep workspaces"),
+        el("span", { class: "muted hint-text" }, "Runners that opt in keep each sender's files between jobs, so builds stay warm. One job can leave files for that sender's next one.")))),
     el("label", { class: "switch" }, lim.approve, el("span", {}, el("strong", {}, "Require owner approval for runners"),
       el("span", { class: "muted hint-text" }, "A runner can take jobs only after you approve it in the session."))));
   jobBox.hidden = true;
   const pyBox = types.querySelector('input[value="py"]');
   const isExecute = () => form.elements.mode.value === "execute";
-  const pyNote = el("p", { class: "muted hint-text", hidden: true, id: "py-note" }, "Python is always allowed in Execute sessions: jobs are Python.");
+  const pyNote = el("p", { class: "muted hint-text", hidden: true, id: "py-note" }, "Python files are always allowed in Execute sessions: Python jobs need them.");
   pyBox.setAttribute("aria-describedby", "py-note");
   types.append(pyNote);
   const syncMode = () => {
@@ -994,11 +1005,11 @@ function newSession() {
     const allowed = fd.getAll("type");
     if (isExecute() && !allowed.includes("py")) allowed.push("py"); // a disabled box is not in the form data
     const ttlWord = TTL_WORDS[fd.get("ttl")];
-    sum.mode.textContent = isExecute() ? `Execute${lim.approve.checked ? " · approval on" : ""}` : "Relay";
+    sum.mode.textContent = isExecute() ? `Execute${lim.shell.checked ? " · Python + shell" : ""}${lim.approve.checked ? " · approval on" : ""}` : "Relay";
     sum.ttl.textContent = fd.get("ttl") === "never" ? "Never (until closed)" : ttlWord;
     sum.types.textContent = allowed.length ? TYPE_LABELS.filter(([t]) => allowed.includes(t)).map(([, label]) => label).join(", ") : "none";
     sum.size.textContent = `${size.value || "?"} MB per file`;
-    sumLine.textContent = `${isExecute() ? "Execute" : "Relay"} · ${fd.get("ttl") === "never" ? "no expiry" : ttlWord} · ${allowed.length} type${allowed.length === 1 ? "" : "s"} · ${size.value || "?"} MB`;
+    sumLine.textContent = `${isExecute() ? (lim.shell.checked ? "Execute+shell" : "Execute") : "Relay"} · ${fd.get("ttl") === "never" ? "no expiry" : ttlWord} · ${allowed.length} type${allowed.length === 1 ? "" : "s"} · ${size.value || "?"} MB`;
   };
   const err = el("p", { class: "error", role: "alert" });
   const create = el("button", { class: "primary cta", type: "submit" }, "Create session",
@@ -1039,6 +1050,9 @@ function newSession() {
         if (!packages.includes(norm)) packages.push(norm);
       }
       job_limits = { runtime, timeout_s, memory_mb, network: false, packages, return_out: true, approve_runners: lim.approve.checked };
+      // Left out when not asked for, so the manifest stays what older clients accept.
+      if (lim.shell.checked) job_limits.kinds = ["python", "shell"];
+      if (lim.workspace.checked) job_limits.workspace = true;
     }
     const maxMb = Number(size.max);
     if (!Number.isInteger(mb) || mb < 1 || mb > maxMb) return (err.textContent = `Max file size must be a whole number from 1 to ${maxMb} MB: this relay allows up to ${maxMb} MB.`);
@@ -1049,7 +1063,7 @@ function newSession() {
       const s = ac.createSession(JSON.stringify(params), undefined);
       const { session_id } = await (await api("POST", "/v1/sessions", { body: s.signedManifest })).json();
       summarize();
-      createdView(session_id, s, execute, aside.querySelector("dl"));
+      createdView(session_id, s, execute, aside.querySelector("dl"), execute && lim.shell.checked);
     } catch (e) {
       err.textContent = `Could not create the session: ${e.message || e}`;
       create.disabled = false;
@@ -1069,7 +1083,7 @@ function newSession() {
 }
 
 // Step two: the owner link, shown once, then the invites to hand out.
-function createdView(session_id, s, execute, summary) {
+function createdView(session_id, s, execute, summary, shell = false) {
   const base = location.origin;
   const owner = ac.ownerInvite(base, s.ownerSeed);
   let steps = newSteps(1);
@@ -1129,7 +1143,7 @@ function createdView(session_id, s, execute, summary) {
         el("p", { class: "nsub" }, "These links stay available under Invites in the session, so you can hand them out later."),
         el("section", { class: "ncard" }, senderInviteRow(ac.memberInvite(base, s.ownerSeed, "sender"))),
         el("section", { class: "ncard" }, inviteRow("Observer", ac.memberInvite(base, s.ownerSeed, "observer"), "can read everything and export the audit log")),
-        ...(execute ? [el("section", { class: "ncard" }, runnerInviteRow(ac.memberInvite(base, s.ownerSeed, "runner")))] : [])),
+        ...(execute ? [el("section", { class: "ncard" }, runnerInviteRow(ac.memberInvite(base, s.ownerSeed, "runner"), shell))] : [])),
       el("aside", { class: "nside" },
         el("div", { class: "ncard sum" }, el("h2", {}, "Session"), summary, openBtn, gate,
           el("button", { type: "button", onclick: () => { invitesShown = false; location.reload(); } }, "Create another"))))));
@@ -1302,7 +1316,7 @@ function buildSessionLayout(s) {
   const pending = el("span", { class: "attach-chip", hidden: true });
   const sendBtn = el("button", { class: "send", type: "submit", title: "Send", "aria-label": "Send", disabled: true }, svg(I_SEND, 18));
   const execute = manifest.mode === "execute";
-  const jobUi = canSend && execute ? buildJobPanel(s, text, file) : null;
+  const jobUi = canSend && execute ? buildJobPanel(s, text, file, () => setHint()) : null;
   const attach = el("button", { class: "icon", type: "button", title: "Attach a file", "aria-label": "Attach a file", onclick: () => file.click() }, svg(ICON_CLIP));
   // The box grows with its text, up to 40% of the window.
   const grow = () => {
@@ -1469,7 +1483,7 @@ function buildSessionLayout(s) {
   const hint = el("p", { class: "chint" });
   const kbd = (...keys) => keys.flatMap((k, i) => [i ? "+" : null, el("kbd", {}, k)]).filter(Boolean);
   const setHint = () => {
-    hint.replaceChildren(...(jobUi?.active() ? ["Python job · ", ...kbd(mac ? "⌘" : "Ctrl", "Enter"), " send · ", ...kbd("Enter"), " new line"]
+    hint.replaceChildren(...(jobUi?.active() ? [`${jobUi.kindName()} job · `, ...kbd(mac ? "⌘" : "Ctrl", "Enter"), " send · ", ...kbd("Enter"), " new line"]
       : touchOnly() ? ["Markdown · @name addresses it · encrypted in this browser"]
       : ["Markdown · @name addresses it · ", ...kbd("Enter"), " send · ", ...kbd("Shift", "Enter"), " new line · encrypted in this browser"]));
   };
@@ -1564,7 +1578,7 @@ function buildSessionLayout(s) {
   const inviteRows = inv.role === "owner" ? {
     sender: senderInviteRow(ac.memberInvite(location.origin, inv.roleSeed, "sender")),
     observer: inviteRow("Observer", ac.memberInvite(location.origin, inv.roleSeed, "observer"), "can read everything and export the audit log"),
-    runner: execute ? runnerInviteRow(ac.memberInvite(location.origin, inv.roleSeed, "runner")) : null } : {};
+    runner: execute ? runnerInviteRow(ac.memberInvite(location.origin, inv.roleSeed, "runner"), !!manifest.job_limits?.kinds?.includes("shell")) : null } : {};
   const invites = inv.role === "owner" ? el("details", {},
     el("summary", {}, "Invites"),
     el("div", { class: "stack" }, el("p", { class: "muted hint-text" }, MASKED_NOTE), Object.values(inviteRows))) : null;
@@ -1577,6 +1591,9 @@ function buildSessionLayout(s) {
     el("section", {}, el("h2", {}, "Allowed types"), el("div", { class: "chips" }, manifest.allowed_types.map((t) => el("span", { class: "chip" }, t)))),
     execute && manifest.job_limits?.packages?.length ? el("section", {}, el("h2", {}, "Packages"),
       el("div", { class: "chips" }, manifest.job_limits.packages.map((t) => el("span", { class: "chip", title: "Runners refuse to join without these versions" }, t)))) : null,
+    execute && (manifest.job_limits?.kinds || manifest.job_limits?.workspace) ? el("section", {}, el("h2", {}, "Job kinds"),
+      el("div", { class: "chips" }, ...(manifest.job_limits.kinds || ["python"]).map((k) => el("span", { class: "chip" }, k)),
+        manifest.job_limits.workspace ? el("span", { class: "chip", title: "Runners may keep each sender's work directory between jobs" }, "workspaces") : null)) : null,
     el("section", { class: "stack" }, el("h2", {}, "Session"),
       el("p", { class: "mono muted" }, sid),
       fresh,
@@ -2785,6 +2802,12 @@ function envLine(env, job) {
     el("span", { class: "muted" }, "ran on "), parts.join(" · "));
 }
 
+// The kinds of job a runner says it runs, from its signed join; Python when it says nothing.
+function runnerKinds(info) {
+  const kinds = Array.isArray(info.kinds) ? info.kinds.filter((k) => k === "python" || k === "shell") : [];
+  return kinds.length ? kinds : ["python"];
+}
+
 // What a runner says it runs, from its signed join.
 function runnerJobs(info) {
   const kinds = Array.isArray(info.kinds) ? info.kinds.filter((k) => typeof k === "string") : [];
@@ -2964,7 +2987,7 @@ async function pollRunners(s) {
           version: typeof j.runner.version === "string" ? j.runner.version : null,
           python: typeof j.runner.python === "string" ? j.runner.python : null,
           networkUnblocked: !!j.runner.network_unblocked, online: !!e.online, job: e.job, busy: !!(e.busy ?? e.job),
-          jobs: runnerJobs(j.runner),
+          jobs: runnerJobs(j.runner), kinds: runnerKinds(j.runner), shell: typeof j.runner.shell === "string" ? j.runner.shell : null,
           setup: e.state || null, detail: typeof e.detail === "string" ? (e.detail.length > 300 ? `${e.detail.slice(0, 300)}…` : e.detail) : null,
           ...runnerStatus(s, e) });
       } catch (err) {
@@ -3126,8 +3149,26 @@ async function decideRunner(s, r, approve, btn) {
 }
 
 // ---------- composer: run as job ----------
-function buildJobPanel(s, text, file) {
+const KIND_NAMES = { python: "Python", shell: "Shell" };
+const MAX_SHELL_BYTES = 64 * 1024;
+
+// A job's start folder follows the file name rules; the runner checks them again.
+function cwdError(path) {
+  const parts = path.split("/");
+  if (new TextEncoder().encode(path).length > 255 || parts.length > 8) return "use a relative path of at most 8 folders";
+  if (parts.some((p) => !p || p.startsWith(".") || /[\\:\u0000-\u001f]/.test(p))) return "use a relative path such as build/out, with no leading dots, backslashes or colons";
+  return null;
+}
+
+function buildJobPanel(s, text, file, onKind) {
   const lim = s.manifest.job_limits;
+  const allowed = ["python", "shell"].filter((k) => (lim.kinds || ["python"]).includes(k));
+  const kindKey = `airlox:jobkind:${s.sid}`;
+  let kind = allowed[0];
+  try {
+    const saved = localStorage.getItem(kindKey);
+    if (allowed.includes(saved)) kind = saved;
+  } catch {} // storage can be blocked: the first allowed kind it is
   let on = false;
   let sendBtn;
   let sync = () => {}; // the composer's "is Send allowed" check
@@ -3139,8 +3180,17 @@ function buildJobPanel(s, text, file) {
   const chips = el("div", { class: "runchips", role: "group", "aria-labelledby": "job-target-label" });
   const labels = el("input", { type: "text", id: "job-labels", placeholder: "gpu, cpu", autocomplete: "off", "aria-label": "Runner labels" });
   const labelField = el("div", { class: "stack field", hidden: true }, el("label", { for: "job-labels" }, "Labels"), labels);
+  const kindField = allowed.length > 1 ? el("div", { class: "stack field" }, el("span", { class: "field-label", id: "job-kind-label" }, "Job type"),
+    el("div", { class: "seg kindseg", role: "radiogroup", "aria-labelledby": "job-kind-label" }, allowed.map((k) =>
+      el("label", {}, el("input", { type: "radio", name: "job-kind", value: k, checked: k === kind, onchange: () => setKind(k) }), el("span", {}, KIND_NAMES[k]))))) : null;
+  const kindNote = el("p", { class: "muted hint-text kindnote", id: "job-kind-note", hidden: true });
+  const cwd = el("input", { type: "text", id: "job-cwd", placeholder: "optional, e.g. build", autocomplete: "off", spellcheck: false });
+  const cwdField = el("div", { class: "stack field", hidden: true }, el("label", { for: "job-cwd" }, "Start in folder"), cwd);
+  const fresh = el("input", { type: "checkbox", id: "job-fresh" });
+  const freshField = el("label", { class: "option check", title: "Runners that keep a workspace for you empty it before this job" }, fresh, "Start with an empty workspace");
   const timeout = el("input", { type: "number", id: "job-timeout", min: 1, max: lim.timeout_s, step: 1, value: lim.timeout_s,
     title: `1 to ${lim.timeout_s} seconds` });
+  const timeoutField = el("div", { class: "stack field narrow" }, el("label", { for: "job-timeout" }, "Timeout (s)"), timeout);
   const files = el("div", { class: "pickfiles" });
   const filesSummary = el("summary", {}, "Input files · none selected");
   // Why a job sent now would fail, with what would fix it.
@@ -3148,10 +3198,12 @@ function buildJobPanel(s, text, file) {
   const readyAct = el("span", { class: "ready-act" });
   const ready = el("div", { class: "job-ready", hidden: true }, el("span", { class: "ready-icon", "aria-hidden": "true" }, "!"), readyText, readyAct);
   const panel = el("div", { class: "jobpanel", hidden: true },
+    // With a choice of kinds, the timeout shares a row with it, which keeps the panel short on a phone.
+    kindField ? el("div", { class: "jobrow" }, kindField, timeoutField) : null,
     el("div", { class: "stack field" }, el("span", { class: "field-label", id: "job-target-label" }, "Run on"), chips),
-    el("div", { class: "jobrow" },
-      labelField,
-      el("div", { class: "stack field narrow" }, el("label", { for: "job-timeout" }, "Timeout (s)"), timeout)),
+    el("div", { class: "jobrow" }, labelField, kindField ? null : timeoutField),
+    lim.workspace ? el("div", { class: "jobrow" }, cwdField, freshField) : null,
+    kindNote,
     ready,
     el("details", { class: "inputfiles" }, filesSummary, files));
   const countPicked = () => {
@@ -3165,7 +3217,7 @@ function buildJobPanel(s, text, file) {
     panel.hidden = !on;
     chipsSig = null;
     filesSig = null;
-    text.placeholder = on ? "Python code to run (or attach a .py file)…" : "Message the session…";
+    syncKind();
     text.classList.toggle("code", on);
     text.spellcheck = !on;
     text.rows = on ? 7 : 1;
@@ -3179,8 +3231,34 @@ function buildJobPanel(s, text, file) {
     }
     refresh();
   };
-  const toggle = el("button", { type: "button", class: "toggle", "aria-pressed": "false", title: "Send Python to a runner to execute", onclick: () => setOn(!on) },
+  const toggle = el("button", { type: "button", class: "toggle", "aria-pressed": "false",
+    title: `Send ${allowed.length > 1 ? "Python or a shell script" : allowed[0] === "shell" ? "a shell script" : "Python"} to a runner to execute`, onclick: () => setOn(!on) },
     svg(I_CODE, 14), "Send as job");
+  const isShell = () => kind === "shell";
+  const kindName = () => KIND_NAMES[kind];
+  const setKind = (k) => {
+    kind = k;
+    try {
+      localStorage.setItem(kindKey, k);
+    } catch {} // a per-viewer convenience only
+    chipsSig = null;
+    refresh();
+    onKind?.();
+  };
+  // What the box holds and how it runs depend on the kind, and for a shell
+  // job on the shell of the runners it may reach.
+  function syncKind() {
+    const sh = isShell();
+    const shells = new Set(s.runners.filter((r) => !r.rejected && accepts(r) && matches(r)).map((r) => r.shell || "sh"));
+    const shell = sh && shells.size === 1 ? [...shells][0] : null;
+    const word = !sh ? "Python code" : shell === "pwsh" ? "PowerShell commands" : "Shell commands";
+    text.placeholder = !on ? "Message the session…" : sh ? `${word} to run…` : "Python code to run (or attach a .py file)…";
+    kindNote.hidden = !on || !sh;
+    kindNote.textContent = shell === "pwsh" ? "Runs with pwsh -NoProfile -Command, with the tools in the runner's sandbox."
+      : shell ? "Runs with sh -e: stops at the first failing command, and uses the tools in the runner's sandbox."
+      : "Runs with the runner's shell (sh -e, or pwsh on Windows) and the tools in its sandbox.";
+    cwdField.hidden = !sh;
+  }
   labels.addEventListener("input", () => syncReady());
 
   // The relay's rule: approved (signed by the owner here), online, idle, and
@@ -3195,6 +3273,9 @@ function buildJobPanel(s, text, file) {
   const approvalNote = (r) => r.relayOnly ? (s.inv.role === "owner" ? "needs your confirmation" : "approval not received here") : null;
   const wantedLabels = () => labels.value.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
   const matches = (r) => target === "any" ? true : target === "labels" ? wantedLabels().every((l) => r.labels?.includes(l)) : `runner:${r.pub}` === target;
+  // The kinds a runner declared in its signed join. The relay does not look at them: it would route a shell job
+  // to any idle runner, and the runner would refuse it, so submit() steers jobs to runners that take them.
+  const accepts = (r) => r.kinds.includes(kind);
 
   // null when a job could go now; otherwise { text, act }.
   function blocker() {
@@ -3202,17 +3283,24 @@ function buildJobPanel(s, text, file) {
     if (!s.runnersLoaded || s.connBad?.has("poll")) return null;
     if (target === "labels" && !wantedLabels().length) return null; // submit() explains
     const live = s.runners.filter((r) => !r.rejected);
-    const fit = live.filter(matches);
+    const fit = live.filter((r) => matches(r) && accepts(r));
     if (fit.some((r) => usable(r) && !r.busy)) return null;
     const pending = fit.find((r) => !cleared(r) && r.setup !== "failed");
-    const one = target.startsWith("runner:") ? fit[0] : null;
+    const one = target.startsWith("runner:") ? live.find(matches) : null;
+    const kn = isShell() ? "shell" : "Python";
+    // Name the kind once any runner is left out by it, or the session has a second one.
+    const of = allowed.length > 1 || live.some((r) => !accepts(r)) ? ` that accepts ${kn} jobs` : "";
+    const noneAccept = live.length > 0 && !live.some(accepts);
     let why;
-    if (one) why = `${one.name} ${{ "needs approval": "needs approval", "setup failed": "failed to set up", preparing: "is still preparing its sandbox" }[runnerState(one)] || `is ${runnerState(one)}`}`;
-    else if (fit.some(usable)) why = target === "labels" ? "Every runner with those labels is busy" : "Every runner is busy";
-    else if (target === "labels" && !fit.length) why = `No runner has the labels ${wantedLabels().join(", ")}`;
+    if (one && !accepts(one)) why = `${one.name} does not accept ${kn} jobs`;
+    else if (one) why = `${one.name} ${{ "needs approval": "needs approval", "setup failed": "failed to set up", preparing: "is still preparing its sandbox" }[runnerState(one)] || `is ${runnerState(one)}`}`;
+    else if (fit.some(usable)) why = target === "labels" ? `Every runner with those labels${of} is busy` : `Every runner${of} is busy`;
+    else if (target === "labels" && !live.some(matches)) why = `No runner has the labels ${wantedLabels().join(", ")}`;
+    else if (target === "labels" && !fit.length) why = `No runner with those labels accepts ${kn} jobs`;
     else if (!live.length) why = "No runner has joined yet";
-    else why = target === "labels" ? "No approved runner with those labels is online" : "No approved runner is online";
-    return { text: `${why}, so a job sent now would fail right away.`, pending: s.inv.role === "owner" ? pending : null, none: !live.length,
+    else if (noneAccept) why = `No runner in this session accepts ${kn} jobs`;
+    else why = target === "labels" ? `No approved runner with those labels${of} is online` : `No approved runner${of} is online`;
+    return { text: `${why}, so a job sent now would fail right away.`, pending: s.inv.role === "owner" ? pending : null, none: !live.length || noneAccept,
       busy: fit.some(usable) };
   }
 
@@ -3231,7 +3319,7 @@ function buildJobPanel(s, text, file) {
     }
     if (!b) return;
     readyText.textContent = b.text;
-    const sig = `${b.pending?.pub || ""}|${b.none}|${b.busy}|${s.revokedRoles.has("runner")}`;
+    const sig = `${b.pending?.pub || ""}|${b.none}|${b.busy}|${s.revokedRoles.has("runner")}|${kind}`;
     if (readyAct.dataset.sig === sig) return;
     readyAct.dataset.sig = sig;
     const owner = s.inv.role === "owner";
@@ -3243,7 +3331,7 @@ function buildJobPanel(s, text, file) {
         (sec?.querySelector(`button[data-act=approve][data-pub="${CSS.escape(b.pending.pub)}"]`) || sec)?.focus({ preventScroll: true });
       } }, `Review ${b.pending.name}`));
     } else if (b.none && owner && !s.revokedRoles.has("runner")) {
-      const cmd = `airlox runner join --invite '${ac.memberInvite(location.origin, s.inv.roleSeed, "runner")}' --name my-runner --sandbox docker`;
+      const cmd = `airlox runner join --invite '${ac.memberInvite(location.origin, s.inv.roleSeed, "runner")}' --name my-runner --sandbox docker${isShell() ? " --image python:3.12-slim" : ""}`;
       const btn = el("button", { type: "button", class: "small", onclick: async () => {
         if (!(await copyText(btn, cmd, "Copy runner command"))) btn.textContent = "Copy it from Invites";
       } }, "Copy runner command");
@@ -3253,9 +3341,10 @@ function buildJobPanel(s, text, file) {
 
   function drawChips() {
     const live = s.runners.filter((r) => !r.rejected);
-    if (target.startsWith("runner:") && !live.some((r) => `runner:${r.pub}` === target)) target = "any";
+    // A runner that is gone, or does not take this kind of job, cannot stay the target.
+    if (target.startsWith("runner:") && !live.some((r) => `runner:${r.pub}` === target && accepts(r))) target = "any";
     labelField.hidden = target !== "labels";
-    const sig = JSON.stringify([target, locked, live.map((r) => [r.pub, r.name, r.labels, runnerState(r), approvalNote(r)])]);
+    const sig = JSON.stringify([target, locked, kind, live.map((r) => [r.pub, r.name, r.labels, runnerState(r), approvalNote(r), accepts(r)])]);
     if (sig === chipsSig) return;
     chipsSig = sig;
     const a = document.activeElement;
@@ -3270,9 +3359,15 @@ function buildJobPanel(s, text, file) {
       chip("any", "Any idle runner"),
       ...live.map((r) => {
         const st = runnerState(r);
-        return chip(`runner:${r.pub}`, el("span", { class: `dot ${st === "idle" ? "on" : st === "needs approval" ? "wait" : st === "busy" ? "busy" : ""}`, "aria-hidden": "true" }),
+        const fits = accepts(r);
+        const c = chip(`runner:${r.pub}`, el("span", { class: `dot ${fits && st === "idle" ? "on" : fits && st === "needs approval" ? "wait" : fits && st === "busy" ? "busy" : ""}`, "aria-hidden": "true" }),
           r.name, r.labels?.length ? el("span", { class: "muted" }, ` · ${r.labels.join(", ")}`) : null,
-          el("span", { class: "state" }, approvalNote(r) ? `${st} · ${approvalNote(r)}` : st));
+          el("span", { class: "state" }, !fits ? `no ${isShell() ? "shell" : "Python"} jobs` : approvalNote(r) ? `${st} · ${approvalNote(r)}` : st));
+        if (!fits) {
+          c.disabled = true;
+          c.title = `${r.name} does not run ${isShell() ? "shell" : "Python"} jobs`;
+        }
+        return c;
       }),
       chip("labels", "By label…"));
     if (keep) chips.querySelector(`[data-target="${CSS.escape(keep)}"]`)?.focus({ preventScroll: true });
@@ -3280,6 +3375,7 @@ function buildJobPanel(s, text, file) {
 
   function refresh() {
     if (!on) return;
+    syncKind();
     drawChips();
     syncReady();
     const cands = [...s.items.values()].filter((i) => i.kind === "file" && i.status === "ok" && i.ref).sort((a, b) => a.seq - b.seq);
@@ -3297,9 +3393,15 @@ function buildJobPanel(s, text, file) {
 
   async function submit() {
     const f = file.files?.[0];
-    let filename = "main.py";
+    const sh = isShell();
+    let filename = sh ? "job.sh" : "main.py";
     let code;
-    if (f) {
+    if (sh) {
+      if (f) throw new Error("a shell job takes its commands from the message box: remove the attached file, or send it as a file instead");
+      code = text.value;
+      if (!code.trim()) throw new Error("write the commands to run in the message box");
+      if (new TextEncoder().encode(code).length > MAX_SHELL_BYTES) throw new Error("the script is over 64 KiB");
+    } else if (f) {
       if (!/\.py$/i.test(f.name)) throw rejectFile(f, "is not a .py file: attach a .py file, or write the code in the message box");
       filename = f.name;
       try {
@@ -3312,6 +3414,9 @@ function buildJobPanel(s, text, file) {
       if (!code.trim()) throw new Error("attach a .py file or write code in the message box");
     }
     if (new TextEncoder().encode(code).length > MB) throw new Error("the code is over 1 MiB");
+    const dir = sh && lim.workspace ? cwd.value.trim().replace(/^\.?\/+|\/+$/g, "") : "";
+    const dirBad = dir && cwdError(dir);
+    if (dirBad) throw new Error(`the start folder is not valid: ${dirBad}`);
     const t = Number(timeout.value);
     if (!Number.isInteger(t) || t < 1 || t > lim.timeout_s) throw new Error(`timeout must be 1 to ${lim.timeout_s} seconds`);
     let tgt;
@@ -3328,14 +3433,28 @@ function buildJobPanel(s, text, file) {
       if (!r) throw new Error("that runner is gone");
       tgt = { type: "runner", participant_pub: r.pub, name: r.name };
     }
+    // The relay routes by target alone: with runners that do not take this kind among the candidates, name one that does.
+    if (tgt.type !== "runner" && s.runnersLoaded && !s.connBad?.has("poll")) {
+      const idle = s.runners.filter((r) => !r.rejected && usable(r) && !r.busy && matches(r));
+      const fit = idle.filter(accepts);
+      if (fit.length && fit.length < idle.length) {
+        const r = fit[Math.floor(Math.random() * fit.length)];
+        tgt = { type: "runner", participant_pub: r.pub, name: r.name };
+      }
+    }
     const refs = [...s.picked].map((id) => s.items.get(id)?.ref).filter(Boolean);
     const meta = { type: "job", filename, code, runtime: lim.runtime, timeout_s: t, memory_mb: null, files: refs, requirements: [], target: tgt };
+    // Absent rather than null or false, as the protocol has it: a Python job stays what older clients send.
+    if (sh) meta.kind = "shell";
+    if (dir) meta.cwd = dir;
+    if (lim.workspace && fresh.checked) meta.fresh = true;
     try {
-      await sendPayload(s, "job", "py", meta, new Uint8Array(), { path: "jobs", headers: { "Airlox-Target": JSON.stringify(tgt) } });
+      await sendPayload(s, "job", sh ? "sh" : "py", meta, new Uint8Array(), { path: "jobs", headers: { "Airlox-Target": JSON.stringify(tgt) } });
     } catch (e) {
       if (e.code !== "no_runner_available" && e.code !== "runner_busy") throw e;
       // The relay kept the job as failed (it shows in the timeline): its inputs are used up.
       s.picked.clear();
+      fresh.checked = false;
       filesSig = null; // job mode stays on: redraw the checkboxes unticked
       refresh();
       const err = new Error(e.code === "runner_busy" ? busyText(tgt.type === "runner" ? tgt.name : null) : notAvailableText(tgt));
@@ -3343,6 +3462,7 @@ function buildJobPanel(s, text, file) {
       throw err;
     }
     s.picked.clear();
+    fresh.checked = false;
     refresh();
     return true;
   }
@@ -3354,7 +3474,7 @@ function buildJobPanel(s, text, file) {
     toggle.disabled = true;
     for (const c of panel.querySelectorAll("button, input, summary")) c.disabled = true;
   };
-  return { panel, toggle, refresh, submit, lock, off: () => setOn(false), active: () => on, setSend: (b, check) => {
+  return { panel, toggle, refresh, submit, lock, kindName, off: () => setOn(false), active: () => on, setSend: (b, check) => {
       sendBtn = b;
       sync = check;
     },
@@ -3363,7 +3483,8 @@ function buildJobPanel(s, text, file) {
 
 // ---------- sending ----------
 async function sendPayload(s, kind, subkind, meta, body, { path = "items", headers = {}, refs = [] } = {}) {
-  const needed = kind === "text" ? "text" : kind === "event" || kind === "result" ? null : subkind;
+  // `sh` marks a shell job, not a content type: only the manifest's kinds govern it.
+  const needed = kind === "text" ? "text" : kind === "event" || kind === "result" || subkind === "sh" ? null : subkind;
   if (needed && !s.manifest.allowed_types.includes(needed)) throw new Error(`${needed} is not allowed in this session`);
   const payload = ac.encodePayload(JSON.stringify(meta), body);
   if (payload.length > s.manifest.max_item_bytes) throw new Error(`too large: the limit is ${fmtBytes(s.manifest.max_item_bytes)}`);

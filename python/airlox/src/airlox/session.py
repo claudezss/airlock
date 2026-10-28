@@ -25,6 +25,7 @@ from .execute import Job, NoRunnerAvailable, Runner, RunnerBusy, RunnerFailed, s
 log = logging.getLogger(__name__)
 
 DEFAULT_TYPES = ("text", "py", "md", "zip", "image")
+MAX_SHELL_BYTES = 64 * 1024
 # The item limit for a relay that does not say what it allows, and the
 # largest default a relay's answer can raise it to.
 DEFAULT_MAX_ITEM_BYTES = 25 * 1024 * 1024
@@ -230,7 +231,10 @@ class Session:
         versions with a PEP 440 specifier (``"cugrid==0.1.0"``, ``"numpy>=1.26,<3"``): runners
         install that version, or, with ``--python``, refuse to join an interpreter that has
         another. Jobs still name the package alone in ``requirements``, and each result's
-        ``env`` says which versions it ran with.
+        ``env`` says which versions it ran with. ``job_limits["kinds"]`` (``["python", "shell"]``;
+        absent means Python only) lets senders submit shell scripts too, with ``run_shell``, and
+        ``job_limits["workspace"]`` (``True``) lets runners that opt in keep each sender's work
+        directory between jobs.
 
         **Save the owner invite.** ``session.invites["owner"]`` is the only way to approve
         runners, mint more invites, revoke a role or close the session later: it holds the
@@ -605,6 +609,8 @@ class Session:
                     detail=r["detail"][:300] if isinstance(r.get("detail"), str) else None,
                     version=info.get("version"),
                     python=info.get("python"),
+                    kinds=list(info.get("kinds") or ["python"]),
+                    shell=info.get("shell"),
                 )
             )
         return out
@@ -691,6 +697,8 @@ class Session:
         memory_mb: Optional[int] = None,
         requirements: Iterable[str] = (),
         progress_file: Optional[str] = None,
+        cwd: Optional[str] = None,
+        fresh: bool = False,
     ) -> Job:
         """Submit Python to a runner. ``files`` are item references from
         ``send_file`` (ZIPs are unpacked into the work dir). Target one
@@ -702,8 +710,57 @@ class Session:
 
         ``progress_file`` names a file in the job's work dir (``"logs/run.log"``)
         whose tail the runner posts while the job runs; read it with
-        ``Job.progress()`` or ``Job.wait(on_progress=...)``."""
+        ``Job.progress()`` or ``Job.wait(on_progress=...)``. ``cwd`` and ``fresh``
+        are for sessions with workspaces: see ``run_shell``."""
+        return self._run_job(
+            "python", code, filename, files, runner, labels, timeout, memory_mb, requirements, progress_file, cwd, fresh
+        )
+
+    def run_shell(
+        self,
+        script: str,
+        *,
+        filename: str = "job.sh",
+        files: Iterable[dict] = (),
+        runner: Optional[Union[Runner, str]] = None,
+        labels: Optional[Iterable[str]] = None,
+        timeout: Optional[int] = None,
+        memory_mb: Optional[int] = None,
+        progress_file: Optional[str] = None,
+        cwd: Optional[str] = None,
+        fresh: bool = False,
+    ) -> Job:
+        """Submit a shell script (at most 64 KiB) to a runner, as ``airlox run -- COMMAND`` does.
+        The session must allow it (``job_limits["kinds"]`` has ``"shell"``) and the runner must
+        offer it (``Runner.kinds``, ``Runner.shell``): the runner runs the script with
+        ``sh -e -c`` (``pwsh -NoProfile -Command`` on Windows) and the tools of its own sandbox,
+        so nothing is installed for it. ``filename`` is only for display.
+
+        The relay routes by target alone and does not look at what runners accept: with
+        ``runner=None`` a runner that does not run shell jobs may be picked and refuses the job
+        (``Result.status == "refused"``, reason ``kind_not_supported``). Name a ``runner`` or
+        ``labels`` that only shell runners carry when the fleet is mixed.
+
+        ``cwd`` is a relative folder of the work dir (``"build/out"``, which must exist) to start
+        in, and ``fresh=True`` has a runner that keeps your workspace empty it first; both matter
+        only in sessions with ``job_limits["workspace"]``. The other arguments are those of
+        ``run_python``, without ``requirements``: a shell job installs nothing."""
+        return self._run_job(
+            "shell", script, filename, files, runner, labels, timeout, memory_mb, (), progress_file, cwd, fresh
+        )
+
+    def _run_job(
+        self, kind, code, filename, files, runner, labels, timeout, memory_mb, requirements, progress_file, cwd, fresh
+    ) -> Job:
         limits = self._require_execute()
+        allowed = limits.get("kinds") or ["python"]
+        if kind not in allowed:
+            raise ac.PolicyError(
+                f"this session does not allow {kind} jobs (it allows {', '.join(allowed)}); "
+                "the owner sets job kinds when creating it"
+            )
+        if kind == "shell" and len(code.encode("utf-8")) > MAX_SHELL_BYTES:
+            raise ValueError("a shell script is at most 64 KiB")
         if runner is not None and labels is not None:
             raise ValueError("pass runner or labels, not both")
         if runner is not None:
@@ -713,6 +770,8 @@ class Session:
                 # The relay may still route to it (if posting the owner's
                 # signed approval failed); it would get the code only to refuse.
                 raise ac.PolicyError(f"runner {r.name} has no signed approval from the owner yet")
+            if kind not in r.kinds:
+                raise ac.PolicyError(f"runner {r.name} does not run {kind} jobs")
             target = {"type": "runner", "participant_pub": r.participant_pub, "name": r.name}
         elif labels is not None:
             target = {"type": "labels", "labels": list(labels)}
@@ -729,10 +788,17 @@ class Session:
             "requirements": list(requirements),
             "target": target,
         }
-        # Absent rather than null: the canonical form leaves it out.
+        # Absent rather than null or false: the canonical form leaves them
+        # out, so a plain Python job is what older runners accept.
+        if kind != "python":
+            meta["kind"] = kind
         if progress_file is not None:
             meta["progress_file"] = progress_file
-        _, env, blob, frame = self._seal("job", "py", meta, b"", [])
+        if cwd is not None:
+            meta["cwd"] = cwd
+        if fresh:
+            meta["fresh"] = True
+        _, env, blob, frame = self._seal("job", "sh" if kind == "shell" else "py", meta, b"", [])
         job = Job(self, json.loads(ac.item_ref(env, blob)), meta)
         try:
             resp = self._req("POST", "/jobs", content=frame, headers={"Airlox-Target": json.dumps(target)})

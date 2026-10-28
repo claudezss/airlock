@@ -348,6 +348,13 @@ chart = res.read("chart.png")            # files the job wrote to $AIRLOX_OUT
 summary = res.read("summary.json")       # by path, whether or not it came zipped
 ```
 
+A session that allows shell jobs (`"kinds": ["python", "shell"]` in
+`job_limits`, or `--kinds python,shell` on the CLI) also takes
+`agent.run_shell("make test", runner="runner-01")`, and the web UI's job
+composer then has a Python/Shell switch (and, with workspaces, a start folder
+and an empty-workspace option). Runners list the kinds they run in
+`Runner.kinds`.
+
 Every result carries `env`, signed by the runner and not written by the job:
 the Python version, the installed version of each allowlisted package, the
 sandbox, the airlox version and where the interpreter came from (`uv-runtime`,
