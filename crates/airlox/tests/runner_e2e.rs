@@ -199,8 +199,8 @@ fn shell(code: &str) -> Job {
 }
 
 impl Rig {
-    /// Post the job (and its tree) as `who`; returns the job's item id.
-    async fn submit(&self, who: &Member, job: Job) -> String {
+    /// Seal the job, posting its tree as `who` first.
+    async fn seal_job(&self, who: &Member, job: Job) -> SealedItem {
         let mut files = vec![];
         if let Some(zip) = &job.tree {
             let item = seal(
@@ -229,19 +229,28 @@ impl Rig {
             cwd: job.cwd.map(String::from),
             fresh: job.fresh,
         };
-        let item = seal(&self.s, who, ItemKind::Job, Some(spec.kind().subkind()), vec![], Payload::job(spec));
+        seal(&self.s, who, ItemKind::Job, Some(spec.kind().subkind()), vec![], Payload::job(spec))
+    }
+
+    /// Offer a sealed job to the relay once.
+    async fn post_job(&self, who: &Member, item: &SealedItem) -> reqwest::Response {
+        self.env
+            .http
+            .post(self.env.url(&format!("/v1/sessions/{}/jobs", self.s.id)))
+            .bearer_auth(&who.token)
+            .header("Airlox-Target", r#"{"type":"any"}"#)
+            .body(frame(item))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// Post the job (and its tree) as `who`; returns the job's item id.
+    async fn submit(&self, who: &Member, job: Job) -> String {
+        let item = self.seal_job(who, job).await;
         // A runner that just finished a job is busy for a moment more.
         for _ in 0..100 {
-            let r = self
-                .env
-                .http
-                .post(self.env.url(&format!("/v1/sessions/{}/jobs", self.s.id)))
-                .bearer_auth(&who.token)
-                .header("Airlox-Target", r#"{"type":"any"}"#)
-                .body(frame(&item))
-                .send()
-                .await
-                .unwrap();
+            let r = self.post_job(who, &item).await;
             if r.status() == 201 {
                 return item.envelope.header.id.clone();
             }
@@ -559,4 +568,139 @@ async fn docker_without_an_image_refuses_shell_jobs() {
     let r = rig.run(&rig.sender, py).await;
     assert_eq!((r.status, r.stdout.as_str()), (JobStatus::Completed, "1\n"), "{:?} {}", r.reason, r.stderr);
     assert_eq!(r.env.unwrap().kinds, Some(vec![JobKind::Python]));
+}
+
+/// A shell job that waits, up to 20 s, for `wait` to exist in `dir`, after
+/// creating `mark` there.
+fn rendezvous(dir: &std::path::Path, mark: &str, wait: &str) -> Job {
+    let dir = dir.display();
+    shell(&format!(
+        "touch '{dir}/{mark}'; i=0; while [ ! -e '{dir}/{wait}' ]; do i=$((i+1)); [ $i -gt 200 ] && echo alone && exit 1; \
+         sleep 0.1; done; echo met\n"
+    ))
+}
+
+async fn wait_for_file(path: &std::path::Path) {
+    for _ in 0..300 {
+        if path.exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("{} never appeared", path.display());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_runner_with_two_slots_runs_two_jobs_at_once_and_refuses_a_third() {
+    let Some(rig) = rig(&["--concurrency", "2"]).await else { return };
+    let signal = tempfile::tempdir().unwrap();
+    let dir = signal.path();
+    let runners = || async {
+        let r = rig
+            .env
+            .http
+            .get(rig.env.url(&format!("/v1/sessions/{}/runners", rig.s.id)))
+            .bearer_auth(&rig.owner.token)
+            .send()
+            .await
+            .unwrap();
+        r.json::<Value>().await.unwrap()["runners"][0].clone()
+    };
+    // The join says how many slots there are.
+    assert_eq!(runners().await["slots"], 2);
+    assert_eq!(runners().await["runner"]["slots"], 2);
+
+    // Each job waits for the other's mark: only jobs that overlap finish.
+    let a = rig.submit(&rig.sender, rendezvous(dir, "a", "b")).await;
+    let b = rig.submit(&rig.sender, rendezvous(dir, "b", "a")).await;
+    wait_for_file(&dir.join("a")).await;
+    wait_for_file(&dir.join("b")).await;
+    let row = runners().await;
+    assert_eq!((row["jobs"].as_array().map(Vec::len), row["busy"].as_bool()), (Some(2), Some(true)));
+
+    // Both slots are taken: a third is refused at once, not queued.
+    let third = rig.seal_job(&rig.sender, shell("echo third\n")).await;
+    let r = rig.post_job(&rig.sender, &third).await;
+    assert_eq!(r.status(), 409);
+    assert_eq!(r.json::<Value>().await.unwrap()["error"], "runner_busy");
+
+    for id in [&a, &b] {
+        let r = rig.result(id).await;
+        assert_eq!(
+            (r.status, r.stdout.as_str()),
+            (JobStatus::Completed, "met\n"),
+            "{:?} {}",
+            r.reason,
+            r.stderr
+        );
+    }
+    // Free again: the same job goes through now.
+    let r = rig.run(&rig.sender, shell("echo third\n")).await;
+    assert_eq!(r.stdout, "third\n");
+    let row = runners().await;
+    assert_eq!((row["jobs"].as_array().map(Vec::len), row["busy"].as_bool()), (Some(0), Some(false)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_workspace_serves_one_job_at_a_time_but_other_senders_run_beside_it() {
+    let Some(rig) = rig(&["--concurrency", "2", "--workspace"]).await else { return };
+    let signal = tempfile::tempdir().unwrap();
+    let dir = signal.path();
+    let other = join(&rig.env, &rig.s, Role::Sender, "agent-2").await;
+
+    // The first holds the sender's workspace until released.
+    let first = rig.submit(&rig.sender, rendezvous(dir, "first", "release")).await;
+    wait_for_file(&dir.join("first")).await;
+
+    // A second job of the same sender finds it in use: the runner refuses it
+    // as a busy runner would (a signed result, so the sender is told).
+    let second = rig.submit(&rig.sender, shell("echo should not run\n")).await;
+    let r = rig.result(&second).await;
+    assert_eq!(r.status, JobStatus::Refused);
+    assert_eq!(r.stdout, "");
+    let why = r.reason.unwrap();
+    assert!(why.starts_with("runner_busy: "), "{why}");
+
+    // Another sender has a workspace of its own and runs beside the first.
+    let r = rig.run(&other, shell("echo beside\n")).await;
+    assert_eq!((r.status, r.stdout.as_str()), (JobStatus::Completed, "beside\n"), "{:?}", r.reason);
+    assert!(rig.replies(&first, "result").await.is_empty(), "the first is still running");
+
+    // Once it is done the workspace is free for the sender's next job.
+    std::fs::write(dir.join("release"), "").unwrap();
+    let r = rig.result(&first).await;
+    assert_eq!((r.status, r.stdout.as_str()), (JobStatus::Completed, "met\n"), "{:?} {}", r.reason, r.stderr);
+    let r = rig.run(&rig.sender, shell("echo again\n")).await;
+    assert_eq!((r.status, r.stdout.as_str()), (JobStatus::Completed, "again\n"), "{:?}", r.reason);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_one_of_two_running_jobs_leaves_the_other_alone() {
+    let Some(rig) = rig(&["--concurrency", "2"]).await else { return };
+    let signal = tempfile::tempdir().unwrap();
+    let dir = signal.path();
+    let doomed = rig.submit(&rig.sender, rendezvous(dir, "doomed", "never")).await;
+    let kept = rig.submit(&rig.sender, rendezvous(dir, "kept", "release")).await;
+    wait_for_file(&dir.join("doomed")).await;
+    wait_for_file(&dir.join("kept")).await;
+
+    let r = rig
+        .env
+        .http
+        .post(rig.env.url(&format!("/v1/sessions/{}/jobs/{doomed}/cancel", rig.s.id)))
+        .bearer_auth(&rig.sender.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 202);
+    let r = rig.result(&doomed).await;
+    assert_eq!(r.status, JobStatus::Cancelled, "{:?}", r.reason);
+
+    // Its slot is free for a new job while the other keeps running.
+    let r = rig.run(&rig.sender, shell("echo next\n")).await;
+    assert_eq!((r.status, r.stdout.as_str()), (JobStatus::Completed, "next\n"), "{:?}", r.reason);
+    assert!(rig.replies(&kept, "result").await.is_empty(), "the other job was not touched");
+    std::fs::write(dir.join("release"), "").unwrap();
+    let r = rig.result(&kept).await;
+    assert_eq!((r.status, r.stdout.as_str()), (JobStatus::Completed, "met\n"), "{:?} {}", r.reason, r.stderr);
 }

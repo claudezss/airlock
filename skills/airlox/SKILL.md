@@ -214,9 +214,9 @@ rather than waiting for it.
 code; 1 if the job produced none, 75 if `--wait` ran out (check `status` in
 `--json` output rather than relying on the code). The result is signed by the
 runner (`"signed": true`); a job that never ran has an unsigned relay `reason`
-such as `no_runner_available` (no approved, online, idle runner matched: jobs
-are not queued), `runner_busy` (the runner that matched is running another
-job; submit again once `runner list` no longer shows it busy) or
+such as `no_runner_available` (no approved, online runner with a free slot
+matched: jobs are not queued), `runner_busy` (the runner that matched has
+every slot taken; submit again once `runner list` no longer shows it busy) or
 `runner_lost`. For long jobs, `--progress-file logs/run.log` has the runner
 post the end of that log while it runs (`airlox items` shows these
 `progress` items). Files the

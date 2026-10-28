@@ -30,14 +30,18 @@ async fn execute_env(f: impl FnOnce(&mut Config)) -> (Env, Sess, Member, Member)
 }
 
 async fn join_runner(env: &Env, s: &Sess, name: &str, labels: &[&str]) -> Member {
-    let (kp, body) = runner_join_body(s, name, labels);
+    join_runner_slots(env, s, name, labels, 1).await
+}
+
+async fn join_runner_slots(env: &Env, s: &Sess, name: &str, labels: &[&str], slots: u32) -> Member {
+    let (kp, body) = runner_join_body(s, name, labels, slots);
     let r = post_join(env, s, body).await;
     assert_eq!(r.status(), StatusCode::CREATED, "{}", r.text().await.unwrap());
     let v: Value = r.json().await.unwrap();
     Member { kp, token: v["token"].as_str().unwrap().to_string() }
 }
 
-fn runner_join_body(s: &Sess, name: &str, labels: &[&str]) -> (Keypair, String) {
+fn runner_join_body(s: &Sess, name: &str, labels: &[&str], slots: u32) -> (Keypair, String) {
     let kp = Keypair::generate();
     let cert = issue_cert(&s.secrets.role_keypair(Role::Runner), &s.id, Role::Runner, kp.public(), now_ms())
         .unwrap();
@@ -60,6 +64,7 @@ fn runner_join_body(s: &Sess, name: &str, labels: &[&str]) -> (Keypair, String) 
                 python: None,
                 kinds: vec![JobKind::Python],
                 shell: None,
+                slots,
             }),
             created_at_ms: now_ms(),
         },
@@ -175,14 +180,18 @@ async fn claim(env: &Env, s: &Sess, runner: &Member, job: &str) -> StatusCode {
     call(env, runner, reqwest::Method::POST, format!("/v1/sessions/{}/jobs/{job}/claim", s.id)).await.status()
 }
 
-async fn heartbeat(env: &Env, s: &Sess, runner: &Member, job: Option<&str>) -> reqwest::Response {
+async fn heartbeat_jobs(env: &Env, s: &Sess, runner: &Member, jobs: &[&str]) -> reqwest::Response {
     env.http
         .post(env.url(&format!("/v1/sessions/{}/runners/me/heartbeat", s.id)))
         .bearer_auth(&runner.token)
-        .body(serde_json::json!({ "job": job }).to_string())
+        .body(serde_json::json!({ "jobs": jobs }).to_string())
         .send()
         .await
         .unwrap()
+}
+
+async fn heartbeat(env: &Env, s: &Sess, runner: &Member, job: Option<&str>) -> reqwest::Response {
+    heartbeat_jobs(env, s, runner, job.as_slice()).await
 }
 
 /// An open runner stream: holding it is what makes the runner online.
@@ -388,7 +397,7 @@ async fn unclaimed_jobs_fail_and_quiet_runners_are_lost() {
     assert_eq!(submit(&env, &s, &sender, &job).await.status(), StatusCode::CREATED);
     assert_eq!(claim(&env, &s, &runner, &id).await, StatusCode::NO_CONTENT);
     let hb: Value = heartbeat(&env, &s, &runner, Some(&id)).await.json().await.unwrap();
-    assert_eq!(hb["job"], id.as_str());
+    assert_eq!(hb["jobs"], json!([id]));
     heartbeat(&env, &s, &runner, None).await;
     assert_eq!(job_state(&env, &s, &owner, &id).await["reason"], "runner_lost");
 }
@@ -649,7 +658,7 @@ async fn shell_jobs_route_like_python_ones() {
 async fn busy_runners_refuse_and_lost_jobs_come_back() {
     let (env, s, owner, sender) = execute_env(|c| {
         c.runner_timeout_ms = 400;
-        c.job_reconnect_grace_ms = 800;
+        c.job_reconnect_grace_ms = 1600;
     })
     .await;
     let runner = join_runner(&env, &s, "runner-01", &[]).await;
@@ -689,7 +698,7 @@ async fn busy_runners_refuse_and_lost_jobs_come_back() {
 
     // The runner reconnects still working on it: it is running again.
     let hb: Value = heartbeat(&env, &s, &runner, Some(&id)).await.json().await.unwrap();
-    assert_eq!(hb["job"], id.as_str());
+    assert_eq!(hb["jobs"], json!([id]));
     assert_eq!(job_state(&env, &s, &owner, &id).await["state"], "running");
 
     // Lost again, and the result arrives later: it still finishes the job.
@@ -698,6 +707,189 @@ async fn busy_runners_refuse_and_lost_jobs_come_back() {
     assert_eq!(post(&env, &s, &runner, frame(&res)).await.status(), StatusCode::CREATED);
     assert_eq!(job_state(&env, &s, &owner, &id).await["state"], "done");
     assert_eq!(runners(&env, &s, &owner).await[0]["busy"], false);
+}
+
+/// A runner with `slots` slots that is online and approved.
+async fn pool_runner(
+    env: &Env,
+    s: &Sess,
+    owner: &Member,
+    name: &str,
+    labels: &[&str],
+    slots: u32,
+) -> (Member, RunnerStream) {
+    let runner = join_runner_slots(env, s, name, labels, slots).await;
+    let stream = RunnerStream::open(env, s, &runner).await;
+    approve(env, s, owner, &runner).await;
+    (runner, stream)
+}
+
+/// Submit a job that must be routed; returns it and the runner it went to.
+async fn submit_ok(env: &Env, s: &Sess, sender: &Member, target: &Target) -> (SealedItem, String) {
+    let job = seal_job(s, sender, target);
+    let r = submit(env, s, sender, &job).await;
+    assert_eq!(r.status(), StatusCode::CREATED, "{}", r.text().await.unwrap());
+    let runner = r.json::<Value>().await.unwrap()["runner"].as_str().unwrap().to_string();
+    (job, runner)
+}
+
+fn runner_row<'a>(list: &'a [Value], m: &Member) -> &'a Value {
+    list.iter().find(|r| r["participant_pub"] == pk(m).as_str()).expect("runner is listed")
+}
+
+/// (slots, active jobs, busy) of a runner in a listing.
+fn load(list: &[Value], m: &Member) -> (u64, usize, bool) {
+    let r = runner_row(list, m);
+    (r["slots"].as_u64().unwrap(), r["jobs"].as_array().unwrap().len(), r["busy"].as_bool().unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn jobs_go_to_the_least_loaded_runner_and_busy_means_every_slot_is_taken() {
+    let (mut env, s, owner, sender) = execute_env(|_| {}).await;
+    // Joined first, two slots; then one slot.
+    let (wide, _w) = pool_runner(&env, &s, &owner, "runner-01", &["cpu"], 2).await;
+    let (narrow, _n) = pool_runner(&env, &s, &owner, "runner-02", &["cpu"], 1).await;
+    let any = Target::Any;
+
+    // Both empty: the earliest joined. Then the one with the lower load
+    // (1/2 against 0/1), then the one that still has room.
+    let (j1, r1) = submit_ok(&env, &s, &sender, &any).await;
+    let (_, r2) = submit_ok(&env, &s, &sender, &any).await;
+    let (_, r3) = submit_ok(&env, &s, &sender, &any).await;
+    assert_eq!((r1, r2, r3), (pk(&wide), pk(&narrow), pk(&wide)));
+
+    // Every slot is taken: not queued, and named as busy rather than absent.
+    let full = seal_job(&s, &sender, &any);
+    let r = submit(&env, &s, &sender, &full).await;
+    assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "runner_busy".into()));
+    assert_eq!(job_state(&env, &s, &owner, &full.envelope.header.id).await["reason"], "runner_busy");
+    let pinned = Target::Runner { participant_pub: wide.kp.public(), name: "runner-01".into() };
+    let r = submit(&env, &s, &sender, &seal_job(&s, &sender, &pinned)).await;
+    assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "runner_busy".into()));
+    let gpu = Target::Labels { labels: vec!["gpu".into()] };
+    let r = submit(&env, &s, &sender, &seal_job(&s, &sender, &gpu)).await;
+    assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "no_runner_available".into()));
+
+    // The listing says how loaded each runner is; `busy` is "no free slot".
+    let list = runners(&env, &s, &owner).await;
+    assert_eq!(load(&list, &wide), (2, 2, true));
+    assert_eq!(load(&list, &narrow), (1, 1, true));
+    assert!(!runner_row(&list, &wide)["job"].is_null(), "older clients read `job` as busy");
+
+    // The loads are rebuilt from the log when the relay restarts; the
+    // runners then reconnect.
+    drop((_w, _n));
+    env.restart(|_| {}).await;
+    let list = runners(&env, &s, &owner).await;
+    assert_eq!(load(&list, &wide), (2, 2, true));
+    assert_eq!(load(&list, &narrow), (1, 1, true));
+    let _w = RunnerStream::open(&env, &s, &wide).await;
+    let _n = RunnerStream::open(&env, &s, &narrow).await;
+
+    // One slot frees when a job ends; only that runner takes the next job,
+    // and the one after that is refused again.
+    assert_eq!(claim(&env, &s, &wide, &j1.envelope.header.id).await, StatusCode::NO_CONTENT);
+    let r = post(&env, &s, &wide, frame(&seal_result(&s, &wide, &j1))).await;
+    assert_eq!(r.status(), StatusCode::CREATED, "{}", r.text().await.unwrap());
+    let list = runners(&env, &s, &owner).await;
+    assert_eq!(load(&list, &wide), (2, 1, false));
+    assert!(runner_row(&list, &wide)["job"].is_null());
+    let (_, r4) = submit_ok(&env, &s, &sender, &any).await;
+    assert_eq!(r4, pk(&wide));
+    let r = submit(&env, &s, &sender, &seal_job(&s, &sender, &any)).await;
+    assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "runner_busy".into()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn heartbeats_name_every_running_job_and_a_lost_one_is_lost_alone() {
+    let (env, s, owner, sender) = execute_env(|_| {}).await;
+    let (runner, _stream) = pool_runner(&env, &s, &owner, "runner-01", &[], 3).await;
+    let mut jobs = vec![];
+    for _ in 0..3 {
+        let (job, _) = submit_ok(&env, &s, &sender, &Target::Any).await;
+        assert_eq!(claim(&env, &s, &runner, &job.envelope.header.id).await, StatusCode::NO_CONTENT);
+        jobs.push(job);
+    }
+    let ids: Vec<String> = jobs.iter().map(|j| j.envelope.header.id.clone()).collect();
+    let [a, b, c] = [ids[0].as_str(), ids[1].as_str(), ids[2].as_str()];
+
+    // All three named: nothing is lost, and the answer lists them.
+    let hb: Value = heartbeat_jobs(&env, &s, &runner, &[a, b, c]).await.json().await.unwrap();
+    let mut named: Vec<&str> = hb["jobs"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    named.sort();
+    let mut want = vec![a, b, c];
+    want.sort();
+    assert_eq!(named, want);
+    for id in [a, b, c] {
+        assert_eq!(job_state(&env, &s, &owner, id).await["state"], "running");
+    }
+
+    // One left out: only that job is lost, and its slot is free again.
+    heartbeat_jobs(&env, &s, &runner, &[a, c]).await;
+    assert_eq!(job_state(&env, &s, &owner, b).await["reason"], "runner_lost");
+    for id in [a, c] {
+        assert_eq!(job_state(&env, &s, &owner, id).await["state"], "running");
+    }
+    assert_eq!(load(&runners(&env, &s, &owner).await, &runner), (3, 2, false));
+
+    // Named again, it comes back, and the runner is full once more.
+    heartbeat_jobs(&env, &s, &runner, &[a, b, c]).await;
+    assert_eq!(job_state(&env, &s, &owner, b).await["state"], "running");
+    assert_eq!(load(&runners(&env, &s, &owner).await, &runner), (3, 3, true));
+
+    // Idle: all three are lost.
+    heartbeat_jobs(&env, &s, &runner, &[]).await;
+    for id in [a, b, c] {
+        assert_eq!(job_state(&env, &s, &owner, id).await["reason"], "runner_lost");
+    }
+    assert_eq!(load(&runners(&env, &s, &owner).await, &runner), (3, 0, false));
+
+    // Three newer jobs take the slots. A lost job does not push into a full
+    // runner, but its result, when it comes, still finishes it.
+    for _ in 0..3 {
+        submit_ok(&env, &s, &sender, &Target::Any).await;
+    }
+    heartbeat_jobs(&env, &s, &runner, &[a]).await;
+    let st = job_state(&env, &s, &owner, a).await;
+    assert_eq!((st["state"].as_str(), st["reason"].as_str()), (Some("failed"), Some("runner_lost")));
+    assert_eq!(load(&runners(&env, &s, &owner).await, &runner), (3, 3, true));
+    let r = post(&env, &s, &runner, frame(&seal_result(&s, &runner, &jobs[0]))).await;
+    assert_eq!(r.status(), StatusCode::CREATED, "{}", r.text().await.unwrap());
+    assert_eq!(job_state(&env, &s, &owner, a).await["state"], "done");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reconnecting_runner_gets_every_assignment_and_cancel_again() {
+    let (env, s, owner, sender) = execute_env(|_| {}).await;
+    let (runner, stream) = pool_runner(&env, &s, &owner, "runner-01", &[], 3).await;
+    let mut ids = vec![];
+    for _ in 0..3 {
+        let (job, _) = submit_ok(&env, &s, &sender, &Target::Any).await;
+        ids.push(job.envelope.header.id.clone());
+        // The backlog is oldest first: give each job its own millisecond.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    for id in &ids[..2] {
+        assert_eq!(claim(&env, &s, &runner, id).await, StatusCode::NO_CONTENT);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The second is cancelled while it runs.
+    let path = format!("/v1/sessions/{}/jobs/{}/cancel", s.id, ids[1]);
+    assert_eq!(call(&env, &sender, reqwest::Method::POST, path).await.status(), StatusCode::ACCEPTED);
+    drop(stream);
+
+    let mut again = RunnerStream::open(&env, &s, &runner).await;
+    let mut got = vec![];
+    for _ in 0..3 {
+        let assigned = again.next("job_assigned").await;
+        assert!(assigned["envelope"].is_string());
+        got.push(assigned["job"].as_str().unwrap().to_string());
+    }
+    // Oldest first, by when each entered its current state: the one still
+    // unclaimed, then the two claimed in order.
+    assert_eq!(got, [ids[2].clone(), ids[0].clone(), ids[1].clone()]);
+    // The pending cancel repeats with its job; nothing else was cancelled.
+    assert_eq!(again.next("job_cancel").await["job"], ids[1].as_str());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -858,7 +1050,7 @@ async fn revoking_runners_fails_their_jobs_and_ends_their_streams() {
     assert!(stream.ended().await);
     assert_eq!(claim(&env, &s, &runner, &id).await, StatusCode::UNAUTHORIZED);
     // No runner can join to take its place.
-    let (_, body) = runner_join_body(&s, "runner-02", &[]);
+    let (_, body) = runner_join_body(&s, "runner-02", &[], 1);
     assert_eq!(error_code(post_join(&env, &s, body).await).await, (StatusCode::FORBIDDEN, "revoked".into()));
 }
 

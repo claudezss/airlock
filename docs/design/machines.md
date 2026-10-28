@@ -275,10 +275,10 @@ one directory per `(session, sender participant key)`:
 - Docker: the workspace is bind-mounted as `/work` rw in place of the
   per-job temp dir; the root stays read-only. Linux local: the pivoted root
   binds it the same way. Nothing changes in what the job may reach.
-- Two jobs from one sender cannot share a workspace at once. A runner takes
-  one job at a time today, so this holds; with concurrency (§14) the
-  workspace is a lock, and a second job from the same sender gets
-  `runner_busy` as it would from a busy runner.
+- Two jobs from one sender cannot share a workspace at once. A runner with
+  several slots (§14) holds a lock per workspace: a second job from the same
+  sender is refused with a signed `refused` result whose reason starts
+  `runner_busy:`, as a runner with no free slot would be.
 
 A job can leave something behind for the next job of the **same sender**.
 That is the same trust domain as the job that planted it, and no more than a
@@ -431,10 +431,19 @@ code. M-D is the one users see first and should not wait for M-E.
    Job Object limits are enough for arbitrary toolchains. Proposed: `pwsh`
    only, and a Windows runner reports `kinds: ["python"]` unless the operator
    passes `--shell pwsh`.
-2. **Concurrency.** One job per runner is a poor fit for a shared CI box.
-   `--concurrency N` with one workspace lock per sender is the natural
-   extension; the relay's `runner_busy` becomes "no free slot". Proposed:
-   after M-D.
+2. **Concurrency.** *Implemented.* One job per runner is a poor fit for a
+   shared CI box. `--concurrency N` (1 to 16, default 1; `--max-jobs` is an
+   alias) is the runner's `slots` in its signed join, and `machine add`
+   puts it in the printed command. The relay sends a runner at most `slots`
+   active jobs, preferring the least loaded runner, and `runner_busy`
+   means "no free slot". A runner's workspace is a lock per sender, kept by
+   the runner. Differences from the proposal: a second job from a sender
+   whose workspace is in use is refused by the runner, not the relay (the
+   relay cannot see content, only the author, and does not know whether a
+   runner keeps workspaces), so the sender sees a `refused` result with a
+   `runner_busy:` reason after it was routed; and the slots are fixed by
+   the join, so a runner changes them by joining again under a new name.
+   Memory and CPU limits are per job: size the host for all slots.
 3. **Chunk cost on the hosted relay.** 120 items a minute per running job
    is cheap in bytes and not in requests. If it shows in the relay's
    footprint measurement, raise the coalescing floor to 2 s before touching

@@ -900,7 +900,7 @@ pub struct RunArgs {
     /// Send to this runner (name or key).
     #[arg(long, conflicts_with_all = ["label"])]
     pub runner: Option<String>,
-    /// Send to any idle runner with all these labels (repeat, or comma-separated).
+    /// Send to any runner with a free slot that has all these labels (repeat, or comma-separated).
     #[arg(long, value_delimiter = ',')]
     pub label: Vec<String>,
     /// A file to send with the job (repeat); ZIPs are unpacked in the job's
@@ -2412,10 +2412,16 @@ pub async fn runner_list(conn: Conn) -> Result<()> {
             "awaiting approval"
         } else if !r.online {
             "offline"
-        } else if r.job.is_some() {
+        } else if r.busy {
             "busy"
         } else {
             "idle"
+        };
+        // A runner with several slots says how many are taken.
+        let state = if r.slots > 1 && state != "offline" && r.approved && !r.rejected {
+            format!("{state} ({}/{} jobs)", r.jobs.len(), r.slots)
+        } else {
+            state.to_string()
         };
         let net = if r.network_unblocked { " · cannot block network" } else { "" };
         let versions = match (&r.version, &r.python) {

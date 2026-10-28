@@ -398,16 +398,19 @@ impl Relay {
         }
     }
 
-    pub async fn heartbeat(&self, job: Option<&str>) -> Result<Value> {
-        self.send_heartbeat(serde_json::json!({ "job": job })).await
+    /// Say which jobs the runner is working on: the relay fails a running
+    /// job that is not named.
+    pub async fn heartbeat(&self, jobs: &[String]) -> Result<Value> {
+        self.send_heartbeat(serde_json::json!({ "jobs": jobs })).await
     }
 
     /// A heartbeat that also reports the runner's setup (`preparing`,
     /// `ready`, `failed`), so the session sees a runner that cannot start.
-    /// `job` is one it still owes an answer for (from before a restart), so
-    /// the relay does not count that job lost while the answer is on its way.
-    pub async fn report(&self, state: &str, detail: Option<&str>, job: Option<&str>) -> Result<Value> {
-        self.send_heartbeat(serde_json::json!({ "job": job, "state": state, "detail": detail })).await
+    /// `jobs` are the ones it still owes an answer for (from before a
+    /// restart), so the relay does not count them lost while the answers are
+    /// on their way.
+    pub async fn report(&self, state: &str, detail: Option<&str>, jobs: &[String]) -> Result<Value> {
+        self.send_heartbeat(serde_json::json!({ "jobs": jobs, "state": state, "detail": detail })).await
     }
 
     async fn send_heartbeat(&self, body: Value) -> Result<Value> {

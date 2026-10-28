@@ -22,7 +22,8 @@
 //! `O_NOFOLLOW`), replaces a link or a file where a directory is needed, and
 //! writes through a temporary file renamed into place, which replaces a link
 //! instead of writing through it. No job runs while a workspace is synced
-//! (a runner takes one job at a time), so the checks cannot race the job.
+//! (a workspace serves one job at a time: the runner leases it to the job
+//! from staging to its result), so the checks cannot race the job.
 
 use std::collections::HashSet;
 use std::fs;

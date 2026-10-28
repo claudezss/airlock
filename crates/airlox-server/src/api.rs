@@ -307,7 +307,7 @@ pub async fn leave(
     blocking(move || {
         let mut g = s.lock();
         if !g.closed {
-            s.fail_runner_job(&mut g, &who, "runner_left")?;
+            s.fail_runner_jobs(&mut g, &who, "runner_left")?;
             s.append(&mut g, Rec::Leave { who })?;
         }
         Ok(())
@@ -1176,7 +1176,7 @@ pub async fn revoke_role(
         // A cut-off runner's job fails, and so does any job a cut-off
         // sender still has queued or running.
         for r in cut.iter().filter(|_| role == Role::Runner) {
-            s.fail_runner_job(&mut g, r, "runner_revoked")?;
+            s.fail_runner_jobs(&mut g, r, "runner_revoked")?;
         }
         let mut authored: Vec<(String, Option<String>)> = g
             .jobs

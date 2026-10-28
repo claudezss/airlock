@@ -114,6 +114,22 @@ pub struct RunnerInfo {
     /// The shell `shell` jobs run under (`sh` or `pwsh`); `null` exactly
     /// when `kinds` has no `shell`.
     pub shell: Option<String>,
+    /// How many jobs the runner runs at once (`--concurrency`), 1 to
+    /// [`MAX_SLOTS`]. Absent from the canonical form when 1, so joins of
+    /// one-job runners are unchanged.
+    #[serde(default = "one_slot", skip_serializing_if = "is_one_slot")]
+    pub slots: u32,
+}
+
+/// Most jobs a runner may declare it runs at once.
+pub const MAX_SLOTS: u32 = 16;
+
+fn one_slot() -> u32 {
+    1
+}
+
+fn is_one_slot(n: &u32) -> bool {
+    *n == 1
 }
 
 /// Longest `version` or `python` string in a runner's join.
@@ -272,6 +288,9 @@ impl SignedJoinRequest {
                 if r.kinds.is_empty() || r.kinds.len() > 2 || !distinct {
                     return Err(Error::invalid("runner kinds", "1 or 2 distinct job kinds"));
                 }
+                if !(1..=MAX_SLOTS).contains(&r.slots) {
+                    return Err(Error::invalid("runner slots", format!("1 to {MAX_SLOTS} jobs at once")));
+                }
                 let shell_ok = match (&r.shell, r.kinds.contains(&JobKind::Shell)) {
                     (Some(sh), true) => matches!(sh.as_str(), "sh" | "pwsh"),
                     (None, false) => true,
@@ -354,6 +373,7 @@ mod tests {
                 python: None,
                 kinds: vec![JobKind::Python],
                 shell: None,
+                slots: 1,
             }),
             created_at_ms: 3,
         };
@@ -380,6 +400,26 @@ mod tests {
         assert!(with(vec![JobKind::Python, JobKind::Shell], None).is_err());
         assert!(with(vec![JobKind::Python], Some("sh")).is_err());
         assert!(with(vec![JobKind::Shell], Some("bash")).is_err());
+
+        // Slots: 1 to 16, signed, and left out of the canonical form when 1.
+        let slots = |n: u32| {
+            let mut j = join.clone();
+            j.runner.as_mut().unwrap().slots = n;
+            sign_join(&p, j).unwrap().verify(&m)
+        };
+        slots(1).unwrap();
+        slots(MAX_SLOTS).unwrap();
+        assert!(slots(0).is_err());
+        assert!(slots(MAX_SLOTS + 1).is_err());
+        assert!(!String::from_utf8(canonical_json(&join).unwrap()).unwrap().contains("slots"));
+        let mut four = join.clone();
+        four.runner.as_mut().unwrap().slots = 4;
+        assert!(String::from_utf8(canonical_json(&four).unwrap()).unwrap().contains(r#""slots":4"#));
+        let signed = sign_join(&p, four).unwrap();
+        signed.verify(&m).unwrap();
+        let mut forged = signed.clone();
+        forged.join.runner.as_mut().unwrap().slots = 16;
+        assert!(forged.verify(&m).is_err());
 
         // A description is signed, bounded and absent from joins without one.
         assert!(!String::from_utf8(canonical_json(&join).unwrap()).unwrap().contains("description"));

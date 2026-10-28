@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use airlox_core::api;
+use airlox_core::cert::MAX_SLOTS;
 use airlox_core::session::{JobKind, JobLimits, Manifest, Mode, Role, SessionParams, SignedManifest};
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
@@ -455,8 +456,12 @@ pub struct Runner {
     pub approved: bool,
     pub rejected: bool,
     pub online: bool,
-    /// The job it is running, per the relay.
-    pub job: Option<String>,
+    /// The jobs it is running, per the relay.
+    pub jobs: Vec<String>,
+    /// How many jobs it runs at once, from its signed join.
+    pub slots: u32,
+    /// Every slot is taken: a new job for it is refused (`runner_busy`).
+    pub busy: bool,
     /// Its setup as it reported it (`preparing`, `ready`, `failed`, or
     /// `None` for runners that do not say), and why it failed: the runner's
     /// own unsigned word, via the relay.
@@ -521,7 +526,7 @@ pub struct ChunkCursor {
     seen: HashSet<String>,
 }
 
-/// No approved, online, idle runner matched; jobs are never queued.
+/// No approved, online runner with a free slot matched; jobs are never queued.
 #[derive(Debug)]
 pub struct NoRunnerAvailable {
     pub job: String,
@@ -536,7 +541,7 @@ impl std::fmt::Display for NoRunnerAvailable {
         if self.reason == "runner_busy" {
             write!(
                 f,
-                "runner busy: {message}; jobs are not queued. Retry when 'airlox runner list' shows it idle."
+                "runner busy: {message}; jobs are not queued. Retry when 'airlox runner list' shows it has a free slot."
             )
         } else {
             write!(f, "no runner available: {message:?}")
@@ -1202,6 +1207,12 @@ impl Session {
             let info = &join["runner"];
             let public = join["cert"]["cert"]["participant_pub"].as_str().unwrap_or_default().to_string();
             let rejected_relay = r["rejected"].as_bool().unwrap_or(false);
+            // The relay's word on what it runs; the slots are the runner's own, signed.
+            let jobs: Vec<String> = r["jobs"]
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_str).take(64).map(String::from).collect())
+                .unwrap_or_default();
+            let slots = info["slots"].as_u64().map_or(1, |n| n.clamp(1, MAX_SLOTS as u64) as u32);
             let approved = if required { approvals.get(&public) == Some(&true) } else { !rejected_relay };
             out.push(Runner {
                 name: info["name"].as_str().unwrap_or_default().into(),
@@ -1213,7 +1224,9 @@ impl Session {
                 approved: approved && !rejected_relay,
                 rejected: rejected_relay || approvals.get(&public) == Some(&false),
                 online: r["online"].as_bool().unwrap_or(false),
-                job: r["job"].as_str().map(String::from),
+                busy: jobs.len() >= slots as usize,
+                jobs,
+                slots,
                 state: r["state"].as_str().map(String::from),
                 // The relay caps it, but the relay is not trusted either.
                 detail: r["detail"].as_str().map(|d| match d.char_indices().nth(MAX_DETAIL_CHARS) {

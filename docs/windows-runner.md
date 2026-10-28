@@ -159,9 +159,10 @@ res = job.wait(timeout=None, on_progress=lambda p: print(p.elapsed_ms, p.tail))
 
 ### One job at a time
 
-A runner runs one job at a time (`--max-jobs 1`). While it is busy,
-`runners()` shows `busy`, and a new job for it is refused at once with
-`runner_busy` (`RunnerBusy` in the SDK) rather than queued.
+A runner runs one job at a time unless started with `--concurrency N` (up to
+16). While every slot is taken, `runners()` shows `busy`, and a new job for it
+is refused at once with `runner_busy` (`RunnerBusy` in the SDK) rather than
+queued.
 
 ## As a Windows service
 

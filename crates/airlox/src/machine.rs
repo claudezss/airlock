@@ -105,6 +105,15 @@ pub struct AddArgs {
     /// (put in the printed command; shell jobs need it).
     #[arg(long)]
     pub image: Option<String>,
+    /// Jobs the runner runs at once, 1 to 16 (put in the printed command).
+    /// Each gets the full --memory; a sender's workspace serves one at a
+    /// time.
+    #[arg(
+        long,
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u32).range(1..=airlox_core::cert::MAX_SLOTS as i64)
+    )]
+    pub concurrency: u32,
     /// Make the code and print the command, but do not wait for the runner;
     /// approve it later with `airlox machine approve`.
     #[arg(long)]
@@ -352,6 +361,9 @@ fn join_line(a: &AddArgs, code: &str, relay: &str, network: bool) -> String {
     if let Some(img) = &a.image {
         line.push_str(&format!(" --image {}", shell_quote(img)));
     }
+    if a.concurrency > 1 {
+        line.push_str(&format!(" --concurrency {}", a.concurrency));
+    }
     line.push_str(" --workspace");
     line
 }
@@ -539,7 +551,9 @@ fn runner_json(r: &Runner, env: Option<&Value>) -> Value {
         "kinds": r.kinds,
         "shell": r.shell,
         "interpreter": env.map(|e| e["interpreter"].clone()).unwrap_or(Value::Null),
-        "job": r.job,
+        "jobs": r.jobs,
+        "slots": r.slots,
+        "busy": r.busy,
     })
 }
 
@@ -645,7 +659,13 @@ async fn ls(a: LsArgs) -> Result<()> {
             if let Some(i) = r["interpreter"].as_str() {
                 parts.push(clean_line(i));
             }
-            if let Some(j) = r["job"].as_str() {
+            let jobs: Vec<&str> = r["jobs"]
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            if r["slots"].as_u64().unwrap_or(1) > 1 {
+                parts.push(format!("{}/{} jobs", jobs.len(), r["slots"]));
+            } else if let Some(j) = jobs.first() {
                 parts.push(format!("running {}", clean_line(j)));
             }
             println!("{:<16}   {}", "", parts.join(" · "));
@@ -795,6 +815,7 @@ mod tests {
             packages: vec![],
             sandbox: None,
             image: Some("ghcr.io/me/ci:latest".into()),
+            concurrency: 1,
             no_wait: false,
             wait: Duration::from_secs(60),
             common: Common { cache_dir: None, display_name: "owner".into(), json: false },
@@ -809,9 +830,15 @@ mod tests {
             join_line(&local, "7-a-b", "http://127.0.0.1:8080", false),
             "airlox runner join --code 7-a-b --relay http://127.0.0.1:8080 --name gpu-box --sandbox local --workspace"
         );
+        // Slots go in the command only when there is more than one.
+        let shared = AddArgs { concurrency: 4, ..local };
+        assert_eq!(
+            join_line(&shared, "7-a-b", "https://airlox.app", false),
+            "airlox runner join --code 7-a-b --name gpu-box --sandbox local --concurrency 4 --workspace"
+        );
         // A process sandbox cannot keep jobs off the network: the command
         // says it accepts that, or the runner would not start.
-        let process = AddArgs { sandbox: Some("process".into()), ..local };
+        let process = AddArgs { sandbox: Some("process".into()), concurrency: 1, ..shared };
         assert!(join_line(&process, "7-a-b", "https://airlox.app", false)
             .ends_with("--sandbox process --accept-network-gap --workspace"));
         assert!(join_line(&process, "7-a-b", "https://airlox.app", true)

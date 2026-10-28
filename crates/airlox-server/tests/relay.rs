@@ -127,6 +127,7 @@ async fn auth_and_policy_are_enforced() {
                 python: None,
                 kinds: vec![JobKind::Python],
                 shell: None,
+                slots: 1,
             }),
             created_at_ms: now_ms(),
         },
