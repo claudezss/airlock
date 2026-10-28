@@ -18,7 +18,7 @@ use airlox_core::item::ItemKind;
 use airlox_core::keys::PublicKey;
 use airlox_core::payload::Target;
 use airlox_core::policy::target_matches;
-use airlox_core::session::{Mode, Role};
+use airlox_core::session::{ContentType, JobKind, Mode, Role};
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -78,6 +78,7 @@ fn job_json(id: &str, g: &Inner) -> Option<Value> {
 fn matching_runners<'a>(
     g: &'a Inner,
     target: &Target,
+    kind: JobKind,
     now: u64,
     timeout_ms: u64,
 ) -> Vec<(&'a String, &'a Participant)> {
@@ -85,6 +86,9 @@ fn matching_runners<'a>(
         .participants
         .iter()
         .filter(|(pk, _)| g.runner_eligible(pk) && g.runner_online(pk, now, timeout_ms))
+        // The kinds a runner signed in its join: one that would only
+        // refuse the job is no match.
+        .filter(|(_, p)| p.runner.as_ref().is_some_and(|r| r.kinds.contains(&kind)))
         .filter(|(pk, p)| {
             let labels = p.runner.as_ref().map(|r| r.labels.as_slice()).unwrap_or_default();
             PublicKey::from_b64(pk).is_ok_and(|key| target_matches(target, key, labels))
@@ -97,12 +101,12 @@ fn matching_runners<'a>(
 /// Pick the runner for a job: eligible, online, matching the target and with
 /// a free slot. The least loaded (active jobs per slot) wins, so jobs spread
 /// over runners; ties go to the earliest joined.
-fn pick_runner(g: &Inner, target: &Target, now: u64, timeout_ms: u64) -> Option<String> {
+fn pick_runner(g: &Inner, target: &Target, kind: JobKind, now: u64, timeout_ms: u64) -> Option<String> {
     // jobs/slots compared as a cross product, without division.
     let fuller = |a: &(&String, &Participant), b: &(&String, &Participant)| {
         (a.1.jobs.len() * g.runner_slots(b.0)).cmp(&(b.1.jobs.len() * g.runner_slots(a.0)))
     };
-    matching_runners(g, target, now, timeout_ms)
+    matching_runners(g, target, kind, now, timeout_ms)
         .into_iter()
         .filter(|(pk, _)| g.runner_has_room(pk))
         .min_by(fuller)
@@ -111,8 +115,8 @@ fn pick_runner(g: &Inner, target: &Target, now: u64, timeout_ms: u64) -> Option<
 
 /// The name of a runner that would take the job if it had a free slot:
 /// eligible, online, matching, and with every slot taken.
-fn busy_runner(g: &Inner, target: &Target, now: u64, timeout_ms: u64) -> Option<String> {
-    matching_runners(g, target, now, timeout_ms)
+fn busy_runner(g: &Inner, target: &Target, kind: JobKind, now: u64, timeout_ms: u64) -> Option<String> {
+    matching_runners(g, target, kind, now, timeout_ms)
         .into_iter()
         .find(|(pk, _)| !g.runner_has_room(pk))
         .map(|(_, p)| p.runner.as_ref().map(|r| r.name.clone()).unwrap_or_default())
@@ -141,12 +145,14 @@ pub async fn post_job(
     })
     .await?;
     let job = up.env.header.id.clone();
+    // The header's subkind is the job's kind (protocol §6).
+    let kind = if up.env.header.subkind == Some(ContentType::Sh) { JobKind::Shell } else { JobKind::Python };
     let timeout_ms = st.store.cfg.runner_timeout_ms;
     let job2 = job.clone();
     let (seq, routed) = blocking(move || {
         commit_upload(&s, &who, up, |s, g, _| {
             let now = now_ms();
-            match pick_runner(g, &target, now, timeout_ms) {
+            match pick_runner(g, &target, kind, now, timeout_ms) {
                 Some(r) => {
                     s.set_job(g, &job2, JobState::Assigned, Some(r.clone()), None)?;
                     let envelope = g.item_event(&job2).map(|e| e.data["envelope"].clone());
@@ -154,7 +160,7 @@ pub async fn post_job(
                     Ok(Ok(r))
                 }
                 None => {
-                    let busy = busy_runner(g, &target, now, timeout_ms);
+                    let busy = busy_runner(g, &target, kind, now, timeout_ms);
                     let reason = if busy.is_some() { "runner_busy" } else { "not_available" };
                     s.set_job(g, &job2, JobState::Failed, None, Some(reason))?;
                     Ok(Err(busy))
@@ -173,7 +179,9 @@ pub async fn post_job(
             format!("runner {name} matches job {job} but has no free slot; it was not queued"),
         )),
         Err(None) => Err(ApiError::no_runner(format!(
-            "no approved, online runner with a free slot matches job {job}; it was not queued"
+            "no approved, online runner that runs {} jobs and has a free slot matches job {job}; it was not \
+             queued",
+            kind.as_str()
         ))),
     }
 }

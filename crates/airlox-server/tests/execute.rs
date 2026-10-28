@@ -34,14 +34,31 @@ async fn join_runner(env: &Env, s: &Sess, name: &str, labels: &[&str]) -> Member
 }
 
 async fn join_runner_slots(env: &Env, s: &Sess, name: &str, labels: &[&str], slots: u32) -> Member {
-    let (kp, body) = runner_join_body(s, name, labels, slots);
+    join_runner_kinds(env, s, name, labels, slots, &[JobKind::Python]).await
+}
+
+async fn join_runner_kinds(
+    env: &Env,
+    s: &Sess,
+    name: &str,
+    labels: &[&str],
+    slots: u32,
+    kinds: &[JobKind],
+) -> Member {
+    let (kp, body) = runner_join_body(s, name, labels, slots, kinds);
     let r = post_join(env, s, body).await;
     assert_eq!(r.status(), StatusCode::CREATED, "{}", r.text().await.unwrap());
     let v: Value = r.json().await.unwrap();
     Member { kp, token: v["token"].as_str().unwrap().to_string() }
 }
 
-fn runner_join_body(s: &Sess, name: &str, labels: &[&str], slots: u32) -> (Keypair, String) {
+fn runner_join_body(
+    s: &Sess,
+    name: &str,
+    labels: &[&str],
+    slots: u32,
+    kinds: &[JobKind],
+) -> (Keypair, String) {
     let kp = Keypair::generate();
     let cert = issue_cert(&s.secrets.role_keypair(Role::Runner), &s.id, Role::Runner, kp.public(), now_ms())
         .unwrap();
@@ -62,8 +79,8 @@ fn runner_join_body(s: &Sess, name: &str, labels: &[&str], slots: u32) -> (Keypa
                 network_unblocked: false,
                 version: None,
                 python: None,
-                kinds: vec![JobKind::Python],
-                shell: None,
+                kinds: kinds.to_vec(),
+                shell: kinds.contains(&JobKind::Shell).then(|| "sh".into()),
                 slots,
             }),
             created_at_ms: now_ms(),
@@ -620,7 +637,16 @@ async fn shell_jobs_route_like_python_ones() {
     assert_eq!(create(&env, &s).await.status(), StatusCode::CREATED);
     let owner = join(&env, &s, Role::Owner, "owner").await;
     let sender = join(&env, &s, Role::Sender, "planner-agent").await;
-    let runner = join_runner(&env, &s, "runner-01", &["cpu"]).await;
+    // A python-only runner, joined first, is passed over for shell jobs.
+    let py_only = join_runner(&env, &s, "runner-00", &["cpu"]).await;
+    let _py_stream = RunnerStream::open(&env, &s, &py_only).await;
+    approve(&env, &s, &owner, &py_only).await;
+    let r = submit(&env, &s, &sender, &seal_shell_job(&s, &sender, "true")).await;
+    assert_eq!(r.status(), StatusCode::CONFLICT);
+    let why = r.text().await.unwrap();
+    assert!(why.contains("no_runner_available") && why.contains("runs shell jobs"), "{why}");
+    let runner =
+        join_runner_kinds(&env, &s, "runner-01", &["cpu"], 1, &[JobKind::Python, JobKind::Shell]).await;
     let mut stream = RunnerStream::open(&env, &s, &runner).await;
     approve(&env, &s, &owner, &runner).await;
 
@@ -1050,7 +1076,7 @@ async fn revoking_runners_fails_their_jobs_and_ends_their_streams() {
     assert!(stream.ended().await);
     assert_eq!(claim(&env, &s, &runner, &id).await, StatusCode::UNAUTHORIZED);
     // No runner can join to take its place.
-    let (_, body) = runner_join_body(&s, "runner-02", &[], 1);
+    let (_, body) = runner_join_body(&s, "runner-02", &[], 1, &[JobKind::Python]);
     assert_eq!(error_code(post_join(&env, &s, body).await).await, (StatusCode::FORBIDDEN, "revoked".into()));
 }
 

@@ -894,8 +894,10 @@ show them, never act on them.
 relay routes on this copy; the runner refuses a job whose signed target does
 not match it. Candidates are runners that are eligible, online, have a free
 slot (fewer active jobs, `assigned` or `running`, than the `slots` of their
-join) and match the target (a `runner` target matches only that key; `labels`
-needs every label; `any` matches all). The least loaded candidate (active jobs
+join), run the job's kind (the header's `sh` subkind is `shell`, anything
+else `python`, against the `kinds` of their join) and match the target (a
+`runner` target matches only that key; `labels` needs every label; `any`
+matches all). The least loaded candidate (active jobs
 per slot) gets the job; ties go to the earliest joined. There is no queue:
 with no candidate the job item is still stored and its state becomes
 `failed`. If a runner that would have matched is online but all its slots are
