@@ -652,6 +652,8 @@ should have that role. The owner link is never returned.")]
                 packages: p.packages.clone(),
                 return_out: true,
                 approve_runners: p.approve_runners.unwrap_or(true),
+                kinds: None,
+                workspace: false,
             }),
             insecure_http_host: p.insecure_http_host.as_deref().map(|h| h.trim().to_ascii_lowercase()),
         };

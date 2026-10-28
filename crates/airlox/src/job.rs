@@ -724,6 +724,10 @@ fn spawn_progress(
                 elapsed_ms: start.elapsed().as_millis() as u64,
                 tail,
                 tail_truncated,
+                stream: None,
+                offset: None,
+                data: None,
+                truncated: false,
             };
             let refs = vec![job_ref.clone()];
             // One try: the next tick says the same, and newer.
@@ -962,6 +966,9 @@ mod tests {
             airlox: "0.1.2".into(),
             sandbox: airlox_core::cert::SandboxKind::Docker,
             interpreter: "docker:python".into(),
+            kinds: None,
+            shell: None,
+            tree: None,
         };
         assert_eq!(checked_env(Some(env.clone())).unwrap().interpreter, "docker:python");
         env.interpreter = "x".repeat(129);

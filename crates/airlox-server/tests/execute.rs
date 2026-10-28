@@ -70,6 +70,10 @@ fn pk(m: &Member) -> String {
 
 fn seal_job(s: &Sess, author: &Member, target: &Target) -> SealedItem {
     let spec = JobSpec {
+        kind: None,
+        cwd: None,
+        tree: None,
+        fresh: false,
         filename: "summarize.py".into(),
         code: "print('hi')".into(),
         runtime: "python3.12".into(),
@@ -392,6 +396,10 @@ fn seal_progress(s: &Sess, runner: &Member, job: &SealedItem, tail: &str) -> Sea
         elapsed_ms: 1000,
         tail: Some(tail.into()),
         tail_truncated: false,
+        stream: None,
+        offset: None,
+        data: None,
+        truncated: false,
     };
     seal_kind(s, runner, ItemKind::Progress, None, vec![job_ref], Payload::progress(p))
 }

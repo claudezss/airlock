@@ -275,6 +275,8 @@ fn new_session(a: &CreateArgs, relay_max: Option<u64>) -> Result<NewSession> {
             packages: a.packages.iter().flat_map(|p| split_packages(p)).collect(),
             return_out: !a.no_out_files,
             approve_runners: !a.no_approval,
+            kinds: None,
+            workspace: false,
         }),
         insecure_http_host: a.insecure_http_host.as_deref().map(|h| h.trim().to_ascii_lowercase()),
     })
@@ -2338,6 +2340,9 @@ mod tests {
             airlox: "0.1.2".into(),
             sandbox: airlox_core::cert::SandboxKind::Process,
             interpreter: "--python".into(),
+            kinds: None,
+            shell: None,
+            tree: None,
         };
         assert_eq!(
             env_line(&env),

@@ -63,6 +63,9 @@ pub fn job_env(
         airlox: env!("CARGO_PKG_VERSION").to_string(),
         sandbox,
         interpreter: if label.is_empty() { "unknown".into() } else { label },
+        kinds: None,
+        shell: None,
+        tree: None,
     }
 }
 

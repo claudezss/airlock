@@ -13,8 +13,9 @@ use crate::cert::{is_runner_token, SignedRoleCert};
 use crate::item::{ItemHeader, ItemKind, ItemRef};
 use crate::keys::PublicKey;
 use crate::payload::{
-    Event, JobEnv, JobProgress, JobResult, JobSpec, JobStatus, Meta, Payload, Target, MAX_ENV_PACKAGES,
-    MAX_OUT_FILES, MAX_PROGRESS_TAIL_BYTES, MAX_REASON_CHARS, MAX_RECIPIENTS, MAX_STDIO_BYTES,
+    Event, JobEnv, JobKind, JobProgress, JobResult, JobSpec, JobStatus, Meta, Payload, Target, MAX_CHUNK_BYTES,
+    MAX_ENV_PACKAGES, MAX_OUT_FILES, MAX_PROGRESS_TAIL_BYTES, MAX_REASON_CHARS, MAX_RECIPIENTS,
+    MAX_SHELL_CODE_BYTES, MAX_STDIO_BYTES,
 };
 use crate::pep440::SpecifierSet;
 use crate::session::{ContentType, Manifest, Mode, Role};
@@ -73,7 +74,14 @@ pub fn check_header(m: &Manifest, author_role: Role, h: &ItemHeader) -> Result<(
         ItemKind::File => require_type(m, h.subkind.expect("validated"))?,
         ItemKind::Job => {
             require_execute(m)?;
-            require_type(m, ContentType::Py)?;
+            let kind = match h.subkind {
+                Some(ContentType::Sh) => JobKind::Shell,
+                _ => {
+                    require_type(m, ContentType::Py)?;
+                    JobKind::Python
+                }
+            };
+            require_kind(m, kind)?;
         }
         ItemKind::Result | ItemKind::Progress => require_execute(m)?,
         ItemKind::Event => {}
@@ -86,6 +94,15 @@ fn require_type(m: &Manifest, t: ContentType) -> Result<()> {
         Ok(())
     } else {
         Err(Error::policy(format!("content type {} is not allowed in this session", t.as_str())))
+    }
+}
+
+fn require_kind(m: &Manifest, k: JobKind) -> Result<()> {
+    let limits = m.job_limits.as_ref().expect("execute manifests carry job_limits");
+    if limits.allows_kind(k) {
+        Ok(())
+    } else {
+        Err(Error::policy(format!("{} jobs are not allowed in this session", k.as_str())))
     }
 }
 
@@ -106,7 +123,12 @@ pub fn check_payload(m: &Manifest, author_role: Role, h: &ItemHeader, p: &Payloa
     match &p.meta {
         Meta::Text { to, .. } => check_recipients(to.as_deref()),
         Meta::File { name, mime } => check_file(h.subkind.expect("validated"), name, mime, &p.body),
-        Meta::Job(spec) => check_job(m, spec),
+        Meta::Job(spec) => {
+            if h.subkind != Some(spec.kind().subkind()) {
+                return Err(Error::policy("the job's kind does not match its header subkind"));
+            }
+            check_job(m, spec)
+        }
         Meta::Result(r) => check_result(r),
         Meta::Event(e) => check_event(author_role, e),
         Meta::Progress(p) => check_progress(p),
@@ -126,11 +148,24 @@ pub fn check_recipients(to: Option<&[PublicKey]>) -> Result<()> {
     Ok(())
 }
 
-/// Shape checks on a progress item.
+/// Shape checks on a progress item: a heartbeat (elapsed time, maybe a
+/// tail) or an output chunk (`stream`, `offset` and `data` together).
 pub fn check_progress(p: &JobProgress) -> Result<()> {
     p.job.validate()?;
     if p.tail.as_ref().is_some_and(|t| t.len() > MAX_PROGRESS_TAIL_BYTES) {
         return Err(Error::policy("a progress tail is limited to 64 KiB"));
+    }
+    match (&p.stream, &p.offset, &p.data) {
+        (None, None, None) if !p.truncated => {}
+        (Some(_), Some(_), Some(d)) => {
+            if d.len() > MAX_CHUNK_BYTES {
+                return Err(Error::policy("an output chunk is limited to 64 KiB"));
+            }
+            if p.tail.is_some() || p.tail_truncated {
+                return Err(Error::policy("an output chunk carries no tail"));
+            }
+        }
+        _ => return Err(Error::policy("an output chunk needs stream, offset and data together")),
     }
     Ok(())
 }
@@ -138,7 +173,16 @@ pub fn check_progress(p: &JobProgress) -> Result<()> {
 /// A job's `progress_file`: a relative, `/`-separated path of portable
 /// components, none starting with a dot, at most 8 deep and 255 bytes.
 pub fn check_progress_file(path: &str) -> Result<()> {
-    let bad = |why: &str| Err(Error::policy(format!("bad progress_file {path:?}: {why}")));
+    check_rel_path("progress_file", path)
+}
+
+/// A job's `cwd`: the same rules as `progress_file`.
+pub fn check_cwd(path: &str) -> Result<()> {
+    check_rel_path("cwd", path)
+}
+
+fn check_rel_path(what: &str, path: &str) -> Result<()> {
+    let bad = |why: &str| Err(Error::policy(format!("bad {what} {path:?}: {why}")));
     if path.is_empty() || path.len() > 255 {
         return bad("1 to 255 bytes");
     }
@@ -221,7 +265,7 @@ pub fn check_file(subkind: ContentType, name: &str, mime: &str, body: &[u8]) -> 
             };
             ext_ok && sniffed == Some(mime)
         }
-        ContentType::Text => false,
+        ContentType::Text | ContentType::Sh => false,
     };
     if !ok {
         return Err(Error::policy(format!(
@@ -331,12 +375,34 @@ pub fn allowlist_name(entry: &str) -> &str {
 pub fn check_job(m: &Manifest, job: &JobSpec) -> Result<()> {
     require_execute(m)?;
     let limits = m.job_limits.as_ref().expect("execute manifests carry job_limits");
+    require_kind(m, job.kind())?;
     check_file_name(&job.filename)?;
-    if ext(&job.filename) != "py" {
-        return Err(Error::policy("job entry file must end in .py"));
+    match job.kind() {
+        JobKind::Python => {
+            if ext(&job.filename) != "py" {
+                return Err(Error::policy("job entry file must end in .py"));
+            }
+            if job.code.len() > MAX_CODE_BYTES {
+                return Err(Error::policy("job code exceeds 1 MiB"));
+            }
+        }
+        JobKind::Shell => {
+            if job.code.len() > MAX_SHELL_CODE_BYTES {
+                return Err(Error::policy("a shell job's script exceeds 64 KiB"));
+            }
+            if !job.requirements.is_empty() {
+                return Err(Error::policy("requirements are for python jobs; a shell job uses the sandbox's tools"));
+            }
+        }
     }
-    if job.code.len() > MAX_CODE_BYTES {
-        return Err(Error::policy("job code exceeds 1 MiB"));
+    if let Some(c) = &job.cwd {
+        check_cwd(c)?;
+    }
+    if let Some(t) = &job.tree {
+        t.validate()?;
+        if !job.files.contains(t) {
+            return Err(Error::policy("the job's tree must be one of its files"));
+        }
     }
     if job.runtime != limits.runtime {
         return Err(Error::policy(format!(
@@ -409,6 +475,24 @@ pub fn check_env(env: &JobEnv) -> Result<()> {
             return Err(Error::policy(format!("env package {name:?} is not a normalized name")));
         }
         short("package version", version, 64)?;
+    }
+    if let Some(kinds) = &env.kinds {
+        if kinds.is_empty() || kinds.len() > 2 {
+            return Err(Error::policy("env kinds must list 1 or 2 kinds"));
+        }
+    }
+    if let Some(sh) = &env.shell {
+        short("shell", sh, 32)?;
+    }
+    if let Some(t) = &env.tree {
+        if let Some(head) = &t.head {
+            if head.is_empty() || head.len() > 64 || !head.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(Error::policy("env tree head must be 1 to 64 hex digits"));
+            }
+        }
+        if !is_hex64(&t.sha256) {
+            return Err(Error::policy("env tree sha256 must be 64 lowercase hex characters"));
+        }
     }
     Ok(())
 }
@@ -528,6 +612,10 @@ mod tests {
 
     fn job() -> JobSpec {
         JobSpec {
+            kind: None,
+            cwd: None,
+            tree: None,
+            fresh: false,
             filename: "summarize.py".into(),
             code: "print(1)".into(),
             runtime: "python3.12".into(),
@@ -640,6 +728,190 @@ mod tests {
         assert!(check_job(&m, &j).is_err());
     }
 
+    fn manifest_with(limits: JobLimits) -> Manifest {
+        secrets()
+            .manifest(&SessionParams {
+                mode: Mode::Execute,
+                created_at_ms: 1000,
+                ttl_ms: Some(1000),
+                allowed_types: vec![ContentType::Text, ContentType::Py, ContentType::Zip],
+                max_item_bytes: 1024 * 1024,
+                job_limits: Some(limits),
+                insecure_http_host: None,
+            })
+            .unwrap()
+            .manifest
+    }
+
+    fn shell_job() -> JobSpec {
+        JobSpec {
+            kind: Some(JobKind::Shell),
+            filename: "job.sh".into(),
+            code: "pytest -x tests/\n".into(),
+            requirements: vec![],
+            ..job()
+        }
+    }
+
+    #[test]
+    fn shell_jobs_need_a_session_that_allows_them() {
+        // Without `kinds`, a session runs python only, as before.
+        let m = manifest(Mode::Execute);
+        assert!(check_job(&m, &shell_job()).unwrap_err().to_string().contains("shell jobs are not allowed"));
+        let sh = header(&m, ItemKind::Job, Some(ContentType::Sh), 10);
+        assert!(check_header(&m, Role::Sender, &sh).is_err());
+
+        let both = manifest_with(JobLimits {
+            kinds: Some(vec![JobKind::Python, JobKind::Shell]),
+            ..Default::default()
+        });
+        check_job(&both, &shell_job()).unwrap();
+        check_job(&both, &JobSpec { requirements: vec![], ..job() }).unwrap();
+        check_header(&both, Role::Sender, &header(&both, ItemKind::Job, Some(ContentType::Sh), 10)).unwrap();
+
+        let shell_only = manifest_with(JobLimits { kinds: Some(vec![JobKind::Shell]), ..Default::default() });
+        assert!(check_job(&shell_only, &JobSpec { requirements: vec![], ..job() }).is_err());
+        let py = header(&shell_only, ItemKind::Job, Some(ContentType::Py), 10);
+        assert!(check_header(&shell_only, Role::Sender, &py).is_err());
+
+        let mut j = shell_job();
+        j.code = "x".repeat(MAX_SHELL_CODE_BYTES + 1);
+        assert!(check_job(&both, &j).is_err());
+        let mut j = shell_job();
+        j.requirements = vec!["numpy".into()];
+        assert!(check_job(&both, &j).is_err(), "shell jobs install nothing");
+        // A shell job's name is for display; any portable name does.
+        let mut j = shell_job();
+        j.filename = "make".into();
+        check_job(&both, &j).unwrap();
+    }
+
+    #[test]
+    fn cwd_and_tree_are_checked() {
+        let m = manifest_with(JobLimits { kinds: Some(vec![JobKind::Shell]), ..Default::default() });
+        let mut j = shell_job();
+        j.cwd = Some("services/api".into());
+        j.tree = Some(iref(1));
+        check_job(&m, &j).unwrap();
+        for bad in ["../x", "/abs", "a/./b", ".git", ""] {
+            j.cwd = Some(bad.into());
+            assert!(check_job(&m, &j).is_err(), "{bad:?}");
+        }
+        j.cwd = None;
+        j.tree = Some(iref(9));
+        assert!(check_job(&m, &j).unwrap_err().to_string().contains("one of its files"));
+    }
+
+    #[test]
+    fn job_canonical_form_is_unchanged_without_the_new_fields() {
+        let json = String::from_utf8(canonical_json(&job()).unwrap()).unwrap();
+        for f in ["\"kind\"", "\"cwd\"", "\"tree\"", "\"fresh\""] {
+            assert!(!json.contains(f), "{json}");
+        }
+        let j: JobSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(j.kind(), JobKind::Python);
+        let sh = String::from_utf8(canonical_json(&shell_job()).unwrap()).unwrap();
+        assert!(sh.contains(r#""kind":"shell""#), "{sh}");
+    }
+
+    #[test]
+    fn manifests_keep_their_form_unless_kinds_or_workspace_are_set() {
+        let m = manifest(Mode::Execute);
+        let json = String::from_utf8(canonical_json(&m).unwrap()).unwrap();
+        assert!(!json.contains("kinds") && !json.contains("workspace"), "{json}");
+        let m = manifest_with(JobLimits {
+            kinds: Some(vec![JobKind::Python, JobKind::Shell]),
+            workspace: true,
+            ..Default::default()
+        });
+        let json = String::from_utf8(canonical_json(&m).unwrap()).unwrap();
+        assert!(json.contains(r#""kinds":["python","shell"]"#) && json.contains(r#""workspace":true"#), "{json}");
+        for kinds in [vec![], vec![JobKind::Shell, JobKind::Shell]] {
+            let r = secrets().manifest(&SessionParams {
+                mode: Mode::Execute,
+                created_at_ms: 1000,
+                ttl_ms: Some(1000),
+                allowed_types: vec![ContentType::Py],
+                max_item_bytes: 1024,
+                job_limits: Some(JobLimits { kinds: Some(kinds), ..Default::default() }),
+                insecure_http_host: None,
+            });
+            assert!(r.is_err());
+        }
+        let r = secrets().manifest(&SessionParams {
+            mode: Mode::Execute,
+            created_at_ms: 1000,
+            ttl_ms: Some(1000),
+            allowed_types: vec![ContentType::Py, ContentType::Sh],
+            max_item_bytes: 1024,
+            job_limits: Some(JobLimits::default()),
+            insecure_http_host: None,
+        });
+        assert!(r.is_err(), "sh is not a content type");
+    }
+
+    #[test]
+    fn progress_chunks() {
+        use crate::payload::Stream;
+        let beat = JobProgress {
+            job: iref(1),
+            elapsed_ms: 5,
+            tail: None,
+            tail_truncated: false,
+            stream: None,
+            offset: None,
+            data: None,
+            truncated: false,
+        };
+        check_progress(&beat).unwrap();
+        let json = String::from_utf8(canonical_json(&beat).unwrap()).unwrap();
+        assert!(!json.contains("stream") && !json.contains(",\"truncated\""), "{json}");
+        let chunk = JobProgress {
+            stream: Some(Stream::Stdout),
+            offset: Some(0),
+            data: Some("collected 212 items\n".into()),
+            ..beat.clone()
+        };
+        check_progress(&chunk).unwrap();
+        let json = String::from_utf8(canonical_json(&chunk).unwrap()).unwrap();
+        assert!(json.contains(r#""stream":"stdout""#), "{json}");
+        let mut bad = chunk.clone();
+        bad.data = Some("x".repeat(MAX_CHUNK_BYTES + 1));
+        assert!(check_progress(&bad).is_err());
+        let mut bad = chunk.clone();
+        bad.offset = None;
+        assert!(check_progress(&bad).is_err());
+        let mut bad = chunk.clone();
+        bad.tail = Some("x".into());
+        assert!(check_progress(&bad).is_err());
+        let last = JobProgress { data: Some(String::new()), truncated: true, ..chunk };
+        check_progress(&last).unwrap();
+    }
+
+    #[test]
+    fn env_kinds_shell_and_tree() {
+        use crate::cert::SandboxKind;
+        use crate::payload::TreeInfo;
+        let mut r = result();
+        r.env = Some(JobEnv {
+            python: "3.12.4".into(),
+            packages: Default::default(),
+            airlox: "0.2.0".into(),
+            sandbox: SandboxKind::Docker,
+            interpreter: "docker:ci@sha256:0123456789ab".into(),
+            kinds: Some(vec![JobKind::Python, JobKind::Shell]),
+            shell: Some("sh".into()),
+            tree: Some(TreeInfo { head: Some("ab12".into()), dirty: true, count: 412, sha256: "c".repeat(64) }),
+        });
+        check_result(&r).unwrap();
+        let mut bad = r.clone();
+        bad.env.as_mut().unwrap().tree.as_mut().unwrap().head = Some("not hex".into());
+        assert!(check_result(&bad).is_err());
+        let mut bad = r;
+        bad.env.as_mut().unwrap().kinds = Some(vec![]);
+        assert!(check_result(&bad).is_err());
+    }
+
     #[test]
     fn result_checks() {
         check_result(&result()).unwrap();
@@ -678,6 +950,9 @@ mod tests {
             airlox: "0.1.2".into(),
             sandbox: SandboxKind::Process,
             interpreter: "--python".into(),
+            kinds: None,
+            shell: None,
+            tree: None,
         });
         check_result(&r).unwrap();
         let json = String::from_utf8(canonical_json(&r).unwrap()).unwrap();

@@ -187,6 +187,10 @@ pub fn generate() -> Result<Value> {
         "AQEBAQEBAQEBAQEBAQEBAQ",
     )?;
     let job_spec = JobSpec {
+        kind: None,
+        cwd: None,
+        tree: None,
+        fresh: false,
         filename: "summarize.py".into(),
         code: "print(sum(range(10)))\n".into(),
         runtime: "python3.12".into(),
