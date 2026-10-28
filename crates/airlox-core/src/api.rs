@@ -249,6 +249,16 @@ pub fn check_result_for_job(
     crate::policy::check_result_matches_job(&job_ref, &job, author, &r)
 }
 
+/// Check one path as a ZIP entry name would be checked (§9).
+pub fn check_zip_path(path: &str) -> Result<()> {
+    crate::validate::zip::check_entry_path(path, &ZipLimits::default()).map(|_| ())
+}
+
+/// Check a job's `cwd` (§7).
+pub fn check_cwd(path: &str) -> Result<()> {
+    crate::policy::check_cwd(path)
+}
+
 /// Returns a JSON array of entries.
 pub fn inspect_zip(bytes: &[u8]) -> Result<String> {
     Ok(serde_json::to_string(&inspect(bytes, &ZipLimits::default())?)?)

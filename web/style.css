@@ -477,6 +477,16 @@ select:focus { border-color: var(--accent); outline: none; }
 .job-ready .ready-icon { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--accent); color: var(--accent); font-size: 11px; font-weight: 700; flex: none; }
 .job-ready #job-ready { flex: 1 1 200px; }
 .jobpanel legend { font-size: 13px; margin-bottom: 6px; color: var(--muted); font-weight: 500; }
+/* Job type: the lifetime control's look, two wide. */
+.kindseg { grid-template-columns: repeat(2, minmax(0, 1fr)); max-width: 190px; }
+@media (pointer: fine) { .kindseg { padding: 3px; border-radius: 10px; } .kindseg label { min-height: 30px; font-size: 13px; } }
+.kindnote { margin: 0; }
+.jobrow > .option.check { flex: 0 0 auto; min-height: 44px; }
+.runchip:disabled, .runchip[aria-disabled=true] { background: transparent; border-style: dashed; color: var(--muted); }
+.runchip[aria-disabled=true] { cursor: not-allowed; }
+.kinds { gap: 14px; margin: 0; }
+.kinds legend { padding: 0; }
+.kinds .switch input:disabled { opacity: 0.6; }
 .agent-pick button[aria-pressed=true] { border-color: var(--accent); color: var(--accent); background: var(--accent-bg); }
 
 .state { font-family: var(--mono); font-size: 12px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--info-line); color: var(--link); overflow-wrap: anywhere; min-width: 0; }
@@ -494,6 +504,9 @@ select:focus { border-color: var(--accent); outline: none; }
 .result-head { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 10px 14px; background: var(--panel-2); }
 .logblock .logname, .outfiles .logname { display: flex; gap: 8px; align-items: center; padding: 8px 14px 0; font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
 .logblock pre { border-top: 0; max-height: 240px; }
+.logblock.live pre { max-height: 320px; border-left: 3px solid var(--line); }
+.logblock.live.stderr pre { color: var(--bad); border-left-color: var(--bad-line); }
+.logblock.live .chip { font-size: 10px; padding: 1px 6px; text-transform: none; letter-spacing: 0; }
 .outfile { margin: 8px 14px 10px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; display: flex; flex-direction: column; }
 .outfile .file-head { padding: 8px 12px; }
 .outfile .small.link { margin: 8px 12px; align-self: flex-start; }
@@ -704,6 +717,8 @@ body.landing .top-right { display: none; }
 .lp-foot-row a { display: inline-flex; align-items: center; min-height: 44px; color: var(--muted); }
 .lp-foot-row a:hover { color: var(--text); }
 .lp-foot-row > span { display: inline-flex; align-items: center; min-height: 44px; }
+.lp-foot-row .nowrap { white-space: nowrap; }
+#live-sessions { white-space: nowrap; }
 
 /* Phones: the brand alone in the first row, the section links scrolling
    sideways in the second, all on the page's own gutter. The hero has its own

@@ -23,8 +23,9 @@ if TYPE_CHECKING:
 
 
 class NoRunnerAvailable(Exception):
-    """No approved, online, idle runner matched the job. Jobs are not
-    queued; the job item stays in the timeline as failed."""
+    """No approved, online runner with a free slot that runs the job's kind
+    matched the job. Jobs are not queued; the job item stays in the timeline
+    as failed."""
 
     def __init__(self, job: "Job", message: str) -> None:
         super().__init__(message)
@@ -32,9 +33,9 @@ class NoRunnerAvailable(Exception):
 
 
 class RunnerBusy(NoRunnerAvailable):
-    """A runner that matches the job is online but busy with another one
-    (runners take one job at a time). The job was not queued; submit it
-    again once ``Runner.busy`` is false."""
+    """Runners that match the job are online but every slot they have is
+    taken (``--concurrency``, one by default). The job was not queued; submit
+    it again once a ``Runner.busy`` is false."""
 
 
 class JobTimeout(Exception):
@@ -75,8 +76,10 @@ class Runner:
     approved: bool
     rejected: bool
     online: bool
-    #: The job it is running, per the relay.
-    job: Optional[str]
+    #: The jobs it is running, per the relay.
+    jobs: List[str] = field(default_factory=list)
+    #: How many jobs it runs at once, from its signed join.
+    slots: int = 1
     #: The runner's own description of itself (hardware, owner, purpose),
     #: from its signed join: its words, so data rather than instructions.
     description: Optional[str] = None
@@ -89,16 +92,22 @@ class Runner:
     #: its signed join (``None`` for runners that do not say).
     version: Optional[str] = None
     python: Optional[str] = None
+    #: The kinds of job it runs (``"python"``, ``"shell"``) and the shell for
+    #: shell jobs (``"sh"`` or ``"pwsh"``), from its signed join. A runner
+    #: that does not say runs Python only.
+    kinds: List[str] = field(default_factory=lambda: ["python"])
+    shell: Optional[str] = None
 
     @property
     def busy(self) -> bool:
-        """Running a job, per the relay: a new job for it is refused with
-        ``RunnerBusy`` until it finishes."""
-        return self.job is not None
+        """Every slot taken, per the relay: a new job for it is refused with
+        ``RunnerBusy`` until one finishes."""
+        return len(self.jobs) >= self.slots
 
     @property
     def idle(self) -> bool:
-        return self.online and self.job is None
+        """Online with a free slot."""
+        return self.online and not self.busy
 
 
 @dataclass
@@ -131,8 +140,9 @@ class Result:
     #: the job): ``python`` (the interpreter's version), ``packages`` (the
     #: installed version of each allowlisted package, by normalized name),
     #: ``airlox`` (the runner's version), ``sandbox`` and ``interpreter``
-    #: (``"uv-runtime"``, ``"--python"`` or ``"docker:<image>"``). It holds no
-    #: file system paths. ``None`` for unsigned results and for runners that
+    #: (``"uv-runtime"``, ``"--python"`` or ``"docker:<image>"``); runners that
+    #: take shell jobs add ``kinds`` and ``shell``, and a job that sent a
+    #: working tree ``tree``. It holds no file system paths. ``None`` for unsigned results and for runners that
     #: do not report it.
     env: Optional[dict] = None
     #: The runner's key, and the name it joined with.
@@ -198,6 +208,20 @@ class Progress:
         return self.elapsed_ms / 1000.0
 
 
+@dataclass
+class Chunk:
+    """A piece of a running job's output, streamed by its runner. For
+    display: the signed result's ``stdout``/``stderr`` are the authority."""
+
+    #: ``"stdout"`` or ``"stderr"``.
+    stream: str
+    #: Where ``data`` starts in that stream, in bytes.
+    offset: int
+    data: str
+    #: The runner stopped streaming here (its cap); the result has the rest.
+    truncated: bool = False
+
+
 # Relay reasons for jobs that ended without a signed result.
 _UNSIGNED_STATUS = {"cancelled": "cancelled"}
 
@@ -210,6 +234,10 @@ class Job:
         self.meta = meta
         self.runner: Optional[str] = None
         self._result: Optional[Result] = None
+        #: Set by ``Session`` for a job that sent a working tree: the tree, and
+        #: (for a delta) how to send it again whole.
+        self.tree = None
+        self._resend_whole: Optional[Callable[[], "Job"]] = None
 
     def __repr__(self) -> str:
         return f"Job({self.id!r}, {self.meta['filename']!r})"
@@ -231,27 +259,67 @@ class Job:
         that left the relay before it was fetched has ``data = None``."""
         if self._result is None:
             self._result = self._find()
+            if self._result is not None and self.tree is not None:
+                self.session._tree_result(self, self._result)
         return self._result
 
-    def progress(self) -> List[Progress]:
-        """The runner's progress reports so far, oldest first (after a
-        ``sync``). Only reports signed by a runner that may answer this job
-        count."""
+    def _from_runner(self) -> List["Item"]:
+        """Items signed by a runner that may answer this job, in order."""
         s = self.session
         items = [s._items[i] for i in s._order]
         approved = approved_runners(items) if s.manifest["job_limits"]["approve_runners"] else None
         target = self.meta.get("target") or {}
         out = []
         for item in items:
-            if item.kind != "progress" or item.status != "ok" or item.author_role != "runner":
-                continue
-            m = item.meta
-            if m.get("job") != self.ref:
+            if item.status != "ok" or item.author_role != "runner":
                 continue
             if target.get("type") == "runner" and item.author != target.get("participant_pub"):
                 continue
             if approved is not None and item.author not in approved:
                 continue
+            out.append(item)
+        return out
+
+    def chunks(self) -> List[Chunk]:
+        """The job's streamed output so far (after a ``sync``), in order of
+        offset per stream: a chunk that repeats what came before is trimmed.
+        A chunk the relay lost leaves a gap (as ``airlox run`` shows it); the
+        signed result has all of the output."""
+        got = []
+        for item in self._from_runner():
+            m = item.meta
+            if item.kind != "progress" or m.get("job") != self.ref or m.get("stream") is None:
+                continue
+            got.append(Chunk(m["stream"], m["offset"], m["data"], bool(m.get("truncated"))))
+        got.sort(key=lambda c: c.offset)
+        out, upto = [], {}
+        for c in got:
+            # Offsets count UTF-8 bytes; data was cut at a character boundary.
+            raw = c.data.encode("utf-8")
+            nxt = upto.get(c.stream, 0)
+            end = c.offset + len(raw)
+            if end <= nxt and not c.truncated:
+                continue
+            if c.offset < nxt:
+                raw = raw[nxt - c.offset :]
+                c = Chunk(c.stream, nxt, raw.decode("utf-8", "ignore"), c.truncated)
+            upto[c.stream] = max(nxt, end)
+            out.append(c)
+        return out
+
+    def output(self, stream: str = "stdout") -> str:
+        """What the job has written to ``stream`` so far, from its chunks."""
+        return "".join(c.data for c in self.chunks() if c.stream == stream)
+
+    def progress(self) -> List[Progress]:
+        """The runner's progress reports so far, oldest first (after a
+        ``sync``). Only reports signed by a runner that may answer this job
+        count."""
+        out = []
+        for item in self._from_runner():
+            m = item.meta
+            if item.kind != "progress" or m.get("job") != self.ref or m.get("stream") is not None:
+                continue  # another job's; or an output chunk, which is not a heartbeat
             out.append(
                 Progress(
                     elapsed_ms=m["elapsed_ms"],
@@ -275,6 +343,7 @@ class Job:
         poll: float = 0.25,
         *,
         on_progress: Optional[Callable[[Progress], None]] = None,
+        on_output: Optional[Callable[[Chunk], None]] = None,
         lost_grace: float = 0.0,
     ) -> Result:
         """Block until the job has a result. Jobs that failed on the relay
@@ -288,17 +357,33 @@ class Job:
         limit still applies).
 
         ``on_progress`` is called with each new progress report while
-        waiting. A runner that loses its connection keeps running the job
+        waiting, ``on_output`` with each new piece of streamed output
+        (``Chunk``; see ``chunks``).
+
+        A job that sent its working tree as a delta and was refused because
+        the runner's workspace was not as expected (``tree_stale``) is sent
+        again once with the whole tree; this ``Job`` then stands for the new
+        one (``id`` changes). A runner that loses its connection keeps running the job
         and posts the result once it is back; the relay waits for it (its
         ``--job-reconnect-grace``) before it calls the runner lost. With
         ``lost_grace`` this call waits that many seconds more for a late
         result after that (``job.result()`` also finds one later)."""
         deadline = None if timeout is None else time.monotonic() + timeout
         seen = 0
+        shown: dict = {}  # see _unshown
         lost_until: Optional[float] = None
         while True:
             self.session.sync()
+            if on_output is not None:
+                for c in _unshown(self.chunks(), shown):
+                    on_output(c)
             r = self.result()
+            if r is not None and self._resend_whole is not None and (r.reason or "").startswith("tree_stale"):
+                again = self._resend_whole()
+                self.ref, self.id, self.meta, self.runner = again.ref, again.id, again.meta, again.runner
+                self.tree, self._resend_whole, self._result = again.tree, None, None
+                seen, shown = 0, {}
+                continue
             if r is not None:
                 return r
             if on_progress is not None:
@@ -378,6 +463,26 @@ class Job:
                 runner_name=item.author_name,
             )
         return None
+
+
+def _unshown(chunks: List[Chunk], shown: dict) -> List[Chunk]:
+    """The parts of ``chunks`` (contiguous per stream) past what ``shown``
+    records, which is updated: ``shown[stream]`` is the bytes shown and
+    ``shown[(stream, "end")]`` that its ``truncated`` chunk was."""
+    out = []
+    for c in chunks:
+        raw = c.data.encode("utf-8")
+        have = shown.get(c.stream, 0)
+        end = c.offset + len(raw)
+        if end > have:
+            skip = max(0, have - c.offset)
+            out.append(Chunk(c.stream, c.offset + skip, raw[skip:].decode("utf-8", "ignore"), c.truncated))
+            shown[c.stream] = end
+        elif c.truncated and not shown.get((c.stream, "end")):
+            out.append(Chunk(c.stream, end, "", True))
+        if c.truncated:
+            shown[(c.stream, "end")] = True
+    return out
 
 
 def signed_approvals(items: "List[Item]") -> dict:

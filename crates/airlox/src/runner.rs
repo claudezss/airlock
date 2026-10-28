@@ -1,29 +1,34 @@
 //! `airlox runner join`: join a session as a runner and run its jobs.
 //!
-//! One job at a time. The loop holds the assignment stream open, claims each
-//! assignment at once, sends a heartbeat (and catches up on session events)
-//! every 10 seconds, and forwards cancels to the running job. A dropped
+//! Up to `--concurrency` jobs at a time (one by default). The loop holds the
+//! assignment stream open, claims each assignment as it starts it, sends a
+//! heartbeat naming the running jobs (and catches up on session events)
+//! every 10 seconds, and forwards cancels to the job they name. A dropped
 //! connection does not stop a running job: the stream and heartbeats
 //! reconnect with backoff, and the result is posted once the relay answers.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use airlox_core::cert::{is_runner_token, issue_cert, sign_join, ClientKind, JoinRequest, RunnerInfo};
+use airlox_core::cert::{
+    is_runner_token, issue_cert, sign_join, ClientKind, JoinRequest, RunnerInfo, MAX_SLOTS,
+};
 use airlox_core::encoding::canonical_json;
 use airlox_core::invite::Invite;
 use airlox_core::keys::Keypair;
+use airlox_core::payload::JobKind;
 use airlox_core::session::{Mode, Role, SignedManifest};
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{watch, Mutex};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::client::{self, status_of, Relay};
-use crate::job::{self, Ctx};
+use crate::job::{self, Ctx, Workspaces};
 use crate::sandbox::local::{probe_python, Local, LocalOpts};
 use crate::sandbox::{docker::Docker, Backend, RuntimeSpec};
 use crate::sse::SseParser;
@@ -49,7 +54,14 @@ pub enum SandboxArg {
     Process,
 }
 
-#[derive(clap::Args, Debug)]
+/// The shell that runs shell jobs on a Windows runner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ShellArg {
+    /// PowerShell 7 (`pwsh -NoProfile -Command`).
+    Pwsh,
+}
+
+#[derive(clap::Args, Debug, Clone)]
 #[command(group(
     clap::ArgGroup::new("source").args(["invite", "code", "invite_file"]).required(true).multiple(true)
 ))]
@@ -129,9 +141,15 @@ pub struct JoinArgs {
     /// $WORK and $AIRLOX_OUT before the result is signed.
     #[arg(long, env = "AIRLOX_WORK_ROOT")]
     pub work_root: Option<PathBuf>,
-    /// docker: use this image instead of building one from the allowlist.
-    #[arg(long)]
+    /// docker: run jobs in this image instead of building one from the
+    /// allowlist. The runner pins it by digest, and offers shell jobs in it.
+    /// The image needs python3 (the job shim is a Python script).
+    #[arg(long, visible_alias = "image")]
     pub docker_image: Option<String>,
+    /// Windows, local or process: also run shell jobs, with this shell.
+    /// Without it a Windows runner runs Python jobs only.
+    #[arg(long, value_enum)]
+    pub shell: Option<ShellArg>,
     /// docker: CPUs per job.
     #[arg(long, default_value = "1")]
     pub docker_cpus: String,
@@ -142,10 +160,22 @@ pub struct JoinArgs {
     /// Only for trusted code.
     #[arg(long)]
     pub unsandboxed: bool,
-    /// Jobs run at once. Only 1 is supported: while busy, the relay refuses
-    /// new jobs for this runner with `runner_busy` instead of queueing them.
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=1))]
-    pub max_jobs: u32,
+    /// Jobs run at once (1 to 16), announced in the runner's join: the relay
+    /// sends no job to a runner whose slots are all taken and refuses it
+    /// with `runner_busy` instead of queueing it. Each job gets the full
+    /// --memory and --docker-cpus, so size the host for all of them. With
+    /// --workspace a sender's workspace is used by one job at a time: a
+    /// second job from the same sender is refused (`runner_busy`) while the
+    /// first runs. The slots are part of the runner's signed join: a runner
+    /// that has joined keeps them, and to change them it joins again under
+    /// a new --name.
+    #[arg(
+        long,
+        alias = "max-jobs",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u32).range(1..=MAX_SLOTS as i64)
+    )]
+    pub concurrency: u32,
     /// How often a running job's progress is posted (elapsed time and the
     /// tail of its progress file); 0s for never.
     #[arg(long, default_value = "60s", value_parser = crate::cli::parse_duration)]
@@ -153,6 +183,27 @@ pub struct JoinArgs {
     /// Most bytes of a job's progress file sent each time.
     #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(0..=32768))]
     pub progress_tail: u32,
+    /// Most output chunks posted per minute while a job runs; more output
+    /// waits and goes out together. 0 turns streaming off.
+    #[arg(long, default_value_t = 120)]
+    pub progress_rate: u32,
+    /// Most output streamed per job, stdout and stderr together; the signed
+    /// result still carries the output.
+    #[arg(long, default_value_t = 16, value_name = "MB")]
+    pub stream_max_mb: u64,
+    /// Keep a work directory for each sender between their jobs, in sessions
+    /// that allow it: a working tree is synced into it, and dependencies and
+    /// build caches survive from one job to the next. Under
+    /// <cache-dir>/workspaces.
+    #[arg(long)]
+    pub workspace: bool,
+    /// A workspace over this size (MB) after a job refuses its sender's next
+    /// job (`workspace_full`) until that job asks for a fresh one.
+    #[arg(long, default_value_t = 10240, value_name = "MB", requires = "workspace")]
+    pub workspace_max_mb: u64,
+    /// Remove workspaces unused for this long.
+    #[arg(long, default_value = "14d", value_parser = crate::cli::parse_duration, requires = "workspace")]
+    pub workspace_ttl: Duration,
     /// Exit after this many jobs (for tests and one-shot use).
     #[arg(long, hide = true)]
     pub exit_after: Option<usize>,
@@ -173,6 +224,14 @@ struct Identity {
     /// The relay that issued `token`; it is only ever sent there.
     #[serde(default)]
     base_url: Option<String>,
+    /// The slots this runner declared when it joined, which the relay
+    /// routes by (a join before slots had one).
+    #[serde(default = "one_slot")]
+    slots: u32,
+}
+
+fn one_slot() -> u32 {
+    1
 }
 
 fn now_ms() -> u64 {
@@ -213,7 +272,8 @@ fn seed_from_hex(s: &str) -> Result<[u8; 32]> {
     b.try_into().map_err(|_| anyhow::anyhow!("bad identity seed length"))
 }
 
-/// Join as a new runner participant; returns `(keypair, token)`.
+/// Join as a new runner participant, with `kp` (the key a code was claimed
+/// for) or a new key; returns `(keypair, token)`.
 async fn join(
     http: &reqwest::Client,
     base_url: &str,
@@ -221,8 +281,9 @@ async fn join(
     args: &JoinArgs,
     backend: &Backend,
     python: Option<&str>,
+    kp: Option<Keypair>,
 ) -> Result<(Keypair, String)> {
-    let kp = Keypair::generate();
+    let kp = kp.unwrap_or_else(Keypair::generate);
     let sid = &invite.session_id;
     let cert = issue_cert(&invite.role_keypair(), sid, Role::Runner, kp.public(), now_ms())?;
     let j = sign_join(
@@ -247,6 +308,9 @@ async fn join(
                 network_unblocked: backend.network_unblocked(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 python: python.map(String::from),
+                kinds: backend.kinds(),
+                shell: backend.shell().map(String::from),
+                slots: args.concurrency,
             }),
             created_at_ms: now_ms(),
         },
@@ -255,7 +319,7 @@ async fn join(
     Ok((kp, token))
 }
 
-fn private_dir(dir: &std::path::Path) -> Result<()> {
+pub fn private_dir(dir: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
@@ -278,6 +342,12 @@ fn save_invite(dir: &std::path::Path, invite: &Invite, link: &str) -> Result<Pat
     Ok(path)
 }
 
+impl JoinArgs {
+    fn image(&self) -> Option<&String> {
+        self.docker_image.as_ref()
+    }
+}
+
 /// Flags that only make sense with some sandboxes, and environment names a
 /// job must never get.
 fn check_args(args: &JoinArgs) -> Result<()> {
@@ -296,6 +366,15 @@ fn check_args(args: &JoinArgs) -> Result<()> {
         && !args.pass_env.is_empty()
     {
         bail!("--pass-env does not reach jobs in the Linux sandbox; use --sandbox process or --unsandboxed");
+    }
+    if args.shell.is_some() && (docker || !cfg!(windows)) {
+        bail!(
+            "--shell is for --sandbox local or process on Windows; shell jobs run under sh everywhere else \
+             (docker needs --image)"
+        );
+    }
+    if args.image().is_some() && !docker {
+        bail!("--image is for --sandbox docker");
     }
     if args.accept_network_gap && args.sandbox != SandboxArg::Process {
         bail!("--accept-network-gap is for --sandbox process");
@@ -355,6 +434,58 @@ fn read_invite_file(path: &std::path::Path) -> Result<String> {
     Ok(text)
 }
 
+/// Where a runner that claimed a code keeps the key it told the relay it
+/// would join with, until it has joined with it.
+fn pending_key_path(dir: &std::path::Path, name: &str) -> PathBuf {
+    dir.join(format!("pending-key-runner-{name}.txt"))
+}
+
+/// Claim `--code` for a key this runner will join with, telling the relay
+/// that key (so `airlox machine add` approves exactly this runner), and keep
+/// the invite and the key in the session's directory under `root`. Returns
+/// the invite link and where it was saved.
+pub(crate) async fn claim_code(
+    http: &reqwest::Client,
+    args: &JoinArgs,
+    root: &std::path::Path,
+) -> Result<(String, PathBuf)> {
+    let code = args.code.as_deref().context("no --code")?;
+    if args.invite.is_some() {
+        eprintln!("note: using --code; ignoring the invite from --invite or AIRLOX_INVITE");
+    }
+    let env = std::env::var("AIRLOX_RELAY").ok().filter(|r| !r.is_empty());
+    let relay = args.relay.clone().or(env).unwrap_or_else(|| DEFAULT_RELAY.into());
+    let kp = Keypair::generate();
+    let link = client::receive_code_as(http, &relay, code, args.allow_insecure_http, Some(&kp.public().to_b64()))
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "{e:#}\nA code works once. If this runner already used it, restart it with the invite it saved:\n  \
+                 airlox runner join --invite-file '{}' --name {} ...",
+                root.join("<session>").join("invite-runner.txt").display(),
+                args.name
+            )
+        })?;
+    let invite = Invite::parse(&link).context("not a valid invite link")?;
+    let dir = root.join(&invite.session_id);
+    // A code works once: save what it carried before anything else can fail,
+    // so neither a failed start nor a restart needs a new code.
+    let saved = save_invite(&dir, &invite, &link)?;
+    if invite.role == Role::Runner {
+        let seed: String = kp.seed().iter().map(|b| format!("{b:02x}")).collect();
+        write_atomic(&pending_key_path(&dir, &args.name), seed.as_bytes(), 0o600)?;
+    }
+    let quoted = format!("'{}'", saved.display().to_string().replace('\'', r"'\''"));
+    eprintln!("Saved the {} invite to {quoted}.", invite.role.as_str());
+    if invite.role == Role::Runner {
+        eprintln!(
+            "To restart this runner later:\n  airlox runner join --invite-file {quoted} --name {} ...",
+            args.name
+        );
+    }
+    Ok((link, saved))
+}
+
 /// The invite link, from wherever the operator put it.
 pub(crate) async fn invite_link(
     http: &reqwest::Client,
@@ -388,27 +519,40 @@ pub(crate) async fn invite_link(
     }
 }
 
+/// The runner ended because the session will not take it back: the owner
+/// rejected it, or revoked its role. Starting it again cannot help.
+#[derive(Debug)]
+pub struct TurnedAway(pub &'static str);
+
+impl std::fmt::Display for TurnedAway {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for TurnedAway {}
+
+/// Whether `e` says the runner cannot rejoin: turned away while running, or
+/// refused at join because its role was revoked or the session closed.
+pub fn turned_away(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.is::<TurnedAway>()
+            || c.downcast_ref::<crate::client::RelayError>()
+                .is_some_and(|r| matches!(r.code.as_str(), "revoked" | "closed"))
+    })
+}
+
 pub async fn run(args: JoinArgs) -> Result<()> {
     check_args(&args)?;
     let http = client::http()?;
     let root = args.cache_dir.clone().unwrap_or_else(default_cache_root);
-    let link = invite_link(&http, &args, &root).await?;
+    let link = match (&args.code, &args.invite_file) {
+        (Some(_), None) => claim_code(&http, &args, &root).await?.0,
+        _ => invite_link(&http, &args, &root).await?,
+    };
     let invite = Invite::parse(&link).context("not a valid invite link")?;
     let sid = invite.session_id.clone();
     let dir = root.join(&sid);
-    // A code works once: save what it carried before anything else can fail,
-    // so neither a failed start nor a restart needs a new code.
-    if args.code.is_some() {
-        let saved = save_invite(&dir, &invite, &link)?;
-        let quoted = format!("'{}'", saved.display().to_string().replace('\'', r"'\''"));
-        eprintln!("Saved the {} invite to {quoted}.", invite.role.as_str());
-        if invite.role == Role::Runner {
-            eprintln!(
-                "To restart this runner later:\n  airlox runner join --invite-file {quoted} --name {} ...",
-                args.name
-            );
-        }
-    }
     if invite.role != Role::Runner {
         bail!("this is a {} invite; runners need the runner invite", invite.role.as_str());
     }
@@ -477,6 +621,12 @@ pub async fn run(args: JoinArgs) -> Result<()> {
                 process: args.sandbox == SandboxArg::Process,
                 python: args.python.clone(),
                 pass_env: args.pass_env.clone(),
+                pwsh: match args.shell {
+                    Some(ShellArg::Pwsh) => Some(crate::sandbox::local::which("pwsh").context(
+                        "--shell pwsh: pwsh was not found on PATH; install PowerShell 7 (https://aka.ms/powershell)",
+                    )?),
+                    None => None,
+                },
             },
         )),
     };
@@ -506,32 +656,50 @@ pub async fn run(args: JoinArgs) -> Result<()> {
     };
     // Join before preparing the sandbox, and say how that goes: a runner
     // that cannot start then shows as failed, with why, rather than missing.
+    // A code this runner claimed named the key it joins with.
+    let pending = pending_key_path(&dir, &args.name);
+    let claimed = std::fs::read_to_string(&pending)
+        .ok()
+        .and_then(|s| seed_from_hex(s.trim()).ok())
+        .map(|s| Keypair::from_seed(&s));
+    // The slots the relay routes by are the ones this runner joined with.
+    let mut slots = saved.as_ref().map_or(args.concurrency, |i| i.slots);
     let (kp, token) = match saved {
         Some(i) => (Keypair::from_seed(&seed_from_hex(&i.participant_seed)?), i.token),
-        None => join(&http, &url, &invite, &args, &backend, python.as_deref()).await?,
+        None => join(&http, &url, &invite, &args, &backend, python.as_deref(), claimed).await?,
     };
-    // A job this runner started before it last stopped and still owes an
-    // answer for: named in the setup heartbeats, so the relay keeps it
-    // running until the answer arrives (runners take one job at a time).
+    // Jobs this runner started before it last stopped and still owes an
+    // answer for: named in the setup heartbeats, so the relay keeps them
+    // running until the answers arrive.
     let done_file = dir.join(format!("jobs-done-{}.txt", args.name));
-    let owed = job::unanswered(&done_file).pop();
-    let owed = owed.as_deref();
+    let owed = job::unanswered(&done_file);
+    let owed = owed.as_slice();
     let mut relay = Relay::new(http.clone(), &url, &sid, &token);
     let (kp, relay) = match relay.report("preparing", None, owed).await {
         Err(e) if status_of(&e) == Some(401) => {
             tracing::info!("saved identity is no longer valid; joining again");
-            let (kp, token) = join(&http, &url, &invite, &args, &backend, python.as_deref()).await?;
+            let (kp, token) = join(&http, &url, &invite, &args, &backend, python.as_deref(), None).await?;
             relay = Relay::new(http.clone(), &url, &sid, &token);
-            save_identity(&id_path, &kp, &token, &base)?;
+            slots = args.concurrency;
+            save_identity(&id_path, &kp, &token, &base, slots)?;
             relay.report("preparing", None, owed).await?;
             (kp, relay)
         }
         Err(e) => return Err(e),
         Ok(_) => {
-            save_identity(&id_path, &kp, &token, &base)?;
+            save_identity(&id_path, &kp, &token, &base, slots)?;
             (kp, relay)
         }
     };
+    let _ = std::fs::remove_file(&pending);
+    if slots != args.concurrency {
+        tracing::warn!(
+            "this runner joined with {slots} job slot{} and the relay sends it that many jobs; --concurrency {} \
+             takes effect when it joins again under a new --name",
+            if slots == 1 { "" } else { "s" },
+            args.concurrency
+        );
+    }
     tracing::info!(
         session = %sid, name = %args.name, participant = %kp.public().fingerprint(),
         sandbox = ?backend.kind(), "joined as a runner"
@@ -550,11 +718,11 @@ pub async fn run(args: JoinArgs) -> Result<()> {
             "this session runs jobs without network access, but --sandbox process cannot block it; restart \
              with --accept-network-gap to run them anyway, or use --sandbox docker"
         );
-        let _ = relay.report("failed", Some(&failure_detail(&e)), None).await;
+        let _ = relay.report("failed", Some(&failure_detail(&e)), &[]).await;
         return Err(e);
     }
     if let Err(e) = backend.prepare(&spec).await {
-        let _ = relay.report("failed", Some(&failure_detail(&e)), None).await;
+        let _ = relay.report("failed", Some(&failure_detail(&e)), &[]).await;
         return Err(e.context("preparing the sandbox"));
     }
     // A cap below what importing the allowlist takes fails every job that
@@ -604,7 +772,19 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         );
     }
     let ctx_env = job::checked_env(backend.env());
-    relay.report("ready", None, owed).await?;
+    let kinds: Vec<_> = backend.kinds().iter().map(JobKind::as_str).collect();
+    tracing::info!(kinds = ?kinds, "this runner runs these kinds of job{}", if backend.shell().is_some() { "" } else { backend.no_shell_hint() });
+    // A session that wants shell jobs, on a runner that cannot run them:
+    // say so where the session can see it, not only in a refusal.
+    let offered = limits.allows_kind(JobKind::Shell) && backend.shell().is_none();
+    let note = offered.then(|| format!("shell jobs are not offered{}", backend.no_shell_hint()));
+    if let Some(n) = &note {
+        tracing::warn!("{n}");
+    }
+    if limits.workspace && !args.workspace {
+        tracing::info!("the session allows workspaces; start the runner with --workspace to keep them");
+    }
+    relay.report("ready", note.as_deref(), owed).await?;
 
     // Unsandboxed jobs see their real paths (in tracebacks, os.getcwd()):
     // under the system temp directory those do not say where the runner
@@ -646,17 +826,40 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         network: limits.network && !args.no_network,
         progress_interval: args.progress_interval,
         progress_tail: args.progress_tail as usize,
+        progress_rate: args.progress_rate,
+        stream_max_bytes: args.stream_max_mb.saturating_mul(1 << 20),
+        workspaces: args.workspace.then(|| Workspaces::new(&root, args.workspace_max_mb, args.workspace_ttl)),
+        workspaces_in_use: Default::default(),
         outbox,
         exit_before_posting: args.exit_before_posting,
         env: ctx_env,
     });
     job::report_interrupted(&ctx, &view).await;
-    let outcome = serve(&ctx, &view, &relay, args.exit_after).await;
+    // Idle workspaces go at startup and then every hour.
+    let in_use = ctx.workspaces_in_use.clone();
+    let sweeper = ctx.workspaces.clone().map(|w| {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(3600));
+            loop {
+                tick.tick().await;
+                let (w, in_use) = (w.clone(), in_use.clone());
+                let _ = tokio::task::spawn_blocking(move || w.sweep(&in_use)).await;
+            }
+        })
+    });
+    let outcome = serve(&ctx, &view, &relay, slots as usize, args.exit_after).await;
+    if let Some(s) = sweeper {
+        s.abort();
+    }
     drop(temp_jobs);
     let closed = view.lock().await.closed;
     if closed {
         tracing::info!("the session has ended");
         let _ = std::fs::remove_dir_all(&dir);
+        // And everything kept for its senders.
+        if let Some(w) = &ctx.workspaces {
+            w.remove_session(&sid);
+        }
     }
     outcome
 }
@@ -673,18 +876,41 @@ fn failure_detail(e: &anyhow::Error) -> String {
     out
 }
 
-fn save_identity(path: &std::path::Path, kp: &Keypair, token: &str, base_url: &str) -> Result<()> {
+fn save_identity(
+    path: &std::path::Path,
+    kp: &Keypair,
+    token: &str,
+    base_url: &str,
+    slots: u32,
+) -> Result<()> {
     let seed: String = kp.seed().iter().map(|b| format!("{b:02x}")).collect();
-    let id =
-        Identity { participant_seed: seed, token: token.to_string(), base_url: Some(base_url.to_string()) };
+    let id = Identity {
+        participant_seed: seed,
+        token: token.to_string(),
+        base_url: Some(base_url.to_string()),
+        slots,
+    };
     write_atomic(path, &serde_json::to_vec(&id)?, 0o600)
 }
 
+/// A job being handled; `cancel` asks it to stop.
 struct Running {
     id: String,
     cancel: watch::Sender<bool>,
-    task: JoinHandle<Result<()>>,
 }
+
+/// The ids of the jobs being worked on, which every heartbeat names.
+type Active = Arc<std::sync::Mutex<Vec<String>>>;
+
+fn active_ids(active: &Active) -> Vec<String> {
+    active.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Held across a claim and across a background heartbeat, so the two never
+/// cross on the wire: a heartbeat that read the jobs before a claim but
+/// reached the relay after it would leave that job out, and the relay would
+/// fail it as lost while it runs.
+type Wire = Arc<tokio::sync::Mutex<()>>;
 
 /// What the assignment stream tells the loop.
 enum Msg {
@@ -744,15 +970,18 @@ async fn stream_assignments(relay: Relay, tx: tokio::sync::mpsc::Sender<Msg>) {
     }
 }
 
-/// Heartbeat every 10 s with the current job, whatever the stream is doing.
+/// Heartbeat every 10 s with the current jobs, whatever the stream is doing.
 /// Ends (and says so) once the relay refuses the token.
-async fn heartbeats(relay: Relay, current: Arc<std::sync::Mutex<Option<String>>>, lost: watch::Sender<bool>) {
+async fn heartbeats(relay: Relay, active: Active, wire: Wire, lost: watch::Sender<bool>) {
     let mut tick = tokio::time::interval(HEARTBEAT);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        let job = current.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Err(e) = relay.heartbeat(job.as_deref()).await {
+        let sent = {
+            let _wire = wire.lock().await;
+            relay.heartbeat(&active_ids(&active)).await
+        };
+        if let Err(e) = sent {
             if status_of(&e) == Some(401) {
                 let _ = lost.send(true);
                 return;
@@ -785,32 +1014,37 @@ async fn signals() {
 }
 
 /// The assignment loop. Returns when the session ends, the runner is
-/// rejected, or on Ctrl-C.
+/// rejected, or on Ctrl-C. Runs up to `slots` jobs at once; an assignment
+/// that arrives while they are all taken (the relay sends none, unless it
+/// lost track of one that ended) waits for a free slot.
 async fn serve(
     ctx: &Arc<Ctx>,
     view: &Arc<Mutex<View>>,
     relay: &Relay,
+    slots: usize,
     exit_after: Option<usize>,
 ) -> Result<()> {
     view.lock().await.sync().await?;
     if !view.lock().await.approved {
         tracing::info!("waiting for the owner's approval");
     }
-    let current_id = Arc::new(std::sync::Mutex::new(None::<String>));
+    let active: Active = Default::default();
+    let wire: Wire = Default::default();
     let (lost_tx, mut lost) = watch::channel(false);
-    let hb = tokio::spawn(heartbeats(relay.clone(), current_id.clone(), lost_tx));
+    let hb = tokio::spawn(heartbeats(relay.clone(), active.clone(), wire.clone(), lost_tx));
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let streamer = tokio::spawn(stream_assignments(relay.clone(), tx));
-    let mut current: Option<Running> = None;
-    // An assignment that arrived while the previous job was still finishing.
-    let mut pending: Option<String> = None;
+    let mut tasks: JoinSet<Result<()>> = JoinSet::new();
+    let mut running: HashMap<tokio::task::Id, Running> = HashMap::new();
+    // Assignments that arrived while every slot was taken, oldest first.
+    let mut pending: VecDeque<String> = VecDeque::new();
     let mut syncing: Option<JoinHandle<()>> = None;
-    let mut handled = 0usize;
+    let (mut started, mut handled) = (0usize, 0usize);
     let mut tick = tokio::time::interval(HEARTBEAT);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Ctrl-C, SIGTERM from `kill` or a service manager, or the Windows
-    // service's stop: stop cleanly, so the running job is cancelled and its
-    // files are removed.
+    // service's stop: stop cleanly, so the running jobs are cancelled and
+    // their files are removed.
     let mut shutdown = SHUTDOWN.subscribe();
     let stop = async move {
         tokio::select! {
@@ -820,58 +1054,70 @@ async fn serve(
     };
     tokio::pin!(stop);
 
-    let start = async |job: String| -> Option<Running> {
-        match relay.claim(&job).await {
+    // Claim a job and start it. It counts as active (and so is named in
+    // heartbeats) from before the claim, and no background heartbeat is in
+    // flight while it is claimed, so none reports it missing.
+    let start = async |job: String,
+                       tasks: &mut JoinSet<Result<()>>,
+                       running: &mut HashMap<tokio::task::Id, Running>| {
+        let claimed = {
+            let _wire = wire.lock().await;
+            active.lock().unwrap_or_else(|e| e.into_inner()).push(job.clone());
+            relay.claim(&job).await
+        };
+        match claimed {
             Ok(true) => {
                 tracing::info!(job = %job, "claimed");
-                *current_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(job.clone());
                 let (tx, rx) = watch::channel(false);
-                let task = tokio::spawn(job::handle(ctx.clone(), view.clone(), job.clone(), rx));
-                Some(Running { id: job, cancel: tx, task })
+                let task = tasks.spawn(job::handle(ctx.clone(), view.clone(), job.clone(), rx));
+                running.insert(task.id(), Running { id: job, cancel: tx });
             }
-            Ok(false) => {
-                tracing::info!(job = %job, "assignment withdrawn before claim");
-                None
-            }
-            Err(e) => {
-                // The relay fails it as unclaimed; keep serving.
-                tracing::warn!(job = %job, "claim failed: {e:#}");
-                None
+            outcome => {
+                active.lock().unwrap_or_else(|e| e.into_inner()).retain(|j| *j != job);
+                match outcome {
+                    Ok(_) => tracing::info!(job = %job, "assignment withdrawn before claim"),
+                    // The relay fails it as unclaimed; keep serving.
+                    Err(e) => tracing::warn!(job = %job, "claim failed: {e:#}"),
+                }
             }
         }
     };
+    // Whether another job may start: a slot is free, and `--exit-after`
+    // has not been reached.
+    let room = |running: usize, started: usize| running < slots && exit_after.is_none_or(|m| started < m);
 
     let result = loop {
         let done = async {
-            match current.as_mut() {
-                Some(r) => Some((&mut r.task).await),
-                None => std::future::pending().await,
+            if tasks.is_empty() {
+                std::future::pending().await
+            } else {
+                tasks.join_next_with_id().await
             }
         };
         tokio::select! {
             msg = rx.recv() => match msg {
                 Some(Msg::Assigned(job)) => {
-                    if current.as_ref().is_some_and(|c| c.id == job) {
-                        continue; // a repeat after reconnecting
+                    // A repeat after reconnecting.
+                    if running.values().any(|r| r.id == job) || pending.contains(&job) {
+                        continue;
                     }
-                    if current.is_some() {
-                        pending = Some(job);
+                    if room(running.len(), started) {
+                        started += 1;
+                        start(job, &mut tasks, &mut running).await;
                     } else {
-                        current = start(job).await;
+                        pending.push_back(job);
                     }
                 }
                 Some(Msg::Cancel(job)) => {
-                    if let Some(r) = current.as_ref().filter(|r| r.id == job) {
+                    if let Some(r) = running.values().find(|r| r.id == job) {
                         tracing::info!(job = %job, "cancel requested");
                         let _ = r.cancel.send(true);
                     }
-                    if pending.as_deref() == Some(job.as_str()) {
-                        pending = None;
-                    }
+                    pending.retain(|j| *j != job);
                 }
-                Some(Msg::Rejected) => break Err(anyhow::anyhow!("the owner rejected this runner")),
+                Some(Msg::Rejected) => break Err(TurnedAway("the owner rejected this runner").into()),
                 Some(Msg::Unauthorized) => {
-                    break Err(anyhow::anyhow!("the relay no longer accepts this runner (rejected, revoked or left)"))
+                    break Err(TurnedAway("the relay no longer accepts this runner (rejected, revoked or left)").into())
                 }
                 Some(Msg::Gone) | None => {
                     view.lock().await.closed = true;
@@ -879,25 +1125,30 @@ async fn serve(
                 }
             },
             Some(r) = done => {
-                let id = current.take().map(|c| c.id).unwrap_or_default();
-                *current_id.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                let (task, r) = match r {
+                    Ok((task, r)) => (task, r),
+                    Err(e) => (e.id(), Err(anyhow::anyhow!("job task panicked: {e}"))),
+                };
+                let id = running.remove(&task).map(|c| c.id).unwrap_or_default();
+                active.lock().unwrap_or_else(|e| e.into_inner()).retain(|j| *j != id);
                 match r {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => tracing::error!(job = %id, "job failed: {e:#}"),
-                    Err(e) => tracing::error!(job = %id, "job task panicked: {e}"),
+                    Ok(()) => {}
+                    Err(e) => tracing::error!(job = %id, "job failed: {e:#}"),
                 }
                 handled += 1;
-                let _ = relay.heartbeat(None).await;
+                let _ = relay.heartbeat(&active_ids(&active)).await;
                 if exit_after.is_some_and(|m| handled >= m) {
                     break Ok(());
                 }
-                if let Some(job) = pending.take() {
-                    current = start(job).await;
+                while room(running.len(), started) {
+                    let Some(job) = pending.pop_front() else { break };
+                    started += 1;
+                    start(job, &mut tasks, &mut running).await;
                 }
             }
             _ = tick.tick() => {
                 // Catch up on approvals and closure between jobs, off the loop.
-                if current.is_none() && syncing.as_ref().is_none_or(|t| t.is_finished()) {
+                if running.is_empty() && syncing.as_ref().is_none_or(|t| t.is_finished()) {
                     let v = view.clone();
                     syncing = Some(tokio::spawn(async move {
                         if let Err(e) = v.lock().await.sync().await {
@@ -924,10 +1175,12 @@ async fn serve(
         }
     };
     streamer.abort();
-    if let Some(r) = current.take() {
+    for r in running.values() {
         let _ = r.cancel.send(true);
-        let _ = tokio::time::timeout(Duration::from_secs(20), r.task).await;
     }
+    let _ =
+        tokio::time::timeout(Duration::from_secs(20), async { while tasks.join_next().await.is_some() {} })
+            .await;
     hb.abort();
     if let Some(t) = syncing {
         t.abort();

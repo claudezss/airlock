@@ -10,7 +10,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use airlox_core::session::{JobLimits, Mode};
+use airlox_core::session::{JobKind, JobLimits, Mode};
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
@@ -18,9 +18,10 @@ use serde_json::{json, Value};
 use crate::client;
 use crate::files::{clean_line, clean_text, out_file_name, received_name, save_new, unpack_out_zip};
 use crate::session::{
-    default_cache_root, file_type, Item, JobSpec, NewSession, NoRunnerAvailable, Outcome, PendingWatch,
-    Profile, Session, Status, Target, DEFAULT_TYPES, FILE_TYPES_HELP,
+    default_cache_root, file_type, Chunk, Item, JobSpec, NewSession, NoRunnerAvailable, Outcome,
+    PendingWatch, Profile, Session, Status, Target, DEFAULT_TYPES, FILE_TYPES_HELP,
 };
+use crate::tree;
 use airlox_core::session::DEFAULT_MAX_ITEM_BYTES;
 
 /// How a command reaches its session.
@@ -29,7 +30,12 @@ pub struct Conn {
     /// Invite link for the session (or set AIRLOX_INVITE). Its role decides
     /// what you can do: owner, sender, observer.
     #[arg(long, env = "AIRLOX_INVITE", hide_env_values = true)]
-    pub invite: String,
+    pub invite: Option<String>,
+    /// Use a machine added with `airlox machine add`, by name, instead of
+    /// an invite (its sender invite). `name/label` also sends jobs to the
+    /// runners with that label.
+    #[arg(long, value_name = "MACHINE", conflicts_with = "invite")]
+    pub on: Option<String>,
     /// Display name shown to other participants when joining for the first time.
     #[arg(long = "as", env = "AIRLOX_NAME", default_value = "cli")]
     pub display_name: String,
@@ -46,14 +52,31 @@ pub struct Conn {
 }
 
 impl Conn {
-    fn cache_root(&self) -> PathBuf {
+    pub(crate) fn cache_root(&self) -> PathBuf {
         self.cache_dir.clone().unwrap_or_else(default_cache_root)
+    }
+
+    /// The invite this command joins with: `--invite`, or `--on`'s machine.
+    pub(crate) fn invite_link(&self) -> Result<String> {
+        match (&self.invite, &self.on) {
+            (Some(i), _) => Ok(i.clone()),
+            (None, Some(on)) => {
+                let (name, _) = crate::machine::split_on(on);
+                crate::machine::sender_invite(&self.cache_root(), name)
+            }
+            (None, None) => bail!("pass --invite (or set AIRLOX_INVITE), or --on <machine>"),
+        }
+    }
+
+    /// The label `--on name/label` adds to a job's target.
+    fn on_label(&self) -> Option<&str> {
+        self.on.as_deref().and_then(|on| crate::machine::split_on(on).1)
     }
 
     async fn join(&self) -> Result<Session> {
         let root = self.cache_root();
         let me = Profile::new(&self.display_name, self.description.as_deref());
-        let mut s = Session::join(&client::http()?, &self.invite, &me, &root).await?;
+        let mut s = Session::join(&client::http()?, &self.invite_link()?, &me, &root).await?;
         if !s.joined_now && me.description.is_some() && s.my_description().is_none() {
             // Our own join is not cached yet: fetch it to compare.
             let _ = s.sync().await;
@@ -95,6 +118,10 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
 /// A session lifetime: a duration, or `never` (`None`).
 #[derive(Clone, Copy, Debug)]
 pub struct Lifetime(pub Option<Duration>);
+
+pub fn parse_kind(s: &str) -> Result<JobKind, String> {
+    JobKind::parse(s.trim()).map_err(|_| format!("unknown job kind {s:?}: use python or shell"))
+}
 
 pub fn parse_lifetime(s: &str) -> Result<Lifetime, String> {
     if s.trim() == "never" {
@@ -172,7 +199,8 @@ pub struct AuditArgs {
 pub enum CreateProfile {
     /// A long-lived session for a runner on a host that takes real work:
     /// --execute, --ttl never, --job-timeout 30m, --job-memory 4096, items
-    /// as large as the relay allows, runner approval on.
+    /// as large as the relay allows, runner approval on, python and shell
+    /// jobs, and workspaces.
     HostRunner,
 }
 
@@ -225,6 +253,16 @@ pub struct CreateArgs {
     /// execute: let runners take jobs without the owner's approval.
     #[arg(long)]
     pub no_approval: bool,
+    /// execute: the kinds of job allowed, comma-separated: python, shell
+    /// (a script run by the runner's shell with the sandbox's own tools)
+    /// [default: python; python,shell with --profile host-runner].
+    #[arg(long, value_delimiter = ',', value_parser = parse_kind)]
+    pub kinds: Vec<JobKind>,
+    /// execute: let runners keep each sender's work directory between jobs,
+    /// so dependencies and builds stay warm (runners opt in with
+    /// --workspace) [default: on with --profile host-runner].
+    #[arg(long)]
+    pub workspace: bool,
     /// Let participants reach the relay over plain http:// at this host
     /// (e.g. airlox-relay.ns.svc inside a cluster), as --relay names it.
     /// Recorded in the signed manifest. The content stays end-to-end
@@ -275,9 +313,21 @@ fn new_session(a: &CreateArgs, relay_max: Option<u64>) -> Result<NewSession> {
             packages: a.packages.iter().flat_map(|p| split_packages(p)).collect(),
             return_out: !a.no_out_files,
             approve_runners: !a.no_approval,
+            kinds: job_kinds(&a.kinds, host),
+            workspace: a.workspace || host,
         }),
         insecure_http_host: a.insecure_http_host.as_deref().map(|h| h.trim().to_ascii_lowercase()),
     })
+}
+
+/// The manifest's `kinds`: absent for python alone, so the manifest is what
+/// older clients accept.
+pub(crate) fn job_kinds(given: &[JobKind], host: bool) -> Option<Vec<JobKind>> {
+    let mut kinds =
+        if given.is_empty() && host { vec![JobKind::Python, JobKind::Shell] } else { given.to_vec() };
+    kinds.sort();
+    kinds.dedup();
+    (!kinds.is_empty() && kinds != [JobKind::Python]).then_some(kinds)
 }
 
 /// The allowlist entries in one `--package` value: it may list several,
@@ -301,8 +351,8 @@ fn split_packages(value: &str) -> Vec<String> {
 }
 
 /// One line about what jobs may do.
-fn jobs_line(l: &JobLimits) -> String {
-    format!(
+pub(crate) fn jobs_line(l: &JobLimits) -> String {
+    let mut line = format!(
         "{} · {} · {} MB · network {} · packages [{}] · approval {}",
         l.runtime,
         human_secs(l.timeout_s as u64),
@@ -310,7 +360,25 @@ fn jobs_line(l: &JobLimits) -> String {
         if l.network { "on" } else { "off" },
         l.packages.join(", "),
         if l.approve_runners { "required" } else { "off" }
-    )
+    );
+    // Said only when not what sessions always were: python, no workspaces.
+    if l.kinds.is_some() {
+        let kinds: Vec<&str> = l.kinds().iter().map(|k| k.as_str()).collect();
+        line.push_str(&format!(" · kinds {}", kinds.join(", ")));
+    }
+    if l.workspace {
+        line.push_str(" · workspaces");
+    }
+    line
+}
+
+/// "850 ms", "41.2 s", "12 min 3 s".
+fn human_wall(ms: u64) -> String {
+    match ms {
+        ms if ms < 1000 => format!("{ms} ms"),
+        ms if ms < 120_000 => format!("{:.1} s", ms as f64 / 1000.0),
+        ms => format!("{} min {} s", ms / 60_000, (ms % 60_000) / 1000),
+    }
 }
 
 /// "90 s", "30 min", "6 h", "1 h 30 min".
@@ -666,7 +734,7 @@ fn print_invites(s: &Session, json_out: bool, created: bool, owner_file: Option<
 }
 
 /// "25 MB", "100 MB", "1.5 GB", in the units the flags use (1 MB = 1024²).
-fn human_bytes(n: u64) -> String {
+pub(crate) fn human_bytes(n: u64) -> String {
     const MB: u64 = 1024 * 1024;
     const GB: u64 = 1024 * MB;
     match n {
@@ -797,18 +865,46 @@ pub async fn send_path(s: &mut Session, p: &Path, reply_to: Option<&str>) -> Res
 // ------------------------------------------------------------------ run --
 
 #[derive(Args, Debug)]
+#[command(group(clap::ArgGroup::new("what").args(["file", "shell", "command"]).required(true)))]
 pub struct RunArgs {
     #[command(flatten)]
     pub conn: Conn,
     /// The Python file to run.
-    pub file: PathBuf,
+    pub file: Option<PathBuf>,
+    /// Run this shell script on the runner instead (a shell job).
+    #[arg(long, value_name = "SCRIPT")]
+    pub shell: Option<PathBuf>,
+    /// The command to run, after `--`: `airlox run --tree -- pytest -x`. The
+    /// words are quoted for the runner's shell and sent as a shell job.
+    #[arg(last = true, value_name = "COMMAND")]
+    pub command: Vec<String>,
+    /// Send the current checkout as the job's input: the files git would
+    /// commit or add (tracked and untracked, ignored ones left out), and
+    /// run the job from the current directory within it. A runner with a
+    /// workspace syncs it into a directory it keeps, so installed
+    /// dependencies and build output survive between runs.
+    #[arg(long)]
+    pub tree: bool,
+    /// --tree: leave out files matching this glob (repeat); also read from
+    /// .airloxignore at the root.
+    #[arg(long, value_name = "GLOB", requires = "tree")]
+    pub tree_exclude: Vec<String>,
+    /// --tree: send files matching this glob although their names usually
+    /// mean credentials (.env, *.pem, id_rsa*, ...), which are refused
+    /// otherwise (repeat).
+    #[arg(long, value_name = "GLOB", requires = "tree")]
+    pub tree_allow: Vec<String>,
+    /// Start from an empty workspace on the runner.
+    #[arg(long)]
+    pub fresh: bool,
     /// Send to this runner (name or key).
     #[arg(long, conflicts_with_all = ["label"])]
     pub runner: Option<String>,
-    /// Send to any idle runner with all these labels (repeat, or comma-separated).
+    /// Send to any runner with a free slot that has all these labels (repeat, or comma-separated).
     #[arg(long, value_delimiter = ',')]
     pub label: Vec<String>,
-    /// A file to send with the job (repeat); ZIPs are unpacked in the job's directory.
+    /// A file to send with the job (repeat); ZIPs are unpacked in the job's
+    /// directory, after the tree.
     #[arg(long = "input")]
     pub inputs: Vec<PathBuf>,
     /// Job time limit (default: the session's).
@@ -817,7 +913,7 @@ pub struct RunArgs {
     /// Job memory limit in MB (default: the session's).
     #[arg(long)]
     pub memory: Option<u32>,
-    /// A package from the session's allowlist the job needs (repeat).
+    /// A package from the session's allowlist the job needs (repeat; python jobs).
     #[arg(long = "requirement")]
     pub requirements: Vec<String>,
     /// A file in the job's work dir (e.g. a simulator's log) whose tail the
@@ -833,37 +929,192 @@ pub struct RunArgs {
     /// Give up waiting after this long (the job keeps running).
     #[arg(long, default_value = "10m", value_parser = parse_duration)]
     pub wait: Duration,
+    /// Print each output chunk as a JSON object on its own line as it
+    /// arrives, then the result.
+    #[arg(long, conflicts_with = "json")]
+    pub stream_json: bool,
+}
+
+/// `argv` as one line for a POSIX shell.
+pub(crate) fn shell_line(argv: &[String]) -> String {
+    argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")
+}
+
+/// `argv` as a PowerShell script: the call operator and each word bare or
+/// single-quoted, then the command's own exit code (`pwsh -Command` turns
+/// any failure into 1).
+pub(crate) fn pwsh_script(argv: &[String]) -> String {
+    // A bare word PowerShell passes on as written: no `$`, quotes, braces,
+    // commas or `@`; `--` it would take as its own marker, and a switch with
+    // `.` or `:` in it it may split.
+    let bare = |s: &str| {
+        let word = |c: char| c.is_ascii_alphanumeric() || "-_./\\:=+".contains(c);
+        match s.strip_prefix('-') {
+            _ if s.is_empty() || s == "--" || !s.chars().all(word) => false,
+            Some(rest) => rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            None => true,
+        }
+    };
+    let words: Vec<String> = argv
+        .iter()
+        .map(|a| if bare(a) { a.clone() } else { format!("'{}'", a.replace('\'', "''")) })
+        .collect();
+    format!(
+        "& {}\nif (-not $?) {{ exit $(if ($LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 1 }}) }}\n",
+        words.join(" ")
+    )
+}
+
+/// The shell job that runs `argv`, quoted for the shell of the runners
+/// `target` reaches (their signed joins say): PowerShell's quoting for
+/// `pwsh` runners, a POSIX shell's otherwise.
+pub(crate) async fn command_script(s: &mut Session, target: &Target, argv: &[String]) -> Result<String> {
+    let shells = s.target_shells(target).await?;
+    match shells.as_slice() {
+        [sh] if sh == "pwsh" => Ok(pwsh_script(argv)),
+        [_, _, ..] => bail!(
+            "the runners this job could go to run different shells ({}), and a command is quoted for one; \
+             pick a runner, or send a script for its shell",
+            shells.join(" and ")
+        ),
+        _ => Ok(format!("{}\n", shell_line(argv))),
+    }
 }
 
 /// Exit status for a job: its own exit code, or 1 if it produced none.
 pub async fn run(a: RunArgs) -> Result<i32> {
-    let code = std::fs::read_to_string(&a.file).with_context(|| format!("reading {}", a.file.display()))?;
-    let filename = a.file.file_name().and_then(|n| n.to_str()).unwrap_or("main.py").to_string();
-    let mut s = a.conn.join().await?;
-    let mut files = Vec::new();
-    for p in &a.inputs {
-        files.push(send_path(&mut s, p, None).await?);
+    let json_out = a.conn.json || a.stream_json;
+    // A command is quoted once the runners it could go to are known.
+    let (kind, mut code, filename) = if let Some(f) = &a.file {
+        let code = std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?;
+        let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("main.py").to_string();
+        (JobKind::Python, code, name)
+    } else if let Some(f) = &a.shell {
+        let code = std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?;
+        let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("job.sh").to_string();
+        (JobKind::Shell, code, name)
+    } else {
+        (JobKind::Shell, String::new(), "job.sh".to_string())
+    };
+    if kind == JobKind::Shell && !a.requirements.is_empty() {
+        bail!("--requirement is for python jobs; a shell job uses the tools on the runner");
     }
-    let target = match (&a.runner, a.label.is_empty()) {
+    let tree = if a.tree {
+        let t = tree::build(
+            &std::env::current_dir()?,
+            &tree::TreeOpts { allow: &a.tree_allow, exclude: &a.tree_exclude },
+        )?;
+        if !t.in_git {
+            eprintln!("note: not in a git repository; sending every file under this directory except .git");
+        }
+        Some(t)
+    } else {
+        None
+    };
+    let mut s = a.conn.join().await?;
+    let mut labels = a.label.clone();
+    if let Some(l) = a.conn.on_label() {
+        labels.push(l.to_string());
+    }
+    let target = match (&a.runner, labels.is_empty()) {
         (Some(r), _) => Target::Runner(r.clone()),
-        (None, false) => Target::Labels(a.label.clone()),
+        (None, false) => Target::Labels(labels),
         (None, true) => Target::Any,
     };
-    let spec = JobSpec {
-        code,
-        filename,
-        files,
-        target,
+    if a.file.is_none() && a.shell.is_none() {
+        code = command_script(&mut s, &target, &a.command).await?;
+    }
+    // The tree goes whole, or as a delta against what this client last left
+    // in its workspace on the runner.
+    let sending = match &tree {
+        Some(t) => {
+            let (zip, delta) = t.zip_for(&mut s, &target, kind, a.fresh).await?;
+            // The payload adds a few hundred bytes of meta to the file. The
+            // whole tree must fit even when a delta goes: a stale workspace
+            // is answered by sending it whole.
+            let max = s.manifest.max_item_bytes.saturating_sub(4096);
+            if t.zip.len() as u64 > max {
+                let largest: Vec<String> = t
+                    .largest
+                    .iter()
+                    .map(|(p, n)| format!("{} ({})", clean_line(p), human_bytes(*n)))
+                    .collect();
+                bail!(
+                    "the tree zips to {}, over the session's item limit of {}. Largest files: {}. Leave some out \
+                     with --tree-exclude <glob> or a line in .airloxignore",
+                    human_bytes(t.zip.len() as u64),
+                    human_bytes(max),
+                    largest.join(", ")
+                );
+            }
+            Some((zip, delta))
+        }
+        None => None,
+    };
+    let target_name = a.conn.on.as_deref().map(|on| crate::machine::split_on(on).0.to_string());
+    let what = match kind {
+        JobKind::Python => filename.clone(),
+        JobKind::Shell if a.shell.is_none() => clean_line(code.lines().next().unwrap_or_default()),
+        JobKind::Shell => format!("sh {filename}"),
+    };
+    // `delta`: the files and bytes a delta tree sent.
+    let summary = |runner: Option<&str>, job: &str, delta: Option<(usize, u64)>| {
+        let mut parts = vec![];
+        if let Some(r) = runner.or(target_name.as_deref()) {
+            parts.push(clean_line(r));
+        }
+        parts.push(format!("job {job}"));
+        parts.push(what.clone());
+        if let Some(t) = &tree {
+            parts.push(t.summary());
+        }
+        if let (Some(t), Some((n, bytes))) = (&tree, delta) {
+            parts.push(format!("sent {n} of {} files, {}", t.json.count, human_bytes(bytes)));
+        }
+        parts.join(" · ")
+    };
+    if !json_out {
+        if let Some(t) = &tree {
+            if !t.largest.is_empty() {
+                let largest: Vec<String> =
+                    t.largest.iter().map(|(p, n)| format!("{} {}", clean_line(p), human_bytes(*n))).collect();
+                eprintln!("{} · largest: {}", t.summary(), largest.join(", "));
+            }
+            for n in &t.notes {
+                eprintln!("   {}", clean_line(n));
+            }
+        }
+        if kind == JobKind::Shell && a.shell.is_some() {
+            eprintln!("{}", clean_text(&code).trim_end());
+        }
+    }
+    let tree_ref = match &sending {
+        Some((zip, _)) => Some(s.send_file_reply(zip.clone(), tree::TREE_ZIP, None).await?),
+        None => None,
+    };
+    let mut inputs = Vec::new();
+    for p in &a.inputs {
+        inputs.push(send_path(&mut s, p, None).await?);
+    }
+    let spec = |tree_ref: Option<Value>| JobSpec {
+        kind,
+        code: code.clone(),
+        filename: filename.clone(),
+        files: tree_ref.iter().cloned().chain(inputs.iter().cloned()).collect(),
+        target: target.clone(),
         timeout_s: a.timeout.map(|t| t.as_secs().max(1) as u32),
         memory_mb: a.memory,
         requirements: a.requirements.clone(),
         progress_file: a.progress_file.clone(),
+        cwd: tree.as_ref().and_then(|t| t.cwd.clone()),
+        tree: tree_ref,
+        fresh: a.fresh,
     };
-    let (job, runner) = match s.run_python(spec).await {
+    let (job, runner) = match s.run_job(spec(tree_ref)).await {
         Ok(j) => j,
         Err(e) => {
             if let Some(n) = e.downcast_ref::<NoRunnerAvailable>() {
-                if a.conn.json {
+                if json_out {
                     print_json(
                         &json!({"job": n.job, "status": "failed", "reason": n.reason, "message": client::relay_text(&n.message)}),
                     );
@@ -873,19 +1124,84 @@ pub async fn run(a: RunArgs) -> Result<i32> {
             return Err(e);
         }
     };
+    if let (Some(t), Some(r)) = (&tree, &runner) {
+        if s.limits().is_ok_and(|l| l.workspace) {
+            s.sent_tree(r, &job, t.listing());
+        }
+    }
+    let runner_name = runner.as_deref().and_then(|k| s.participant_name(k));
     if a.no_wait {
-        if a.conn.json {
-            let runner_name = runner.as_deref().and_then(|k| s.participant_name(k));
+        if json_out {
             print_json(&json!({"job": job, "runner": runner, "runner_name": runner_name}));
         } else {
-            println!("submitted job {job}; get its result with: airlox result -- {job}");
+            let conn = conn_flags(&a.conn);
+            println!("submitted job {job}");
+            println!("get its result:      airlox result{conn} --wait 30m -- {job}");
+            println!("or be woken by it:   airlox listen{conn} --once");
         }
         return Ok(0);
     }
-    if !a.conn.json {
-        eprintln!("job {job} submitted; waiting for its result…");
+    if !json_out {
+        let delta = match &sending {
+            Some((zip, Some(n))) => Some((*n, zip.len() as u64)),
+            _ => None,
+        };
+        eprintln!("{}", summary(runner_name.as_deref(), &job, delta));
     }
-    finish(&mut s, &job, a.wait, a.out_dir.as_deref(), a.conn.json).await
+    let mode = if a.stream_json {
+        Stream::Json
+    } else if a.conn.json {
+        Stream::Off
+    } else {
+        Stream::Text
+    };
+    let mut job = job;
+    let mut waited = wait_outcome(&mut s, &job, a.wait, mode).await?;
+    // The workspace was not as this client left it (another client of the
+    // same identity, a job that changed files, a runner that lost it): send
+    // the whole tree once.
+    let stale = |w: &(Option<Outcome>, Shown)| {
+        w.0.as_ref().and_then(|r| r.reason.as_deref()).is_some_and(|r| r.starts_with("tree_stale"))
+    };
+    if let (Some(t), Some((_, Some(_)))) = (&tree, &sending) {
+        if stale(&waited) {
+            if !json_out {
+                eprintln!("the runner's workspace is not as this client left it; sending the whole tree");
+            }
+            let r = s.send_file_reply(t.zip.clone(), tree::TREE_ZIP, None).await?;
+            let (again, runner) = s.run_job(spec(Some(r))).await?;
+            if let Some(runner) = &runner {
+                s.sent_tree(runner, &again, t.listing());
+            }
+            if !json_out {
+                let name = runner.as_deref().and_then(|k| s.participant_name(k));
+                eprintln!("{}", summary(name.as_deref(), &again, None));
+            }
+            job = again;
+            waited = wait_outcome(&mut s, &job, a.wait, mode).await?;
+        }
+    }
+    report(&job, waited, a.out_dir.as_deref(), a.conn.json || a.stream_json)
+}
+
+/// The flags that name the session again in a printed command: `--on`, or
+/// nothing (the invite is in the environment or was passed; it is never
+/// printed).
+fn conn_flags(c: &Conn) -> String {
+    match &c.on {
+        Some(on) => format!(" --on {}", shell_quote(on)),
+        None => String::new(),
+    }
+}
+
+/// How `finish` shows output chunks while it waits.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stream {
+    /// stdout chunks to stdout, stderr chunks to stderr.
+    Text,
+    /// One JSON object per chunk, on stdout.
+    Json,
+    Off,
 }
 
 #[derive(Args, Debug)]
@@ -906,17 +1222,66 @@ pub struct ResultArgs {
 
 pub async fn result(a: ResultArgs) -> Result<i32> {
     let mut s = a.conn.join().await?;
-    finish(&mut s, &a.job, a.wait, a.out_dir.as_deref(), a.conn.json).await
+    let mode = if a.conn.json { Stream::Off } else { Stream::Text };
+    let waited = wait_outcome(&mut s, &a.job, a.wait, mode).await?;
+    report(&a.job, waited, a.out_dir.as_deref(), a.conn.json)
 }
 
-async fn finish(
+/// What a wait has already printed of each stream, contiguous from the start.
+#[derive(Default)]
+struct Shown {
+    stdout: String,
+    stderr: String,
+}
+
+impl Shown {
+    fn show(&mut self, c: &Chunk, mode: Stream) {
+        use std::io::Write as _;
+        match mode {
+            Stream::Off => {}
+            Stream::Json => println!("{}", json!({"chunk": c})),
+            Stream::Text => {
+                let text = clean_text(&c.data);
+                if c.stream == "stderr" {
+                    if c.offset == self.stderr.len() as u64 {
+                        self.stderr.push_str(&c.data);
+                    }
+                    eprint!("{text}");
+                    let _ = std::io::stderr().flush();
+                } else {
+                    if c.offset == self.stdout.len() as u64 {
+                        self.stdout.push_str(&c.data);
+                    }
+                    print!("{text}");
+                    let _ = std::io::stdout().flush();
+                }
+                if c.truncated {
+                    eprintln!("\n[airlox] the runner stopped streaming here; the result has the rest");
+                }
+            }
+        }
+    }
+}
+
+/// Wait for a job's outcome, showing its output as it streams.
+async fn wait_outcome(
     s: &mut Session,
     job: &str,
     wait: Duration,
+    mode: Stream,
+) -> Result<(Option<Outcome>, Shown)> {
+    let mut shown = Shown::default();
+    let waited = s.wait_streaming(job, Some(wait), |c| shown.show(c, mode)).await?;
+    Ok((waited, shown))
+}
+
+fn report(
+    job: &str,
+    (waited, shown): (Option<Outcome>, Shown),
     out_dir: Option<&Path>,
     json_out: bool,
 ) -> Result<i32> {
-    let Some(r) = s.wait(job, Some(wait)).await? else {
+    let Some(r) = waited else {
         if json_out {
             print_json(&json!({"job": job, "status": "running"}));
         } else {
@@ -938,7 +1303,7 @@ async fn finish(
             "lost contact with the runner; it may still finish and post its result: airlox result --wait 30m -- {job}"
         );
     } else {
-        print_outcome(&r, &saved, out_dir.is_none());
+        print_outcome(&r, &saved, out_dir.is_none(), &shown);
         for n in &notes {
             eprintln!("   {}", clean_line(n));
         }
@@ -1009,23 +1374,45 @@ fn env_line(e: &airlox_core::payload::JobEnv) -> String {
     if !packages.is_empty() {
         parts.push(packages);
     }
+    if let Some(sh) = &e.shell {
+        parts.push(format!("shell {sh}"));
+    }
+    if let Some(t) = &e.tree {
+        let head = t.head.as_deref().map(|h| &h[..h.len().min(12)]).unwrap_or("no commit");
+        let changes = if t.dirty { " + changes" } else { "" };
+        parts.push(format!("tree {head}{changes}, {} files", t.count));
+    }
     parts.push(format!("{} sandbox", format!("{:?}", e.sandbox).to_lowercase()));
     parts.push(format!("airlox {}", e.airlox));
     clean_line(&parts.join(" · "))
 }
 
-fn print_outcome(r: &Outcome, saved: &[String], hint: bool) {
-    if !r.stdout.is_empty() {
-        print!("{}", clean_text(&r.stdout));
-        if !r.stdout.ends_with('\n') {
-            println!();
+/// The part of the signed `full` text not yet shown: all of it when what
+/// the stream showed is not where it starts (the result is the authority).
+fn unshown<'a>(full: &'a str, shown: &str, what: &str) -> &'a str {
+    match full.strip_prefix(shown) {
+        Some(rest) => rest,
+        None => {
+            eprintln!("\n[airlox] the signed {what} differs from what was streamed; here it is in full:");
+            full
         }
     }
-    if !r.stderr.is_empty() {
-        eprint!("{}", clean_text(&r.stderr));
-        if !r.stderr.ends_with('\n') {
-            eprintln!();
-        }
+}
+
+fn print_outcome(r: &Outcome, saved: &[String], hint: bool, shown: &Shown) {
+    let stdout = unshown(&r.stdout, &shown.stdout, "stdout");
+    if !stdout.is_empty() {
+        print!("{}", clean_text(stdout));
+    }
+    if !r.stdout.is_empty() && !r.stdout.ends_with('\n') {
+        println!();
+    }
+    let stderr = unshown(&r.stderr, &shown.stderr, "stderr");
+    if !stderr.is_empty() {
+        eprint!("{}", clean_text(stderr));
+    }
+    if !r.stderr.is_empty() && !r.stderr.ends_with('\n') {
+        eprintln!();
     }
     let code = r.exit_code.map(|c| format!("exit {c}")).unwrap_or_else(|| "no exit code".into());
     let reason = r.reason.as_deref().map(|x| format!(" ({})", clean_line(x))).unwrap_or_default();
@@ -1034,7 +1421,8 @@ fn print_outcome(r: &Outcome, saved: &[String], hint: bool) {
         (true, None) => "signed by the runner".into(),
         (false, _) => "reported by the relay, unsigned".into(),
     };
-    eprintln!("── {} · {code}{reason} · {} ms · {signed}", r.status, r.wall_ms);
+    let peak = if r.peak_mem_mb > 0 { format!(" · peak {} MB", r.peak_mem_mb) } else { String::new() };
+    eprintln!("── {} · {code}{reason} · {}{peak} · {signed}", r.status, human_wall(r.wall_ms));
     if let Some(env) = &r.env {
         eprintln!("   ran on {}", env_line(env));
     }
@@ -1052,6 +1440,114 @@ fn print_outcome(r: &Outcome, saved: &[String], hint: bool) {
     let gone: Vec<_> = r.out_files.iter().filter(|f| f.data.is_none()).map(|f| clean_line(&f.name)).collect();
     if !gone.is_empty() {
         eprintln!("   left the relay before they were fetched: {}", gone.join(", "));
+    }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum JobCmd {
+    /// The session's jobs, newest last: state, runner, age and what each ran.
+    Ls(JobLsArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct JobLsArgs {
+    #[command(flatten)]
+    pub conn: Conn,
+    /// Only the jobs you submitted.
+    #[arg(long)]
+    pub mine: bool,
+    /// At most this many (the newest).
+    #[arg(long, default_value_t = 20)]
+    pub limit: usize,
+}
+
+/// One line for what a job runs: the command, or the file.
+fn job_what(m: &Value) -> String {
+    let code = m["code"].as_str().unwrap_or_default();
+    match m["kind"].as_str() {
+        Some("shell") if m["filename"] == "job.sh" => {
+            let first = code.lines().next().unwrap_or_default();
+            let more = if code.trim_end().lines().count() > 1 { " …" } else { "" };
+            format!("{first}{more}")
+        }
+        Some("shell") => format!("sh {}", m["filename"].as_str().unwrap_or_default()),
+        _ => m["filename"].as_str().unwrap_or_default().to_string(),
+    }
+}
+
+pub async fn job_ls(a: JobLsArgs) -> Result<()> {
+    let mut s = a.conn.join().await?;
+    s.sync().await?;
+    let jobs: Vec<Item> = s
+        .items()
+        .iter()
+        .filter(|i| i.kind == "job" && i.status == Status::Ok && (!a.mine || i.author == s.me))
+        .cloned()
+        .collect();
+    let skip = jobs.len().saturating_sub(a.limit);
+    let mut out = Vec::new();
+    for i in &jobs[skip..] {
+        let m = i.meta.clone().unwrap_or(Value::Null);
+        let (state, runner, exit_code) = match s.result(&i.id) {
+            Some(r) => (r.status.clone(), r.runner_name.clone().or(r.runner.clone()), r.exit_code),
+            None => match s.job_state(&i.id).await {
+                Ok(st) => {
+                    let runner =
+                        st["runner"].as_str().map(|k| s.participant_name(k).unwrap_or_else(|| k.to_string()));
+                    let state = match (st["state"].as_str(), st["reason"].as_str()) {
+                        (Some("failed"), Some(why)) => format!("failed: {why}"),
+                        (Some(state), _) => state.to_string(),
+                        _ => "unknown".into(),
+                    };
+                    (state, runner, None)
+                }
+                Err(_) => ("unknown".into(), None, None),
+            },
+        };
+        out.push(json!({
+            "job": i.id,
+            "kind": m["kind"].as_str().unwrap_or("python"),
+            "what": job_what(&m),
+            "author": i.author_name.clone().unwrap_or_else(|| i.author.clone()),
+            "mine": i.author == s.me,
+            "created_at_ms": i.created_at_ms,
+            "state": state,
+            "exit_code": exit_code,
+            "runner": runner,
+        }));
+    }
+    if a.conn.json {
+        print_json(&json!({"jobs": out}));
+        return Ok(());
+    }
+    if out.is_empty() {
+        println!("no jobs yet");
+    }
+    for j in &out {
+        let exit = j["exit_code"].as_i64().map(|c| format!(" (exit {c})")).unwrap_or_default();
+        println!(
+            "{}  {:<10} {:<22} {:<12} {}",
+            j["job"].as_str().unwrap_or_default(),
+            human_age(j["created_at_ms"].as_u64().unwrap_or(0)),
+            clean_line(&format!("{}{exit}", j["state"].as_str().unwrap_or_default())),
+            clean_line(j["runner"].as_str().unwrap_or("-")),
+            clean_line(j["what"].as_str().unwrap_or_default()),
+        );
+    }
+    Ok(())
+}
+
+/// "41 s", "12 min", "3 h", "2 d" since `ms`.
+fn human_age(ms: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    match now.saturating_sub(ms) / 1000 {
+        s if s < 60 => format!("{s} s"),
+        s if s < 3600 => format!("{} min", s / 60),
+        s if s < 86400 => format!("{} h", s / 3600),
+        s => format!("{} d", s / 86400),
     }
 }
 
@@ -1725,7 +2221,7 @@ fn agent_env(conn: &Conn) -> Vec<(&'static str, std::ffi::OsString)> {
     let root = conn.cache_root();
     let root = std::path::absolute(&root).unwrap_or(root);
     let mut env: Vec<(&'static str, std::ffi::OsString)> = vec![
-        ("AIRLOX_INVITE", conn.invite.clone().into()),
+        ("AIRLOX_INVITE", conn.invite_link().unwrap_or_default().into()),
         ("AIRLOX_NAME", conn.display_name.clone().into()),
         ("AIRLOX_CACHE_DIR", root.into_os_string()),
     ];
@@ -1963,10 +2459,16 @@ pub async fn runner_list(conn: Conn) -> Result<()> {
             "awaiting approval"
         } else if !r.online {
             "offline"
-        } else if r.job.is_some() {
+        } else if r.busy {
             "busy"
         } else {
             "idle"
+        };
+        // A runner with several slots says how many are taken.
+        let state = if r.slots > 1 && state != "offline" && r.approved && !r.rejected {
+            format!("{state} ({}/{} jobs)", r.jobs.len(), r.slots)
+        } else {
+            state.to_string()
         };
         let net = if r.network_unblocked { " · cannot block network" } else { "" };
         let versions = match (&r.version, &r.python) {
@@ -2338,6 +2840,9 @@ mod tests {
             airlox: "0.1.2".into(),
             sandbox: airlox_core::cert::SandboxKind::Process,
             interpreter: "--python".into(),
+            kinds: None,
+            shell: None,
+            tree: None,
         };
         assert_eq!(
             env_line(&env),
@@ -2346,11 +2851,30 @@ mod tests {
         let bare = airlox_core::payload::JobEnv {
             packages: Default::default(),
             interpreter: "uv-runtime\x1b[2J\nforged".into(),
-            ..env
+            ..env.clone()
         };
         let line = env_line(&bare);
         assert!(!line.contains('\x1b') && !line.contains('\n'), "{line:?}");
         assert!(line.starts_with("Python 3.12.4 (uv-runtime"));
+        let shell = airlox_core::payload::JobEnv {
+            packages: Default::default(),
+            interpreter: "docker:ci@sha256:0123456789ab".into(),
+            kinds: Some(vec![JobKind::Python, JobKind::Shell]),
+            shell: Some("sh".into()),
+            tree: Some(airlox_core::payload::TreeInfo {
+                head: Some("0123456789abcdef0123".into()),
+                dirty: true,
+                count: 412,
+                sha256: "c".repeat(64),
+                changed: None,
+            }),
+            ..env
+        };
+        assert_eq!(
+            env_line(&shell),
+            "Python 3.12.4 (docker:ci@sha256:0123456789ab) · shell sh · tree 0123456789ab + changes, 412 files · \
+             process sandbox · airlox 0.1.2"
+        );
     }
 
     #[test]
@@ -2408,6 +2932,17 @@ mod tests {
         assert_eq!(shell_quote("http://relay.ns.svc:8080"), "http://relay.ns.svc:8080");
         assert_eq!(shell_quote("https://x/$(id)"), "'https://x/$(id)'");
         assert_eq!(shell_quote("a'b"), r"'a'\''b'");
+    }
+
+    #[test]
+    fn a_command_for_pwsh_is_quoted_for_pwsh() {
+        let argv = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let line = |w: &[&str]| pwsh_script(&argv(w)).lines().next().unwrap().to_string();
+        assert_eq!(line(&["pytest", "-x", "tests/a.py", r"C:\x"]), r"& pytest -x tests/a.py C:\x");
+        assert_eq!(line(&["echo", "$HOME", "it's", "a,b", "@x", ""]), "& echo '$HOME' 'it''s' 'a,b' '@x' ''");
+        assert_eq!(line(&["my tool", "--", "-D.x=1", "--flag"]), "& 'my tool' '--' '-D.x=1' --flag");
+        assert!(pwsh_script(&argv(&["x"]))
+            .ends_with("exit $(if ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }) }\n"));
     }
 
     fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {

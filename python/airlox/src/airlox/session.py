@@ -20,11 +20,13 @@ from . import _core as ac
 import httpx
 
 from .cache import Cache, default_root
+from . import tree as _tree
 from .execute import Job, NoRunnerAvailable, Runner, RunnerBusy, RunnerFailed, signed_approvals
 
 log = logging.getLogger(__name__)
 
 DEFAULT_TYPES = ("text", "py", "md", "zip", "image")
+MAX_SHELL_BYTES = 64 * 1024
 # The item limit for a relay that does not say what it allows, and the
 # largest default a relay's answer can raise it to.
 DEFAULT_MAX_ITEM_BYTES = 25 * 1024 * 1024
@@ -230,7 +232,10 @@ class Session:
         versions with a PEP 440 specifier (``"cugrid==0.1.0"``, ``"numpy>=1.26,<3"``): runners
         install that version, or, with ``--python``, refuse to join an interpreter that has
         another. Jobs still name the package alone in ``requirements``, and each result's
-        ``env`` says which versions it ran with.
+        ``env`` says which versions it ran with. ``job_limits["kinds"]`` (``["python", "shell"]``;
+        absent means Python only) lets senders submit shell scripts too, with ``run_shell``, and
+        ``job_limits["workspace"]`` (``True``) lets runners that opt in keep each sender's work
+        directory between jobs.
 
         **Save the owner invite.** ``session.invites["owner"]`` is the only way to approve
         runners, mint more invites, revoke a role or close the session later: it holds the
@@ -537,7 +542,8 @@ class Session:
     def _seal(self, kind: str, subkind: Optional[str], meta: dict, body: bytes, refs: Iterable[dict]):
         """Returns ``(item_id, envelope_json, blob, frame)``."""
         allowed = self.manifest["allowed_types"]
-        needed = {"text": "text", "file": subkind, "job": "py"}.get(kind)
+        # A shell job (`sh`) needs the session's kinds, not a content type.
+        needed = {"text": "text", "file": subkind, "job": "py" if subkind == "py" else None}.get(kind)
         if needed is not None and needed not in allowed:
             raise ac.PolicyError(f"{needed} is not allowed in this session (allowed: {', '.join(allowed)})")
         payload = ac.encode_payload(json.dumps(meta), body)
@@ -598,13 +604,16 @@ class Session:
                     approved=approved and not r["rejected"],
                     rejected=r["rejected"] or approvals.get(pub) is False,
                     online=r["online"],
-                    job=r["job"],
+                    jobs=[j for j in r.get("jobs") or [] if isinstance(j, str)],
+                    slots=int(info.get("slots") or 1),
                     description=join.get("description"),
                     state=r.get("state"),
                     # The relay caps it, but the relay is not trusted either.
                     detail=r["detail"][:300] if isinstance(r.get("detail"), str) else None,
                     version=info.get("version"),
                     python=info.get("python"),
+                    kinds=list(info.get("kinds") or ["python"]),
+                    shell=info.get("shell"),
                 )
             )
         return out
@@ -691,6 +700,11 @@ class Session:
         memory_mb: Optional[int] = None,
         requirements: Iterable[str] = (),
         progress_file: Optional[str] = None,
+        cwd: Optional[str] = None,
+        fresh: bool = False,
+        tree: Union[str, Path, "_tree.Tree", None] = None,
+        tree_allow: Iterable[str] = (),
+        tree_exclude: Iterable[str] = (),
     ) -> Job:
         """Submit Python to a runner. ``files`` are item references from
         ``send_file`` (ZIPs are unpacked into the work dir). Target one
@@ -702,8 +716,74 @@ class Session:
 
         ``progress_file`` names a file in the job's work dir (``"logs/run.log"``)
         whose tail the runner posts while the job runs; read it with
-        ``Job.progress()`` or ``Job.wait(on_progress=...)``."""
+        ``Job.progress()`` or ``Job.wait(on_progress=...)``. ``cwd``, ``fresh``
+        and ``tree`` are as for ``run_shell``."""
+        return self._run_job(
+            "python", code, filename, files, runner, labels, timeout, memory_mb, requirements, progress_file, cwd,
+            fresh, tree, tree_allow, tree_exclude,
+        )
+
+    def run_shell(
+        self,
+        script: str,
+        *,
+        filename: str = "job.sh",
+        files: Iterable[dict] = (),
+        runner: Optional[Union[Runner, str]] = None,
+        labels: Optional[Iterable[str]] = None,
+        timeout: Optional[int] = None,
+        memory_mb: Optional[int] = None,
+        progress_file: Optional[str] = None,
+        cwd: Optional[str] = None,
+        fresh: bool = False,
+        tree: Union[str, Path, "_tree.Tree", None] = None,
+        tree_allow: Iterable[str] = (),
+        tree_exclude: Iterable[str] = (),
+    ) -> Job:
+        """Submit a shell script (at most 64 KiB) to a runner, as ``airlox run -- COMMAND`` does.
+        The session must allow it (``job_limits["kinds"]`` has ``"shell"``) and the runner must
+        offer it (``Runner.kinds``, ``Runner.shell``): the runner runs the script with
+        ``sh -e -c`` (``pwsh -NoProfile -Command`` on Windows) and the tools of its own sandbox,
+        so nothing is installed for it. ``filename`` is only for display.
+
+        The relay only routes a shell job to a runner whose signed join says it runs them; with
+        none online and free, this raises ``NoRunnerAvailable`` (or ``RunnerBusy``).
+
+        ``tree`` sends a working tree along, as ``airlox run --tree`` does: a directory (its
+        git repository's tracked and untracked files, ignored ones left out; outside a
+        repository every file under it but ``.git``) or a ``Tree`` from ``airlox.tree.build``.
+        It refuses files named like credentials (``.env``, ``*.pem``…) unless ``tree_allow``
+        names them; ``tree_exclude`` and ``.airloxignore`` leave files out. The job starts in
+        that directory within the tree unless ``cwd`` says otherwise. In a session with
+        workspaces, a later job to the same runner sends only the files that changed; if the
+        runner's workspace turns out not to be as this client left it, ``Job.wait`` sends the
+        whole tree once.
+
+        ``cwd`` is a relative folder of the work dir (``"build/out"``, which must exist) to start
+        in, and ``fresh=True`` has a runner that keeps your workspace empty it first; both matter
+        only in sessions with ``job_limits["workspace"]``. The other arguments are those of
+        ``run_python``, without ``requirements``: a shell job installs nothing."""
+        return self._run_job(
+            "shell", script, filename, files, runner, labels, timeout, memory_mb, (), progress_file, cwd, fresh,
+            tree, tree_allow, tree_exclude,
+        )
+
+    def _run_job(
+        self, kind, code, filename, files, runner, labels, timeout, memory_mb, requirements, progress_file, cwd, fresh,
+        tree=None, tree_allow=(), tree_exclude=(), whole_tree=False,
+    ) -> Job:
+        # Used twice if the tree must be sent again whole.
+        files, requirements = list(files), list(requirements)
+        labels = None if labels is None else list(labels)
         limits = self._require_execute()
+        allowed = limits.get("kinds") or ["python"]
+        if kind not in allowed:
+            raise ac.PolicyError(
+                f"this session does not allow {kind} jobs (it allows {', '.join(allowed)}); "
+                "the owner sets job kinds when creating it"
+            )
+        if kind == "shell" and len(code.encode("utf-8")) > MAX_SHELL_BYTES:
+            raise ValueError("a shell script is at most 64 KiB")
         if runner is not None and labels is not None:
             raise ValueError("pass runner or labels, not both")
         if runner is not None:
@@ -713,11 +793,17 @@ class Session:
                 # The relay may still route to it (if posting the owner's
                 # signed approval failed); it would get the code only to refuse.
                 raise ac.PolicyError(f"runner {r.name} has no signed approval from the owner yet")
+            if kind not in r.kinds:
+                raise ac.PolicyError(f"runner {r.name} does not run {kind} jobs")
             target = {"type": "runner", "participant_pub": r.participant_pub, "name": r.name}
         elif labels is not None:
             target = {"type": "labels", "labels": list(labels)}
         else:
             target = {"type": "any"}
+        if tree is not None and not isinstance(tree, _tree.Tree):
+            tree = _tree.build(tree, allow=tree_allow, exclude=tree_exclude)
+        if tree is not None and cwd is None:
+            cwd = tree.cwd
         meta = {
             "type": "job",
             "filename": filename,
@@ -729,10 +815,23 @@ class Session:
             "requirements": list(requirements),
             "target": target,
         }
-        # Absent rather than null: the canonical form leaves it out.
+        delta = False
+        if tree is not None:
+            zip_data, delta = self._tree_zip(tree, kind, target, fresh or whole_tree)
+            ref = self.send_file(zip_data, name=_tree.TREE_ZIP)
+            meta["files"].insert(0, ref)
+            meta["tree"] = ref
+        # Absent rather than null or false: the canonical form leaves them
+        # out, so a plain Python job is what older runners accept.
+        if kind != "python":
+            meta["kind"] = kind
         if progress_file is not None:
             meta["progress_file"] = progress_file
-        _, env, blob, frame = self._seal("job", "py", meta, b"", [])
+        if cwd is not None:
+            meta["cwd"] = cwd
+        if fresh:
+            meta["fresh"] = True
+        _, env, blob, frame = self._seal("job", "sh" if kind == "shell" else "py", meta, b"", [])
         job = Job(self, json.loads(ac.item_ref(env, blob)), meta)
         try:
             resp = self._req("POST", "/jobs", content=frame, headers={"Airlox-Target": json.dumps(target)})
@@ -743,7 +842,66 @@ class Session:
                 raise NoRunnerAvailable(job, e.message) from None
             raise
         job.runner = resp.json().get("runner")
+        if tree is not None:
+            job.tree = tree
+            if job.runner and limits.get("workspace"):
+                self._cache.save_held(job.runner, job.id, tree.listing())
+            if delta:
+                # If the workspace is not as expected, send the tree whole.
+                args = (kind, code, filename, files, runner, labels, timeout, memory_mb, requirements, progress_file)
+                job._resend_whole = lambda: self._run_job(*args, cwd, fresh, tree, whole_tree=True)
         return job
+
+    def _tree_zip(self, tree: "_tree.Tree", kind: str, target: dict, whole: bool):
+        """The zip to send for ``tree``, and whether it is a delta: only the
+        files that differ from what this client's workspace on the runner
+        should hold, when the session keeps workspaces, one runner can take
+        the job (it is named, or it is the only approved one that matches and
+        runs ``kind``), ``whole`` is false (a ``fresh`` job, or a resend), and
+        this client knows what it left there."""
+        data, delta = tree.zip, False
+        if self.manifest["job_limits"].get("workspace") and not whole:
+            if target["type"] == "runner":
+                pubs = [target["participant_pub"]]
+            else:
+                want = target.get("labels") or []
+                pubs = [
+                    r.participant_pub
+                    for r in self.runners()
+                    if r.approved and not r.rejected and kind in r.kinds and all(l in r.labels for l in want)
+                ]
+            held = self._cache.load_held(pubs[0]) if len(pubs) == 1 else None
+            # Only what a result confirmed: a job never waited for may not have run.
+            got = tree.delta(held["files"]) if held is not None and held.get("seen") else None
+            if got is not None:
+                data, delta = got[0], True
+        # Whole, even when a delta goes: a stale workspace is answered by
+        # sending the tree whole.
+        limit = self.manifest["max_item_bytes"] - 4096
+        if len(tree.zip) > limit:
+            largest = ", ".join(f"{p} ({n} bytes)" for p, n in tree.largest)
+            raise ValueError(
+                f"the tree zips to {len(tree.zip)} bytes, over the session's item limit of {limit}. "
+                f"Largest files: {largest}. Leave some out with tree_exclude or a line in .airloxignore"
+            )
+        return data, delta
+
+    def _tree_result(self, job: Job, result) -> None:
+        """Learn from a job's result what its runner's workspace now holds:
+        the tree less the files the result says changed. A result that does
+        not say (refused, too many changes, no workspace) forgets it, so the
+        next tree goes whole."""
+        if not result.signed or not result.runner:
+            return
+        held = self._cache.load_held(result.runner)
+        if held is None or held.get("job") != job.id:
+            return
+        changed = ((result.env or {}).get("tree") or {}).get("changed")
+        if isinstance(changed, list):
+            files = {p: h for p, h in held["files"].items() if p not in changed}
+            self._cache.save_held(result.runner, job.id, files, seen=True)
+        else:
+            self._cache.forget_held(result.runner)
 
     def run_file(self, path: Union[str, Path], **kw) -> Job:
         """``run_python`` with a local ``.py`` file as the entry point."""

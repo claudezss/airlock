@@ -104,3 +104,29 @@ test("seal in wasm, open with vectors key", () => {
   assert.deepEqual(ac.openItem(key, out.envelope, out.blob), payload);
   assert.equal(errClass(() => ac.checkHeader(MANIFEST, CERTS.observer.signed_canonical, out.envelope, out.blob)), "PolicyError");
 });
+
+test("shell jobs, as the browser sends them, need the manifest to allow them", () => {
+  // The same session (same owner seed) with kinds and workspaces in its job limits.
+  const params = structuredClone(VEC.inputs.session_params);
+  Object.assign(params.job_limits, { kinds: ["python", "shell"], workspace: true });
+  const shellManifest = ac.createSession(JSON.stringify(params), b64d(VEC.inputs.owner_seed)).signedManifest;
+  const key = b64d(VEC.session.session_key);
+  const job = {
+    type: "job", kind: "shell", filename: "job.sh", code: "make test\n", runtime: "python3.12", timeout_s: 30,
+    memory_mb: null, files: [], requirements: [], cwd: "build", fresh: true, target: { type: "any" },
+  };
+  const seal = (subkind) =>
+    ac.sealItem(
+      key,
+      b64d(CERTS.sender.participant_seed),
+      JSON.stringify({ id: ac.newItemId(), session_id: VEC.session.session_id, kind: "job", subkind, created_at_ms: VEC.inputs.session_params.created_at_ms + 50 }),
+      ac.encodePayload(JSON.stringify(job), new Uint8Array()),
+    );
+  const sh = seal("sh");
+  const opened = ac.openChecked(shellManifest, CERTS.sender.signed_canonical, key, sh.envelope, sh.blob);
+  assert.equal(opened.role, "sender");
+  assert.equal(JSON.parse(opened.meta).kind, "shell");
+  assert.equal(errClass(() => ac.openChecked(MANIFEST, CERTS.sender.signed_canonical, key, sh.envelope, sh.blob)), "PolicyError");
+  const py = seal("py");
+  assert.notEqual(errClass(() => ac.openChecked(shellManifest, CERTS.sender.signed_canonical, key, py.envelope, py.blob)), null);
+});

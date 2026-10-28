@@ -237,6 +237,18 @@ fn check_result_for_job(
     .map_err(err)
 }
 
+/// Raises if `path` would be refused as a ZIP entry name.
+#[pyfunction]
+fn check_zip_path(path: &str) -> PyResult<()> {
+    api::check_zip_path(path).map_err(err)
+}
+
+/// Raises if `path` is not a valid job `cwd`.
+#[pyfunction]
+fn check_cwd(path: &str) -> PyResult<()> {
+    api::check_cwd(path).map_err(err)
+}
+
 /// Returns a JSON array of {path, size, compressed_size, is_dir}.
 #[pyfunction]
 fn inspect_zip(py: Python<'_>, data: &[u8]) -> PyResult<String> {
@@ -321,6 +333,8 @@ fn core_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(item_ref, m)?)?;
     m.add_function(wrap_pyfunction!(check_result_for_job, m)?)?;
     m.add_function(wrap_pyfunction!(inspect_zip, m)?)?;
+    m.add_function(wrap_pyfunction!(check_zip_path, m)?)?;
+    m.add_function(wrap_pyfunction!(check_cwd, m)?)?;
     m.add_function(wrap_pyfunction!(extract_zip, m)?)?;
     m.add_function(wrap_pyfunction!(sanitize_image, m)?)?;
     m.add_function(wrap_pyfunction!(shim_source, m)?)?;

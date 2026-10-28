@@ -141,7 +141,7 @@ impl ItemHeader {
             (self.kind, self.subkind),
             (ItemKind::Text, None)
                 | (ItemKind::File, Some(C::Py | C::Md | C::Zip | C::Image))
-                | (ItemKind::Job, Some(C::Py))
+                | (ItemKind::Job, Some(C::Py | C::Sh))
                 | (ItemKind::Result, None)
                 | (ItemKind::Event, None)
                 | (ItemKind::Progress, None)

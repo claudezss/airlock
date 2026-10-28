@@ -525,3 +525,66 @@ def test_an_item_given_up_on_wakes_you_when_it_arrives_after_all(relay, caches):
     gone[0], stuck.status = False, "ok"
     assert [i.text for i in coder.wait_for_messages(timeout=10, settle=0, pending_timeout=0.3)] == ["lost"]
     assert coder.wait_for_messages(timeout=1, settle=0, pending_timeout=0.3) == []
+
+
+def test_tree_globs_match_the_cli():
+    from airlox.tree import _credential_name, glob_match, pattern_matches
+
+    assert glob_match("*.pem", "server.pem") and not glob_match("*.pem", "a/server.pem")
+    assert glob_match(".env.*", ".env.local") and not glob_match(".env.*", ".env")
+    assert glob_match("id_rsa*", "id_rsa.pub")
+    assert glob_match("**/fixtures/*.bin", "tests/fixtures/a.bin") and glob_match("**/fixtures/*.bin", "fixtures/a.bin")
+    assert glob_match("data/**", "data/x/y.csv")
+    assert pattern_matches("*.pem", "certs/server.pem")
+    assert pattern_matches("fixtures", "tests/fixtures/big.bin")
+    assert pattern_matches("tests/fixtures", "tests/fixtures/big.bin")
+    assert not pattern_matches("tests/fixtures", "other/tests/fixtures/big.bin")
+    assert pattern_matches("/build/", "build/out.o") and not pattern_matches("/build/", "src/build/out.o")
+    for p in [".env", "app/.env.production", "deploy/key.pem", "id_rsa", ".netrc", "x/credentials.json",
+              ".ENV", "keys/ID_ED25519", "home/.aws/credentials", ".npmrc", "infra/prod.tfvars",
+              "u/.docker/config.json", ".kube/config"]:
+        assert _credential_name(p), p
+    for p in ["env.py", "README.md", "src/pem.rs", "credentials.json.example", "app/config.json", "kube/config"]:
+        assert not _credential_name(p), p
+
+
+def test_a_home_directory_outside_git_is_not_a_tree(tmp_path, monkeypatch):
+    from airlox.tree import TreeRefused, build
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows
+    (tmp_path / ".npmrc").write_text("//registry/:_authToken=x\n")
+    with pytest.raises(TreeRefused, match="home directory"):
+        build(tmp_path)
+
+
+def test_a_plain_directory_becomes_a_tree_and_a_delta_lists_everything(tmp_path):
+    import json as _json
+
+    from airlox.tree import TREE_JSON, build
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("print(1)\n")
+    (tmp_path / "run.sh").write_text("#!/bin/sh\n")
+    (tmp_path / "run.sh").chmod(0o755)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "HEAD").write_text("x")
+    (tmp_path / ".airloxignore").write_text("# comment\n*.log\n")
+    (tmp_path / "debug.log").write_text("x")
+    # Outside a repository the directory is the root, `.git` and ignored files left out.
+    t = build(tmp_path)
+    assert not t.in_git and t.cwd is None and t.json["head"] is None and t.json["dirty"]
+    assert sorted(t.listing()) == [".airloxignore", "run.sh", "src/a.py"]
+    modes = {f["path"]: f["mode"] for f in t.json["files"]}
+    assert modes["run.sh"] == 0o100755 and modes["src/a.py"] == 0o100644
+    airlox._core.inspect_zip(t.zip)
+    assert build(tmp_path).zip == t.zip, "the same files make the same zip"
+    assert sorted(build(tmp_path / "src").listing()) == ["a.py"]
+
+    held = dict(t.listing(), **{"src/a.py": "0" * 64})
+    data, n = t.delta(held)
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        assert sorted(z.namelist()) == [TREE_JSON, "src/a.py"] and n == 1
+        desc = _json.loads(z.read(TREE_JSON))
+    assert desc["delta"] is True and desc["count"] == 3 and len(desc["files"]) == 3
+    assert t.delta(t.listing())[1] == 0 and t.delta({}) is None

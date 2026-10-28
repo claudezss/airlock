@@ -9,6 +9,7 @@ readable only by the current user.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -110,6 +111,43 @@ class Cache:
         if not _ITEM_ID.fullmatch(item_id):
             raise ValueError(f"not an item id: {item_id!r}")
         _write_atomic(self.dir / "blobs" / item_id, blob)
+
+    # trees -----------------------------------------------------------
+    # What this client believes its workspace on a runner holds, shared with
+    # the CLI: ``trees/<hex runner key>.json`` = ``{"job", "files"}``, the tree
+    # its last job there sent less what that job's result said changed. Only a
+    # hint for sending less: the runner checks every file it relies on.
+    def _tree_file(self, runner: str) -> Optional[Path]:
+        try:
+            key = base64.urlsafe_b64decode(runner + "=" * (-len(runner) % 4))
+        except (ValueError, TypeError):
+            return None
+        return self.dir / "trees" / f"{key.hex()}.json" if len(key) == 32 else None
+
+    def load_held(self, runner: str) -> Optional[dict]:
+        p = self._tree_file(runner)
+        try:
+            held = json.loads(p.read_text()) if p else None
+        except (OSError, ValueError):
+            return None
+        return held if isinstance(held, dict) and isinstance(held.get("files"), dict) else None
+
+    def save_held(self, runner: str, job: str, files: dict, seen: bool = False) -> None:
+        """``seen``: the job's result said what the workspace holds; until
+        then ``files`` is only what was sent."""
+        p = self._tree_file(runner)
+        if p is None:
+            return
+        p.parent.mkdir(exist_ok=True)
+        _write_atomic(p, json.dumps({"job": job, "files": files, "seen": seen}).encode())
+
+    def forget_held(self, runner: str) -> None:
+        p = self._tree_file(runner)
+        if p is not None:
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
 
     def delete(self) -> None:
         shutil.rmtree(self.dir, ignore_errors=True)

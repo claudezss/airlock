@@ -87,6 +87,9 @@ pub enum ContentType {
     Md,
     Zip,
     Image,
+    /// A shell job's subkind. Never a file type, so never in `allowed_types`:
+    /// the manifest's `job_limits.kinds` decides whether shell jobs may run.
+    Sh,
 }
 
 impl ContentType {
@@ -97,8 +100,47 @@ impl ContentType {
             ContentType::Md => "md",
             ContentType::Zip => "zip",
             ContentType::Image => "image",
+            ContentType::Sh => "sh",
         }
     }
+}
+
+/// What a job is: Python run by the session's runtime, or a script run by
+/// the runner's shell with the sandbox's own tools.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum JobKind {
+    Python,
+    Shell,
+}
+
+impl JobKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JobKind::Python => "python",
+            JobKind::Shell => "shell",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "python" => Ok(JobKind::Python),
+            "shell" => Ok(JobKind::Shell),
+            _ => Err(Error::invalid("job kind", s)),
+        }
+    }
+
+    /// The job item's header subkind: `py` or `sh`.
+    pub fn subkind(&self) -> ContentType {
+        match self {
+            JobKind::Python => ContentType::Py,
+            JobKind::Shell => ContentType::Sh,
+        }
+    }
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Ceilings every runner must enforce. Only present in Execute mode.
@@ -117,12 +159,30 @@ pub struct JobLimits {
     pub packages: Vec<String>,
     pub return_out: bool,
     pub approve_runners: bool,
+    /// The kinds of job the session allows. Absent means `["python"]`, so
+    /// manifests from before shell jobs keep their meaning (and their
+    /// canonical form).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kinds: Option<Vec<JobKind>>,
+    /// Runners may keep each sender's work directory between jobs (protocol
+    /// §7, workspaces). Absent when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub workspace: bool,
 }
 
 impl JobLimits {
     /// Whether jobs may require the package with this normalized name.
     pub fn allows_package(&self, name: &str) -> bool {
         self.packages.iter().any(|p| crate::policy::allowlist_name(p) == name)
+    }
+
+    /// The kinds of job the session allows, `["python"]` when unsaid.
+    pub fn kinds(&self) -> Vec<JobKind> {
+        self.kinds.clone().unwrap_or_else(|| vec![JobKind::Python])
+    }
+
+    pub fn allows_kind(&self, k: JobKind) -> bool {
+        self.kinds().contains(&k)
     }
 }
 
@@ -138,6 +198,8 @@ impl Default for JobLimits {
             packages: vec![],
             return_out: true,
             approve_runners: true,
+            kinds: None,
+            workspace: false,
         }
     }
 }
@@ -227,6 +289,12 @@ impl Manifest {
         if self.allowed_types.is_empty() {
             return Err(Error::invalid("manifest", "allowed_types is empty"));
         }
+        if self.allows(ContentType::Sh) {
+            return Err(Error::invalid(
+                "manifest",
+                "sh is a job kind, not a content type; allow shell jobs with job_limits.kinds",
+            ));
+        }
         let mut seen = self.allowed_types.clone();
         seen.sort_by_key(|t| t.as_str());
         seen.dedup();
@@ -289,6 +357,17 @@ fn validate_job_limits(l: &JobLimits) -> Result<()> {
             return Err(Error::invalid("job_limits", format!("package {name:?} is listed twice")));
         }
         names.push(name);
+    }
+    if let Some(kinds) = &l.kinds {
+        if kinds.is_empty() {
+            return Err(Error::invalid("job_limits", "kinds is empty; leave it out for python only"));
+        }
+        let mut seen = kinds.clone();
+        seen.sort();
+        seen.dedup();
+        if seen.len() != kinds.len() {
+            return Err(Error::invalid("job_limits", "kinds has duplicates"));
+        }
     }
     Ok(())
 }

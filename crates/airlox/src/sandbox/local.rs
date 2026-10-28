@@ -13,6 +13,10 @@
 //!   whole process tree, and every process in it killed when the job ends.
 //!   Network cannot be blocked.
 //!
+//! Shell jobs run the host's own tools: on Linux the read-only binds of
+//! `/usr`, `/bin` and `/etc` inside the namespaces, elsewhere plain
+//! processes (on Windows `pwsh`, only when the operator opts in).
+//!
 //! The runtime is a `uv` virtual environment with the package allowlist,
 //! built once at prepare time, or the interpreter the operator names with
 //! `--python` (such as an existing venv's), which is checked against the
@@ -42,6 +46,9 @@ pub struct LocalOpts {
     pub python: Option<PathBuf>,
     /// Variables from the runner's environment that jobs also get.
     pub pass_env: Vec<String>,
+    /// Windows: the `pwsh` that runs shell jobs (`--shell pwsh`); without it
+    /// the runner offers Python jobs only.
+    pub pwsh: Option<PathBuf>,
 }
 
 pub struct Local {
@@ -354,7 +361,7 @@ fn symlinks_on_path(p: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn which(name: &str) -> Option<PathBuf> {
+pub(crate) fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     let names: Vec<String> =
         if cfg!(windows) { vec![format!("{name}.exe"), name.to_string()] } else { vec![name.to_string()] };
@@ -420,6 +427,16 @@ impl Local {
 
     pub fn sandboxed(&self) -> bool {
         self.opts.sandboxed
+    }
+
+    /// The shell shell jobs run under: `sh` here, `pwsh` on a Windows runner
+    /// whose operator asked for it.
+    pub fn shell(&self) -> Option<&'static str> {
+        if cfg!(windows) {
+            self.opts.pwsh.as_ref().map(|_| "pwsh")
+        } else {
+            Some("sh")
+        }
     }
 
     /// Where the runner keeps its runtime: its state, the interpreter's venv
@@ -668,8 +685,7 @@ impl Local {
                 shim: self.shim.clone(),
                 python: python.clone(),
                 runtime_dirs: self.runtime_dirs.clone(),
-                entry: job.entry.clone(),
-                timeout_s: job.timeout_s,
+                job_args: job.shim_job_args("/work", &format!("/meta/{}", super::SCRIPT_FILE)),
                 memory_mb: job.memory_mb,
                 network: job.network,
             };
@@ -681,16 +697,19 @@ impl Local {
         }
         let mut c = Command::new(python);
         // -I: the shim's own folder is not importable, nor PYTHON* honoured.
+        let work = job.work_dir().to_string_lossy().into_owned();
+        let script = job.meta_dir().join(super::SCRIPT_FILE).to_string_lossy().into_owned();
         c.arg("-I")
             .arg(&self.shim)
-            .arg("--work")
-            .arg(job.work_dir())
-            .args(["--entry", &job.entry, "--timeout", &job.timeout_s.to_string()])
+            .args(job.shim_job_args(&work, &script))
             .arg("--result")
             .arg(job.meta_dir().join("result.json"))
             .arg("--out")
             .arg(job.out_dir())
             .args(["--memory-mb", &job.memory_mb.to_string()]);
+        if let (Some(pwsh), true) = (&self.opts.pwsh, job.kind == airlox_core::payload::JobKind::Shell) {
+            c.arg("--shell-bin").arg(pwsh);
+        }
         for name in &self.opts.pass_env {
             c.args(["--pass-env", name]);
         }

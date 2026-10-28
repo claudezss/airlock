@@ -1,6 +1,12 @@
 # Machines: a job slot on your own hardware, for any agent
 
-Status: proposal. Builds on [DESIGN.md](../DESIGN.md) §6 (runner) and
+Status: implemented (M-A to M-E) in 0.2. Where the implementation differs: a sender invite cannot be rotated
+in place, because revoking a role is permanent and its invite is derived from
+the owner seed, so there is no `machine invite --rotate` (`machine rm` and
+`machine add` start over); and runners declare their `kinds` and shell in their
+signed join (a breaking change to the join), so `machine ls` shows them as
+soon as a runner joins. Originally a
+proposal. Builds on [DESIGN.md](../DESIGN.md) §6 (runner) and
 [protocol.md](../protocol.md) §7, §11 and §13. Nothing here changes the
 cryptography, the roles or the relay's blindness; it changes what a job may
 be, how its output arrives, what the runner keeps between jobs, and how a
@@ -220,9 +226,12 @@ upload; `--progress-rate 0` turns streaming off for a runner.
   `airlox run --tree -- pytest` from `services/api` runs there.
 - Before sending, the CLI prints the count and size and the names of up to
   five of the largest files. It refuses, by default, a tree that contains a
-  file matching a short built-in list of credential names (`.env`, `.env.*`,
-  `*.pem`, `id_rsa*`, `*.keystore`, `.netrc`, `credentials.json`) unless
-  `--tree-allow <glob>` names it, and `--tree-exclude <glob>` (repeatable,
+  file matching a built-in list of credential names, ignoring case (`.env`,
+  `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`, `*.keystore`,
+  `.netrc`, `.npmrc`, `.pypirc`, `credentials`, `credentials.json`,
+  `*.tfvars`, `.docker/config.json`, and a few more) unless
+  `--tree-allow <glob>` names it (the MCP tool cannot: an agent leaves such
+  files out), and `--tree-exclude <glob>` (repeatable,
   also read from `.airloxignore`) drops files. Untracked files are the usual
   home of secrets, which is why the default is to send them with a check
   rather than to leave them out: a test that needs a generated fixture
@@ -262,17 +271,17 @@ one directory per `(session, sender participant key)`:
   `--fresh` on `airlox run` asks for an empty workspace first.
 - `HOME` is the work dir, so tool caches accumulate there too.
 - Limits: `--workspace-max-mb` (default 10240) per workspace; a job that
-  leaves the workspace over the limit gets `status: completed` and the next
-  job from that sender is refused with `workspace_full` until it runs with
-  `--fresh`. `--workspace-ttl` (default 14 days idle) removes unused ones;
+  leaves the workspace over the limit gets `status: completed`, a note in
+  its stderr, and its workspace emptied, so the disk is not held until the
+  sender's next job. Nothing bounds a job's writes while it runs. `--workspace-ttl` (default 14 days idle) removes unused ones;
   closing the session removes all of it. A runner restart keeps workspaces.
 - Docker: the workspace is bind-mounted as `/work` rw in place of the
   per-job temp dir; the root stays read-only. Linux local: the pivoted root
   binds it the same way. Nothing changes in what the job may reach.
-- Two jobs from one sender cannot share a workspace at once. A runner takes
-  one job at a time today, so this holds; with concurrency (§14) the
-  workspace is a lock, and a second job from the same sender gets
-  `runner_busy` as it would from a busy runner.
+- Two jobs from one sender cannot share a workspace at once. A runner with
+  several slots (§14) holds a lock per workspace: a second job from the same
+  sender is refused with a signed `refused` result whose reason starts
+  `runner_busy:`, as a runner with no free slot would be.
 
 A job can leave something behind for the next job of the **same sender**.
 That is the same trust domain as the job that planted it, and no more than a
@@ -281,10 +290,20 @@ from each other by directory and, in the sandbox, by the bind; the runner
 operator's own files are as far from a workspace as they are from a temp
 dir today.
 
-Delta upload (sending only changed files) is a later milestone (§13): the
-runner would post a signed `workspace` event with the `sha256` list it holds,
-and the CLI would send only what differs. Full trees first; they are small
-for most repositories once ignored paths are out.
+Delta upload (sending only changed files) shipped as M-E, a little
+differently from first proposed. Instead of a separate signed `workspace`
+event listing every `sha256` the runner holds (one more item per job, as
+long as the tree's file list), the result the runner signs anyway carries
+`env.tree.changed`: the tree's files the job left different. The client
+remembers the tree it last sent to that runner, drops what the result says
+changed, and sends a zip of only the files that differ, with the full list
+in `tree.json` and `"delta": true`. The runner checks every file it is told
+to keep before writing anything, and refuses the job with `tree_stale` when
+one is not as listed (another client of the same identity, a lost
+workspace, a guess at the wrong runner); the client then sends the whole
+tree once. The client's memory is only a hint: correctness rests on the
+runner's check. Deltas go to a runner the job names, or to the only
+approved runner that matches (a machine's), never with `--fresh`.
 
 ## 8. Machines
 
@@ -312,7 +331,10 @@ claim (`POST /v1/drops/{nameplate}/claim`, §4.1) gains an optional
 `participant_pub`, which `runner join --code` sets to the key it will join
 with; the relay reports it to the code's creator (`session code --wait`
 already streams how a code ended). `machine add` approves exactly that key
-when it joins and leaves approval on for everyone else. This trusts the
+when it joins under the machine's name, and leaves approval on for everyone
+else. At a terminal it first shows the runner's name, host and key fingerprint
+and asks (`--yes` skips this), since a code on a screen can be read and used
+first by someone else. This trusts the
 relay to report the claimant honestly, which is the trust a code already
 places in it (it could recover the invite); it does not trust the relay with
 anything a link would not. A person who wants no such trust uses `--invite`
@@ -378,9 +400,10 @@ restarts, because the identity cache makes the job still "mine". Changes:
 - **Machines keep an owner invite on disk**, in a directory the MCP server
   cannot read, as `--owner-invite-dir` does today. A sender invite handed
   to a hosted agent is a secret with a bounded blast radius: submit
-  sandboxed jobs to approved runners until `machine rm`. Rotation is
-  `machine invite --rotate`, which revokes the sender role (DESIGN.md §4,
-  revocation) and issues a new one; runners are unaffected.
+  sandboxed jobs to approved runners until `machine rm`. There is no
+  rotation in place: revoking a role is permanent (DESIGN.md §4, revocation)
+  and the sender invite is derived from the owner seed, so a leaked sender
+  invite is answered by `machine rm` and a new `machine add`.
 - **Streaming reveals timing** of output to the relay (when chunks were
   posted and how large), as items always have. No plaintext.
 
@@ -403,7 +426,7 @@ working for what 0.1.x could do, and a 0.2 runner accepts 0.1.x jobs.
 | M-B | streamed chunks in `progress`, `run`/`result` printing, relay retention rules, web UI append | runner + relay + two clients |
 | M-C | `--tree` with checks, `cwd`, `env.tree`; workspaces with sync, limits, `--fresh` | CLI + runner; no protocol change beyond fields in M-A |
 | M-D | `machine add/ls/invite/approve/rm`, `--on`, drop-claim `participant_pub`, `runner serve`, `install-service`; README and skill rewritten around it | CLI + relay (small) + docs |
-| M-E | delta trees via signed `workspace` events; `job ls` | later, driven by use |
+| M-E | delta trees (via `env.tree.changed` in results, §7); `job ls` | done |
 
 M-A through M-D are each one to two weeks for one person familiar with the
 code. M-D is the one users see first and should not wait for M-E.
@@ -414,10 +437,19 @@ code. M-D is the one users see first and should not wait for M-E.
    Job Object limits are enough for arbitrary toolchains. Proposed: `pwsh`
    only, and a Windows runner reports `kinds: ["python"]` unless the operator
    passes `--shell pwsh`.
-2. **Concurrency.** One job per runner is a poor fit for a shared CI box.
-   `--concurrency N` with one workspace lock per sender is the natural
-   extension; the relay's `runner_busy` becomes "no free slot". Proposed:
-   after M-D.
+2. **Concurrency.** *Implemented.* One job per runner is a poor fit for a
+   shared CI box. `--concurrency N` (1 to 16, default 1; `--max-jobs` is an
+   alias) is the runner's `slots` in its signed join, and `machine add`
+   puts it in the printed command. The relay sends a runner at most `slots`
+   active jobs, preferring the least loaded runner, and `runner_busy`
+   means "no free slot". A runner's workspace is a lock per sender, kept by
+   the runner. Differences from the proposal: a second job from a sender
+   whose workspace is in use is refused by the runner, not the relay (the
+   relay cannot see content, only the author, and does not know whether a
+   runner keeps workspaces), so the sender sees a `refused` result with a
+   `runner_busy:` reason after it was routed; and the slots are fixed by
+   the join, so a runner changes them by joining again under a new name.
+   Memory and CPU limits are per job: size the host for all slots.
 3. **Chunk cost on the hosted relay.** 120 items a minute per running job
    is cheap in bytes and not in requests. If it shows in the relay's
    footprint measurement, raise the coalescing floor to 2 s before touching

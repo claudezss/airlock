@@ -77,8 +77,13 @@ pub fn new_session(mode: Mode, ttl_ms: u64) -> Sess {
 
 /// `None`: a session that never expires.
 pub fn new_session_ttl(mode: Mode, ttl_ms: Option<u64>) -> Sess {
+    new_session_with(mode, ttl_ms, |_| {})
+}
+
+/// A session whose parameters the caller adjusts first.
+pub fn new_session_with(mode: Mode, ttl_ms: Option<u64>, f: impl FnOnce(&mut SessionParams)) -> Sess {
     let secrets = SessionSecrets::generate();
-    let params = SessionParams {
+    let mut params = SessionParams {
         mode,
         created_at_ms: now_ms(),
         ttl_ms,
@@ -87,6 +92,7 @@ pub fn new_session_ttl(mode: Mode, ttl_ms: Option<u64>) -> Sess {
         job_limits: (mode == Mode::Execute).then(Default::default),
         insecure_http_host: None,
     };
+    f(&mut params);
     let signed = secrets.manifest(&params).unwrap();
     Sess { id: signed.manifest.session_id.clone(), manifest_json: canon(&signed), secrets }
 }

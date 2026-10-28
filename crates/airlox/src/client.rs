@@ -179,6 +179,19 @@ pub async fn receive_code(
     code: &str,
     allow_insecure_http: bool,
 ) -> Result<String> {
+    receive_code_as(http, relay, code, allow_insecure_http, None).await
+}
+
+/// [`receive_code`], telling the relay the participant key this machine
+/// will join with, which the relay reports to the code's creator (so
+/// `airlox machine add` can approve exactly this runner).
+pub async fn receive_code_as(
+    http: &reqwest::Client,
+    relay: &str,
+    code: &str,
+    allow_insecure_http: bool,
+    participant_pub: Option<&str>,
+) -> Result<String> {
     let code = airlox_core::transfer::Code::parse(code)?;
     let relay = relay.trim_end_matches('/');
     if airlox_core::invite::check_transport(relay, None).is_err() && !allow_insecure_http {
@@ -190,10 +203,12 @@ pub async fn receive_code(
             if ok { relay_text(relay) } else { format!("{} is not a relay URL", relay_text(relay)) }
         );
     }
-    let req = http
-        .post(format!("{relay}/v1/drops/{}/claim", code.nameplate))
-        .timeout(REQUEST_TIMEOUT)
-        .json(&serde_json::json!({"claim": code.claim()}));
+    let req = http.post(format!("{relay}/v1/drops/{}/claim", code.nameplate)).timeout(REQUEST_TIMEOUT).json(
+        &match participant_pub {
+            Some(p) => serde_json::json!({"claim": code.claim(), "participant_pub": p}),
+            None => serde_json::json!({"claim": code.claim()}),
+        },
+    );
     let r = match check(req.send().await?).await {
         Ok(r) => r,
         Err(e) => match status_of(&e) {
@@ -257,12 +272,22 @@ pub async fn send_code(http: &reqwest::Client, relay: &str, invite: &str) -> Res
 impl SentCode {
     /// `GET /v1/drops/{n}`: `waiting`, `picked_up`, `burned`, `cancelled` or `expired`.
     pub async fn state(&self, http: &reqwest::Client) -> Result<String> {
+        Ok(self.status(http).await?.0)
+    }
+
+    /// The state, and the participant key the claimant said it will join
+    /// with, if it said (relays and claimants before machines do not).
+    pub async fn status(&self, http: &reqwest::Client) -> Result<(String, Option<String>)> {
         let req = http
             .get(format!("{}/v1/drops/{}", self.relay, self.nameplate))
             .bearer_auth(&self.token)
             .timeout(REQUEST_TIMEOUT);
         let v = read_json(check(req.send().await?).await?).await?;
-        Ok(v["state"].as_str().unwrap_or("unknown").to_string())
+        let claimant = v["participant_pub"]
+            .as_str()
+            .filter(|p| airlox_core::keys::PublicKey::from_b64(p).is_ok())
+            .map(String::from);
+        Ok((v["state"].as_str().unwrap_or("unknown").to_string(), claimant))
     }
 
     /// `DELETE /v1/drops/{n}`: the code stops working.
@@ -373,16 +398,19 @@ impl Relay {
         }
     }
 
-    pub async fn heartbeat(&self, job: Option<&str>) -> Result<Value> {
-        self.send_heartbeat(serde_json::json!({ "job": job })).await
+    /// Say which jobs the runner is working on: the relay fails a running
+    /// job that is not named.
+    pub async fn heartbeat(&self, jobs: &[String]) -> Result<Value> {
+        self.send_heartbeat(serde_json::json!({ "jobs": jobs })).await
     }
 
     /// A heartbeat that also reports the runner's setup (`preparing`,
     /// `ready`, `failed`), so the session sees a runner that cannot start.
-    /// `job` is one it still owes an answer for (from before a restart), so
-    /// the relay does not count that job lost while the answer is on its way.
-    pub async fn report(&self, state: &str, detail: Option<&str>, job: Option<&str>) -> Result<Value> {
-        self.send_heartbeat(serde_json::json!({ "job": job, "state": state, "detail": detail })).await
+    /// `jobs` are the ones it still owes an answer for (from before a
+    /// restart), so the relay does not count them lost while the answers are
+    /// on their way.
+    pub async fn report(&self, state: &str, detail: Option<&str>, jobs: &[String]) -> Result<Value> {
+        self.send_heartbeat(serde_json::json!({ "jobs": jobs, "state": state, "detail": detail })).await
     }
 
     async fn send_heartbeat(&self, body: Value) -> Result<Value> {

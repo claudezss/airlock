@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use airlox_core::api;
-use airlox_core::session::{JobLimits, Manifest, Mode, Role, SessionParams, SignedManifest};
+use airlox_core::cert::MAX_SLOTS;
+use airlox_core::session::{JobKind, JobLimits, Manifest, Mode, Role, SessionParams, SignedManifest};
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -88,6 +89,22 @@ pub fn default_cache_root() -> PathBuf {
 /// never written.
 struct Cache {
     dir: PathBuf,
+}
+
+/// What this client believes its workspace on one runner holds: the tree
+/// its last job there sent, less what that job's result said changed. Only
+/// a hint for sending less: the runner checks every file it relies on.
+#[derive(Serialize, Deserialize)]
+struct Held {
+    /// The job that sent the tree; only its result updates this.
+    job: String,
+    /// Path to hex SHA-256.
+    files: HashMap<String, String>,
+    /// That job's result has been seen: until then `files` is only what was
+    /// sent, and a job that never ran (or ran on a runner that keeps no
+    /// workspace) leaves nothing.
+    #[serde(default)]
+    seen: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -189,6 +206,29 @@ impl Cache {
             bail!("not an item id: {id:?}");
         }
         write_atomic(&self.dir.join("blobs").join(id), blob, 0o600)
+    }
+
+    /// Where what this client believes its workspace on `runner` holds is
+    /// kept; `None` for a key that is not one.
+    fn tree_file(&self, runner: &str) -> Option<PathBuf> {
+        let key = airlox_core::keys::PublicKey::from_b64(runner).ok()?;
+        Some(self.dir.join("trees").join(format!("{}.json", airlox_core::encoding::hex(&key.to_bytes()))))
+    }
+
+    fn load_held(&self, runner: &str) -> Option<Held> {
+        serde_json::from_slice(&fs::read(self.tree_file(runner)?).ok()?).ok()
+    }
+
+    fn save_held(&self, runner: &str, held: &Held) -> Result<()> {
+        let path = self.tree_file(runner).context("not a runner key")?;
+        fs::create_dir_all(path.parent().expect("under trees/"))?;
+        write_atomic(&path, &serde_json::to_vec(held)?, 0o600)
+    }
+
+    fn forget_held(&self, runner: &str) {
+        if let Some(p) = self.tree_file(runner) {
+            let _ = fs::remove_file(p);
+        }
     }
 
     /// Delete caches of sessions whose manifest has expired.
@@ -421,8 +461,12 @@ pub struct Runner {
     pub approved: bool,
     pub rejected: bool,
     pub online: bool,
-    /// The job it is running, per the relay.
-    pub job: Option<String>,
+    /// The jobs it is running, per the relay.
+    pub jobs: Vec<String>,
+    /// How many jobs it runs at once, from its signed join.
+    pub slots: u32,
+    /// Every slot is taken: a new job for it is refused (`runner_busy`).
+    pub busy: bool,
     /// Its setup as it reported it (`preparing`, `ready`, `failed`, or
     /// `None` for runners that do not say), and why it failed: the runner's
     /// own unsigned word, via the relay.
@@ -432,6 +476,10 @@ pub struct Runner {
     /// signed join, when it said.
     pub version: Option<String>,
     pub python: Option<String>,
+    /// The kinds of job it runs and the shell for `shell` jobs, from its
+    /// signed join.
+    pub kinds: Vec<String>,
+    pub shell: Option<String>,
 }
 
 /// Which runner a job goes to.
@@ -443,6 +491,8 @@ pub enum Target {
 }
 
 pub struct JobSpec {
+    /// `python`, or `shell` for a script run by the runner's shell.
+    pub kind: JobKind,
     pub code: String,
     pub filename: String,
     /// Item references from `send_file`.
@@ -453,9 +503,35 @@ pub struct JobSpec {
     pub requirements: Vec<String>,
     /// A file in the work dir whose tail the runner reports while the job runs.
     pub progress_file: Option<String>,
+    /// Where in the work dir the job starts (relative); `None` for the work dir.
+    pub cwd: Option<String>,
+    /// The reference (one of `files`) of the working tree sent with the job.
+    pub tree: Option<Value>,
+    /// Empty the sender's workspace on the runner before the job runs.
+    pub fresh: bool,
 }
 
-/// No approved, online, idle runner matched; jobs are never queued.
+/// A piece of a running job's output, as its runner streamed it. Display
+/// only: the signed result's stdout and stderr are the authority.
+#[derive(Clone, Debug, Serialize)]
+pub struct Chunk {
+    /// `stdout` or `stderr`.
+    pub stream: String,
+    pub offset: u64,
+    pub data: String,
+    /// The runner stopped streaming after this chunk; the result has the rest.
+    pub truncated: bool,
+}
+
+/// Where a job's streamed output has been read up to, per stream.
+#[derive(Clone, Debug, Default)]
+pub struct ChunkCursor {
+    next: HashMap<String, u64>,
+    /// Items already looked at, so each poll only reads new ones.
+    seen: HashSet<String>,
+}
+
+/// No approved, online runner with a free slot matched; jobs are never queued.
 #[derive(Debug)]
 pub struct NoRunnerAvailable {
     pub job: String,
@@ -470,7 +546,7 @@ impl std::fmt::Display for NoRunnerAvailable {
         if self.reason == "runner_busy" {
             write!(
                 f,
-                "runner busy: {message}; jobs are not queued. Retry when 'airlox runner list' shows it idle."
+                "runner busy: {message}; jobs are not queued. Retry when 'airlox runner list' shows it has a free slot."
             )
         } else {
             write!(f, "no runner available: {message:?}")
@@ -604,6 +680,59 @@ impl Outcome {
     pub fn runner_lost(&self) -> bool {
         !self.signed && self.reason.as_deref() == Some("runner_lost")
     }
+}
+
+/// [`Session::chunks`], over a list of items.
+/// Only items `from_runner` accepts count: chunks are display, but they reach
+/// terminals and agents.
+fn chunks_in(
+    items: &[Item],
+    job: &str,
+    cursor: &mut ChunkCursor,
+    from_runner: impl Fn(&Item) -> bool,
+) -> Vec<Chunk> {
+    let mut fresh: Vec<Chunk> = Vec::new();
+    for item in items {
+        if item.kind != "progress" || item.status != Status::Ok || cursor.seen.contains(&item.id) {
+            continue;
+        }
+        let Some(m) = item.meta.as_ref() else { continue };
+        if m["job"]["id"] != job || item.author_role.as_deref() != Some("runner") || !from_runner(item) {
+            continue;
+        }
+        cursor.seen.insert(item.id.clone());
+        let (Some(stream), Some(offset), Some(data)) =
+            (m["stream"].as_str(), m["offset"].as_u64(), m["data"].as_str())
+        else {
+            continue;
+        };
+        fresh.push(Chunk {
+            stream: stream.into(),
+            offset,
+            data: data.into(),
+            truncated: m["truncated"].as_bool().unwrap_or(false),
+        });
+    }
+    fresh.sort_by_key(|c| c.offset);
+    let mut out = Vec::new();
+    for mut c in fresh {
+        let next = cursor.next.entry(c.stream.clone()).or_insert(0);
+        let end = c.offset + c.data.len() as u64;
+        if end <= *next && !c.truncated {
+            continue;
+        }
+        if c.offset < *next {
+            let mut skip = (*next - c.offset) as usize;
+            while skip < c.data.len() && !c.data.is_char_boundary(skip) {
+                skip += 1;
+            }
+            c.data.drain(..skip.min(c.data.len()));
+            c.offset = *next;
+        }
+        *next = (*next).max(end);
+        out.push(c);
+    }
+    out
 }
 
 // -------------------------------------------------------------- session --
@@ -1064,7 +1193,7 @@ impl Session {
 
     // ------------------------------------------------------ execute mode --
 
-    fn limits(&self) -> Result<&JobLimits> {
+    pub fn limits(&self) -> Result<&JobLimits> {
         if self.manifest.mode != Mode::Execute {
             bail!("this session is in relay mode; it has no runners");
         }
@@ -1090,6 +1219,12 @@ impl Session {
             let info = &join["runner"];
             let public = join["cert"]["cert"]["participant_pub"].as_str().unwrap_or_default().to_string();
             let rejected_relay = r["rejected"].as_bool().unwrap_or(false);
+            // The relay's word on what it runs; the slots are the runner's own, signed.
+            let jobs: Vec<String> = r["jobs"]
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_str).take(64).map(String::from).collect())
+                .unwrap_or_default();
+            let slots = info["slots"].as_u64().map_or(1, |n| n.clamp(1, MAX_SLOTS as u64) as u32);
             let approved = if required { approvals.get(&public) == Some(&true) } else { !rejected_relay };
             out.push(Runner {
                 name: info["name"].as_str().unwrap_or_default().into(),
@@ -1101,7 +1236,9 @@ impl Session {
                 approved: approved && !rejected_relay,
                 rejected: rejected_relay || approvals.get(&public) == Some(&false),
                 online: r["online"].as_bool().unwrap_or(false),
-                job: r["job"].as_str().map(String::from),
+                busy: jobs.len() >= slots as usize,
+                jobs,
+                slots,
                 state: r["state"].as_str().map(String::from),
                 // The relay caps it, but the relay is not trusted either.
                 detail: r["detail"].as_str().map(|d| match d.char_indices().nth(MAX_DETAIL_CHARS) {
@@ -1110,13 +1247,57 @@ impl Session {
                 }),
                 version: info["version"].as_str().map(String::from),
                 python: info["python"].as_str().map(String::from),
+                kinds: serde_json::from_value(info["kinds"].clone()).unwrap_or_default(),
+                shell: info["shell"].as_str().map(String::from),
                 participant_pub: public,
             });
         }
         Ok(out)
     }
 
-    async fn runner(&mut self, which: &str) -> Result<Runner> {
+    /// What this client's workspace on `runner` (a key) should hold, path to
+    /// hex SHA-256; `None` when it does not know.
+    /// What this client's workspace on `runner` holds, as far as a result
+    /// has said. A tree sent without waiting for its result (`--no-wait`) is
+    /// checked first.
+    pub async fn held_tree(&mut self, runner: &str) -> Option<HashMap<String, String>> {
+        let held = self.cache.load_held(runner)?;
+        if held.seen {
+            return Some(held.files);
+        }
+        // Learns the result, if it is in (poll_job calls tree_result).
+        let _ = self.poll_job(&held.job).await;
+        self.cache.load_held(runner).filter(|h| h.seen).map(|h| h.files)
+    }
+
+    /// `job`, which carries a tree of `files`, went to `runner`: once it
+    /// runs, that is what the workspace holds.
+    pub fn sent_tree(&self, runner: &str, job: &str, files: HashMap<String, String>) {
+        if let Err(e) = self.cache.save_held(runner, &Held { job: job.into(), files, seen: false }) {
+            tracing::debug!("could not remember the tree sent: {e:#}");
+        }
+    }
+
+    /// Learn from a job's result what its runner's workspace now holds: the
+    /// tree less the files the result says changed. A result that does not
+    /// say (refused, too many changes, no workspace) forgets it, so the
+    /// next tree goes whole.
+    pub fn tree_result(&self, o: &Outcome) {
+        let Some(runner) = o.runner.as_deref().filter(|_| o.signed) else { return };
+        let Some(mut held) = self.cache.load_held(runner).filter(|h| h.job == o.job) else { return };
+        match o.env.as_ref().and_then(|e| e.tree.as_ref()).and_then(|t| t.changed.as_ref()) {
+            Some(changed) => {
+                for p in changed {
+                    held.files.remove(p);
+                }
+                held.seen = true;
+                let _ = self.cache.save_held(runner, &held);
+            }
+            None => self.cache.forget_held(runner),
+        }
+    }
+
+    pub async fn runner(&mut self, which: &str) -> Result<Runner> {
         let matches: Vec<Runner> = self
             .runners()
             .await?
@@ -1128,6 +1309,31 @@ impl Session {
             0 => bail!("no runner matches {which:?}"),
             _ => bail!("more than one runner matches {which:?}; use its key"),
         }
+    }
+
+    /// The shells (`sh`, `pwsh`) of the runners a shell job for `target`
+    /// could go to, from their signed joins: the online ones, or all of them
+    /// when none is online. Empty when none matches.
+    pub async fn target_shells(&mut self, target: &Target) -> Result<Vec<String>> {
+        let runners: Vec<Runner> = match target {
+            Target::Runner(which) => match self.runner(which).await {
+                Ok(r) => vec![r],
+                // `run_job` says why.
+                Err(_) => vec![],
+            },
+            Target::Labels(l) => {
+                self.runners().await?.into_iter().filter(|r| l.iter().all(|l| r.labels.contains(l))).collect()
+            }
+            Target::Any => self.runners().await?,
+        };
+        let runners: Vec<Runner> =
+            runners.into_iter().filter(|r| !r.rejected && r.kinds.iter().any(|k| k == "shell")).collect();
+        let online = runners.iter().any(|r| r.online);
+        let mut shells: Vec<String> =
+            runners.into_iter().filter(|r| r.online || !online).filter_map(|r| r.shell).collect();
+        shells.sort();
+        shells.dedup();
+        Ok(shells)
     }
 
     /// Let a runner take jobs (owner only): the relay's approval, then a
@@ -1152,10 +1358,19 @@ impl Session {
         Ok(r)
     }
 
-    /// Submit Python to a runner. Returns the job's item id and the runner
+    /// Submit a job to a runner. Returns the job's item id and the runner
     /// the relay assigned, or `NoRunnerAvailable` at once if none matched.
-    pub async fn run_python(&mut self, spec: JobSpec) -> Result<(String, Option<String>)> {
+    pub async fn run_job(&mut self, spec: JobSpec) -> Result<(String, Option<String>)> {
         let limits = self.limits()?.clone();
+        if !limits.allows_kind(spec.kind) {
+            let kinds: Vec<&str> = limits.kinds().iter().map(|k| k.as_str()).collect();
+            bail!(
+                "this session does not allow {} jobs (it allows {}); the owner sets job kinds when creating it \
+                 (--kinds, or --profile host-runner)",
+                spec.kind.as_str(),
+                kinds.join(", ")
+            );
+        }
         let target = match &spec.target {
             Target::Runner(which) => {
                 let r = self.runner(which).await?;
@@ -1185,11 +1400,25 @@ impl Session {
             "requirements": spec.requirements,
             "target": target,
         });
-        // Absent rather than null: the canonical form leaves it out.
+        // Absent rather than null or false: the canonical form leaves them
+        // out, so a plain Python job is what older runners accept.
         if let Some(p) = &spec.progress_file {
             meta["progress_file"] = json!(p);
         }
-        let (id, _, _, frame) = self.seal("job", Some("py"), &meta, b"", vec![])?;
+        if spec.kind != JobKind::Python {
+            meta["kind"] = json!(spec.kind.as_str());
+        }
+        if let Some(c) = &spec.cwd {
+            meta["cwd"] = json!(c);
+        }
+        if let Some(t) = &spec.tree {
+            meta["tree"] = t.clone();
+        }
+        if spec.fresh {
+            meta["fresh"] = json!(true);
+        }
+        let subkind = spec.kind.subkind().as_str();
+        let (id, _, _, frame) = self.seal("job", Some(subkind), &meta, b"", vec![])?;
         match self.relay.post_raw("/jobs", frame, &[("Airlox-Target", target.to_string())]).await {
             Ok(resp) => {
                 let v: Value = client::read_capped(resp, 64 << 10)
@@ -1310,16 +1539,52 @@ impl Session {
         None
     }
 
-    /// Wait for a job's outcome. A job that failed on the relay (no runner,
-    /// runner lost, cancelled before it started) gives an unsigned outcome
-    /// with the relay's reason. `None` if `timeout` passes first. A
-    /// `runner_lost` outcome ([`Outcome::runner_lost`]) is not final: a
-    /// late signed result still completes the job.
-    pub async fn wait(&mut self, job: &str, timeout: Option<Duration>) -> Result<Option<Outcome>> {
+    /// The output chunks of `job` that arrived since `cursor` last looked,
+    /// in stream order. A chunk that overlaps what was already shown is cut
+    /// to its new part; one after a gap (a chunk the relay dropped before
+    /// this client fetched it) is shown anyway.
+    pub fn chunks(&self, job: &str, cursor: &mut ChunkCursor) -> Vec<Chunk> {
+        let Some(job_item) = self.get(job).filter(|i| i.kind == "job" && i.status == Status::Ok) else {
+            return Vec::new();
+        };
+        let target = job_item.meta.as_ref().map(|m| &m["target"]);
+        let target = target.filter(|t| t["type"] == "runner").and_then(|t| t["participant_pub"].as_str());
+        let approved: Option<HashSet<String>> = match self.manifest.job_limits.as_ref() {
+            Some(l) if l.approve_runners => {
+                Some(self.signed_approvals().into_iter().filter(|(_, ok)| *ok).map(|(k, _)| k).collect())
+            }
+            _ => None,
+        };
+        // As for a result: about this exact job, from its target if it named
+        // one, and from an approved runner where approval is required.
+        chunks_in(&self.items, job, cursor, |item| {
+            item.meta.as_ref().is_some_and(|m| m["job"] == job_item.item_ref)
+                && target.is_none_or(|t| t == item.author)
+                && approved.as_ref().is_none_or(|a| a.contains(&item.author))
+        })
+    }
+
+    /// Wait for a job's outcome, calling `each` with the output chunks that
+    /// arrive meanwhile (see [`Session::chunks`]). A job that failed on the
+    /// relay (no runner, runner lost, cancelled before it started) gives an
+    /// unsigned outcome with the relay's reason. `None` if `timeout` passes
+    /// first. A `runner_lost` outcome ([`Outcome::runner_lost`]) is not
+    /// final: a late signed result still completes the job.
+    pub async fn wait_streaming(
+        &mut self,
+        job: &str,
+        timeout: Option<Duration>,
+        mut each: impl FnMut(&Chunk),
+    ) -> Result<Option<Outcome>> {
         let deadline = timeout.map(|t| Instant::now() + t);
+        let mut cursor = ChunkCursor::default();
         loop {
-            if let Some(r) = self.poll_job(job).await? {
-                return Ok(Some(r));
+            let polled = self.poll_job(job).await?;
+            for c in self.chunks(job, &mut cursor) {
+                each(&c);
+            }
+            if polled.is_some() {
+                return Ok(polled);
             }
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 return Ok(None);
@@ -1337,6 +1602,7 @@ impl Session {
             r => r?,
         };
         if let Some(r) = self.result(job) {
+            self.tree_result(&r);
             return Ok(Some(r));
         }
         if self.closed.is_some() {
@@ -1353,6 +1619,7 @@ impl Session {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let _ = self.sync().await;
         if let Some(r) = self.result(job) {
+            self.tree_result(&r);
             return Ok(Some(r));
         }
         let reason = st["reason"].as_str().map(String::from);
@@ -1567,7 +1834,8 @@ impl Session {
         let mut evicted: Vec<(Option<Instant>, String)> = self
             .items
             .iter()
-            .filter(|i| i.status == Status::Evicted && i.author != self.me)
+            // Progress is display data the relay drops for good: never wanted.
+            .filter(|i| i.status == Status::Evicted && i.author != self.me && i.kind != "progress")
             .map(|i| (self.wanted.get(&i.id).copied(), i.id.clone()))
             .filter(|(at, _)| at.is_none_or(|t| t.elapsed() >= REASK))
             .collect();
@@ -1977,6 +2245,42 @@ mod tests {
             status: Status::Ok,
             error: None,
         }
+    }
+
+    fn chunk(seq: u64, job: &str, stream: &str, offset: u64, data: &str) -> Item {
+        let mut i = item(seq, "runner", None, None);
+        i.kind = "progress".into();
+        i.author_role = Some("runner".into());
+        i.meta = Some(json!({"job": {"id": job}, "elapsed_ms": 1, "tail": null, "tail_truncated": false,
+            "stream": stream, "offset": offset, "data": data}));
+        i
+    }
+
+    #[test]
+    fn chunks_come_once_in_stream_order_whatever_order_they_arrive_in() {
+        let mut items = vec![chunk(2, "j", "stdout", 6, "world\n"), chunk(1, "j", "stdout", 0, "hello ")];
+        items.push(chunk(3, "other", "stdout", 0, "not this job"));
+        let mut beat = item(4, "runner", None, None);
+        beat.kind = "progress".into();
+        beat.author_role = Some("runner".into());
+        beat.meta = Some(json!({"job": {"id": "j"}, "elapsed_ms": 1, "tail": "x", "tail_truncated": false}));
+        items.push(beat);
+        let mut c = ChunkCursor::default();
+        let got: Vec<_> = chunks_in(&items, "j", &mut c, |_| true).into_iter().map(|c| c.data).collect();
+        assert_eq!(got, ["hello ", "world\n"]);
+        assert!(chunks_in(&items, "j", &mut c, |_| true).is_empty(), "nothing new");
+        // A late chunk overlapping what was shown is cut to its new part;
+        // stderr counts on its own.
+        items.push(chunk(5, "j", "stdout", 9, "ld\nmore"));
+        items.push(chunk(6, "j", "stderr", 0, "warn"));
+        let got: Vec<_> =
+            chunks_in(&items, "j", &mut c, |_| true).into_iter().map(|c| (c.stream, c.data)).collect();
+        assert_eq!(got, [("stderr".to_string(), "warn".to_string()), ("stdout".into(), "more".into())]);
+        // Not from a runner: ignored.
+        let mut forged = chunk(7, "j", "stdout", 16, "forged");
+        forged.author_role = Some("sender".into());
+        items.push(forged);
+        assert!(chunks_in(&items, "j", &mut c, |_| true).is_empty());
     }
 
     fn hops_of(items: &[Item], seq: u64) -> usize {

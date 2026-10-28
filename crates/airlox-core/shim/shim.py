@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """Airlox job shim (v1).
 
-Runs one job entry file inside a sandbox and records what happened. Standard
-library only, so it works in any python3.8+ image.
+Runs one job inside a sandbox and records what happened. Standard library
+only, so it works in any python3.8+ image.
 
-    python3 shim.py --work DIR --entry FILE --timeout SECONDS --result PATH
-                    [--out DIR] [--fsize-mb N] [--memory-mb N] [--nproc N]
-                    [--pass-env NAME ...]
+    python3 shim.py --work DIR (--entry FILE | --shell sh|pwsh --script PATH)
+                    --timeout SECONDS --result PATH
+                    [--cwd REL] [--shell-bin PATH] [--out DIR] [--fsize-mb N]
+                    [--memory-mb N] [--nproc N] [--pass-env NAME ...]
+
+A Python job runs FILE (in the work dir) with `python -E -s`. A shell job
+runs the script at PATH (kept outside the work dir) as `sh -e -c "$code"`,
+or `pwsh -NoProfile -Command` on Windows, with the sandbox's own PATH.
+Either starts in REL, a directory inside the work dir (default: the work
+dir itself).
 
 Writes PATH (result.json) plus stdout.txt and stderr.txt beside it. Always
 exits 0 when it managed to write result.json; the job's own outcome is inside.
@@ -26,6 +33,7 @@ Containment guarantees:
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -152,6 +160,39 @@ def make_preexec(fsize_mb, memory_mb, nproc):
     return preexec
 
 
+def resolve_cwd(work, rel):
+    """Where a job starts: REL inside the work dir, which must exist and,
+    with links resolved, lie inside it. Returns (path, error)."""
+    if not rel:
+        return work, None
+    parts = rel.replace("\\", "/").split("/")
+    if os.path.isabs(rel) or any(p in ("", ".", "..") for p in parts):
+        return None, "cwd %r is not a relative path inside the work dir" % rel
+    real = os.path.normcase(os.path.realpath(os.path.join(work, *parts)))
+    base = os.path.normcase(os.path.realpath(work))
+    if real != base and not real.startswith(base.rstrip(os.sep) + os.sep):
+        return None, "cwd %r leads outside the work dir" % rel
+    if not os.path.isdir(real):
+        return None, "cwd %r does not exist in the work dir" % rel
+    return os.path.realpath(os.path.join(work, *parts)), None
+
+
+def shell_command(shell, shell_bin, script, path):
+    """The argv of a shell job, as (argv, error)."""
+    try:
+        with open(script, "rb") as f:
+            code = f.read().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        return None, "could not read the job script: %s" % e
+    if shell == "pwsh":
+        exe = shell_bin or shutil.which("pwsh", path=path)
+        if not exe:
+            return None, "pwsh was not found in the sandbox"
+        return [exe, "-NoProfile", "-Command", code], None
+    exe = shell_bin or shutil.which("sh", path=path) or "/bin/sh"
+    return [exe, "-e", "-c", code], None
+
+
 def write_result(path, obj):
     meta_dir = os.path.dirname(path)
     fd, tmp = tempfile.mkstemp(prefix=".result-", dir=meta_dir)
@@ -164,7 +205,11 @@ def write_result(path, obj):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", required=True)
-    ap.add_argument("--entry", required=True)
+    ap.add_argument("--entry", help="a Python job's file, in the work dir")
+    ap.add_argument("--shell", choices=["sh", "pwsh"], help="run --script with this shell")
+    ap.add_argument("--script", help="a shell job's script (kept outside the work dir)")
+    ap.add_argument("--shell-bin", help="the shell's executable, where its name is not on PATH")
+    ap.add_argument("--cwd", help="start in this directory, relative to the work dir")
     ap.add_argument("--timeout", type=float, required=True)
     ap.add_argument("--result", required=True)
     ap.add_argument("--python", default=sys.executable)
@@ -179,6 +224,8 @@ def main(argv=None):
         help="copy this variable from the shim's environment into the job's (repeatable)",
     )
     a = ap.parse_args(argv)
+    if bool(a.entry) == bool(a.script) or bool(a.script) != bool(a.shell):
+        ap.error("give --entry, or --shell with --script")
 
     work = os.path.abspath(a.work)
     result = os.path.abspath(a.result)
@@ -196,9 +243,14 @@ def main(argv=None):
         "error": None,
     }
 
-    entry = os.path.join(work, a.entry)
-    if os.sep in a.entry or "/" in a.entry or a.entry.startswith(".") or not os.path.isfile(entry):
-        out["error"] = "entry file missing or invalid"
+    if a.entry:
+        entry = os.path.join(work, a.entry)
+        if os.sep in a.entry or "/" in a.entry or a.entry.startswith(".") or not os.path.isfile(entry):
+            out["error"] = "entry file missing or invalid"
+            return write_result(result, out)
+    cwd, err = resolve_cwd(work, a.cwd)
+    if err:
+        out["error"] = err
         return write_result(result, out)
 
     subreaper = become_subreaper()
@@ -213,9 +265,18 @@ def main(argv=None):
             signal.signal(getattr(signal, sig), on_signal)
 
     tmpdir = os.path.join(work, ".airlox-tmp")
+    # A workspace outlives its jobs: each starts with an empty TMPDIR.
+    if os.path.islink(tmpdir):
+        os.unlink(tmpdir)
+    shutil.rmtree(tmpdir, ignore_errors=True)
     os.makedirs(tmpdir, exist_ok=True)
+    # A shell job's PATH is the sandbox's own (the image's, or the host's
+    # system directories); a Python job's starts with its interpreter.
+    sandbox_path = os.environ.get("PATH") or "/usr/local/bin:/usr/bin:/bin"
     env = {
-        "PATH": os.pathsep.join([os.path.dirname(python), "/usr/local/bin", "/usr/bin", "/bin"]),
+        "PATH": sandbox_path
+        if a.script
+        else os.pathsep.join([os.path.dirname(python), "/usr/local/bin", "/usr/bin", "/bin"]),
         "LANG": "C.UTF-8",
         "HOME": work,
         "TMPDIR": tmpdir,
@@ -225,9 +286,8 @@ def main(argv=None):
         env["AIRLOX_OUT"] = os.path.abspath(a.out)
     if IS_WINDOWS:
         env["SYSTEMROOT"] = os.environ.get("SYSTEMROOT", r"C:\Windows")
-        env["PATH"] = os.pathsep.join(
-            [os.path.dirname(python), os.path.join(env["SYSTEMROOT"], "System32"), env["SYSTEMROOT"]]
-        )
+        system = [os.path.join(env["SYSTEMROOT"], "System32"), env["SYSTEMROOT"]]
+        env["PATH"] = os.pathsep.join(system if a.script else [os.path.dirname(python)] + system)
         env["TEMP"] = env["TMP"] = tmpdir
         env["USERPROFILE"] = work
         for name in WINDOWS_SYSTEM_ENV:
@@ -251,17 +311,28 @@ def main(argv=None):
         popen_kw["start_new_session"] = True
         popen_kw["preexec_fn"] = make_preexec(a.fsize_mb, a.memory_mb, a.nproc)
 
+    if a.script:
+        job_argv, err = shell_command(a.shell, a.shell_bin, a.script, env["PATH"])
+        if err:
+            out["error"] = err
+            return write_result(result, out)
+        what = a.shell
+    else:
+        # -E -s: ignore PYTHON* variables and user site-packages; the work dir
+        # stays importable. -u: unbuffered, so output survives a kill.
+        # -B: no .pyc files. -X utf8: UTF-8 I/O regardless of locale.
+        # The entry is named from the work dir unless the job starts below it.
+        job_argv = [python, "-E", "-s", "-u", "-B", "-X", "utf8", a.entry if cwd == work else entry]
+        what = "python"
+
     with open(os.path.join(meta_dir, "stdout.txt"), "wb") as so, open(
         os.path.join(meta_dir, "stderr.txt"), "wb"
     ) as se:
         start = time.monotonic()
         try:
-            # -E -s: ignore PYTHON* variables and user site-packages; the work dir
-            # stays importable. -u: unbuffered, so output survives a kill.
-            # -B: no .pyc files. -X utf8: UTF-8 I/O regardless of locale.
             proc = subprocess.Popen(
-                [python, "-E", "-s", "-u", "-B", "-X", "utf8", a.entry],
-                cwd=work,
+                job_argv,
+                cwd=cwd,
                 env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=so,
@@ -269,7 +340,7 @@ def main(argv=None):
                 **popen_kw
             )
         except OSError as e:
-            out["error"] = "could not start python: %s" % e
+            out["error"] = "could not start %s: %s" % (what, e)
             return write_result(result, out)
         state["proc"] = proc
         if out["cancelled"]:

@@ -6,13 +6,16 @@ mod cli;
 mod client;
 mod files;
 mod job;
+mod machine;
 mod mcp;
 mod runner;
 mod sandbox;
+mod serve;
 #[cfg(windows)]
 mod service;
 mod session;
 mod sse;
+mod tree;
 mod view;
 
 use clap::{Parser, Subcommand};
@@ -32,12 +35,20 @@ enum Cmd {
     /// Send a message or files.
     #[command(subcommand)]
     Send(cli::SendCmd),
-    /// Run a Python file on a runner and print its result.
+    /// Run a command, a shell script or a Python file on a runner, streaming
+    /// its output: `airlox run --on gpu-box --tree -- pytest -x`.
     Run(cli::RunArgs),
     /// Get a job's result.
     Result(cli::ResultArgs),
     /// Stop a running job.
     Cancel(cli::CancelArgs),
+    /// Jobs: list them with their state, runner and age.
+    #[command(subcommand)]
+    Job(cli::JobCmd),
+    /// Machines: pair one with a single command on each side, then
+    /// `airlox run --on <name>`.
+    #[command(subcommand)]
+    Machine(machine::MachineCmd),
     /// Print the session's items so far.
     Items(cli::ItemsArgs),
     /// Print items as they arrive.
@@ -60,6 +71,14 @@ enum Cmd {
 enum RunnerCmd {
     /// Join a session with a runner invite and run its jobs until it ends.
     Join(Box<runner::JoinArgs>),
+    /// `join`, started again after a failure (with backoff), optionally
+    /// logging to a file: for a runner that stays up.
+    Serve(Box<serve::ServeArgs>),
+    /// Run the runner as a service of this user that starts at login and
+    /// after failures: a systemd --user unit (Linux) or a launchd agent
+    /// (macOS) running `serve`, with the PATH it is installed from. Takes the
+    /// `join` flags.
+    InstallService(Box<serve::InstallArgs>),
     /// Run a runner as a Windows service: install or uninstall it.
     #[cfg(windows)]
     #[command(subcommand)]
@@ -139,7 +158,24 @@ fn main() -> std::process::ExitCode {
             };
         }
     }
-    tracing_subscriber::fmt().with_env_filter(filter()).with_writer(std::io::stderr).init();
+    let log_file = match &cli.cmd {
+        Cmd::Runner(RunnerCmd::Serve(a)) => a.log_file.clone(),
+        _ => None,
+    };
+    match log_file {
+        Some(path) => {
+            let f = match serve::open_log(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("airlox: could not open --log-file {}: {e}", path.display());
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            let f = std::sync::Mutex::new(f);
+            tracing_subscriber::fmt().with_env_filter(filter()).with_ansi(false).with_writer(f).init();
+        }
+        None => tracing_subscriber::fmt().with_env_filter(filter()).with_writer(std::io::stderr).init(),
+    }
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
@@ -154,12 +190,16 @@ fn main() -> std::process::ExitCode {
             Cmd::Run(a) => cli::run(a).await,
             Cmd::Result(a) => cli::result(a).await,
             Cmd::Cancel(a) => cli::cancel(a).await.map(|()| 0),
+            Cmd::Job(cli::JobCmd::Ls(a)) => cli::job_ls(a).await.map(|()| 0),
+            Cmd::Machine(c) => machine::machine(c).await.map(|()| 0),
             Cmd::Items(a) => cli::items(a).await.map(|()| 0),
             Cmd::Watch(a) => cli::watch(a).await.map(|()| 0),
             Cmd::Listen(a) => cli::listen(a).await,
             Cmd::Delivery(c) => cli::delivery(c).await.map(|()| 0),
             Cmd::Receive(a) => cli::receive(a).await.map(|()| 0),
             Cmd::Runner(RunnerCmd::Join(args)) => runner::run(*args).await.map(|()| 0),
+            Cmd::Runner(RunnerCmd::Serve(a)) => serve::serve(*a).await.map(|()| 0),
+            Cmd::Runner(RunnerCmd::InstallService(a)) => serve::install(*a).await.map(|()| 0),
             #[cfg(windows)]
             Cmd::Runner(RunnerCmd::Service(service::ServiceCmd::Install(a))) => {
                 service::install(*a).await.map(|()| 0)

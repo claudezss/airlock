@@ -14,8 +14,14 @@
 //! broadcast, so the in-memory index can always be rebuilt from the log and
 //! no client ever sees an event id that a crash could reuse. Runner presence
 //! (open streams, heartbeats) lives in memory only.
+//!
+//! `progress` items are the exception: output chunks arrive by the hundred
+//! and are display only, so they are never logged. They take event ids from
+//! a block the log reserved first ([`Rec::Reserve`]), live in memory until
+//! delivered or held out, and then vanish without a trace: no envelope, no
+//! event. A restart forgets the ones in flight.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -53,6 +59,9 @@ pub const RESEED_HOLD_MS: u64 = 10 * 60 * 1000;
 /// always check who the owner approved.
 pub const KEEP_EVENT_BYTES: u64 = 16 * 1024;
 const EVENT_BUFFER: usize = 1024;
+/// Event ids reserved in the log at a time for progress items, which are not
+/// logged themselves: after a crash no id handed out in the block is reused.
+const SEQ_RESERVE: u64 = 1024;
 
 /// One state change. Serialized as a line of `log.jsonl`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -107,6 +116,11 @@ pub enum Rec {
     },
     Close {
         reason: String,
+    },
+    /// The next `count` event ids may go to progress items, which are not
+    /// logged: replay skips them instead of reusing them.
+    Reserve {
+        count: u64,
     },
     /// The owner let a runner take jobs.
     Approve {
@@ -173,8 +187,8 @@ pub struct Participant {
     pub runner: Option<RunnerInfo>,
     pub approved: bool,
     pub rejected: bool,
-    /// The runner's active job, if any.
-    pub job: Option<String>,
+    /// The runner's active jobs (assigned or running), at most its slots.
+    pub jobs: BTreeSet<String>,
 }
 
 pub struct JobRec {
@@ -273,6 +287,9 @@ pub struct ItemRec {
     pub evict_at: u64,
     /// Never evicted: a small signed event from the owner.
     pub keep: bool,
+    /// A `progress` item: not logged, not counted toward the session's
+    /// history, and forgotten entirely once its blob goes.
+    pub progress: bool,
 }
 
 pub struct Inner {
@@ -286,6 +303,10 @@ pub struct Inner {
     tokens: HashMap<String, String>,
     pub items: HashMap<String, ItemRec>,
     pub events: Vec<Arc<Event>>,
+    /// Items in `items` that are progress reports.
+    pub progress_items: usize,
+    /// Event ids up to this one may have been given to progress items.
+    reserved_to: u64,
     pub held_bytes: u64,
     pub pending_bytes: u64,
     pub pending: HashSet<String>,
@@ -327,10 +348,45 @@ impl Inner {
         self.log_len
     }
 
-    /// Schedule eviction once every remaining recipient has acked.
+    /// Items that count toward the session's item limit: everything but
+    /// progress reports.
+    pub fn history_items(&self) -> usize {
+        self.items.len() - self.progress_items
+    }
+
+    /// Whether `rec` is about a progress item, and so is applied without
+    /// being logged.
+    fn is_progress_rec(&self, rec: &Rec) -> bool {
+        match rec {
+            Rec::Ack { item, .. } | Rec::Evict { item } => self.items.get(item).is_some_and(|r| r.progress),
+            _ => false,
+        }
+    }
+
+    /// Drop a progress item: its blob accounting, its envelope in the event
+    /// log, everything. Clients that have not fetched it find it gone (the
+    /// blob answers 404) and the live ones are told `evicted` once.
+    fn forget_progress(&mut self, seq: u64, item: &str) -> Option<Arc<Event>> {
+        let r = self.items.remove(item)?;
+        self.progress_items -= 1;
+        if r.blob_present {
+            self.held_bytes -= r.blob_len;
+            self.usage.sub(r.ip_hash.as_deref(), r.blob_len);
+        }
+        if let Ok(i) = self.events.binary_search_by_key(&r.seq, |e| e.seq) {
+            self.events.remove(i);
+        }
+        // Not kept in `events`: a client that replays the log never saw the item.
+        Some(Arc::new(Event { seq, kind: "evicted", data: json!({"item": item}) }))
+    }
+
+    /// Schedule eviction once every remaining recipient has acked. A
+    /// progress item goes at once; the grace period is for blobs a client
+    /// may still need to fetch again.
     fn check_delivered(&mut self, item: &str, ts: u64) {
         let grace = self.grace_ms;
         if let Some(r) = self.items.get_mut(item) {
+            let grace = if r.progress { 0 } else { grace };
             if r.blob_present && !r.keep && !r.recipients.is_empty() && r.recipients.is_subset(&r.acked) {
                 let t = ts.saturating_add(grace);
                 if t < r.evict_at {
@@ -397,7 +453,7 @@ impl Inner {
                         runner: j.join.runner.clone(),
                         approved: false,
                         rejected: false,
-                        job: None,
+                        jobs: BTreeSet::new(),
                     },
                 );
                 self.tokens.insert(token_sha256.clone(), pk);
@@ -413,6 +469,8 @@ impl Inner {
                     && *blob_len <= KEEP_EVENT_BYTES
                     && self.participants.get(&author).is_some_and(|p| p.role == Role::Owner);
                 let evict_at = if keep { u64::MAX } else { ts.saturating_add(self.hold_ms) };
+                let progress = env.header.kind == ItemKind::Progress;
+                self.progress_items += usize::from(progress);
                 self.items.insert(
                     id.clone(),
                     ItemRec {
@@ -425,6 +483,7 @@ impl Inner {
                         blob_present: true,
                         evict_at,
                         keep,
+                        progress,
                     },
                 );
                 if !keep {
@@ -472,15 +531,13 @@ impl Inner {
             Rec::Job { job, state, runner, reason } => {
                 let author = self.items.get(job).map(|r| r.author.clone()).unwrap_or_default();
                 let prev = self.jobs.get(job).and_then(|j| j.runner.clone());
-                // Free the previous runner; occupy the new one while active.
+                // Free the previous runner's slot; occupy the new one's while active.
                 if let Some(p) = prev.as_ref().and_then(|r| self.participants.get_mut(r)) {
-                    if p.job.as_deref() == Some(job.as_str()) {
-                        p.job = None;
-                    }
+                    p.jobs.remove(job);
                 }
                 if state.active() {
                     if let Some(p) = runner.as_ref().and_then(|r| self.participants.get_mut(r)) {
-                        p.job = Some(job.clone());
+                        p.jobs.insert(job.clone());
                     }
                 }
                 self.jobs.insert(
@@ -499,6 +556,9 @@ impl Inner {
                     "job",
                     json!({"job": job, "state": state, "runner": runner, "reason": reason}),
                 ))
+            }
+            Rec::Evict { item } if self.items.get(item).is_some_and(|r| r.progress) => {
+                Ok(self.forget_progress(line.seq, item))
             }
             Rec::Evict { item } => {
                 if let Some(r) = self.items.get_mut(item) {
@@ -572,6 +632,10 @@ impl Inner {
                 self.closed = true;
                 Ok(self.push_event(line.seq, "closed", json!({"reason": reason})))
             }
+            Rec::Reserve { count } => {
+                self.reserved_to = self.reserved_to.max(line.seq.saturating_add(*count));
+                Ok(None)
+            }
             Rec::Unknown => Ok(None),
         }
     }
@@ -613,6 +677,16 @@ impl Inner {
         self.presence
             .get(pk)
             .is_some_and(|p| p.streams > 0 && now.saturating_sub(p.last_seen_ms) <= timeout_ms)
+    }
+
+    /// How many jobs a runner runs at once (its signed `slots`).
+    pub fn runner_slots(&self, pk: &str) -> usize {
+        self.participants.get(pk).and_then(|p| p.runner.as_ref()).map_or(1, |r| r.slots as usize)
+    }
+
+    /// Whether an eligible runner has a slot for another job.
+    pub fn runner_has_room(&self, pk: &str) -> bool {
+        self.participants.get(pk).is_some_and(|p| p.jobs.len() < self.runner_slots(pk))
     }
 
     /// A job its runner `who` lost (the relay failed it as `runner_lost`)
@@ -692,6 +766,8 @@ impl Session {
             tokens: HashMap::new(),
             items: HashMap::new(),
             events: Vec::new(),
+            progress_items: 0,
+            reserved_to: 0,
             held_bytes: 0,
             pending_bytes: 0,
             pending: HashSet::new(),
@@ -777,12 +853,14 @@ impl Session {
         let mut inner = Self::new_inner(log, valid as u64, cfg, &signed, usage);
         for line in raw[..valid].split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
             let line: LogLine = serde_json::from_slice(line).map_err(invalid)?;
-            if line.seq != inner.next_seq {
+            // Only ids reserved for progress items, which are not logged, may be missing.
+            if line.seq != inner.next_seq && !(inner.next_seq..=inner.reserved_to + 1).contains(&line.seq) {
                 return Err(invalid(format!("log sequence gap at {}", line.seq)));
             }
             inner.apply(&line).map_err(invalid)?;
             inner.next_seq = line.seq + 1;
         }
+        inner.next_seq = inner.next_seq.max(inner.reserved_to + 1);
         if inner.last_activity_ms == 0 {
             inner.last_activity_ms = signed.manifest.created_at_ms;
         }
@@ -844,6 +922,9 @@ impl Session {
         if inner.broken {
             return Err(io::Error::other("session log is unwritable"));
         }
+        if inner.is_progress_rec(&rec) {
+            return self.append_progress(inner, rec);
+        }
         let line = LogLine { seq: inner.next_seq, ts_ms: now_ms(), rec };
         let mut bytes = serde_json::to_vec(&line).map_err(invalid)?;
         bytes.push(b'\n');
@@ -857,6 +938,25 @@ impl Session {
             return Err(e);
         }
         inner.log_len += bytes.len() as u64;
+        inner.next_seq += 1;
+        let ev = inner.apply(&line).map_err(invalid)?;
+        if let Some(e) = &ev {
+            let _ = self.tx.send(e.clone());
+        }
+        Ok(ev)
+    }
+
+    /// Apply and broadcast a record about a progress item without logging
+    /// it. Its event id comes from a block the log reserved, which costs a
+    /// log line (and an fsync) only once per [`SEQ_RESERVE`] records.
+    pub fn append_progress(&self, inner: &mut Inner, rec: Rec) -> io::Result<Option<Arc<Event>>> {
+        if inner.broken {
+            return Err(io::Error::other("session log is unwritable"));
+        }
+        if inner.next_seq > inner.reserved_to {
+            self.append(inner, Rec::Reserve { count: SEQ_RESERVE })?;
+        }
+        let line = LogLine { seq: inner.next_seq, ts_ms: now_ms(), rec };
         inner.next_seq += 1;
         let ev = inner.apply(&line).map_err(invalid)?;
         if let Some(e) = &ev {
@@ -883,10 +983,11 @@ impl Session {
         self.append(inner, rec).map(|_| ())
     }
 
-    /// Fail the active job of a runner that left, was rejected or went quiet.
-    pub fn fail_runner_job(&self, inner: &mut Inner, runner: &str, reason: &str) -> io::Result<()> {
-        let job = inner.participants.get(runner).and_then(|p| p.job.clone());
-        if let Some(job) = job {
+    /// Fail the active jobs of a runner that left or was rejected or revoked.
+    pub fn fail_runner_jobs(&self, inner: &mut Inner, runner: &str, reason: &str) -> io::Result<()> {
+        let jobs: Vec<String> =
+            inner.participants.get(runner).map(|p| p.jobs.iter().cloned().collect()).unwrap_or_default();
+        for job in jobs {
             self.set_job(inner, &job, JobState::Failed, Some(runner.to_string()), Some(reason))?;
             self.tell_runner(runner, "job_cancel", json!({"job": job}));
         }
@@ -1019,6 +1120,8 @@ impl Session {
                     set("action", json!("close"));
                     set("reason", json!(reason));
                 }
+                // Bookkeeping for the ids of progress items, which are not in the trail.
+                Rec::Reserve { .. } => continue,
                 Rec::Unknown => set("action", json!("unknown")),
             }
             serde_json::to_writer(&mut out, &a).map_err(invalid)?;

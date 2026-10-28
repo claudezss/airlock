@@ -146,6 +146,8 @@ pub async fn health(State(st): State<AppState>) -> Json<Value> {
         "ok": true,
         "protocol": airlox_core::PROTOCOL_VERSION,
         "max_item_bytes": st.store.cfg.max_item_bytes,
+        // How many sessions the relay holds: a count, never which.
+        "sessions": st.store.count(),
     }))
 }
 
@@ -305,7 +307,7 @@ pub async fn leave(
     blocking(move || {
         let mut g = s.lock();
         if !g.closed {
-            s.fail_runner_job(&mut g, &who, "runner_left")?;
+            s.fail_runner_jobs(&mut g, &who, "runner_left")?;
             s.append(&mut g, Rec::Leave { who })?;
         }
         Ok(())
@@ -592,22 +594,29 @@ pub(crate) async fn receive_upload(
         if g.pending.contains(&item_id) {
             return Err(ApiError::conflict_code("uploading", "this item is being uploaded; try again"));
         }
-        if g.items.len() + g.pending.len() >= cfg.max_items {
-            return Err(ApiError::session_full("session is at its item limit"));
-        }
-        if g.log_len() + env_json.len() as u64 + LOG_LINE_OVERHEAD > cfg.max_log_bytes {
-            return Err(ApiError::new(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "session_full",
-                "session history limit reached",
-            ));
-        }
-        // Progress is a nicety: the last tenth of a session's item and
-        // history budget is kept for what answers jobs.
-        let nearly_full = (g.items.len() + g.pending.len()) * 10 >= cfg.max_items * 9
-            || g.log_len() * 10 >= cfg.max_log_bytes * 9;
-        if h.kind == ItemKind::Progress && nearly_full {
-            return Err(ApiError::session_full("session is nearly full; progress reports are paused"));
+        let history = g.history_items() + g.pending.len();
+        if h.kind == ItemKind::Progress {
+            // Progress is a nicety: the last tenth of a session's item and
+            // history budget is kept for what answers jobs. It does not use
+            // that budget itself: it is not logged, and it is gone once
+            // delivered, so it has a limit of its own for what is held.
+            if history * 10 >= cfg.max_items * 9 || g.log_len() * 10 >= cfg.max_log_bytes * 9 {
+                return Err(ApiError::session_full("session is nearly full; progress reports are paused"));
+            }
+            if g.progress_items >= cfg.max_items {
+                return Err(ApiError::session_full("too many progress reports are waiting to be fetched"));
+            }
+        } else {
+            if history >= cfg.max_items {
+                return Err(ApiError::session_full("session is at its item limit"));
+            }
+            if g.log_len() + env_json.len() as u64 + LOG_LINE_OVERHEAD > cfg.max_log_bytes {
+                return Err(ApiError::new(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "session_full",
+                    "session history limit reached",
+                ));
+            }
         }
         if g.held_bytes + g.pending_bytes + blob_len > cfg.max_session_bytes {
             return Err(ApiError::new(
@@ -735,7 +744,12 @@ pub(crate) fn commit_upload<T>(
             blob_sha256: Some(blob_sha256),
             ip_hash: Some(ip_hash.clone()),
         };
-        let seq = match s.append(&mut g, rec) {
+        let appended = if env.header.kind == ItemKind::Progress {
+            s.append_progress(&mut g, rec)
+        } else {
+            s.append(&mut g, rec)
+        };
+        let seq = match appended {
             Ok(ev) => ev.map(|e| e.seq).unwrap_or_default(),
             Err(e) => {
                 g.transfer_bytes += blob_len;
@@ -1162,7 +1176,7 @@ pub async fn revoke_role(
         // A cut-off runner's job fails, and so does any job a cut-off
         // sender still has queued or running.
         for r in cut.iter().filter(|_| role == Role::Runner) {
-            s.fail_runner_job(&mut g, r, "runner_revoked")?;
+            s.fail_runner_jobs(&mut g, r, "runner_revoked")?;
         }
         let mut authored: Vec<(String, Option<String>)> = g
             .jobs

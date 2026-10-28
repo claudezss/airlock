@@ -7,8 +7,10 @@ use std::time::Duration;
 use airlox_core::cert::{issue_cert, sign_join, ClientKind, JoinRequest, RunnerInfo, SandboxKind};
 use airlox_core::item::{new_item_id, seal, ItemKind, ItemRef, NewItem, SealedItem};
 use airlox_core::keys::Keypair;
-use airlox_core::payload::{Event, JobProgress, JobResult, JobSpec, JobStatus, Meta, Payload, Target};
-use airlox_core::session::{ContentType, Mode, Role};
+use airlox_core::payload::{
+    Event, JobKind, JobProgress, JobResult, JobSpec, JobStatus, Meta, Payload, Stream as OutStream, Target,
+};
+use airlox_core::session::{ContentType, JobLimits, Mode, Role};
 use airlox_server::Config;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
@@ -28,14 +30,35 @@ async fn execute_env(f: impl FnOnce(&mut Config)) -> (Env, Sess, Member, Member)
 }
 
 async fn join_runner(env: &Env, s: &Sess, name: &str, labels: &[&str]) -> Member {
-    let (kp, body) = runner_join_body(s, name, labels);
+    join_runner_slots(env, s, name, labels, 1).await
+}
+
+async fn join_runner_slots(env: &Env, s: &Sess, name: &str, labels: &[&str], slots: u32) -> Member {
+    join_runner_kinds(env, s, name, labels, slots, &[JobKind::Python]).await
+}
+
+async fn join_runner_kinds(
+    env: &Env,
+    s: &Sess,
+    name: &str,
+    labels: &[&str],
+    slots: u32,
+    kinds: &[JobKind],
+) -> Member {
+    let (kp, body) = runner_join_body(s, name, labels, slots, kinds);
     let r = post_join(env, s, body).await;
     assert_eq!(r.status(), StatusCode::CREATED, "{}", r.text().await.unwrap());
     let v: Value = r.json().await.unwrap();
     Member { kp, token: v["token"].as_str().unwrap().to_string() }
 }
 
-fn runner_join_body(s: &Sess, name: &str, labels: &[&str]) -> (Keypair, String) {
+fn runner_join_body(
+    s: &Sess,
+    name: &str,
+    labels: &[&str],
+    slots: u32,
+    kinds: &[JobKind],
+) -> (Keypair, String) {
     let kp = Keypair::generate();
     let cert = issue_cert(&s.secrets.role_keypair(Role::Runner), &s.id, Role::Runner, kp.public(), now_ms())
         .unwrap();
@@ -56,6 +79,9 @@ fn runner_join_body(s: &Sess, name: &str, labels: &[&str]) -> (Keypair, String) 
                 network_unblocked: false,
                 version: None,
                 python: None,
+                kinds: kinds.to_vec(),
+                shell: kinds.contains(&JobKind::Shell).then(|| "sh".into()),
+                slots,
             }),
             created_at_ms: now_ms(),
         },
@@ -70,6 +96,10 @@ fn pk(m: &Member) -> String {
 
 fn seal_job(s: &Sess, author: &Member, target: &Target) -> SealedItem {
     let spec = JobSpec {
+        kind: None,
+        cwd: None,
+        tree: None,
+        fresh: false,
         filename: "summarize.py".into(),
         code: "print('hi')".into(),
         runtime: "python3.12".into(),
@@ -167,14 +197,18 @@ async fn claim(env: &Env, s: &Sess, runner: &Member, job: &str) -> StatusCode {
     call(env, runner, reqwest::Method::POST, format!("/v1/sessions/{}/jobs/{job}/claim", s.id)).await.status()
 }
 
-async fn heartbeat(env: &Env, s: &Sess, runner: &Member, job: Option<&str>) -> reqwest::Response {
+async fn heartbeat_jobs(env: &Env, s: &Sess, runner: &Member, jobs: &[&str]) -> reqwest::Response {
     env.http
         .post(env.url(&format!("/v1/sessions/{}/runners/me/heartbeat", s.id)))
         .bearer_auth(&runner.token)
-        .body(serde_json::json!({ "job": job }).to_string())
+        .body(serde_json::json!({ "jobs": jobs }).to_string())
         .send()
         .await
         .unwrap()
+}
+
+async fn heartbeat(env: &Env, s: &Sess, runner: &Member, job: Option<&str>) -> reqwest::Response {
+    heartbeat_jobs(env, s, runner, job.as_slice()).await
 }
 
 /// An open runner stream: holding it is what makes the runner online.
@@ -380,7 +414,7 @@ async fn unclaimed_jobs_fail_and_quiet_runners_are_lost() {
     assert_eq!(submit(&env, &s, &sender, &job).await.status(), StatusCode::CREATED);
     assert_eq!(claim(&env, &s, &runner, &id).await, StatusCode::NO_CONTENT);
     let hb: Value = heartbeat(&env, &s, &runner, Some(&id)).await.json().await.unwrap();
-    assert_eq!(hb["job"], id.as_str());
+    assert_eq!(hb["jobs"], json!([id]));
     heartbeat(&env, &s, &runner, None).await;
     assert_eq!(job_state(&env, &s, &owner, &id).await["reason"], "runner_lost");
 }
@@ -392,15 +426,265 @@ fn seal_progress(s: &Sess, runner: &Member, job: &SealedItem, tail: &str) -> Sea
         elapsed_ms: 1000,
         tail: Some(tail.into()),
         tail_truncated: false,
+        stream: None,
+        offset: None,
+        data: None,
+        truncated: false,
     };
     seal_kind(s, runner, ItemKind::Progress, None, vec![job_ref], Payload::progress(p))
+}
+
+fn seal_chunk(
+    s: &Sess,
+    runner: &Member,
+    job: &SealedItem,
+    stream: OutStream,
+    offset: u64,
+    data: &str,
+) -> SealedItem {
+    let job_ref = ItemRef::to(job);
+    let p = JobProgress {
+        job: job_ref.clone(),
+        elapsed_ms: 1000,
+        tail: None,
+        tail_truncated: false,
+        stream: Some(stream),
+        offset: Some(offset),
+        data: Some(data.into()),
+        truncated: false,
+    };
+    seal_kind(s, runner, ItemKind::Progress, None, vec![job_ref], Payload::progress(p))
+}
+
+/// A runner that is online, approved and running a job.
+async fn running_job(
+    env: &Env,
+    s: &Sess,
+    owner: &Member,
+    sender: &Member,
+) -> (Member, SealedItem, RunnerStream) {
+    let runner = join_runner(env, s, "runner-01", &[]).await;
+    let stream = RunnerStream::open(env, s, &runner).await;
+    approve(env, s, owner, &runner).await;
+    let job = seal_job(s, sender, &Target::Any);
+    assert_eq!(submit(env, s, sender, &job).await.status(), StatusCode::CREATED);
+    assert_eq!(claim(env, s, &runner, &job.envelope.header.id).await, StatusCode::NO_CONTENT);
+    (runner, job, stream)
+}
+
+/// Post an output chunk; returns its item id and event id.
+async fn post_chunk(
+    env: &Env,
+    s: &Sess,
+    runner: &Member,
+    job: &SealedItem,
+    offset: u64,
+    data: &str,
+) -> (String, u64) {
+    let chunk = seal_chunk(s, runner, job, OutStream::Stdout, offset, data);
+    let r = post(env, s, runner, frame(&chunk)).await;
+    assert_eq!(r.status(), StatusCode::CREATED, "{}", r.text().await.unwrap());
+    let v: Value = r.json().await.unwrap();
+    (chunk.envelope.header.id.clone(), v["seq"].as_u64().unwrap())
+}
+
+fn mentions(evs: &[Value], id: &str) -> bool {
+    evs.iter().any(|e| e.to_string().contains(id))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn progress_is_not_history_and_leaves_no_trace() {
+    let (env, s, owner, sender) = execute_env(|c| {
+        c.max_items = 6;
+        c.blob_hold_ms = 1500;
+    })
+    .await;
+    let (runner, job, _stream) = running_job(&env, &s, &owner, &sender).await;
+    let mut ids = vec![];
+    for i in 0..5 {
+        ids.push(post_chunk(&env, &s, &runner, &job, i * 4, "out\n").await.0);
+    }
+
+    // Five chunks and the job: they do not fill a six-item session, which
+    // still takes five more items; the sixth is the session's limit.
+    for i in 0..5 {
+        let r = post(&env, &s, &sender, frame(&seal_text(&s, &sender, &format!("note {i}")))).await;
+        assert_eq!(r.status(), StatusCode::CREATED, "note {i}: {}", r.text().await.unwrap());
+    }
+    let r = post(&env, &s, &sender, frame(&seal_text(&s, &sender, "one too many"))).await;
+    assert_eq!(error_code(r).await, (StatusCode::TOO_MANY_REQUESTS, "session_full".into()));
+
+    // Held and listed like any item until delivered.
+    let evs = events(&env, &s, &owner).await;
+    assert!(ids.iter().all(|id| mentions(&evs, id)));
+    assert_eq!(blob(&env, &s, &sender, &ids[1]).await.status(), StatusCode::OK);
+
+    // Once every recipient has fetched one it goes at once (no grace
+    // period), and the live ones are told; nobody keeps its envelope.
+    let live = call(&env, &owner, reqwest::Method::GET, format!("/v1/sessions/{}/stream", s.id)).await;
+    ack(&env, &s, &sender, &ids[0]).await;
+    assert_eq!(blob(&env, &s, &owner, &ids[0]).await.status(), StatusCode::OK);
+    ack(&env, &s, &owner, &ids[0]).await;
+    let told = read_sse_until(live, "event: evicted").await;
+    assert!(told.contains(&ids[0]));
+    assert_eq!(blob(&env, &s, &owner, &ids[0]).await.status(), StatusCode::NOT_FOUND);
+    let evs = events(&env, &s, &owner).await;
+    assert!(!mentions(&evs, &ids[0]), "a delivered chunk left an event behind");
+    let on_disk = env.dir.path().join("sessions").join(&s.id).join("blobs");
+    assert!(!on_disk.join(&ids[0]).exists());
+    // Asking for it, or acking it late, is a plain "no such item".
+    assert_eq!(want(&env, &s, &owner, &ids[0]).await.status(), StatusCode::NOT_FOUND);
+    let late =
+        call(&env, &owner, reqwest::Method::POST, format!("/v1/sessions/{}/items/{}/ack", s.id, ids[0]));
+    assert_eq!(late.await.status(), StatusCode::NOT_FOUND);
+
+    // The others nobody fetched go when the blob hold ends.
+    assert!(
+        eventually(|| async { blob(&env, &s, &owner, &ids[4]).await.status() == StatusCode::NOT_FOUND })
+            .await
+    );
+    let evs = events(&env, &s, &owner).await;
+    assert!(ids.iter().all(|id| !mentions(&evs, id)));
+    assert!(ids.iter().all(|id| !on_disk.join(id).exists()));
+    // Everything else stays: the job and the notes.
+    assert!(mentions(&evs, &job.envelope.header.id));
+    assert_eq!(evs.iter().filter(|e| e["kind"] == "item").count(), 6);
+    let trail = audit(&env, &s, &owner).await;
+    assert_eq!(trail.status(), StatusCode::OK);
+    let trail = trail.text().await.unwrap();
+    assert!(ids.iter().all(|id| !trail.contains(id)), "progress is not in the audit trail");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn held_progress_has_its_own_limit() {
+    let (env, s, owner, sender) = execute_env(|c| c.max_items = 4).await;
+    let (runner, job, _stream) = running_job(&env, &s, &owner, &sender).await;
+    for i in 0..4 {
+        post_chunk(&env, &s, &runner, &job, i, "x").await;
+    }
+    let chunk = seal_chunk(&s, &runner, &job, OutStream::Stdout, 4, "x");
+    let r = post(&env, &s, &runner, frame(&chunk)).await;
+    assert_eq!(error_code(r).await, (StatusCode::TOO_MANY_REQUESTS, "session_full".into()));
+    // The session's history is untouched: the sender can still post.
+    let r = post(&env, &s, &sender, frame(&seal_text(&s, &sender, "hello"))).await;
+    assert_eq!(r.status(), StatusCode::CREATED);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn progress_event_ids_are_not_reused_after_a_restart() {
+    let (mut env, s, owner, sender) = execute_env(|_| {}).await;
+    let (runner, job, stream) = running_job(&env, &s, &owner, &sender).await;
+    let mut last = 0;
+    let mut ids = vec![];
+    for i in 0..3 {
+        let (id, seq) = post_chunk(&env, &s, &runner, &job, i, "x").await;
+        ids.push(id);
+        last = seq;
+    }
+    drop(stream);
+
+    // Chunks are not in the log, so a restart forgets them, but it must not
+    // hand their event ids out again.
+    env.restart(|_| {}).await;
+    let blobs = env.dir.path().join("sessions").join(&s.id).join("blobs");
+    assert!(ids.iter().all(|id| !blobs.join(id).exists()), "an orphaned chunk survived the restart");
+    let note = seal_text(&s, &sender, "after the restart");
+    let r = post(&env, &s, &sender, frame(&note)).await;
+    assert_eq!(r.status(), StatusCode::CREATED, "{}", r.text().await.unwrap());
+    let seq = r.json::<Value>().await.unwrap()["seq"].as_u64().unwrap();
+    assert!(seq > last, "event id {seq} was already used by a chunk ({last})");
+    let evs = events(&env, &s, &owner).await;
+    let seqs: Vec<u64> = evs.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+    assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+    assert_eq!(seqs.last(), Some(&seq));
+    // The job is still the runner's, and its chunks flow on after the restart.
+    let (_, next) = post_chunk(&env, &s, &runner, &job, 3, "x").await;
+    assert!(next > seq);
+    // Reserving ids is bookkeeping, not part of the trail.
+    let trail = audit(&env, &s, &owner).await.text().await.unwrap();
+    assert!(!trail.contains("reserve"));
+    // And another restart, now with the reserved block in the log, loads.
+    env.restart(|_| {}).await;
+    assert!(events(&env, &s, &owner).await.len() >= evs.len());
+}
+
+fn seal_shell_job(s: &Sess, author: &Member, code: &str) -> SealedItem {
+    let spec = JobSpec {
+        kind: Some(JobKind::Shell),
+        cwd: None,
+        tree: None,
+        fresh: false,
+        filename: "job.sh".into(),
+        code: code.into(),
+        runtime: "python3.12".into(),
+        timeout_s: 30,
+        memory_mb: None,
+        files: vec![],
+        requirements: vec![],
+        target: Target::Any,
+        progress_file: None,
+    };
+    seal_kind(s, author, ItemKind::Job, Some(ContentType::Sh), vec![], Payload::job(spec))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shell_jobs_route_like_python_ones() {
+    let env = Env::new().await;
+    let s = new_session_with(Mode::Execute, Some(3_600_000), |p| {
+        let limits = JobLimits { kinds: Some(vec![JobKind::Python, JobKind::Shell]), ..Default::default() };
+        p.job_limits = Some(limits);
+    });
+    assert_eq!(create(&env, &s).await.status(), StatusCode::CREATED);
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let sender = join(&env, &s, Role::Sender, "planner-agent").await;
+    // A python-only runner, joined first, is passed over for shell jobs.
+    let py_only = join_runner(&env, &s, "runner-00", &["cpu"]).await;
+    let _py_stream = RunnerStream::open(&env, &s, &py_only).await;
+    approve(&env, &s, &owner, &py_only).await;
+    let r = submit(&env, &s, &sender, &seal_shell_job(&s, &sender, "true")).await;
+    assert_eq!(r.status(), StatusCode::CONFLICT);
+    let why = r.text().await.unwrap();
+    assert!(why.contains("no_runner_available") && why.contains("runs shell jobs"), "{why}");
+    let runner =
+        join_runner_kinds(&env, &s, "runner-01", &["cpu"], 1, &[JobKind::Python, JobKind::Shell]).await;
+    let mut stream = RunnerStream::open(&env, &s, &runner).await;
+    approve(&env, &s, &owner, &runner).await;
+
+    let job = seal_shell_job(&s, &sender, "echo hi\n");
+    let id = job.envelope.header.id.clone();
+    let r = submit(&env, &s, &sender, &job).await;
+    assert_eq!(r.status(), StatusCode::CREATED, "{}", r.text().await.unwrap());
+    let assigned = stream.next("job_assigned").await;
+    assert_eq!(assigned["job"], id.as_str());
+    assert_eq!(assigned["envelope"].as_str().unwrap(), canon(&job.envelope));
+    assert_eq!(claim(&env, &s, &runner, &id).await, StatusCode::NO_CONTENT);
+    assert_eq!(job_state(&env, &s, &owner, &id).await["state"], "running");
+
+    let (chunk_id, _) = post_chunk(&env, &s, &runner, &job, 0, "hi\n").await;
+    assert_eq!(blob(&env, &s, &sender, &chunk_id).await.status(), StatusCode::OK);
+    let r = post(&env, &s, &runner, frame(&seal_result(&s, &runner, &job))).await;
+    assert_eq!(r.status(), StatusCode::CREATED, "{}", r.text().await.unwrap());
+    assert_eq!(job_state(&env, &s, &owner, &id).await["state"], "done");
+
+    // The relay learns the kind from the header, as it learns `py`.
+    let evs = events(&env, &s, &owner).await;
+    let ev = evs.iter().find(|e| e["kind"] == "item" && e["data"]["envelope"].to_string().contains(&id));
+    let env_json: Value = serde_json::from_str(ev.unwrap()["data"]["envelope"].as_str().unwrap()).unwrap();
+    assert_eq!(env_json["header"]["subkind"], "sh");
+
+    // Python jobs still go through, and a python-only session refuses shell.
+    let r = submit(&env, &s, &sender, &seal_job(&s, &sender, &Target::Any)).await;
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let (env2, s2, _owner2, sender2) = execute_env(|_| {}).await;
+    let r = submit(&env2, &s2, &sender2, &seal_shell_job(&s2, &sender2, "true")).await;
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn busy_runners_refuse_and_lost_jobs_come_back() {
     let (env, s, owner, sender) = execute_env(|c| {
         c.runner_timeout_ms = 400;
-        c.job_reconnect_grace_ms = 800;
+        c.job_reconnect_grace_ms = 1600;
     })
     .await;
     let runner = join_runner(&env, &s, "runner-01", &[]).await;
@@ -440,7 +724,7 @@ async fn busy_runners_refuse_and_lost_jobs_come_back() {
 
     // The runner reconnects still working on it: it is running again.
     let hb: Value = heartbeat(&env, &s, &runner, Some(&id)).await.json().await.unwrap();
-    assert_eq!(hb["job"], id.as_str());
+    assert_eq!(hb["jobs"], json!([id]));
     assert_eq!(job_state(&env, &s, &owner, &id).await["state"], "running");
 
     // Lost again, and the result arrives later: it still finishes the job.
@@ -449,6 +733,189 @@ async fn busy_runners_refuse_and_lost_jobs_come_back() {
     assert_eq!(post(&env, &s, &runner, frame(&res)).await.status(), StatusCode::CREATED);
     assert_eq!(job_state(&env, &s, &owner, &id).await["state"], "done");
     assert_eq!(runners(&env, &s, &owner).await[0]["busy"], false);
+}
+
+/// A runner with `slots` slots that is online and approved.
+async fn pool_runner(
+    env: &Env,
+    s: &Sess,
+    owner: &Member,
+    name: &str,
+    labels: &[&str],
+    slots: u32,
+) -> (Member, RunnerStream) {
+    let runner = join_runner_slots(env, s, name, labels, slots).await;
+    let stream = RunnerStream::open(env, s, &runner).await;
+    approve(env, s, owner, &runner).await;
+    (runner, stream)
+}
+
+/// Submit a job that must be routed; returns it and the runner it went to.
+async fn submit_ok(env: &Env, s: &Sess, sender: &Member, target: &Target) -> (SealedItem, String) {
+    let job = seal_job(s, sender, target);
+    let r = submit(env, s, sender, &job).await;
+    assert_eq!(r.status(), StatusCode::CREATED, "{}", r.text().await.unwrap());
+    let runner = r.json::<Value>().await.unwrap()["runner"].as_str().unwrap().to_string();
+    (job, runner)
+}
+
+fn runner_row<'a>(list: &'a [Value], m: &Member) -> &'a Value {
+    list.iter().find(|r| r["participant_pub"] == pk(m).as_str()).expect("runner is listed")
+}
+
+/// (slots, active jobs, busy) of a runner in a listing.
+fn load(list: &[Value], m: &Member) -> (u64, usize, bool) {
+    let r = runner_row(list, m);
+    (r["slots"].as_u64().unwrap(), r["jobs"].as_array().unwrap().len(), r["busy"].as_bool().unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn jobs_go_to_the_least_loaded_runner_and_busy_means_every_slot_is_taken() {
+    let (mut env, s, owner, sender) = execute_env(|_| {}).await;
+    // Joined first, two slots; then one slot.
+    let (wide, _w) = pool_runner(&env, &s, &owner, "runner-01", &["cpu"], 2).await;
+    let (narrow, _n) = pool_runner(&env, &s, &owner, "runner-02", &["cpu"], 1).await;
+    let any = Target::Any;
+
+    // Both empty: the earliest joined. Then the one with the lower load
+    // (1/2 against 0/1), then the one that still has room.
+    let (j1, r1) = submit_ok(&env, &s, &sender, &any).await;
+    let (_, r2) = submit_ok(&env, &s, &sender, &any).await;
+    let (_, r3) = submit_ok(&env, &s, &sender, &any).await;
+    assert_eq!((r1, r2, r3), (pk(&wide), pk(&narrow), pk(&wide)));
+
+    // Every slot is taken: not queued, and named as busy rather than absent.
+    let full = seal_job(&s, &sender, &any);
+    let r = submit(&env, &s, &sender, &full).await;
+    assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "runner_busy".into()));
+    assert_eq!(job_state(&env, &s, &owner, &full.envelope.header.id).await["reason"], "runner_busy");
+    let pinned = Target::Runner { participant_pub: wide.kp.public(), name: "runner-01".into() };
+    let r = submit(&env, &s, &sender, &seal_job(&s, &sender, &pinned)).await;
+    assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "runner_busy".into()));
+    let gpu = Target::Labels { labels: vec!["gpu".into()] };
+    let r = submit(&env, &s, &sender, &seal_job(&s, &sender, &gpu)).await;
+    assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "no_runner_available".into()));
+
+    // The listing says how loaded each runner is; `busy` is "no free slot".
+    let list = runners(&env, &s, &owner).await;
+    assert_eq!(load(&list, &wide), (2, 2, true));
+    assert_eq!(load(&list, &narrow), (1, 1, true));
+    assert!(!runner_row(&list, &wide)["job"].is_null(), "older clients read `job` as busy");
+
+    // The loads are rebuilt from the log when the relay restarts; the
+    // runners then reconnect.
+    drop((_w, _n));
+    env.restart(|_| {}).await;
+    let list = runners(&env, &s, &owner).await;
+    assert_eq!(load(&list, &wide), (2, 2, true));
+    assert_eq!(load(&list, &narrow), (1, 1, true));
+    let _w = RunnerStream::open(&env, &s, &wide).await;
+    let _n = RunnerStream::open(&env, &s, &narrow).await;
+
+    // One slot frees when a job ends; only that runner takes the next job,
+    // and the one after that is refused again.
+    assert_eq!(claim(&env, &s, &wide, &j1.envelope.header.id).await, StatusCode::NO_CONTENT);
+    let r = post(&env, &s, &wide, frame(&seal_result(&s, &wide, &j1))).await;
+    assert_eq!(r.status(), StatusCode::CREATED, "{}", r.text().await.unwrap());
+    let list = runners(&env, &s, &owner).await;
+    assert_eq!(load(&list, &wide), (2, 1, false));
+    assert!(runner_row(&list, &wide)["job"].is_null());
+    let (_, r4) = submit_ok(&env, &s, &sender, &any).await;
+    assert_eq!(r4, pk(&wide));
+    let r = submit(&env, &s, &sender, &seal_job(&s, &sender, &any)).await;
+    assert_eq!(error_code(r).await, (StatusCode::CONFLICT, "runner_busy".into()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn heartbeats_name_every_running_job_and_a_lost_one_is_lost_alone() {
+    let (env, s, owner, sender) = execute_env(|_| {}).await;
+    let (runner, _stream) = pool_runner(&env, &s, &owner, "runner-01", &[], 3).await;
+    let mut jobs = vec![];
+    for _ in 0..3 {
+        let (job, _) = submit_ok(&env, &s, &sender, &Target::Any).await;
+        assert_eq!(claim(&env, &s, &runner, &job.envelope.header.id).await, StatusCode::NO_CONTENT);
+        jobs.push(job);
+    }
+    let ids: Vec<String> = jobs.iter().map(|j| j.envelope.header.id.clone()).collect();
+    let [a, b, c] = [ids[0].as_str(), ids[1].as_str(), ids[2].as_str()];
+
+    // All three named: nothing is lost, and the answer lists them.
+    let hb: Value = heartbeat_jobs(&env, &s, &runner, &[a, b, c]).await.json().await.unwrap();
+    let mut named: Vec<&str> = hb["jobs"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    named.sort();
+    let mut want = vec![a, b, c];
+    want.sort();
+    assert_eq!(named, want);
+    for id in [a, b, c] {
+        assert_eq!(job_state(&env, &s, &owner, id).await["state"], "running");
+    }
+
+    // One left out: only that job is lost, and its slot is free again.
+    heartbeat_jobs(&env, &s, &runner, &[a, c]).await;
+    assert_eq!(job_state(&env, &s, &owner, b).await["reason"], "runner_lost");
+    for id in [a, c] {
+        assert_eq!(job_state(&env, &s, &owner, id).await["state"], "running");
+    }
+    assert_eq!(load(&runners(&env, &s, &owner).await, &runner), (3, 2, false));
+
+    // Named again, it comes back, and the runner is full once more.
+    heartbeat_jobs(&env, &s, &runner, &[a, b, c]).await;
+    assert_eq!(job_state(&env, &s, &owner, b).await["state"], "running");
+    assert_eq!(load(&runners(&env, &s, &owner).await, &runner), (3, 3, true));
+
+    // Idle: all three are lost.
+    heartbeat_jobs(&env, &s, &runner, &[]).await;
+    for id in [a, b, c] {
+        assert_eq!(job_state(&env, &s, &owner, id).await["reason"], "runner_lost");
+    }
+    assert_eq!(load(&runners(&env, &s, &owner).await, &runner), (3, 0, false));
+
+    // Three newer jobs take the slots. A lost job does not push into a full
+    // runner, but its result, when it comes, still finishes it.
+    for _ in 0..3 {
+        submit_ok(&env, &s, &sender, &Target::Any).await;
+    }
+    heartbeat_jobs(&env, &s, &runner, &[a]).await;
+    let st = job_state(&env, &s, &owner, a).await;
+    assert_eq!((st["state"].as_str(), st["reason"].as_str()), (Some("failed"), Some("runner_lost")));
+    assert_eq!(load(&runners(&env, &s, &owner).await, &runner), (3, 3, true));
+    let r = post(&env, &s, &runner, frame(&seal_result(&s, &runner, &jobs[0]))).await;
+    assert_eq!(r.status(), StatusCode::CREATED, "{}", r.text().await.unwrap());
+    assert_eq!(job_state(&env, &s, &owner, a).await["state"], "done");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reconnecting_runner_gets_every_assignment_and_cancel_again() {
+    let (env, s, owner, sender) = execute_env(|_| {}).await;
+    let (runner, stream) = pool_runner(&env, &s, &owner, "runner-01", &[], 3).await;
+    let mut ids = vec![];
+    for _ in 0..3 {
+        let (job, _) = submit_ok(&env, &s, &sender, &Target::Any).await;
+        ids.push(job.envelope.header.id.clone());
+        // The backlog is oldest first: give each job its own millisecond.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    for id in &ids[..2] {
+        assert_eq!(claim(&env, &s, &runner, id).await, StatusCode::NO_CONTENT);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The second is cancelled while it runs.
+    let path = format!("/v1/sessions/{}/jobs/{}/cancel", s.id, ids[1]);
+    assert_eq!(call(&env, &sender, reqwest::Method::POST, path).await.status(), StatusCode::ACCEPTED);
+    drop(stream);
+
+    let mut again = RunnerStream::open(&env, &s, &runner).await;
+    let mut got = vec![];
+    for _ in 0..3 {
+        let assigned = again.next("job_assigned").await;
+        assert!(assigned["envelope"].is_string());
+        got.push(assigned["job"].as_str().unwrap().to_string());
+    }
+    // Oldest first, by when each entered its current state: the one still
+    // unclaimed, then the two claimed in order.
+    assert_eq!(got, [ids[2].clone(), ids[0].clone(), ids[1].clone()]);
+    // The pending cancel repeats with its job; nothing else was cancelled.
+    assert_eq!(again.next("job_cancel").await["job"], ids[1].as_str());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -609,7 +1076,7 @@ async fn revoking_runners_fails_their_jobs_and_ends_their_streams() {
     assert!(stream.ended().await);
     assert_eq!(claim(&env, &s, &runner, &id).await, StatusCode::UNAUTHORIZED);
     // No runner can join to take its place.
-    let (_, body) = runner_join_body(&s, "runner-02", &[]);
+    let (_, body) = runner_join_body(&s, "runner-02", &[], 1, &[JobKind::Python]);
     assert_eq!(error_code(post_join(&env, &s, body).await).await, (StatusCode::FORBIDDEN, "revoked".into()));
 }
 

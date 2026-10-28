@@ -14,6 +14,7 @@ use crate::cert::SandboxKind;
 use crate::encoding::canonical_json;
 use crate::item::{ItemKind, ItemRef};
 use crate::keys::PublicKey;
+pub use crate::session::JobKind;
 use crate::{Error, Result};
 
 pub const MAX_META_BYTES: usize = 4 * 1024 * 1024;
@@ -31,17 +32,27 @@ pub const MAX_ENV_PACKAGES: usize = 256;
 pub enum Target {
     /// One specific runner, pinned by its participant key. `name` is for display.
     Runner { participant_pub: PublicKey, name: String },
-    /// Any idle runner carrying every listed label.
+    /// Any runner with a free slot carrying every listed label.
     Labels { labels: Vec<String> },
     /// Any idle approved runner.
     Any,
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct JobSpec {
-    /// Entry file name, e.g. "summarize.py".
+    /// `python` or `shell`. Absent means `python`, so a Python job is
+    /// byte-for-byte what clients before shell jobs send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<JobKind>,
+    /// Entry file name, e.g. "summarize.py"; for a shell job, a name for
+    /// display (e.g. "job.sh").
     pub filename: String,
+    /// The Python source, or the shell script (at most 64 KiB).
     pub code: String,
     /// Must equal the manifest's job_limits.runtime.
     pub runtime: String,
@@ -58,10 +69,41 @@ pub struct JobSpec {
     /// a simulator's log. Absent from the canonical form when not given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress_file: Option<String>,
+    /// Where in the work dir the job starts: a relative `/`-separated path
+    /// (the component rules of `progress_file`). Absent for the work dir.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The input in `files` that is a working tree (`tree.zip` with
+    /// `.airlox/tree.json`): a runner with a workspace syncs it rather than
+    /// unpacking it. Absent when the job sends no tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<ItemRef>,
+    /// Empty the sender's workspace before the job runs. Absent when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fresh: bool,
+}
+
+impl JobSpec {
+    /// The job's kind, `python` when unsaid.
+    pub fn kind(&self) -> JobKind {
+        self.kind.unwrap_or(JobKind::Python)
+    }
 }
 
 /// Longest log tail a progress item carries.
 pub const MAX_PROGRESS_TAIL_BYTES: usize = 64 * 1024;
+/// Longest output chunk a progress item carries.
+pub const MAX_CHUNK_BYTES: usize = 64 * 1024;
+/// Longest shell script a job may carry.
+pub const MAX_SHELL_CODE_BYTES: usize = 64 * 1024;
+
+/// Which of a job's output streams a progress chunk is from.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Stream {
+    Stdout,
+    Stderr,
+}
 
 /// A running job's progress, posted by its runner (`kind: progress`, with a
 /// reference to the job).
@@ -76,6 +118,21 @@ pub struct JobProgress {
     pub tail: Option<String>,
     /// More of the file came before `tail`.
     pub tail_truncated: bool,
+    /// An output chunk: which stream `data` is from. Absent for a
+    /// heartbeat-style progress item (elapsed time and tail only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<Stream>,
+    /// The byte position of `data` in its stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+    /// At most 64 KiB of the stream, cut at a UTF-8 boundary. Display only:
+    /// the signed result's `stdout`/`stderr` are the authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    /// The runner stopped streaming here (its cap on streamed bytes); the
+    /// result still carries the output. Absent when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -129,7 +186,41 @@ pub struct JobEnv {
     /// Where the interpreter came from: `uv-runtime` (built by the runner
     /// from the allowlist), `--python` (the operator's), or `docker:<image>`.
     pub interpreter: String,
+    /// The kinds of job this runner accepts. Absent from runners before
+    /// shell jobs (which run `python` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kinds: Option<Vec<JobKind>>,
+    /// The shell `shell` jobs run under: `sh` or `pwsh`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+    /// The working tree the job ran against, copied from its `tree.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<TreeInfo>,
 }
+
+/// Which working tree a job ran against (from the job's `.airlox/tree.json`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TreeInfo {
+    /// The commit checked out, hex; absent outside a git repository.
+    pub head: Option<String>,
+    /// The tree differs from `head` (uncommitted or untracked changes).
+    pub dirty: bool,
+    /// Files in the tree.
+    pub count: u64,
+    /// Hex SHA-256 of the tree's zip.
+    pub sha256: String,
+    /// For a job that ran in a workspace: the tree's files that were no
+    /// longer as listed once it finished (edited or removed by the job or by
+    /// its other inputs), at most [`MAX_TREE_CHANGED`]. Absent when the
+    /// runner keeps no workspace or more changed than that; a sender then
+    /// sends its next tree whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed: Option<Vec<String>>,
+}
+
+/// The most paths a result's `env.tree.changed` lists.
+pub const MAX_TREE_CHANGED: usize = 256;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -265,6 +356,10 @@ mod tests {
             Payload::text("hi"),
             Payload::file("a.md", "text/markdown", b"# a".to_vec()),
             Payload::job(JobSpec {
+                kind: None,
+                cwd: None,
+                tree: None,
+                fresh: false,
                 filename: "x.py".into(),
                 code: "print(1)".into(),
                 runtime: "python3.12".into(),

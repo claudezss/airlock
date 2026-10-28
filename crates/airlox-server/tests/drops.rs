@@ -32,12 +32,11 @@ async fn park(env: &Env) -> (Code, String) {
 }
 
 async fn claim(env: &Env, n: u32, claim: &str) -> reqwest::Response {
-    env.http
-        .post(env.url(&format!("/v1/drops/{n}/claim")))
-        .json(&json!({"claim": claim}))
-        .send()
-        .await
-        .unwrap()
+    claim_as(env, n, json!({"claim": claim})).await
+}
+
+async fn claim_as(env: &Env, n: u32, body: Value) -> reqwest::Response {
+    env.http.post(env.url(&format!("/v1/drops/{n}/claim"))).json(&body).send().await.unwrap()
 }
 
 /// The status and error code of a claim.
@@ -75,6 +74,58 @@ async fn claims_once_and_tells_the_sender() {
     assert_eq!(s["state"], "picked_up");
     assert!(s["picked_up_at_ms"].as_u64().is_some());
     assert_eq!(claim_err(&env, n, &code.claim()).await, (StatusCode::GONE, "used".into()));
+}
+
+#[tokio::test]
+async fn claims_report_the_key_they_will_join_with() {
+    let env = Env::with(|c| c.max_drops_per_ip = 100).await;
+    let key = airlox_core::keys::Keypair::generate().public().to_b64();
+
+    // With a key: the creator learns it, and the invite comes out as usual.
+    let (code, token) = park(&env).await;
+    let n = code.nameplate;
+    assert_eq!(state(&env, n, &token).await["participant_pub"], Value::Null);
+    let r = claim_as(&env, n, json!({"claim": code.claim(), "participant_pub": key})).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(code.open(v["box"].as_str().unwrap()).unwrap(), INVITE);
+    let s = state(&env, n, &token).await;
+    assert_eq!((s["state"].as_str(), s["participant_pub"].as_str()), (Some("picked_up"), Some(key.as_str())));
+
+    // Without one, or with a null: as before, and nothing is reported.
+    for with_null in [false, true] {
+        let (code, token) = park(&env).await;
+        let mut body = json!({"claim": code.claim()});
+        if with_null {
+            body["participant_pub"] = Value::Null;
+        }
+        assert_eq!(claim_as(&env, code.nameplate, body).await.status(), StatusCode::OK);
+        let s = state(&env, code.nameplate, &token).await;
+        assert_eq!((s["state"].as_str(), &s["participant_pub"]), (Some("picked_up"), &Value::Null));
+    }
+}
+
+#[tokio::test]
+async fn a_malformed_key_is_refused_without_spending_the_code() {
+    let env = Env::new().await;
+    let (code, token) = park(&env).await;
+    let n = code.nameplate;
+    let short = airlox_core::encoding::b64e(&[1u8; 16]);
+    for bad in [json!("not base64!"), json!(short), json!(""), json!(7)] {
+        let r = claim_as(&env, n, json!({"claim": code.claim(), "participant_pub": bad})).await;
+        let status = r.status();
+        let v: Value = r.json().await.unwrap_or(Value::Null);
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        if !bad.is_number() {
+            assert_eq!(v["error"], "invalid", "{bad}");
+        }
+    }
+    // Still waiting, no wrong claim counted: the right claim with a good key works.
+    assert_eq!(state(&env, n, &token).await["state"], "waiting");
+    let key = airlox_core::keys::Keypair::generate().public().to_b64();
+    let r = claim_as(&env, n, json!({"claim": code.claim(), "participant_pub": key})).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(state(&env, n, &token).await["participant_pub"], key.as_str());
 }
 
 #[tokio::test]

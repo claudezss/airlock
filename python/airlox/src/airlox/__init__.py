@@ -15,6 +15,7 @@
 from ._core import AirloxError, DecryptError, PolicyError, SignatureError, ValidationError
 
 from .execute import (
+    Chunk,
     Job,
     JobTimeout,
     NoRunnerAvailable,
@@ -26,9 +27,11 @@ from .execute import (
     RunnerFailed,
 )
 from .session import Item, RelayError, Session, TransferCode, receive_code
+from .tree import Tree, TreeRefused
 
 __all__ = [
     "AirloxError",
+    "Chunk",
     "DecryptError",
     "Item",
     "Job",
@@ -45,6 +48,8 @@ __all__ = [
     "Session",
     "SignatureError",
     "TransferCode",
+    "Tree",
+    "TreeRefused",
     "ValidationError",
     "receive_code",
 ]

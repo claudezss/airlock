@@ -7,8 +7,11 @@
 //! the job has not run here before. Any failure becomes a `refused` result;
 //! nothing runs.
 //!
-//! While a job runs the runner posts signed `progress` items (elapsed time
-//! and the tail of the job's `progress_file`). Its answer (out files and
+//! While a job runs the runner posts signed `progress` items: elapsed time
+//! and the tail of the job's `progress_file`, and its output as it comes
+//! ([`stream`]). Inputs are staged in a fresh work dir, or, for a runner with
+//! workspaces, in the one it keeps for the job's sender ([`workspace`]),
+//! where a working tree is synced rather than unpacked. Its answer (out files and
 //! result) is sealed and kept on disk ([`outbox`]) before any of it is
 //! posted, then posted with retries for as long as the relay is unreachable,
 //! so a job that outlives a dropped connection, or a runner restart, still
@@ -16,7 +19,13 @@
 
 mod outbox;
 mod redact;
+mod stream;
+mod tree;
+mod workspace;
 
+pub use workspace::Workspaces;
+
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -26,20 +35,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use airlox_core::encoding::{b64e, canonical_json, hex, sha256};
 use airlox_core::item::{new_item_id, seal, ItemKind, ItemRef, NewItem};
 use airlox_core::keys::Keypair;
+use airlox_core::keys::PublicKey;
 use airlox_core::payload::{
-    JobEnv, JobProgress, JobResult, JobSpec, JobStatus, Meta, OutFile, Payload, MAX_PROGRESS_TAIL_BYTES,
-    MAX_STDIO_BYTES,
+    JobEnv, JobKind, JobProgress, JobResult, JobSpec, JobStatus, Meta, OutFile, Payload,
+    MAX_PROGRESS_TAIL_BYTES, MAX_STDIO_BYTES,
 };
 use airlox_core::policy::{check_file_name, target_matches};
-use airlox_core::session::{ContentType, Role};
+use airlox_core::session::{ContentType, JobLimits, Role};
 use airlox_core::validate::zip::{check_entry_path, extract_zip, ZipLimits};
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use tokio::sync::{watch, Mutex};
 
 use crate::client::{is_duplicate, is_transient, Relay};
-use crate::sandbox::{Backend, PreparedJob, RawResult};
+use crate::sandbox::{Backend, PreparedJob, RawResult, SCRIPT_FILE};
 use crate::view::View;
+use tree::Tree;
+use workspace::Workspace;
 
 /// How long a job that arrives just ahead of the owner's signed approval
 /// waits for it before being refused.
@@ -66,6 +78,18 @@ pub struct Ctx {
     pub progress_interval: Duration,
     /// Most bytes of a job's `progress_file` sent with each progress item.
     pub progress_tail: usize,
+    /// Most output chunks posted per minute while a job runs (`--progress-rate`);
+    /// zero for no streaming.
+    pub progress_rate: u32,
+    /// Most bytes of a job's output, both streams together, streamed
+    /// (`--stream-max-mb`).
+    pub stream_max_bytes: u64,
+    /// Kept work dirs, one per sender (`--workspace`); `None` for a fresh
+    /// work dir every job.
+    pub workspaces: Option<Workspaces>,
+    /// The workspaces running jobs hold, by work dir: a runner that runs
+    /// several jobs at once lets a sender's workspace serve one at a time.
+    pub workspaces_in_use: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
     /// Where finished jobs' answers wait until the relay has them.
     pub outbox: PathBuf,
     /// Tests: exit once an answer is saved, before posting any of it.
@@ -173,9 +197,34 @@ fn record_to(done_file: &Path, line: &str) -> Result<()> {
     Ok(())
 }
 
+/// A sender's workspace, held by a job until the lease is dropped.
+struct WorkspaceLease {
+    in_use: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
+    dir: PathBuf,
+}
+
+impl WorkspaceLease {
+    /// `None` while another job holds the workspace.
+    fn take(in_use: &Arc<std::sync::Mutex<HashSet<PathBuf>>>, ws: &Workspace) -> Option<Self> {
+        let dir = ws.work();
+        let fresh = in_use.lock().unwrap_or_else(|e| e.into_inner()).insert(dir.clone());
+        fresh.then(|| WorkspaceLease { in_use: in_use.clone(), dir })
+    }
+}
+
+impl Drop for WorkspaceLease {
+    fn drop(&mut self) {
+        self.in_use.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.dir);
+    }
+}
+
 /// A job that passed every check, with its inputs.
 struct Accepted {
     spec: JobSpec,
+    /// The sender's workspace on this runner, when the job gets one, and
+    /// the hold on it that lasts until the job is done with it.
+    workspace: Option<Workspace>,
+    _lease: Option<WorkspaceLease>,
     /// (item ref, file name, subkind, plaintext) per input.
     inputs: Vec<(ItemRef, String, ContentType, Vec<u8>)>,
     input_sha256: String,
@@ -186,6 +235,32 @@ enum Verdict {
     Refuse(String),
     /// It started here before the runner restarted; it does not run again.
     Interrupted,
+}
+
+/// Why a job that did not open is refused. The core's policy check is what
+/// says the session does not allow its kind.
+fn open_failure(e: &anyhow::Error) -> String {
+    let why = format!("{e:#}");
+    if why.contains("jobs are not allowed in this session") {
+        format!("kind_not_supported: {why}")
+    } else {
+        format!("job did not verify: {why}")
+    }
+}
+
+/// Why this runner will not run a job of `kind`, if it will not: the session
+/// does not allow it, or this runner does not offer it.
+fn kind_refusal(kind: JobKind, limits: &JobLimits, backend: &Backend) -> Option<String> {
+    if !limits.allows_kind(kind) {
+        return Some(format!("kind_not_supported: this session does not allow {} jobs", kind.as_str()));
+    }
+    (!backend.kinds().contains(&kind)).then(|| {
+        format!(
+            "kind_not_supported: this runner does not run {} jobs{}",
+            kind.as_str(),
+            backend.no_shell_hint()
+        )
+    })
 }
 
 /// Fetch, verify and check a job and its inputs.
@@ -203,11 +278,15 @@ async fn verify(ctx: &Ctx, view: &mut View, job_id: &str) -> Result<(ItemRef, Ve
     let refuse = |why: String| Ok((job_ref.clone(), Verdict::Refuse(why)));
     let job = match job {
         Ok(j) => j,
-        Err(e) => return refuse(format!("job did not verify: {e:#}")),
+        Err(e) => return refuse(open_failure(&e)),
     };
     let Meta::Job(spec) = job.meta else { return refuse("not a job".into()) };
     if !matches!(job.role, Role::Sender | Role::Owner) {
         return refuse("jobs must come from the sender or owner role".into());
+    }
+    let limits = view.manifest.job_limits.clone().context("execute session without job limits")?;
+    if let Some(why) = kind_refusal(spec.kind(), &limits, &ctx.backend) {
+        return refuse(why);
     }
     match run_record(ctx, job_id) {
         Some(true) => bail!("job {job_id} already ran here; ignoring the duplicate"),
@@ -233,6 +312,45 @@ async fn verify(ctx: &Ctx, view: &mut View, job_id: &str) -> Result<(ItemRef, Ve
     if !view.approved {
         return refuse("this runner has no signed approval from the session owner".into());
     }
+    // The workspace is the author's: a sender's, or an owner's own jobs'.
+    let author = view
+        .envelope(job_id)
+        .and_then(|e| serde_json::from_str::<serde_json::Value>(e).ok())
+        .and_then(|e| PublicKey::from_b64(e["header"]["author"].as_str()?).ok())
+        .context("the job's author")?;
+    let workspace = ctx
+        .workspaces
+        .as_ref()
+        .filter(|_| limits.workspace)
+        .map(|w| (w.of(&view.manifest.session_id, &author), w.max_bytes));
+    // One job at a time uses a workspace; the sender's next one is refused,
+    // as a busy runner would refuse it, and may be sent again once this one
+    // has finished.
+    let lease = match &workspace {
+        Some((ws, _)) => match WorkspaceLease::take(&ctx.workspaces_in_use, ws) {
+            Some(lease) => Some(lease),
+            None => {
+                return refuse(
+                    "runner_busy: another job of yours is using your workspace on this runner, and a \
+                     workspace serves one job at a time; send this one again when that job has finished"
+                        .into(),
+                )
+            }
+        },
+        None => None,
+    };
+    if let Some((ws, max)) = &workspace {
+        let used = ws.size_bytes();
+        if used > *max && !spec.fresh {
+            return refuse(format!(
+                "workspace_full: your workspace on this runner holds {} MB, over its {} MB limit; run the \
+                 job with fresh (airlox run --fresh) to empty it",
+                used.div_ceil(1 << 20),
+                max >> 20
+            ));
+        }
+    }
+    let workspace = workspace.map(|(ws, _)| ws);
     let mut inputs = Vec::new();
     let mut hasher = Sha256::new();
     for r in &spec.files {
@@ -253,7 +371,7 @@ async fn verify(ctx: &Ctx, view: &mut View, job_id: &str) -> Result<(ItemRef, Ve
         inputs.push((r.clone(), name, subkind, opened.body));
     }
     let input_sha256 = hex(&hasher.finalize());
-    Ok((job_ref, Verdict::Run(Box::new(Accepted { spec, inputs, input_sha256 }))))
+    Ok((job_ref, Verdict::Run(Box::new(Accepted { spec, workspace, _lease: lease, inputs, input_sha256 }))))
 }
 
 fn create_new(path: &Path, data: &[u8]) -> Result<()> {
@@ -266,20 +384,35 @@ fn create_new(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Charge an archive's expanded size to the job's budget: one archive may
+/// expand to the limit, not every one of a job's inputs.
+fn charge(budget: &mut u64, body: &[u8], limits: &ZipLimits) -> Result<()> {
+    let expands: u64 = airlox_core::validate::zip::inspect_zip(body, limits)?.iter().map(|e| e.size).sum();
+    *budget = budget.checked_sub(expands).with_context(|| {
+        format!("the job's archives expand beyond {} MiB in total", limits.max_total_bytes >> 20)
+    })?;
+    Ok(())
+}
+
+/// The tree input of a job, read and checked.
+fn load_tree(a: &Accepted, tree: &ItemRef) -> Result<Tree> {
+    let (_, _, subkind, body) =
+        a.inputs.iter().find(|(r, ..)| r == tree).context("the job's tree is not one of its inputs")?;
+    if *subkind != ContentType::Zip {
+        bail!("the job's tree is not a zip");
+    }
+    Tree::load(body, &ZipLimits::default())
+}
+
 /// Place inputs and the entry file in `work`. ZIPs are unpacked (each into a
 /// fresh directory first, as extraction requires, then moved over); no two
 /// inputs may claim the same name.
 fn stage_inputs(root: &Path, work: &Path, a: &Accepted) -> Result<()> {
     let limits = ZipLimits::default();
-    // One archive may expand to the limit, not every one of a job's inputs.
     let mut budget = limits.max_total_bytes;
     for (i, (_, name, subkind, body)) in a.inputs.iter().enumerate() {
         if *subkind == ContentType::Zip {
-            let expands: u64 =
-                airlox_core::validate::zip::inspect_zip(body, &limits)?.iter().map(|e| e.size).sum();
-            budget = budget.checked_sub(expands).with_context(|| {
-                format!("the job's archives expand beyond {} MiB in total", limits.max_total_bytes >> 20)
-            })?;
+            charge(&mut budget, body, &limits)?;
             let staging = root.join(format!("unzip-{i}"));
             fs::create_dir(&staging)?;
             extract_zip(body, &staging, &limits)?;
@@ -296,7 +429,76 @@ fn stage_inputs(root: &Path, work: &Path, a: &Accepted) -> Result<()> {
             create_new(&work.join(name), body)?;
         }
     }
-    create_new(&work.join(&a.spec.filename), a.spec.code.as_bytes())
+    if a.spec.kind() == JobKind::Python {
+        create_new(&work.join(&a.spec.filename), a.spec.code.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Place inputs and the entry file in a sender's workspace. The tree is
+/// synced first; the other inputs and the entry file then replace what is
+/// there, but not each other.
+fn stage_workspace(ws: &Workspace, a: &Accepted, tree: Option<&Tree>) -> Result<()> {
+    let limits = ZipLimits::default();
+    let mut budget = limits.max_total_bytes;
+    let mut claimed = std::collections::HashSet::new();
+    if let (Some(tree), Some(tree_ref)) = (tree, &a.spec.tree) {
+        if let Some((_, _, _, body)) = a.inputs.iter().find(|(r, ..)| r == tree_ref) {
+            charge(&mut budget, body, &limits)?;
+            ws.sync_tree(tree, body)?;
+        }
+    }
+    for (r, name, subkind, body) in &a.inputs {
+        if a.spec.tree.as_ref() == Some(r) {
+            continue;
+        }
+        let zipped = *subkind == ContentType::Zip;
+        if zipped {
+            charge(&mut budget, body, &limits)?;
+        }
+        ws.put(name, body, zipped, &limits, &mut claimed)?;
+    }
+    if a.spec.kind() == JobKind::Python {
+        ws.put(&a.spec.filename, a.spec.code.as_bytes(), false, &limits, &mut claimed)?;
+    }
+    Ok(())
+}
+
+/// Everything a job needs on disk: its inputs and entry file in the work
+/// dir (a workspace is made ready first), a shell job's script in the meta
+/// dir.
+fn stage(job: &PreparedJob, a: &Accepted, tree: Option<&Tree>) -> Result<()> {
+    match &a.workspace {
+        Some(ws) => {
+            ws.prepare(a.spec.fresh)?;
+            stage_workspace(ws, a, tree)?;
+        }
+        None if tree.is_some_and(|t| t.delta) => {
+            let missing = tree.map(|t| t.files.iter().map(|f| f.path.clone()).collect()).unwrap_or_default();
+            return Err(workspace::TreeStale { missing }.into());
+        }
+        None => stage_inputs(&job.root, &job.work_dir(), a)?,
+    }
+    if a.spec.kind() == JobKind::Shell {
+        create_new(&job.meta_dir().join(SCRIPT_FILE), a.spec.code.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Give a tree to the user containers run as (root runners run them as
+/// nobody), without following links.
+#[cfg(unix)]
+fn chown_for_container(path: &Path) {
+    use nix::fcntl::AtFlags;
+    let nobody = Some(nix::unistd::Uid::from_raw(65534));
+    let group = Some(nix::unistd::Gid::from_raw(65534));
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let _ = nix::unistd::fchownat(None, &p, nobody, group, AtFlags::AT_SYMLINK_NOFOLLOW);
+        if fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir()) {
+            stack.extend(fs::read_dir(&p).into_iter().flatten().flatten().map(|e| e.path()));
+        }
+    }
 }
 
 fn read_capped(path: &Path, max: u64) -> Result<(Vec<u8>, bool)> {
@@ -724,6 +926,10 @@ fn spawn_progress(
                 elapsed_ms: start.elapsed().as_millis() as u64,
                 tail,
                 tail_truncated,
+                stream: None,
+                offset: None,
+                data: None,
+                truncated: false,
             };
             let refs = vec![job_ref.clone()];
             // One try: the next tick says the same, and newer.
@@ -802,18 +1008,27 @@ pub async fn handle(
             result.code_sha256 = hex(&sha256(a.spec.code.as_bytes()));
             result.input_sha256 = a.input_sha256.clone();
             result.env = ctx.env.clone();
+            if let Some(t) = &a.spec.tree {
+                tracing::info!(job = %job_id, tree = %t.id, workspace = a.workspace.is_some(), "the job carries a working tree");
+            }
             let memory_mb =
                 a.spec.memory_mb.unwrap_or(limits.memory_mb).min(ctx.memory_cap_mb.unwrap_or(u32::MAX));
             let dir = tempfile::Builder::new().prefix("job-").tempdir_in(&ctx.jobs_dir)?;
             let job = PreparedJob {
                 id: job_id.clone(),
                 root: dir.path().to_path_buf(),
+                work: a.workspace.as_ref().map_or_else(|| dir.path().join("work"), Workspace::work),
+                kind: a.spec.kind(),
                 entry: a.spec.filename.clone(),
+                shell: ctx.backend.shell().unwrap_or("sh"),
+                cwd: a.spec.cwd.clone(),
                 timeout_s: a.spec.timeout_s,
                 memory_mb,
                 network: ctx.network,
             };
-            for d in [job.work_dir(), job.out_dir(), job.meta_dir()] {
+            // A workspace's work dir is made ready with its inputs, below.
+            let fresh_work = a.workspace.is_none().then(|| job.work_dir());
+            for d in fresh_work.into_iter().chain([job.out_dir(), job.meta_dir()]) {
                 fs::create_dir(&d)?;
                 // A root runner runs docker jobs as nobody, who must be able to write here.
                 #[cfg(unix)]
@@ -833,10 +1048,28 @@ pub async fn handle(
             // prints (and reports as progress) must not carry where the
             // runner keeps them, nor whose home they are in.
             let hidden = Arc::new(hidden_dirs(&ctx, &job));
-            if let Err(e) = stage_inputs(&job.root, &job.work_dir(), &a) {
-                result.reason = Some(format!("could not stage inputs: {e:#}"));
+            let tree = a.spec.tree.as_ref().map(|t| load_tree(&a, t)).transpose();
+            if let (Ok(Some(t)), Some(env)) = (&tree, &mut result.env) {
+                env.tree = Some(t.info.clone());
+            }
+            let staged = tree.as_ref().map_err(|e| anyhow::anyhow!("{e:#}")).and_then(|tree| {
+                stage(&job, &a, tree.as_ref())?;
+                // Container users own what they will write to.
+                #[cfg(unix)]
+                if nix::unistd::getuid().is_root() && matches!(ctx.backend, Backend::Docker(_)) {
+                    chown_for_container(&job.work_dir());
+                }
+                Ok(())
+            });
+            if let Err(e) = staged {
+                // Nothing ran: a refused result says nothing of where.
+                result.env = None;
+                result.reason = Some(match e.downcast_ref::<workspace::TreeStale>() {
+                    Some(stale) => stale.to_string(),
+                    None => format!("could not stage inputs: {e:#}"),
+                });
             } else {
-                tracing::info!(job = %job_id, entry = %job.entry, "running");
+                tracing::info!(job = %job_id, kind = job.kind.as_str(), "running");
                 let progress = spawn_progress(
                     &ctx,
                     &poster,
@@ -845,11 +1078,13 @@ pub async fn handle(
                     a.spec.progress_file.clone(),
                     hidden.clone(),
                 );
+                let output = stream::spawn(&ctx, &poster, &job_ref, job.meta_dir(), hidden.clone());
                 let raw = ctx.backend.run(&job, cancel).await.unwrap_or_else(|e| RawResult {
                     error: Some(format!("the sandbox could not run the job: {e:#}")),
                     ..Default::default()
                 });
                 drop(progress);
+                drop(output);
                 let (status, exit_code, reason) = outcome(&raw, job.timeout_s, memory_mb);
                 result.status = status;
                 result.exit_code = exit_code;
@@ -895,6 +1130,40 @@ pub async fn handle(
             // and the reason and notes the runner wrote, whose errors name
             // the work directories. (Redacting never lengthens text.)
             hide_dirs(&mut result, &hidden);
+            if let Some(ws) = a.workspace {
+                // Measured now, so the sender's next job knows if it may run,
+                // and what of its tree it need not send again.
+                let ran = result.status != JobStatus::Refused;
+                let tree = tree.ok().flatten().filter(|_| ran);
+                let max = ctx.workspaces.as_ref().map_or(u64::MAX, |w| w.max_bytes);
+                // Over the limit, it goes now rather than holding the disk
+                // until the sender's next job: nothing bounds a job's writes
+                // while it runs.
+                let (size, changed, emptied) = tokio::task::spawn_blocking(move || {
+                    let changed = tree.as_ref().and_then(|t| ws.changed(t));
+                    let size = ws.finish();
+                    let emptied = size > max && ws.prepare(true).is_ok();
+                    (size, changed, emptied)
+                })
+                .await
+                .unwrap_or((0, None, false));
+                if let Some(t) = result.env.as_mut().and_then(|e| e.tree.as_mut()) {
+                    t.changed = changed;
+                }
+                if emptied {
+                    let line = format!(
+                        "\n[airlox] your workspace on this runner grew to {} MB, over its {} MB limit, so the runner emptied it",
+                        size.div_ceil(1 << 20),
+                        max >> 20
+                    );
+                    if result.stderr.len() + line.len() <= MAX_STDIO_BYTES {
+                        result.stderr.push_str(&line);
+                    }
+                    tracing::warn!(job = %job_id, workspace_mb = size >> 20, "workspace over its limit: emptied");
+                } else {
+                    tracing::info!(job = %job_id, workspace_mb = size >> 20, "workspace kept");
+                }
+            }
             crate::sandbox::make_removable(dir.path());
             drop(dir);
         }
@@ -918,6 +1187,62 @@ pub async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn docker(image: Option<&str>) -> Backend {
+        Backend::Docker(crate::sandbox::docker::Docker::new(
+            "docker".into(),
+            image.map(String::from),
+            "1".into(),
+            None,
+            Path::new("/nonexistent"),
+        ))
+    }
+
+    fn limits(kinds: Option<Vec<JobKind>>) -> JobLimits {
+        JobLimits { kinds, ..Default::default() }
+    }
+
+    #[test]
+    fn a_job_of_a_kind_the_runner_or_session_lacks_is_refused_with_a_stable_reason() {
+        let both = limits(Some(vec![JobKind::Python, JobKind::Shell]));
+        // A docker runner with no image offers python only, and says how to change that.
+        let why = kind_refusal(JobKind::Shell, &both, &docker(None)).unwrap();
+        assert!(why.starts_with("kind_not_supported: this runner does not run shell jobs"), "{why}");
+        assert!(why.contains("--image"), "{why}");
+        assert!(kind_refusal(JobKind::Python, &both, &docker(None)).is_none());
+        // With an image it offers both.
+        assert!(kind_refusal(JobKind::Shell, &both, &docker(Some("ci:latest"))).is_none());
+        // A session that allows python only (no `kinds` at all).
+        let why = kind_refusal(JobKind::Shell, &limits(None), &docker(Some("ci"))).unwrap();
+        assert_eq!(why, "kind_not_supported: this session does not allow shell jobs");
+        let shell_only = limits(Some(vec![JobKind::Shell]));
+        assert!(kind_refusal(JobKind::Python, &shell_only, &docker(Some("ci"))).unwrap().contains("session"));
+        // The core's own policy error for an unallowed kind gets the same prefix.
+        let e = anyhow::Error::from(airlox_core::Error::Policy(
+            "shell jobs are not allowed in this session".into(),
+        ));
+        assert!(open_failure(&e).starts_with("kind_not_supported: "), "{}", open_failure(&e));
+        let e = anyhow::anyhow!("bad signature");
+        assert!(open_failure(&e).starts_with("job did not verify: "));
+    }
+
+    #[test]
+    fn a_workspace_is_held_by_one_job_until_its_lease_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let sender = Keypair::generate().public();
+        let workspaces = Workspaces::new(dir.path(), 10, Duration::from_secs(60));
+        let in_use = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let mine = workspaces.of("ax_s", &sender);
+        let lease = WorkspaceLease::take(&in_use, &mine).expect("free");
+        assert!(WorkspaceLease::take(&in_use, &workspaces.of("ax_s", &sender)).is_none());
+        // Another sender, or the same sender in another session, is not blocked.
+        assert!(
+            WorkspaceLease::take(&in_use, &workspaces.of("ax_s", &Keypair::generate().public())).is_some()
+        );
+        assert!(WorkspaceLease::take(&in_use, &workspaces.of("ax_t", &sender)).is_some());
+        drop(lease);
+        assert!(WorkspaceLease::take(&in_use, &mine).is_some());
+    }
 
     #[test]
     fn what_the_runner_wrote_names_no_directory_either() {
@@ -962,6 +1287,9 @@ mod tests {
             airlox: "0.1.2".into(),
             sandbox: airlox_core::cert::SandboxKind::Docker,
             interpreter: "docker:python".into(),
+            kinds: None,
+            shell: None,
+            tree: None,
         };
         assert_eq!(checked_env(Some(env.clone())).unwrap().interpreter, "docker:python");
         env.interpreter = "x".repeat(129);

@@ -287,7 +287,7 @@
     }
   ],
   "join": {
-    "canonical": "{\"cert\":{\"cert\":{\"issued_at_ms\":1761400000001,\"participant_pub\":\"oJql9HpnWYAv-VX43C0qFKXJnSO-l_hkEn_5ODRVpPA\",\"role\":\"runner\",\"session_id\":\"ax_kzdvvj2umnduyauf35o36k6kw4\",\"v\":1},\"sig\":\"q2Js6KIDjPE9hBFuRE3xE8VH7jOMnnXmsJJ6qLFttsVtvsqs1lueYMLurK4pUkC63IJDQOvBRBKmR5S_bt-LCg\"},\"created_at_ms\":1761400000002,\"display_name\":\"runner-01\",\"kind\":\"runner\",\"runner\":{\"host\":\"build-box\",\"labels\":[\"cpu\",\"py3.12\"],\"name\":\"runner-01\",\"network_unblocked\":false,\"sandbox\":\"docker\"},\"session_id\":\"ax_kzdvvj2umnduyauf35o36k6kw4\",\"v\":1}",
+    "canonical": "{\"cert\":{\"cert\":{\"issued_at_ms\":1761400000001,\"participant_pub\":\"oJql9HpnWYAv-VX43C0qFKXJnSO-l_hkEn_5ODRVpPA\",\"role\":\"runner\",\"session_id\":\"ax_kzdvvj2umnduyauf35o36k6kw4\",\"v\":1},\"sig\":\"q2Js6KIDjPE9hBFuRE3xE8VH7jOMnnXmsJJ6qLFttsVtvsqs1lueYMLurK4pUkC63IJDQOvBRBKmR5S_bt-LCg\"},\"created_at_ms\":1761400000002,\"display_name\":\"runner-01\",\"kind\":\"runner\",\"runner\":{\"host\":\"build-box\",\"kinds\":[\"python\"],\"labels\":[\"cpu\",\"py3.12\"],\"name\":\"runner-01\",\"network_unblocked\":false,\"sandbox\":\"docker\",\"shell\":null},\"session_id\":\"ax_kzdvvj2umnduyauf35o36k6kw4\",\"v\":1}",
     "signed": {
       "join": {
         "cert": {
@@ -305,20 +305,24 @@
         "kind": "runner",
         "runner": {
           "host": "build-box",
+          "kinds": [
+            "python"
+          ],
           "labels": [
             "cpu",
             "py3.12"
           ],
           "name": "runner-01",
           "network_unblocked": false,
-          "sandbox": "docker"
+          "sandbox": "docker",
+          "shell": null
         },
         "session_id": "ax_kzdvvj2umnduyauf35o36k6kw4",
         "v": 1
       },
-      "sig": "CGOJsmASpED4vaKetdGNEhKCWracFqohK5WT8m_bz4KujJyzPuD9aSXmEy1zPRsN_9IUh9HFGbFjrY9gPGEtBw"
+      "sig": "fWRgHSAO_eChXKdIAZJsQcK-ecgKPHqUwgjXdBQBaoU4srm1oexP38EKQlp1dIQhm5Jys-ouhG_LBQxEcDgmBA"
     },
-    "signed_canonical": "{\"join\":{\"cert\":{\"cert\":{\"issued_at_ms\":1761400000001,\"participant_pub\":\"oJql9HpnWYAv-VX43C0qFKXJnSO-l_hkEn_5ODRVpPA\",\"role\":\"runner\",\"session_id\":\"ax_kzdvvj2umnduyauf35o36k6kw4\",\"v\":1},\"sig\":\"q2Js6KIDjPE9hBFuRE3xE8VH7jOMnnXmsJJ6qLFttsVtvsqs1lueYMLurK4pUkC63IJDQOvBRBKmR5S_bt-LCg\"},\"created_at_ms\":1761400000002,\"display_name\":\"runner-01\",\"kind\":\"runner\",\"runner\":{\"host\":\"build-box\",\"labels\":[\"cpu\",\"py3.12\"],\"name\":\"runner-01\",\"network_unblocked\":false,\"sandbox\":\"docker\"},\"session_id\":\"ax_kzdvvj2umnduyauf35o36k6kw4\",\"v\":1},\"sig\":\"CGOJsmASpED4vaKetdGNEhKCWracFqohK5WT8m_bz4KujJyzPuD9aSXmEy1zPRsN_9IUh9HFGbFjrY9gPGEtBw\"}"
+    "signed_canonical": "{\"join\":{\"cert\":{\"cert\":{\"issued_at_ms\":1761400000001,\"participant_pub\":\"oJql9HpnWYAv-VX43C0qFKXJnSO-l_hkEn_5ODRVpPA\",\"role\":\"runner\",\"session_id\":\"ax_kzdvvj2umnduyauf35o36k6kw4\",\"v\":1},\"sig\":\"q2Js6KIDjPE9hBFuRE3xE8VH7jOMnnXmsJJ6qLFttsVtvsqs1lueYMLurK4pUkC63IJDQOvBRBKmR5S_bt-LCg\"},\"created_at_ms\":1761400000002,\"display_name\":\"runner-01\",\"kind\":\"runner\",\"runner\":{\"host\":\"build-box\",\"kinds\":[\"python\"],\"labels\":[\"cpu\",\"py3.12\"],\"name\":\"runner-01\",\"network_unblocked\":false,\"sandbox\":\"docker\",\"shell\":null},\"session_id\":\"ax_kzdvvj2umnduyauf35o36k6kw4\",\"v\":1},\"sig\":\"fWRgHSAO_eChXKdIAZJsQcK-ecgKPHqUwgjXdBQBaoU4srm1oexP38EKQlp1dIQhm5Jys-ouhG_LBQxEcDgmBA\"}"
   },
   "manifest": {
     "canonical": "{\"allowed_types\":[\"text\",\"py\",\"md\",\"zip\",\"image\"],\"created_at_ms\":1761400000000,\"expires_at_ms\":1761403600000,\"job_limits\":{\"approve_runners\":true,\"memory_mb\":512,\"network\":false,\"packages\":[\"matplotlib\",\"numpy\",\"pandas\"],\"return_out\":true,\"runtime\":\"python3.12\",\"timeout_s\":30},\"max_item_bytes\":26214400,\"mode\":\"execute\",\"owner_pub\":\"A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg\",\"roles\":{\"observer\":\"aUDqhwYvIR5rS-W_JseE5k2Cbai3raqUWtMVb5AlMso\",\"runner\":\"Jrrb1sOH_UP-JWWP4MScHCbN-4uhhOyzuGqBmPqJh64\",\"sender\":\"Jc4Grq2winlQM3pxRx9r1H9A1Yo5WKq4MrACHyylOLU\"},\"session_id\":\"ax_kzdvvj2umnduyauf35o36k6kw4\",\"v\":1}",

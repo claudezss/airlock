@@ -4,9 +4,11 @@
 //! python3 shim.py --work /work --entry summarize.py --timeout 30 --result /meta/result.json
 //! ```
 //!
-//! It scrubs the environment, runs the entry file with `python -E -s`, enforces
-//! the wall clock (killing the whole process group), records peak RSS and
-//! writes `result.json`. Stdout and stderr go to files next to the result.
+//! It scrubs the environment, runs the entry file with `python -E -s` (or,
+//! with `--shell sh --script PATH`, the script with `sh -e -c`), starting in
+//! `--cwd` below the work dir if given, enforces the wall clock (killing the
+//! whole process group), records peak RSS and writes `result.json`. Stdout and
+//! stderr go to files next to the result.
 
 use serde::{Deserialize, Serialize};
 
