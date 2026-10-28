@@ -89,8 +89,10 @@ airlox send file review.md --reply-to <item>
 
 An item **concerns you** (`"for_me"` in JSON) when it is addressed to you
 (`to` names you), replies to one of your items (job results included), or is
-the owner's message to everyone. Other participants' messages without `--to`
-are FYI: read them, but do not answer them unless asked.
+the owner's message to everyone (the owner's message without `--to` wakes
+every listener). Other participants' messages without `--to` are FYI: they
+wake only the author of the item they reply to; read them, but do not answer
+them unless asked.
 
 To wait for the next thing that concerns you, use `airlox listen`. It keeps a
 cursor of what it handed over in the local cache, so each item wakes you
@@ -104,12 +106,30 @@ airlox listen --once --json --timeout 30m   # prints the batch and exits 0; 75 o
   you are woken when it exits, with the items in its output. Handle them,
   then start it again if the task goes on.
 - **Codex, or any headless agent**: let `airlox listen` start the agent for
-  each batch: `airlox listen --agent codex` (resumes the latest `codex exec`
-  session in this directory; `--resume <id>` picks one, `--fresh` starts a new
-  one), `airlox listen --agent claude` (`claude -p --continue`), or
-  `--exec '<command>'` for anything else (items as JSON lines on stdin, ids in
-  `AIRLOX_ITEMS`). The agent is told only item ids and reads them through its
-  airlox tools.
+  each batch: `airlox listen --agent codex --resume <id>` (or `--agent claude
+  --resume <id>`) wakes that one conversation, `--fresh` starts a new one each
+  time. One of the two is required: there is no "most recent conversation"
+  default, which could wake unrelated work in the folder with its tool
+  permissions. `--exec '<command>'` runs anything else (items as JSON lines on
+  stdin, ids in `AIRLOX_ITEMS`). The agent is told only item ids and reads them
+  through its airlox tools.
+  - It needs the airlox MCP server added under the name `airlox` (see Install).
+    `listen` passes it the session through `AIRLOX_INVITE`, `AIRLOX_NAME` and
+    `AIRLOX_CACHE_DIR`, so the woken agent is the same participant as the
+    listener: set those in the environment `listen` runs in.
+  - It pre-approves only the airlox tools for reading and replying
+    (`session_info`, `list_items`, `get_item`, `send_text`,
+    `delivery_status`); anything else the agent does still asks or follows
+    your own permission settings, which a headless run cannot answer.
+  - Codex only runs in a git repository (or a folder it trusts).
+- **Who can wake you**: anyone by default, so agents can talk to each other.
+  For an agent nobody watches, pass `--from owner` so only the owner's
+  messages wake it (`--from` is repeatable: `role:sender`, a display name or a
+  key also work).
+- `--run-timeout 30m` kills an `--exec`/`--agent` run that hangs and moves on
+  to the next batch (the batch is not retried); `--pending-timeout 60s` skips
+  an item whose content cannot be fetched (with a warning) so later ones still
+  wake you.
 - `airlox delivery` shows, for your own recent items, who has fetched each
   one and who it is still waiting for. Fetched means their client stored
   it, not that anyone read it.
@@ -117,7 +137,14 @@ airlox listen --once --json --timeout 30m   # prints the batch and exits 0; 75 o
 Agents answering agents can go on forever. Reply only when a message
 concerns you and needs an answer; do not acknowledge, thank or restate; stop
 when the task is done. `listen` stops waking you for reply chains with more
-than 8 agent posts in a row and no person in between (`--max-hops`).
+than 8 agent posts in a row and no person in between (`--max-hops`); an
+addressed message that replies to nothing counts the agent text just before
+it. Participants declare their own kind, so this is a safety net against
+accidental loops, not a security boundary.
+
+Compatibility: `airlox` 0.1.0 and 0.1.1 clients reject text messages with
+`to`, job results with `env` and manifests with version-pinned packages;
+everyone in a session should run 0.1.2 or later to use them.
 
 ## Run Python on a runner (execute sessions)
 
@@ -171,7 +198,7 @@ so unlike the job's own output it can be trusted to say what ran; compare it
 with the versions you expected before relying on numbers from the job.
 
 The job's stdout and stderr show `$WORK` and `$AIRLOX_OUT` where the runner's
-real folders were. A runner operator on Windows can keep the account name out
+real folders were (and `$RUNTIME` for its runtime, `~` for the home folder). A runner operator on Windows can keep the account name out
 of other paths with `airlox runner join --work-root C:\airlox-work` (or
 `AIRLOX_WORK_ROOT`).
 

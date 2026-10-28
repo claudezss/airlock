@@ -212,6 +212,97 @@ impl Cache {
     }
 }
 
+/// Keeps a listener's cursor from stalling behind an item that never
+/// arrives (its blob evicted, no holder online): an item pending longer than
+/// the limit is skipped, with a warning on stderr.
+pub struct PendingWatch {
+    limit: Duration,
+    since: HashMap<u64, Instant>,
+    skipped: HashSet<u64>,
+}
+
+impl PendingWatch {
+    pub fn new(limit: Duration) -> PendingWatch {
+        PendingWatch { limit, since: HashMap::new(), skipped: HashSet::new() }
+    }
+
+    /// Like [`Session::settled_seq`], but not held back by items pending
+    /// longer than the limit as of `now`.
+    pub fn settled_seq(&mut self, items: &[Item], now: Instant) -> Option<u64> {
+        let pending: Vec<u64> = items.iter().filter(|i| i.status == Status::Pending).map(|i| i.seq).collect();
+        self.since.retain(|seq, _| pending.contains(seq));
+        let mut lowest = None;
+        for seq in pending {
+            let since = *self.since.entry(seq).or_insert(now);
+            if now.saturating_duration_since(since) >= self.limit {
+                if self.skipped.insert(seq) {
+                    eprintln!(
+                        "skipping #{seq}: still not fetched after {}s; waking for later items",
+                        self.limit.as_secs()
+                    );
+                }
+            } else {
+                lowest = Some(lowest.map_or(seq, |l: u64| l.min(seq)));
+            }
+        }
+        match lowest {
+            Some(p) => p.checked_sub(1),
+            None => items.iter().map(|i| i.seq).max(),
+        }
+    }
+
+    /// How long until the next pending item is given up on.
+    pub fn next_check(&self, now: Instant) -> Option<Duration> {
+        self.since
+            .iter()
+            .filter(|(seq, _)| !self.skipped.contains(seq))
+            .map(|(_, since)| self.limit.saturating_sub(now.saturating_duration_since(*since)))
+            .min()
+    }
+}
+
+/// Whether `spec` names participant `p`: `owner`, `role:<role>`, a key or a
+/// display name (`@` optional).
+fn names(p: &Participant, spec: &str) -> bool {
+    let spec = spec.trim();
+    match spec {
+        "owner" => p.role == "owner",
+        _ => match spec.strip_prefix("role:") {
+            Some(role) => p.role == role,
+            None => p.participant_pub == spec || p.display_name == spec.strip_prefix('@').unwrap_or(spec),
+        },
+    }
+}
+
+/// See [`Session::agent_hops`].
+fn hops(items: &[Item], index: &HashMap<String, usize>, web: &dyn Fn(&str) -> bool, item: &Item) -> usize {
+    let parent = |i: &Item| index.get(i.reply_to()?).map(|&n| &items[n]);
+    let mut chain = 0;
+    let mut cur = Some(item);
+    while let Some(i) = cur {
+        if web(&i.author) || chain > 1000 {
+            break;
+        }
+        chain += 1;
+        cur = parent(i);
+    }
+    // Two agents addressing each other without replying never form a chain:
+    // count the text just before it, up to the last thing a person posted.
+    let mut run = 0;
+    if item.to().is_some() && item.reply_to().is_none() {
+        run = 1;
+        for i in items.iter().rev().filter(|i| i.seq < item.seq) {
+            if web(&i.author) || run > 1000 {
+                break;
+            }
+            if i.kind == "text" {
+                run += 1;
+            }
+        }
+    }
+    chain.max(run)
+}
+
 /// Why the relay stopped answering: the session is gone, or (401) this
 /// participant left or its role was revoked.
 fn gone_reason(e: &anyhow::Error) -> String {
@@ -1349,20 +1440,29 @@ impl Session {
         self.get(item.reply_to()?)
     }
 
-    /// How many items in a row, walking up `item`'s reply chain from it,
-    /// were posted by programs (anything but the web client) rather than a
-    /// person. Listeners stop waking agents for long agent-only chains.
+    /// How many items in a row were posted by programs (anything but the web
+    /// client) rather than a person, which listeners use to stop waking
+    /// agents for long agent-only exchanges: the items up `item`'s reply
+    /// chain, or for an addressed item that replies to nothing, the text
+    /// items just before it since a web participant last spoke, whichever
+    /// is more. Participant kind is self-declared, so this is a safety net
+    /// against accidental loops, not a security boundary.
     pub fn agent_hops(&self, item: &Item) -> usize {
-        let mut n = 0;
-        let mut cur = Some(item);
-        while let Some(i) = cur {
-            if self.participants.get(&i.author).is_some_and(|p| p.kind == "web") || n > 1000 {
-                break;
-            }
-            n += 1;
-            cur = self.parent(i);
-        }
-        n
+        let web = |author: &str| self.participants.get(author).is_some_and(|p| p.kind == "web");
+        hops(&self.items, &self.index, &web, item)
+    }
+
+    /// Whether `item`'s author is one of `specs` (any author if empty): the
+    /// owner (`owner`, or `role:<role>`), a display name (`@` optional) or a
+    /// key.
+    pub fn author_in(&self, item: &Item, specs: &[String]) -> bool {
+        specs.is_empty()
+            || self.participants.get(&item.author).is_some_and(|p| specs.iter().any(|s| names(p, s)))
+    }
+
+    /// Whether `spec` (see [`Session::author_in`]) names a participant other than you.
+    pub fn knows_participant(&self, spec: &str) -> bool {
+        self.participants.values().any(|p| !p.left && p.participant_pub != self.me && names(p, spec))
     }
 
     pub fn get(&self, id: &str) -> Option<&Item> {
@@ -1839,6 +1939,120 @@ mod tests {
             item_ref: json!({}),
             data: Some(data),
         }]
+    }
+
+    fn item(seq: u64, author: &str, to: Option<&[&str]>, reply_to: Option<u64>) -> Item {
+        Item {
+            seq,
+            id: format!("i{seq}"),
+            kind: "text".into(),
+            subkind: None,
+            author: author.into(),
+            author_role: None,
+            author_name: None,
+            created_at_ms: 0,
+            refs: reply_to.map(|n| json!([{"id": format!("i{n}")}])).unwrap_or(json!([])),
+            item_ref: json!({}),
+            meta: Some(match to {
+                Some(to) => json!({"text": "x", "to": to}),
+                None => json!({"text": "x"}),
+            }),
+            body: vec![],
+            status: Status::Ok,
+            error: None,
+        }
+    }
+
+    fn hops_of(items: &[Item], seq: u64) -> usize {
+        let index = items.iter().enumerate().map(|(n, i)| (i.id.clone(), n)).collect();
+        let web = |a: &str| a == "person";
+        hops(items, &index, &web, items.iter().find(|i| i.seq == seq).unwrap())
+    }
+
+    #[test]
+    fn hops_follow_a_reply_chain_up_to_a_person() {
+        let items = [
+            item(1, "person", None, None),
+            item(2, "a", Some(&["b"]), Some(1)),
+            item(3, "b", Some(&["a"]), Some(2)),
+            item(4, "a", Some(&["b"]), Some(3)),
+        ];
+        assert_eq!([2, 3, 4].map(|n| hops_of(&items, n)), [1, 2, 3]);
+    }
+
+    #[test]
+    fn agents_addressing_each_other_without_replying_still_count() {
+        let mut items = vec![item(1, "person", None, None)];
+        for n in 2..=7u64 {
+            let (from, to) = if n % 2 == 0 { ("a", "b") } else { ("b", "a") };
+            items.push(item(n, from, Some(&[to]), None));
+        }
+        // Each message names no parent, but the run of agent text grows.
+        assert_eq!([2, 3, 7].map(|n| hops_of(&items, n)), [1, 2, 6]);
+        // A person speaking resets the count.
+        items.push(item(8, "person", None, None));
+        items.push(item(9, "a", Some(&["b"]), None));
+        assert_eq!(hops_of(&items, 9), 1);
+        // Non-text items neither count nor break the run; the reply chain
+        // still wins when it is longer; a broadcast is not an addressed item.
+        let mut progress = item(10, "runner", None, None);
+        progress.kind = "progress".into();
+        items.push(progress);
+        items.push(item(11, "b", Some(&["a"]), None));
+        assert_eq!(hops_of(&items, 11), 2);
+        items.push(item(12, "a", None, None));
+        assert_eq!(hops_of(&items, 12), 1);
+    }
+
+    fn pending(seq: u64) -> Item {
+        let mut i = item(seq, "a", None, None);
+        i.status = Status::Pending;
+        i
+    }
+
+    #[test]
+    fn a_pending_item_holds_the_cursor_only_for_the_limit() {
+        let mut watch = PendingWatch::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        let items = [item(1, "a", None, None), pending(2), item(3, "a", None, None)];
+        assert_eq!(watch.settled_seq(&items, t0), Some(1));
+        assert_eq!(watch.next_check(t0 + Duration::from_secs(20)), Some(Duration::from_secs(40)));
+        assert_eq!(watch.settled_seq(&items, t0 + Duration::from_secs(59)), Some(1));
+        // Given up on: later items settle, and #2 is not waited for again.
+        assert_eq!(watch.settled_seq(&items, t0 + Duration::from_secs(60)), Some(3));
+        assert_eq!(watch.next_check(t0 + Duration::from_secs(60)), None);
+        // A later one pending is held on its own clock.
+        let items = [item(1, "a", None, None), pending(2), item(3, "a", None, None), pending(4)];
+        assert_eq!(watch.settled_seq(&items, t0 + Duration::from_secs(61)), Some(3));
+        assert_eq!(watch.settled_seq(&items, t0 + Duration::from_secs(130)), Some(4));
+        // Nothing pending: everything settles.
+        let items = [item(1, "a", None, None), item(2, "a", None, None)];
+        assert_eq!(watch.settled_seq(&items, t0), Some(2));
+    }
+
+    fn participant(key: &str, name: &str, role: &str) -> Participant {
+        Participant {
+            participant_pub: key.into(),
+            role: role.into(),
+            display_name: name.into(),
+            description: None,
+            kind: "cli".into(),
+            cert: String::new(),
+            left: false,
+        }
+    }
+
+    #[test]
+    fn participants_are_named_by_role_display_name_or_key() {
+        let owner = participant("K1", "lead", "owner");
+        let coder = participant("K2", "coder", "sender");
+        for spec in ["owner", "role:owner", "lead", "@lead", "K1"] {
+            assert!(names(&owner, spec), "{spec}");
+        }
+        for spec in ["owner", "role:owner", "lead", "K1", "role:runner", "coder2"] {
+            assert!(!names(&coder, spec), "{spec}");
+        }
+        assert!(names(&coder, "role:sender") && names(&coder, " @coder ") && names(&coder, "K2"));
     }
 
     #[test]

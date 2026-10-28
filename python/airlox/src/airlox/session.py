@@ -7,6 +7,7 @@ module is HTTP plumbing, the local cache, and ergonomics.
 from __future__ import annotations
 
 import json
+import logging
 import random
 import re
 import struct
@@ -20,6 +21,8 @@ import httpx
 
 from .cache import Cache, default_root
 from .execute import Job, NoRunnerAvailable, Runner, RunnerBusy, RunnerFailed, signed_approvals
+
+log = logging.getLogger(__name__)
 
 DEFAULT_TYPES = ("text", "py", "md", "zip", "image")
 # The item limit for a relay that does not say what it allows, and the
@@ -174,6 +177,11 @@ class Session:
         self._participants: Dict[str, dict] = {}
         self._items: Dict[str, Item] = {}
         self._order: List[str] = []
+        #: Cursor of the batch ``wait_for_messages`` last returned, not yet marked handled.
+        self._uncommitted: Optional[int] = None
+        #: When (monotonic) each pending item was first seen so, and which were given up on.
+        self._pending_since: Dict[int, float] = {}
+        self._pending_skipped: set = set()
         self._envelopes: Dict[str, str] = {}
         self._evicted: set = set()
         self._wanted: Dict[str, float] = {}  # evicted items this client asked holders for → when
@@ -446,8 +454,8 @@ class Session:
 
         ``to`` addresses it: participant names, keys or ``"role:owner"``
         (see :meth:`resolve_recipients`); their listeners wake for it. A
-        message without ``to`` goes to everyone and wakes only the author of
-        the item it replies to. ``reply_to`` (an item or its id) links it to
+        message without ``to`` goes to everyone: the owner's wakes every
+        listener, anyone else's only the author of the item it replies to. ``reply_to`` (an item or its id) links it to
         the item it answers."""
         meta: dict = {"type": "text", "text": text}
         to = list(to)
@@ -798,31 +806,87 @@ class Session:
         return None
 
     def agent_hops(self, item: Item) -> int:
-        """How many items in a row up ``item``'s reply chain came from
-        programs (anything but the web client): long agent-only chains are
-        how agents end up answering each other forever."""
-        n, cur = 0, item
-        while cur is not None and n <= 1000:
-            if (self._participants.get(cur.author) or {}).get("kind") == "web":
-                break
-            n += 1
+        """How many items in a row came from programs (anything but the web
+        client): up ``item``'s reply chain or, for an addressed item that
+        replies to nothing, among the text items just before it since a web
+        participant last spoke, whichever is more. Long agent-only exchanges
+        are how agents end up answering each other forever. Participant kind
+        is self-declared, so this is a safety net against accidental loops,
+        not a security boundary."""
+
+        def web(author: str) -> bool:
+            return (self._participants.get(author) or {}).get("kind") == "web"
+
+        chain, cur = 0, item
+        while cur is not None and chain <= 1000 and not web(cur.author):
+            chain += 1
             cur = self._items.get(cur.reply_to) if cur.reply_to else None
-        return n
+        run = 0
+        if item.to is not None and item.reply_to is None:
+            run = 1
+            for item_id in reversed(self._order):
+                i = self._items[item_id]
+                if i.seq >= item.seq:
+                    continue
+                if web(i.author) or run > 1000:
+                    break
+                if i.kind == "text":
+                    run += 1
+        return max(chain, run)
+
+    def _author_in(self, item: Item, specs: List[str]) -> bool:
+        if not specs:
+            return True
+        p = self._participants.get(item.author)
+        if p is None:
+            return False
+        for spec in specs:
+            spec = spec.strip()
+            if spec == "owner":
+                ok = p["role"] == "owner"
+            elif spec.startswith("role:"):
+                ok = p["role"] == spec[5:]
+            else:
+                ok = p["participant_pub"] == spec or p["display_name"] == spec.removeprefix("@")
+            if ok:
+                return True
+        return False
 
     @property
     def handled_seq(self) -> Optional[int]:
         """The local cursor :meth:`mark_handled` keeps (shared with ``airlox listen``)."""
         return self._cache.handled(self.role)
 
-    def mark_handled(self, seq: int) -> None:
-        """Record that items up to ``seq`` were handled. Only moves forward."""
+    def mark_handled(self, seq: Optional[int] = None) -> None:
+        """Record that items up to ``seq`` were handled. Only moves forward.
+        Without ``seq``, commit the batch :meth:`wait_for_messages` last
+        returned."""
+        if seq is None:
+            seq, self._uncommitted = self._uncommitted, None
+            if seq is None:
+                return
         if (self.handled_seq or -1) < seq:
             self._cache.save_handled(self.role, seq)
 
-    def _settled_seq(self) -> int:
+    def _settled_seq(self, pending_timeout: Optional[float] = None) -> int:
+        """The highest sequence number below every item still being fetched.
+        An item pending longer than ``pending_timeout`` seconds (if given) is
+        skipped with a warning, so one that never arrives holds nothing up."""
+        now = time.monotonic()
         pending = [i.seq for i in self._items.values() if i.status == "pending"]
-        if pending:
-            return min(pending) - 1
+        self._pending_since = {seq: self._pending_since.get(seq, now) for seq in pending}
+        waiting = []
+        for seq in pending:
+            if pending_timeout and now - self._pending_since[seq] >= pending_timeout:
+                if seq not in self._pending_skipped:
+                    self._pending_skipped.add(seq)
+                    log.warning(
+                        "skipping #%d: still not fetched after %gs; waking for later items", seq, pending_timeout
+                    )
+            else:
+                waiting.append(seq)
+        if waiting:
+            return min(waiting) - 1
         return max((i.seq for i in self._items.values()), default=0)
 
     def wait_for_messages(
@@ -830,39 +894,58 @@ class Session:
         timeout: Optional[float] = None,
         *,
         include_all: bool = False,
+        from_: Union[str, Iterable[str], None] = None,
         max_hops: int = 8,
         settle: float = 2.0,
+        pending_timeout: Optional[float] = 60.0,
     ) -> List[Item]:
         """Block until items for you arrive (see :meth:`wake_reason`; every
         item from others with ``include_all``) after the handled cursor, and
-        return them as one batch, marking them handled. A burst that lands
-        within ``settle`` seconds comes as one batch. Reply chains with more
-        than ``max_hops`` program-authored items in a row are skipped (0:
-        no limit). Returns ``[]`` on timeout or when the session closes."""
+        return them as one batch. A burst that lands within ``settle``
+        seconds comes as one batch. Reply chains with more than ``max_hops``
+        program-authored items in a row are skipped (0: no limit; see
+        :meth:`agent_hops`). ``from_`` limits who can wake you: ``"owner"``,
+        ``"role:<role>"``, display names or keys (default: anyone). An item
+        still being fetched after ``pending_timeout`` seconds is skipped with
+        a warning (``None`` or 0: wait forever). Returns ``[]`` on timeout or
+        when the session closes.
+
+        The batch is acknowledged late: it is marked handled when you next
+        call this method, or when you call :meth:`mark_handled` with no
+        argument, so a crash while handling it wakes you for it again."""
         deadline = None if timeout is None else time.monotonic() + timeout
+        specs = [from_] if isinstance(from_, str) else list(from_ or [])
 
         def wakes(i: Item) -> bool:
             if include_all:
                 ok = not i.mine and i.status == "ok" and i.kind not in ("progress", "event")
             else:
                 ok = self.wake_reason(i) is not None
-            return ok and (max_hops <= 0 or self.agent_hops(i) <= max_hops)
+            return ok and self._author_in(i, specs) and (max_hops <= 0 or self.agent_hops(i) <= max_hops)
 
+        self.mark_handled()  # the previous batch was handled if we are asked again
         self.sync()
         cursor = self.handled_seq or 0
         while True:
-            upto = self._settled_seq()
+            upto = self._settled_seq(pending_timeout)
             batch = [self._items[i] for i in self._order if cursor < self._items[i].seq <= upto]
             batch = [i for i in batch if wakes(i)]
             cursor = max(cursor, upto)
-            self.mark_handled(cursor)
             if batch:
+                self._uncommitted = cursor
                 return batch
+            self.mark_handled(cursor)
             left = None if deadline is None else deadline - time.monotonic()
             if self.closed or (left is not None and left <= 0):
                 return []
+            wait = 300.0 if left is None else min(left, 300.0)
+            if pending_timeout:  # come back when a pending item is due to be skipped
+                now = time.monotonic()
+                due = [pending_timeout - (now - t) for q, t in self._pending_since.items() if q not in self._pending_skipped]
+                if due:
+                    wait = min(wait, max(0.1, min(due)))
             woke = False
-            for item in self.stream(timeout=300.0 if left is None else min(left, 300.0)):
+            for item in self.stream(timeout=wait):
                 if item.seq > cursor and wakes(item):
                     woke = True
                     break

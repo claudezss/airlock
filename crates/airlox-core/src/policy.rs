@@ -388,7 +388,6 @@ fn is_hex64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Shape checks on a job result.
 /// Shape checks on the environment a result reports: short printable
 /// strings, and package names in normalized form.
 pub fn check_env(env: &JobEnv) -> Result<()> {
@@ -414,6 +413,7 @@ pub fn check_env(env: &JobEnv) -> Result<()> {
     Ok(())
 }
 
+/// Shape checks on a job result.
 pub fn check_result(r: &JobResult) -> Result<()> {
     r.job.validate()?;
     if r.stdout.len() > MAX_STDIO_BYTES || r.stderr.len() > MAX_STDIO_BYTES {

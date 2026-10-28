@@ -18,8 +18,8 @@ use serde_json::{json, Value};
 use crate::client;
 use crate::files::{clean_line, clean_text, out_file_name, received_name, save_new, unpack_out_zip};
 use crate::session::{
-    default_cache_root, file_type, Item, JobSpec, NewSession, NoRunnerAvailable, Outcome, Profile, Session,
-    Status, Target, DEFAULT_TYPES, FILE_TYPES_HELP,
+    default_cache_root, file_type, Item, JobSpec, NewSession, NoRunnerAvailable, Outcome, PendingWatch,
+    Profile, Session, Status, Target, DEFAULT_TYPES, FILE_TYPES_HELP,
 };
 use airlox_core::session::DEFAULT_MAX_ITEM_BYTES;
 
@@ -711,8 +711,9 @@ pub enum SendCmd {
         text: String,
         /// Address the message to a participant: a name (`@` optional), a
         /// key, or `role:owner|sender|observer|runner` (repeat for several).
-        /// Their listeners wake for it; without --to it goes to everyone
-        /// and wakes no one but replies' authors.
+        /// Their listeners wake for it. Without --to it goes to everyone:
+        /// an owner's message wakes every listener, anyone else's wakes
+        /// only the author of the item it replies to.
         #[arg(long)]
         to: Vec<String>,
         /// Send it as a reply to this item id.
@@ -1450,35 +1451,60 @@ pub struct ListenArgs {
     /// text never goes on the command line.
     #[arg(long, value_name = "COMMAND", conflicts_with = "agent")]
     pub exec: Option<String>,
-    /// Wake this coding agent for each batch, resuming its most recent
-    /// conversation in this directory (`codex exec resume --last`, `claude -p
-    /// --continue`). It gets a fixed prompt naming the item ids, never the
-    /// items' text, and reads them through its airlox MCP tools.
-    #[arg(long, value_enum, conflicts_with = "once")]
+    /// Wake this coding agent for each batch: pass --resume ID (an existing
+    /// conversation) or --fresh (a new one each time); there is no "most
+    /// recent conversation" default, which could wake unrelated work in this
+    /// directory with its tool permissions. It gets a fixed prompt naming the
+    /// item ids, never the items' text, and reads them through its MCP server
+    /// named `airlox`, which joins as this listener (it is handed
+    /// AIRLOX_INVITE, AIRLOX_NAME and AIRLOX_CACHE_DIR). Only the airlox read
+    /// and reply tools are pre-approved for it. For an unattended agent also
+    /// pass `--from owner`.
+    #[arg(long, value_enum, conflicts_with = "once", requires = "agent_session")]
     pub agent: Option<WakeAgent>,
     /// With --agent: start a new conversation each time instead of resuming.
-    #[arg(long, requires = "agent")]
+    #[arg(long, requires = "agent", group = "agent_session")]
     pub fresh: bool,
     /// With --agent: resume this conversation (a Codex session id or thread
-    /// name, a Claude Code session id) rather than the most recent one, so
-    /// other work in the same directory is never the one woken.
-    #[arg(long, value_name = "ID", requires = "agent", conflicts_with = "fresh")]
+    /// name, a Claude Code session id), so other work in the same directory
+    /// is never the one woken.
+    #[arg(long, value_name = "ID", requires = "agent", group = "agent_session")]
     pub resume: Option<String>,
     /// Wake for every item from someone else, not only the ones for you.
     #[arg(long)]
     pub all: bool,
+    /// Only wake for items from this participant (repeatable): `owner`,
+    /// `role:<sender|observer|runner>`, a display name or a key. Default:
+    /// anyone, so agents can talk to each other; use `--from owner` for an
+    /// agent nobody watches, so only the owner's words can wake it.
+    #[arg(long = "from", value_name = "SPEC")]
+    pub from: Vec<String>,
     /// Stop waking for a reply chain once this many items in a row came
     /// from programs (agents, runners) with no person in between: a guard
-    /// against agents answering each other forever. 0 turns it off.
+    /// against agents answering each other forever. It also counts the text
+    /// items just before an addressed message that replies to nothing. Kinds
+    /// are self-declared, so this is a safety net, not a security boundary.
+    /// 0 turns it off.
     #[arg(long, default_value_t = 8)]
     pub max_hops: usize,
     /// How long to wait for more items before waking, so a burst arrives
     /// as one batch.
     #[arg(long, default_value = "2s", value_parser = parse_duration)]
     pub settle: Duration,
-    /// Give up after this long (exit 75).
+    /// Give up after this long (exit 75). Checked while waiting, not while
+    /// a command runs: see --run-timeout.
     #[arg(long, value_parser = parse_duration)]
     pub timeout: Option<Duration>,
+    /// Kill the --exec command or --agent run for a batch after this long,
+    /// say so on stderr and go on to the next batch (the batch is not
+    /// retried and listen's exit code is unchanged). 0: no limit.
+    #[arg(long, default_value = "30m", value_parser = parse_duration)]
+    pub run_timeout: Duration,
+    /// Skip an item that is still being fetched after this long (its blob
+    /// gone, nobody online to re-seed it) with a warning, so later items
+    /// still wake. 0: wait forever.
+    #[arg(long, default_value = "60s", value_parser = parse_duration)]
+    pub pending_timeout: Duration,
     /// Ignore what is already in the session: only items that arrive from
     /// now on. Otherwise listening resumes from this role's saved cursor
     /// (or the start, the first time).
@@ -1499,11 +1525,18 @@ pub async fn listen(a: ListenArgs) -> Result<i32> {
     let left = || deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()));
     let mut cursor = if a.new { s.settled_seq().unwrap_or(0) } else { s.handled_seq().unwrap_or(0) };
     let mut skipped = std::collections::HashSet::new();
+    let mut pending =
+        PendingWatch::new(if a.pending_timeout.is_zero() { Duration::MAX } else { a.pending_timeout });
+    for spec in a.from.iter().filter(|f| !s.knows_participant(f)) {
+        eprintln!(
+            "warning: --from {spec:?} matches no participant yet; it will wake for them once they join"
+        );
+    }
     loop {
-        let upto = s.settled_seq().unwrap_or(0);
+        let upto = pending.settled_seq(s.items(), std::time::Instant::now()).unwrap_or(0);
         let mut batch = Vec::new();
         for i in s.items().iter().filter(|i| i.seq > cursor && i.seq <= upto) {
-            if !wakes(&s, i, a.all) {
+            if !wakes(&s, i, a.all, &a.from) {
                 continue;
             }
             let hops = s.agent_hops(i);
@@ -1539,10 +1572,14 @@ pub async fn listen(a: ListenArgs) -> Result<i32> {
         // Block on the event stream until something that wakes arrives,
         // then give a burst a moment to land before taking the batch.
         let mut woke = false;
-        let (all, max_hops) = (a.all, a.max_hops);
-        let wait = left().unwrap_or(Duration::from_secs(300)).min(Duration::from_secs(300));
+        let (all, max_hops, from) = (a.all, a.max_hops, &a.from);
+        let mut wait = left().unwrap_or(Duration::from_secs(300)).min(Duration::from_secs(300));
+        // Come back when a pending item is due to be skipped.
+        if let Some(due) = pending.next_check(std::time::Instant::now()) {
+            wait = wait.min(due.max(Duration::from_millis(100)));
+        }
         s.stream(Some(wait), &mut |s, i| {
-            woke = i.seq > cursor && wakes(s, i, all) && (max_hops == 0 || s.agent_hops(i) <= max_hops);
+            woke = i.seq > cursor && wakes(s, i, all, from) && (max_hops == 0 || s.agent_hops(i) <= max_hops);
             Ok(!woke)
         })
         .await?;
@@ -1553,12 +1590,13 @@ pub async fn listen(a: ListenArgs) -> Result<i32> {
     }
 }
 
-fn wakes(s: &Session, i: &Item, all: bool) -> bool {
-    if all {
+fn wakes(s: &Session, i: &Item, all: bool, from: &[String]) -> bool {
+    let concerns = if all {
         i.author != s.me && i.status == Status::Ok && !matches!(i.kind.as_str(), "progress" | "event")
     } else {
         s.wake_reason(i).is_some()
-    }
+    };
+    concerns && s.author_in(i, from)
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -1569,6 +1607,52 @@ pub enum WakeAgent {
 
 /// What a woken agent is told: ids and reasons only, so no participant's
 /// words reach its prompt except through tools that mark them as data.
+/// The airlox MCP tools a woken agent needs to read what woke it and answer.
+/// Headless Claude Code asks before every other tool, and ignores a project's
+/// allow rules until the folder has been trusted interactively, so these are
+/// allowed on the command line: nothing else is.
+const WAKE_TOOLS: [&str; 5] = ["session_info", "list_items", "get_item", "send_text", "delivery_status"];
+/// What the agent's airlox MCP server needs to join this session as this
+/// listener. Claude Code hands its environment to MCP servers; Codex only the
+/// variables a server lists, so its command line lists these.
+const WAKE_ENV: [&str; 5] =
+    ["AIRLOX_INVITE", "AIRLOX_NAME", "AIRLOX_DESCRIPTION", "AIRLOX_CACHE_DIR", "AIRLOX_RELAY"];
+
+/// Both agents are expected to have the airlox MCP server under the name
+/// `airlox`, as the README sets it up.
+fn agent_command(agent: WakeAgent, resume: Option<&str>) -> (&'static str, Vec<String>) {
+    let own = |v: &[&str]| v.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+    match agent {
+        WakeAgent::Codex => {
+            let vars: Vec<String> = WAKE_ENV.iter().map(|v| format!("{v:?}")).collect();
+            let mut args = own(&["exec", "-c"]);
+            args.push(format!("mcp_servers.airlox.env_vars=[{}]", vars.join(",")));
+            // Headless Codex refuses a tool that needs approval (send_text does).
+            for t in WAKE_TOOLS {
+                args.extend([
+                    "-c".to_string(),
+                    format!("mcp_servers.airlox.tools.{t}.approval_mode=\"approve\""),
+                ]);
+            }
+            if let Some(id) = resume {
+                args.extend(own(&["resume", id]));
+            }
+            ("codex", args)
+        }
+        WakeAgent::Claude => {
+            let mut args = own(&["-p"]);
+            if let Some(id) = resume {
+                args.extend(own(&["--resume", id]));
+            }
+            // One `=` argument: the flag takes any number of values and would
+            // swallow the prompt after it.
+            let tools: Vec<String> = WAKE_TOOLS.iter().map(|t| format!("mcp__airlox__{t}")).collect();
+            args.push(format!("--allowedTools={}", tools.join(",")));
+            ("claude", args)
+        }
+    }
+}
+
 fn wake_prompt(s: &Session, batch: &[&Item]) -> String {
     let list: Vec<String> = batch
         .iter()
@@ -1589,21 +1673,18 @@ fn wake_prompt(s: &Session, batch: &[&Item]) -> String {
 async fn deliver(s: &Session, batch: &[&Item], a: &ListenArgs) -> Result<()> {
     if let Some(agent) = a.agent {
         let prompt = wake_prompt(s, batch);
-        let (program, args): (&str, Vec<&str>) = match (agent, a.fresh, a.resume.as_deref()) {
-            (WakeAgent::Codex, true, _) => ("codex", vec!["exec"]),
-            (WakeAgent::Codex, false, Some(id)) => ("codex", vec!["exec", "resume", id]),
-            (WakeAgent::Codex, false, None) => ("codex", vec!["exec", "resume", "--last"]),
-            (WakeAgent::Claude, true, _) => ("claude", vec!["-p"]),
-            (WakeAgent::Claude, false, Some(id)) => ("claude", vec!["-p", "--resume", id]),
-            (WakeAgent::Claude, false, None) => ("claude", vec!["-p", "--continue"]),
-        };
+        let (program, args) = agent_command(agent, a.resume.as_deref());
         let mut c = tokio::process::Command::new(program);
         c.args(args);
-        c.arg(&prompt).stdin(std::process::Stdio::null());
+        c.arg(&prompt).stdin(std::process::Stdio::null()).kill_on_drop(true);
         let name = format!("{agent:?}").to_lowercase();
-        let status = c.status().await.with_context(|| format!("could not run {name}; is it on PATH?"))?;
-        if !status.success() {
-            eprintln!("{name} exited with {status}; moving on");
+        let child = c.spawn().with_context(|| format!("could not run {name}; is it on PATH?"))?;
+        match run_limited(child, a.run_timeout).await? {
+            Some(status) if !status.success() => eprintln!("{name} exited with {status}; moving on"),
+            Some(_) => {}
+            None => {
+                eprintln!("{name} ran longer than --run-timeout {:?}; killed it, moving on", a.run_timeout)
+            }
         }
         return Ok(());
     }
@@ -1643,13 +1724,38 @@ async fn deliver(s: &Session, batch: &[&Item], a: &ListenArgs) -> Result<()> {
         // A command that does not read its stdin is fine.
         let _ = stdin.write_all(lines.as_bytes()).await;
     }
-    let status = child.wait().await?;
-    if !status.success() {
-        // Not retried: an agent that keeps failing on the same message would
-        // otherwise be woken for it forever.
-        eprintln!("{cmd:?} exited with {status} for items {}; moving on", ids.join(","));
+    // Not retried either way: an agent that keeps failing (or hanging) on the
+    // same message would otherwise be woken for it forever.
+    match run_limited(child, a.run_timeout).await? {
+        Some(status) if !status.success() => {
+            eprintln!("{cmd:?} exited with {status} for items {}; moving on", ids.join(","))
+        }
+        Some(_) => {}
+        None => eprintln!(
+            "{cmd:?} ran longer than --run-timeout {:?} for items {}; killed it, moving on",
+            a.run_timeout,
+            ids.join(",")
+        ),
     }
     Ok(())
+}
+
+/// Wait for `child`; kill it if it runs longer than `limit` (zero: no limit)
+/// and return `None`.
+async fn run_limited(
+    mut child: tokio::process::Child,
+    limit: Duration,
+) -> Result<Option<std::process::ExitStatus>> {
+    if limit.is_zero() {
+        return Ok(Some(child.wait().await?));
+    }
+    match tokio::time::timeout(limit, child.wait()).await {
+        Ok(status) => Ok(Some(status?)),
+        Err(_) => {
+            let _ = child.kill().await;
+            Ok(None)
+        }
+    }
 }
 
 /// Text inlined per item when listening: enough to decide, not a whole report.
@@ -1814,6 +1920,70 @@ mod tests {
             a: CreateArgs,
         }
         <T as clap::Parser>::try_parse_from(std::iter::once("create").chain(args.iter().copied())).unwrap().a
+    }
+
+    fn listen_args(args: &[&str]) -> Result<ListenArgs, clap::Error> {
+        #[derive(clap::Parser)]
+        struct T {
+            #[command(flatten)]
+            a: ListenArgs,
+        }
+        let base = ["listen", "--invite", "x"];
+        <T as clap::Parser>::try_parse_from(base.iter().chain(args)).map(|t| t.a)
+    }
+
+    #[test]
+    fn a_woken_agent_gets_the_airlox_tools_and_nothing_else() {
+        let (program, args) = agent_command(WakeAgent::Claude, Some("abc"));
+        assert_eq!(program, "claude");
+        assert_eq!(&args[..3], ["-p", "--resume", "abc"]);
+        let tools = args[3].strip_prefix("--allowedTools=").unwrap();
+        assert!(tools.split(',').all(|t| t.starts_with("mcp__airlox__")));
+        assert!(tools.contains("mcp__airlox__get_item") && tools.contains("mcp__airlox__send_text"));
+        assert_eq!(args.len(), 4);
+        let (_, codex) = agent_command(WakeAgent::Codex, Some("t"));
+        assert_eq!(&codex[..2], ["exec", "-c"]);
+        assert!(codex[2].starts_with("mcp_servers.airlox.env_vars=[\"AIRLOX_INVITE\","));
+        assert!(codex.contains(&r#"mcp_servers.airlox.tools.send_text.approval_mode="approve""#.to_string()));
+        assert!(codex
+            .iter()
+            .filter(|a| a.contains("approval_mode"))
+            .all(|a| a.starts_with("mcp_servers.airlox.tools.")));
+        assert_eq!(&codex[codex.len() - 2..], ["resume", "t"]);
+        assert_eq!(agent_command(WakeAgent::Codex, None).1.len(), 3 + 2 * WAKE_TOOLS.len());
+    }
+
+    #[test]
+    fn an_agent_needs_a_named_conversation_or_a_fresh_one() {
+        let e = listen_args(&["--agent", "claude"]).unwrap_err().to_string();
+        assert!(e.contains("--fresh") && e.contains("--resume"), "{e}");
+        assert!(listen_args(&["--agent", "codex", "--resume", "thread-1"]).is_ok());
+        assert!(listen_args(&["--agent", "claude", "--fresh", "--from", "owner", "--from", "role:sender"])
+            .is_ok());
+        assert!(listen_args(&["--agent", "claude", "--fresh", "--resume", "x"]).is_err());
+        assert!(listen_args(&["--fresh"]).is_err(), "--fresh is for --agent");
+        let a = listen_args(&["--once"]).unwrap();
+        assert_eq!(
+            (a.run_timeout, a.pending_timeout, a.from.len()),
+            (Duration::from_secs(30 * 60), Duration::from_secs(60), 0)
+        );
+        let a = listen_args(&["--exec", "true", "--run-timeout", "5s", "--pending-timeout", "0"]).unwrap();
+        assert_eq!((a.run_timeout, a.pending_timeout), (Duration::from_secs(5), Duration::ZERO));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_that_runs_too_long_is_killed() {
+        let spawn = |script: &str| {
+            tokio::process::Command::new("sh").args(["-c", script]).kill_on_drop(true).spawn().unwrap()
+        };
+        let t = std::time::Instant::now();
+        let killed = run_limited(spawn("sleep 30"), Duration::from_millis(200)).await.unwrap();
+        assert!(killed.is_none() && t.elapsed() < Duration::from_secs(10));
+        let done = run_limited(spawn("exit 3"), Duration::from_secs(30)).await.unwrap().unwrap();
+        assert_eq!(done.code(), Some(3));
+        let unlimited = run_limited(spawn("exit 0"), Duration::ZERO).await.unwrap().unwrap();
+        assert!(unlimited.success());
     }
 
     #[test]

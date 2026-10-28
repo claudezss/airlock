@@ -330,13 +330,18 @@ allowlist), `--python` (the operator's own), or `docker:<image>`. It holds no
 file system paths. `python` and `airlox` are 1 to 32 printable characters,
 `interpreter` 1 to 128, each version 1 to 64, and at most 256 packages are
 listed.
-A runner reports it on a job that ran; a `refused` result has none.
+A runner reports it on a job that ran; a `refused` result has none. A runner
+shortens the digest of a digest-pinned image (`repo@sha256:` plus 12 hex
+digits), cuts `interpreter` to fit, and leaves out a package whose version it
+could not read; if the result would still fail these checks it omits `env`.
 
 Before signing a result, a runner replaces the absolute path of the job's
-work directory in `stdout` and `stderr` with `$WORK`, of its out directory
-with `$AIRLOX_OUT`, and of the job's own directory with `$JOB`, so an
-account name in a temporary path does not travel with the result. Files the
-job wrote are returned as they are.
+work directory in `stdout`, `stderr` and `reason` with `$WORK`, of its out
+directory with `$AIRLOX_OUT`, of the job's own directory with `$JOB`, of its
+own runtime and cache directories with `$RUNTIME` and of the user's home
+directory with `~` (the same goes for a progress item's `tail`), so an
+account name in a path does not travel with the result. Files the job wrote
+are returned as they are.
 
 `target` is `{"type":"runner","participant_pub":…,"name":…}` (one runner,
 pinned by its participant key; `name` is for display),
@@ -360,8 +365,20 @@ non-empty replies to the item its first reference names; a `result` answers
 its `job` the same way. `to` says whose attention a message needs: clients
 use it, with replies, to decide which agents to wake (an item addressed to
 the reader, a reply to one of the reader's items whoever else it names, or
-the owner's message to everyone). `to` is advice, not access control: every participant can read
-every item. Clients that predate `to` reject messages that carry it.
+the owner's message to everyone: a message without `to` wakes every listener
+when the owner sent it and otherwise only the author of the item it replies
+to). `to` is advice, not access control: every participant can read every
+item. A listener may limit who can wake it to chosen authors (`airlox listen
+--from`), and stops waking for a long run of posts from non-web
+participants, counted up the reply chain or, for an addressed message that
+replies to nothing, over the text items just before it since a web participant
+last posted. A participant's `kind` is self-declared, so that count is a
+safety net against accidental loops, not a security boundary.
+
+**Compatibility.** Clients 0.1.0 and 0.1.1 reject text items that carry `to`,
+job results that carry `env`, and manifests whose allowlist pins package
+versions (`name==1.2.3`); there is no
+protocol flag: use 0.1.2 or later in a session that uses them.
 
 ## 8. Policy
 

@@ -422,6 +422,18 @@ impl Local {
         self.opts.sandboxed
     }
 
+    /// Where the runner keeps its runtime: its state, the interpreter's venv
+    /// and the Python installation behind it. What jobs print must not name them.
+    pub fn runtime_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = vec![self.state_dir.clone()];
+        if let Some(python) = &self.python {
+            let up = |p: &Path| p.parent().and_then(Path::parent).map(Path::to_path_buf);
+            dirs.extend(up(python));
+            dirs.extend(std::fs::canonicalize(python).ok().and_then(|real| up(&real)));
+        }
+        dirs
+    }
+
     pub fn kind(&self) -> SandboxKind {
         if self.opts.process {
             SandboxKind::Process
@@ -462,12 +474,9 @@ impl Local {
                 (python, info, "uv-runtime")
             }
         };
-        self.env = info.as_ref().map(|i| JobEnv {
-            python: i.version.clone(),
-            packages: i.packages.iter().map(|p| (p.name.clone(), p.version.clone())).collect(),
-            airlox: env!("CARGO_PKG_VERSION").to_string(),
-            sandbox: self.kind(),
-            interpreter: interpreter.to_string(),
+        self.env = info.as_ref().map(|i| {
+            let pkgs = i.packages.iter().map(|p| (p.name.clone(), p.version.clone()));
+            super::job_env(&i.version, pkgs, self.kind(), interpreter)
         });
         self.packages = info.map(|i| i.packages);
         // The venv's interpreter is a link into a Python installation that

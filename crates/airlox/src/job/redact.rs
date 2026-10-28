@@ -1,24 +1,30 @@
-//! Keeps the runner's job directories out of what a job printed.
+//! Keeps the runner's directories out of what a job printed.
 //!
 //! A job that runs as a plain process sees its real work directory, so a
 //! traceback or an `os.getcwd()` in its output names wherever the runner put
 //! it, which on Windows is under the user's profile
-//! (`C:\Users\<user>\AppData\Local\Temp\…`). Before a result is signed, the
-//! absolute path of each of the job's directories in stdout and stderr is
-//! replaced with a stable name. Files the job wrote are not touched.
+//! (`C:\Users\<user>\AppData\Local\Temp\…`). Before a result is signed
+//! (and before progress is posted), the absolute path of each of the job's
+//! directories, of the runner's runtime and cache, and of the user's home in
+//! stdout, stderr, the reason and the progress tail is replaced with a
+//! stable name. Files the job wrote are not touched.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A path shorter than this is never replaced: a root-ish path would eat
 /// the text around it. It is also longer than any name replacing a path,
 /// so redacting never makes the text longer.
 const MIN_PATH_LEN: usize = 12;
 
+/// The shortest home directory replaced: `/root` or `C:\` would eat the
+/// text around them, `/home/ann` is a real one. `~` is shorter than any.
+const MIN_HOME_LEN: usize = 8;
+
 /// Every way a job might print `path`: as given, as the file system names
 /// it (links resolved, short Windows names expanded, the `\\?\` prefix
 /// dropped), each with either slash, and with backslashes doubled (as in a
 /// Python `repr` or in JSON).
-fn spellings(path: &Path) -> Vec<String> {
+fn spellings(path: &Path, min_len: usize) -> Vec<String> {
     let mut bases = vec![path.to_string_lossy().into_owned()];
     if let Ok(real) = std::fs::canonicalize(path) {
         let real = real.to_string_lossy().into_owned();
@@ -33,7 +39,7 @@ fn spellings(path: &Path) -> Vec<String> {
         let fwd = b.replace('\\', "/");
         let doubled = back.replace('\\', "\\\\");
         for s in [b, back, fwd, doubled] {
-            if s.len() >= MIN_PATH_LEN && !out.contains(&s) {
+            if s.len() >= min_len && !out.contains(&s) {
                 out.push(s);
             }
         }
@@ -59,8 +65,13 @@ fn replace_all(text: &str, from: &str, to: &str, ignore_case: bool) -> String {
 }
 
 fn redact(text: &str, dirs: &[(&Path, &str)], ignore_case: bool) -> String {
-    let mut all: Vec<(String, &str)> =
-        dirs.iter().flat_map(|(dir, name)| spellings(dir).into_iter().map(move |s| (s, *name))).collect();
+    let mut all: Vec<(String, &str)> = dirs
+        .iter()
+        .flat_map(|(dir, name)| {
+            let min = if *name == HOME { MIN_HOME_LEN } else { MIN_PATH_LEN };
+            spellings(dir, min).into_iter().map(move |s| (s, *name))
+        })
+        .collect();
     // Longest first, so `…/work` becomes `$WORK` before its parent matches.
     all.sort_by_key(|(s, _)| std::cmp::Reverse(s.len()));
     let mut out = text.to_string();
@@ -70,10 +81,27 @@ fn redact(text: &str, dirs: &[(&Path, &str)], ignore_case: bool) -> String {
     out
 }
 
+/// What replaces the user's home directory.
+pub const HOME: &str = "~";
+/// What replaces the runner's runtime and cache directories (the venv, the
+/// Python installation it links to, the runner's state).
+pub const RUNTIME: &str = "$RUNTIME";
+
 /// `text` with each directory's absolute path replaced by its name. Windows
 /// paths are matched without regard to case.
 pub fn paths(text: &str, dirs: &[(&Path, &str)]) -> String {
     redact(text, dirs, cfg!(windows))
+}
+
+/// [`paths`] for owned directories, as a job keeps them.
+pub fn hide(text: &str, dirs: &[(PathBuf, &'static str)]) -> String {
+    let dirs: Vec<(&Path, &str)> = dirs.iter().map(|(p, n)| (p.as_path(), *n)).collect();
+    paths(text, &dirs)
+}
+
+/// The user's home directory, when the environment names one.
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)
 }
 
 #[cfg(test)]
@@ -147,6 +175,36 @@ mod tests {
         // The job printed the resolved path (macOS: /private/var/…); the
         // runner knows the unresolved one.
         assert_eq!(redact(&text, &dirs(&root, &work, &out), false), "cwd $WORK");
+    }
+
+    #[test]
+    fn home_and_runtime_directories_become_names_whichever_is_longer() {
+        let home = Path::new("/home/ann");
+        let runtime = Path::new("/home/ann/.cache/airlox/runner/runtimes/ab12");
+        let install = Path::new("/home/ann/.local/share/uv/python/cpython-3.12.4");
+        let dirs = [(home, HOME), (runtime, RUNTIME), (install, RUNTIME)];
+        let text = "File \"/home/ann/.cache/airlox/runner/runtimes/ab12/lib/x.py\"\n\
+                    /home/ann/.local/share/uv/python/cpython-3.12.4/lib/os.py\n\
+                    open('/home/ann/notes.txt') /home/ann";
+        assert_eq!(
+            redact(text, &dirs, false),
+            "File \"$RUNTIME/lib/x.py\"\n$RUNTIME/lib/os.py\nopen('~/notes.txt') ~"
+        );
+        // Too short to be a home worth replacing.
+        assert_eq!(redact("/root/x", &[(Path::new("/root"), HOME)], false), "/root/x");
+    }
+
+    #[test]
+    fn windows_home_is_found_without_regard_to_case_and_with_doubled_slashes() {
+        let home = Path::new(r"C:\Users\jdoe");
+        let text = r"cwd c:\users\JDOE\proj repr 'C:\\Users\\jdoe\\x' uri file:///C:/Users/jdoe/y";
+        assert_eq!(redact(text, &[(home, HOME)], true), r"cwd ~\proj repr '~\\x' uri file:///~/y");
+    }
+
+    #[test]
+    fn hide_takes_owned_directories() {
+        let d = [(PathBuf::from("/home/ann"), HOME)];
+        assert_eq!(hide("in /home/ann/x", &d), "in ~/x");
     }
 
     #[test]

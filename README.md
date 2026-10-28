@@ -111,7 +111,7 @@ airlox send file report.md
 AIRLOX_INVITE='<owner link>' airlox watch    # print items as they arrive
 airlox send text "Review parser.py?" --to coder          # address it; --reply-to <item> links an answer
 airlox listen --once --json                  # block until something concerns you, print it, exit
-airlox listen --agent codex                  # or wake an agent per batch (codex, claude, --exec)
+airlox listen --agent codex --resume <id>    # or wake an agent per batch (--fresh for a new conversation; claude, --exec)
 airlox delivery                              # who has fetched your items
 ```
 
@@ -127,12 +127,25 @@ it to your agent's skills, or point the agent at it.
 
 Agents talking to agents wake only for what concerns them: messages
 addressed to them (`--to`), replies to their own items (job results
-included), and the owner's messages to everyone. Claude Code runs
+included), and the owner's messages to everyone (a message without `--to`
+wakes only its replied-to author, unless the owner sent it). Claude Code runs
 `airlox listen --once` in the background and is woken when it exits; Codex
 and other headless agents are started per batch by `airlox listen --agent
-codex|claude` or `--exec`, which pass only item ids, never message text. A
+codex|claude --resume <id>` (or `--fresh`; one is required, so the folder's
+most recent conversation is never woken by accident) or `--exec`, which pass
+only item ids, never message text. The woken agent reads them with its
+`airlox` MCP server, which joins as the listener (`listen` hands it
+`AIRLOX_INVITE`, `AIRLOX_NAME` and `AIRLOX_CACHE_DIR`), and only the airlox
+read and reply tools are pre-approved for it. Codex runs only in a git
+repository. For an agent nobody watches add `--from
+owner`, so only the owner can wake it (the default is anyone, so agents can
+talk to each other). `--run-timeout` (default 30m) kills a command that hangs
+and `--pending-timeout` (default 60s) skips an item that cannot be fetched. A
 reply chain of more than 8 agent posts in a row with no person in between
-stops waking anyone (`--max-hops`).
+stops waking anyone (`--max-hops`); participant kinds are self-declared, so
+this is a safety net against accidental loops, not a security boundary.
+Clients 0.1.0 and 0.1.1 reject messages with `to`, results with `env` and
+version-pinned packages: upgrade them to use these.
 
 Chat apps and IDEs use the MCP server, which runs locally so session keys
 never leave your machine. It reads and writes files only inside the
@@ -276,10 +289,12 @@ Linux) works in a temporary folder, and on Windows that is under
 `C:\Users\<name>\AppData\Local\Temp`, so a traceback printed by the job
 would name the account. `airlox runner join --work-root C:\airlox-work` (or
 `AIRLOX_WORK_ROOT`) puts the jobs' folders in a directory you choose instead.
-Whichever you use, the runner replaces the job's work folder in its stdout and
-stderr with `$WORK`, its output folder with `$AIRLOX_OUT` and the job's own
-folder with `$JOB` before it signs the result; files the job writes are
-returned as written.
+Whichever you use, the runner replaces the job's work folder in its stdout,
+stderr, failure reason and progress tail with `$WORK`, its output folder with
+`$AIRLOX_OUT`, the job's own folder with `$JOB`, its runtime and cache folders
+(the venv, the Python install behind it) with `$RUNTIME` and your home folder
+with `~` before it signs the result; files the job writes are returned as
+written.
 
 The runner builds its job image once (`python:3.12-slim` plus the session's
 package allowlist) and refuses any job not signed by a sender or the owner.

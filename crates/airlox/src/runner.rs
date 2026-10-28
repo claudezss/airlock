@@ -603,7 +603,7 @@ pub async fn run(args: JoinArgs) -> Result<()> {
             if no_network { " (this session says network: false)" } else { "" }
         );
     }
-    let ctx_env = backend.env();
+    let ctx_env = job::checked_env(backend.env());
     relay.report("ready", None, owed).await?;
 
     // Unsandboxed jobs see their real paths (in tracebacks, os.getcwd()):

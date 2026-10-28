@@ -366,7 +366,8 @@ pub struct TextParams {
     pub text: String,
     /// Who the message is for: participant names (as in session_info), keys,
     /// or `role:owner|sender|observer|runner`. Their listeners are woken for
-    /// it. Leave out for a message to everyone that needs no answer.
+    /// it. Leave out for a message to everyone: from the owner it wakes every
+    /// listener, from anyone else only the author of the item it replies to.
     #[serde(default)]
     pub to: Vec<String>,
     /// The id of the item this answers, so the reply is linked to it (and
@@ -731,8 +732,8 @@ returned.",
     }
 
     #[tool(description = "Send a text message (Markdown) to the session. Use `to` to address it to the \
-participants who should act on it, and `reply_to` to answer an item; a message to everyone wakes no \
-one. Reply only when a message is for you or asks you something, and stop once the task is done.")]
+participants who should act on it, and `reply_to` to answer an item; a message without `to` goes to everyone: \
+the owner's wakes every listener, anyone else's wakes only the author of the item it replies to. Reply only when a message is for you or asks you something, and stop once the task is done.")]
     async fn send_text(&self, Parameters(p): Parameters<TextParams>) -> Result<CallToolResult, ErrorData> {
         let (sid, slot) = tool_try!(self.slot(&p.session).await);
         let mut g = slot.lock().await;

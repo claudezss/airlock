@@ -646,6 +646,30 @@ impl Drop for AbortOnDrop {
 
 /// The tail of `file` (relative), found in the job's work dir or, failing
 /// that, its out dir (`$AIRLOX_OUT`, where a tool may write its log).
+/// `env` if clients accept it (`check_env`), else none: a result whose
+/// `env` fails the check is rejected whole, so it goes without.
+pub(crate) fn checked_env(env: Option<JobEnv>) -> Option<JobEnv> {
+    let env = env?;
+    match airlox_core::policy::check_env(&env) {
+        Ok(()) => Some(env),
+        Err(e) => {
+            tracing::warn!("not reporting where jobs run in results, clients would reject it: {e}");
+            None
+        }
+    }
+}
+
+/// The directories a job's output must not name, and what stands for each:
+/// its own (`$WORK`, `$AIRLOX_OUT`, `$JOB`), the runner's runtime and cache
+/// (`$RUNTIME`) and the user's home (`~`).
+fn hidden_dirs(ctx: &Ctx, job: &PreparedJob) -> Vec<(PathBuf, &'static str)> {
+    let mut dirs =
+        vec![(job.work_dir(), "$WORK"), (job.out_dir(), "$AIRLOX_OUT"), (job.root.clone(), "$JOB")];
+    dirs.extend(ctx.backend.runtime_dirs().into_iter().map(|d| (d, redact::RUNTIME)));
+    dirs.extend(redact::home_dir().map(|h| (h, redact::HOME)));
+    dirs
+}
+
 fn read_progress_file(roots: &[PathBuf], file: &str, max: usize) -> (Option<String>, bool) {
     roots
         .iter()
@@ -662,6 +686,7 @@ fn spawn_progress(
     job_ref: &ItemRef,
     roots: Vec<PathBuf>,
     file: Option<String>,
+    hidden: Arc<Vec<(PathBuf, &'static str)>>,
 ) -> Option<AbortOnDrop> {
     if ctx.progress_interval.is_zero() {
         return None;
@@ -686,6 +711,7 @@ fn spawn_progress(
                     .unwrap_or_default(),
                 None => (None, false),
             };
+            let tail = tail.map(|t| redact::hide(&t, &hidden));
             let p = JobProgress {
                 job: job_ref.clone(),
                 elapsed_ms: start.elapsed().as_millis() as u64,
@@ -796,6 +822,10 @@ pub async fn handle(
                     v.ack(&r.id).await;
                 }
             }
+            // A job run as a plain process saw its real directories; what it
+            // prints (and reports as progress) must not carry where the
+            // runner keeps them, nor whose home they are in.
+            let hidden = Arc::new(hidden_dirs(&ctx, &job));
             if let Err(e) = stage_inputs(&job.root, &job.work_dir(), &a) {
                 result.reason = Some(format!("could not stage inputs: {e:#}"));
             } else {
@@ -806,6 +836,7 @@ pub async fn handle(
                     &job_ref,
                     vec![job.work_dir(), job.out_dir()],
                     a.spec.progress_file.clone(),
+                    hidden.clone(),
                 );
                 let raw = ctx.backend.run(&job, cancel).await.unwrap_or_else(|e| RawResult {
                     error: Some(format!("the sandbox could not run the job: {e:#}")),
@@ -821,14 +852,9 @@ pub async fn handle(
                 result.peak_mem_mb = (peak_kb / 1024) as u32;
                 (result.stdout, result.stdout_truncated) = stdio(&job.meta_dir().join("stdout.txt"));
                 (result.stderr, result.stderr_truncated) = stdio(&job.meta_dir().join("stderr.txt"));
-                // A job run as a plain process saw its real directories; its
-                // output must not carry where the runner keeps them.
-                let hide =
-                    [(job.work_dir(), "$WORK"), (job.out_dir(), "$AIRLOX_OUT"), (job.root.clone(), "$JOB")];
-                let hide: Vec<(&Path, &str)> = hide.iter().map(|(p, n)| (p.as_path(), *n)).collect();
-                result.stdout = redact::paths(&result.stdout, &hide);
-                result.stderr = redact::paths(&result.stderr, &hide);
-                result.reason = result.reason.take().map(|r| redact::paths(&r, &hide));
+                result.stdout = redact::hide(&result.stdout, &hidden);
+                result.stderr = redact::hide(&result.stderr, &hidden);
+                result.reason = result.reason.take().map(|r| redact::hide(&r, &hidden));
                 let mut notes = Vec::new();
                 if limits.return_out {
                     // The payload adds a few hundred bytes of meta to the file.
@@ -884,6 +910,24 @@ pub async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_env_clients_would_reject_is_dropped_not_the_result() {
+        let mut env = JobEnv {
+            python: "3.12.4".into(),
+            packages: [("numpy".to_string(), "2.1.0".to_string())].into(),
+            airlox: "0.1.2".into(),
+            sandbox: airlox_core::cert::SandboxKind::Docker,
+            interpreter: "docker:python".into(),
+        };
+        assert_eq!(checked_env(Some(env.clone())).unwrap().interpreter, "docker:python");
+        env.interpreter = "x".repeat(129);
+        assert!(checked_env(Some(env.clone())).is_none());
+        env.interpreter = "docker:python".into();
+        env.packages.insert("pandas".into(), String::new());
+        assert!(checked_env(Some(env)).is_none());
+        assert!(checked_env(None).is_none());
+    }
 
     #[test]
     fn out_dir_becomes_images_and_one_zip() {

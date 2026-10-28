@@ -757,3 +757,55 @@ def test_listen_wakes_only_for_what_concerns_you(relay, caches, tmp_path):
     # Reads say how fresh they are.
     p = cli("items", "--not-mine", "--after", "0", invite=sender, cache=caches("coder"))
     assert "checked the relay at" in p.stderr and "latest #" in p.stderr
+
+
+def test_listen_agent_needs_a_conversation_to_wake(tmp_path):
+    for args in (["--agent", "claude"], ["--agent", "codex"]):
+        p = cli("listen", *args, check=False)
+        assert p.returncode == 2 and "--fresh" in p.stderr and "--resume" in p.stderr, p.stderr
+    p = cli("listen", "--agent", "claude", "--fresh", "--resume", "x", check=False)
+    assert p.returncode == 2 and "cannot be used with" in p.stderr
+
+
+def test_listen_from_and_run_timeout(relay, caches, tmp_path):
+    owner = Session.create(relay.url, display_name="lead", cache_dir=caches("owner"))
+    sender = owner.invites["sender"]
+    planner = Session.join(sender, display_name="planner", cache_dir=caches("planner"))
+    cli("session", "info", "--as", "coder", invite=sender, cache=caches("coder"))
+    out = tmp_path / "hook.out"
+    hook = tmp_path / "hook.sh"
+    hook.write_text('#!/bin/sh\ncat >> "$OUT"\n')
+    hook.chmod(0o755)
+    env = {**os.environ, "OUT": str(out), "AIRLOX_INVITE": sender, "AIRLOX_CACHE_DIR": str(caches("coder"))}
+    proc = subprocess.Popen(
+        [BIN, "listen", "--exec", str(hook), "--from", "owner", "--from", "nobody-yet", "--new", "--settle", "0s",
+         "--timeout", "40s"],
+        env=env, stderr=subprocess.PIPE, text=True)
+    time.sleep(2)
+    planner.send_text("from the planner", to=["coder"])
+    time.sleep(1)
+    assert not out.exists(), "only the owner may wake this listener"
+    owner.send_text("from the owner", to=["coder"])
+    assert wait_for(lambda: out.exists() and "from the owner" in out.read_text(), timeout=10)
+    assert "from the planner" not in out.read_text()
+    proc.terminate()
+    assert '"nobody-yet" matches no participant' in proc.communicate(timeout=10)[1]
+
+    # A command that hangs is killed after --run-timeout, and listening goes on.
+    stuck = tmp_path / "stuck.sh"
+    started = tmp_path / "started"
+    stuck.write_text('#!/bin/sh\necho "$AIRLOX_ITEMS" >> "$STARTED"\nexec sleep 60\n')
+    stuck.chmod(0o755)
+    proc = subprocess.Popen(
+        [BIN, "listen", "--exec", str(stuck), "--new", "--settle", "0s", "--run-timeout", "1s", "--timeout", "40s"],
+        env={**env, "STARTED": str(started)}, stderr=subprocess.PIPE, text=True)
+    time.sleep(2)
+    owner.send_text("one", to=["coder"])
+    assert wait_for(lambda: started.exists(), timeout=10)
+    time.sleep(2.5)
+    owner.send_text("two", to=["coder"])
+    assert wait_for(lambda: started.read_text().count("\n") == 2, timeout=10), "listening went on"
+    time.sleep(2)  # the second run is killed too, so nothing holds stderr open
+    proc.terminate()
+    err = proc.communicate(timeout=10)[1]
+    assert "ran longer than --run-timeout" in err and "killed it" in err, err

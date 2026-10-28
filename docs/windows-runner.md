@@ -43,9 +43,9 @@ containers), and is the one to use for code you don't trust.
   any traceback the job prints. `--work-root C:\airlox-work` (or
   `AIRLOX_WORK_ROOT`) puts the folders in a directory you choose; the runner
   creates it, so the account it runs as needs write access to its parent. Either
-  way, the runner replaces the folder's path in the job's stdout and stderr
-  with `$WORK` (and `$AIRLOX_OUT` for the output folder) before it signs the
-  result.
+  way, the runner replaces the folder's path in the job's stdout, stderr and
+  progress tail with `$WORK` (and `$AIRLOX_OUT` for the output folder, `$RUNTIME`
+  for its runtime and cache, `~` for your profile) before it signs the result.
 - **A scrubbed environment.** A job sees only `PATH` (its interpreter and
   the Windows system folders), `SYSTEMROOT`, `TEMP`/`TMP` inside its work
   folder, `HOME` and `USERPROFILE` (the work folder), `LANG`, `MPLBACKEND`,

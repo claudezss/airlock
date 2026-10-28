@@ -153,13 +153,12 @@ impl Docker {
     }
 
     fn set_env(&mut self, info: &PythonInfo, image: &str) {
-        self.env = Some(JobEnv {
-            python: info.version.clone(),
-            packages: info.packages.iter().map(|p| (p.name.clone(), p.version.clone())).collect(),
-            airlox: env!("CARGO_PKG_VERSION").to_string(),
-            sandbox: SandboxKind::Docker,
-            interpreter: format!("docker:{image}"),
-        });
+        self.env = Some(super::job_env(
+            &info.version,
+            info.packages.iter().map(|p| (p.name.clone(), p.version.clone())),
+            SandboxKind::Docker,
+            &format!("docker:{image}"),
+        ));
     }
 
     /// What the image's `python3` reports about itself and the allowlisted
