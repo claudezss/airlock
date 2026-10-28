@@ -1683,7 +1683,8 @@ impl Session {
         let mut evicted: Vec<(Option<Instant>, String)> = self
             .items
             .iter()
-            .filter(|i| i.status == Status::Evicted && i.author != self.me)
+            // Progress is display data the relay drops for good: never wanted.
+            .filter(|i| i.status == Status::Evicted && i.author != self.me && i.kind != "progress")
             .map(|i| (self.wanted.get(&i.id).copied(), i.id.clone()))
             .filter(|(at, _)| at.is_none_or(|t| t.elapsed() >= REASK))
             .collect();
