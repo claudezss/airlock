@@ -3653,19 +3653,21 @@ async function streamLoop(s) {
   }
 }
 
-// How many sessions this relay holds right now, as it says: a number only.
+// How many sessions on this relay someone is in right now, as it says: a
+// number only. Sessions merely held until they expire or go idle are not
+// counted.
 function liveSessions() {
   const out = document.getElementById("live-sessions");
   fetch("/v1/health").then((r) => r.json()).then((h) => {
-    const n = h.sessions;
+    const n = h.active;
     if (!Number.isSafeInteger(n) || n < 0) return;
     const word = `session${n === 1 ? "" : "s"}`;
-    out.textContent = ` · ${n.toLocaleString()} ${word} open on this relay`;
+    out.textContent = ` · ${n.toLocaleString()} ${word} active`;
     out.hidden = false;
     const stat = document.getElementById("live-stat");
     if (stat) {
       document.getElementById("live-stat-n").textContent = n.toLocaleString();
-      document.getElementById("live-stat-label").textContent = `${word} open on this relay right now`;
+      document.getElementById("live-stat-label").textContent = `${word} active on this relay right now`;
       stat.hidden = false;
     }
   }).catch(() => {});

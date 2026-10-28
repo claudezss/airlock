@@ -618,7 +618,8 @@ refuses a manifest or an upload that exceeds a limit.
 | `AIRLOX_MAX_ITEMS` | 5 000 | Items per session. |
 | `AIRLOX_MAX_LOG_BYTES` | 4 MiB | Session log size (joins and envelopes). It bounds the per-session memory index; past it, joins and items get `413`. |
 | `AIRLOX_IDLE_TTL` | 2 h | Purges a session early after this long with no joins, items, acks or downloads, and no upload in progress. |
-| `AIRLOX_IDLE_TTL_UNEXPIRING` | 30 d | The same for sessions that never expire; `never` keeps them until they are closed. Without it, an abandoned session would hold its slot under the session limits for good. |
+| `AIRLOX_IDLE_TTL_UNEXPIRING` | 3 d | The same for sessions that never expire; `never` keeps them until they are closed. Without it, an abandoned session would hold its slot under the session limits for good. A paired machine's runner keeps its session alive with heartbeats, so only a machine that is off for this long is purged. |
+| `AIRLOX_ACTIVE_WINDOW` | 15 m | How long after its last join, item, ack or download a session still counts in `/v1/health`'s `active` (a session with an open stream always counts). `sessions` is every session held; the landing page shows `active`. |
 | `AIRLOX_MAX_BYTES_PER_IP` | unlimited | Ciphertext the uploads from one address may have held on the relay at once, across all its sessions (IPv4 address, IPv6 /64); past it, `413`. Each held blob counts against the address that uploaded it (or re-seeded it) until it is evicted or its session ends. |
 | `AIRLOX_MAX_SESSIONS_PER_IP` | 20 | Active sessions per creator address: per IPv4 address, per IPv6 /64. With `--trust-proxy`, the address is the last `X-Forwarded-For` hop, the one the proxy appended. |
 | `AIRLOX_MAX_SESSIONS` | 1 000 | Active sessions in total. |

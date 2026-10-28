@@ -51,10 +51,15 @@ pub struct Config {
     #[arg(
         long = "idle-ttl-unexpiring",
         env = "AIRLOX_IDLE_TTL_UNEXPIRING",
-        default_value = "30d",
+        default_value = "3d",
         value_parser = parse_duration_or_never
     )]
     pub idle_ttl_unexpiring_ms: u64,
+    /// A session counts as active (`/v1/health` `active`) while a participant
+    /// holds a stream to it, or for this long after its last join, item, ack
+    /// or download.
+    #[arg(long = "active-window", env = "AIRLOX_ACTIVE_WINDOW", default_value = "15m", value_parser = parse_duration_ms)]
+    pub active_window_ms: u64,
     /// Ciphertext the uploads from one address may have held on the relay at
     /// once, over all sessions (an IPv6 address counts by its /64).
     #[arg(long, env = "AIRLOX_MAX_BYTES_PER_IP", default_value = "unlimited", value_parser = parse_size_or_unlimited)]

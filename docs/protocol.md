@@ -670,7 +670,7 @@ sends nothing for 30 seconds is answered with `408`.
 
 | Method and path | Auth | Body | Success |
 |---|---|---|---|
-| `GET /v1/health` | none | none | `200 {"ok": true, "protocol": 1, "max_item_bytes": 104857600, "sessions": 12}`; clients default a new session's `max_item_bytes` to it; `sessions` is how many sessions the relay holds (open, not yet expired or closed) |
+| `GET /v1/health` | none | none | `200 {"ok": true, "protocol": 1, "max_item_bytes": 104857600, "sessions": 12, "active": 3}`; clients default a new session's `max_item_bytes` to it; `sessions` is how many sessions the relay holds (open, not yet expired or closed) and `active` how many of them someone is in (a participant or runner holds a stream, or there was a join, item, ack or download within the relay's `--active-window`, 15 minutes by default) |
 | `POST /v1/sessions` | none | signed manifest | `201 {"session_id", "expires_at_ms"}` |
 | `GET /v1/sessions/{id}` | none | none | `200 {"signed_manifest"}` |
 | `POST /v1/sessions/{id}/participants` | none | signed join request | `201 {"token", "participant_pub", "role", "seq"}` |

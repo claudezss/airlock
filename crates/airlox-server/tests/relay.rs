@@ -963,3 +963,45 @@ async fn health_counts_open_sessions_and_nothing_more() {
     assert_eq!(r.unwrap().status(), StatusCode::NO_CONTENT);
     assert_eq!(health().await["sessions"], 1);
 }
+
+#[tokio::test]
+async fn health_active_counts_sessions_someone_is_in() {
+    // With no activity window, only an open stream makes a session active.
+    let env = Env::with(|c| c.active_window_ms = 0).await;
+    let health = || async {
+        env.http.get(env.url("/v1/health")).send().await.unwrap().json::<serde_json::Value>().await.unwrap()
+    };
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let h = health().await;
+    assert_eq!((h["sessions"].as_u64(), h["active"].as_u64()), (Some(1), Some(0)));
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let stream = env
+        .http
+        .get(env.url(&format!("/v1/sessions/{}/stream", s.id)))
+        .bearer_auth(&owner.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health().await["active"], 1);
+    drop(stream);
+    // The stream's slot is released when the connection goes.
+    for _ in 0..50 {
+        if health().await["active"] == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("a closed stream still counted the session as active");
+}
+
+#[tokio::test]
+async fn health_active_counts_recent_activity() {
+    let env = Env::with(|c| c.active_window_ms = 60_000).await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let h =
+        env.http.get(env.url("/v1/health")).send().await.unwrap().json::<serde_json::Value>().await.unwrap();
+    // Creating it is activity.
+    assert_eq!(h["active"], 1);
+}

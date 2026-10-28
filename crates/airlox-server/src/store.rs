@@ -1307,6 +1307,22 @@ impl Store {
         self.sessions.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 
+    /// Sessions someone is in: a participant or runner holds a stream, or
+    /// something happened within `window_ms`. A session merely held until it
+    /// expires or goes idle is not active.
+    pub fn count_active(&self, now: u64, window_ms: u64) -> usize {
+        self.all()
+            .iter()
+            .filter(|s| {
+                let g = s.lock();
+                !g.closed
+                    && (!g.streams.is_empty()
+                        || g.presence.values().any(|p| p.streams > 0)
+                        || now.saturating_sub(g.last_activity_ms) <= window_ms)
+            })
+            .count()
+    }
+
     pub fn count_for_ip(&self, ip_hash: &str) -> usize {
         self.all().iter().filter(|s| s.lock().ip_hash.as_deref() == Some(ip_hash)).count()
     }
