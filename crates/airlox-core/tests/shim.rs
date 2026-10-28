@@ -216,3 +216,155 @@ fn rejects_bad_entry() {
     assert!(r.error.is_some());
     assert_eq!(r.exit_code, None);
 }
+
+impl Job {
+    /// A shell job's command: the script sits in `meta`, outside the work dir.
+    fn shell_cmd(&self, script: &str, cwd: Option<&str>, timeout: &str) -> Command {
+        std::fs::create_dir_all(self.root.join("meta")).unwrap();
+        let path = self.root.join("meta/job.sh");
+        std::fs::write(&path, script).unwrap();
+        let mut c = Command::new("python3");
+        c.arg(self.root.join("shim.py"))
+            .args(["--work", self.root.join("work").to_str().unwrap()])
+            .args(["--shell", "sh", "--script", path.to_str().unwrap(), "--timeout", timeout])
+            .args(["--result", self.root.join("meta/result.json").to_str().unwrap()]);
+        if let Some(cwd) = cwd {
+            c.args(["--cwd", cwd]);
+        }
+        c
+    }
+
+    fn run_shell(&self, script: &str, cwd: Option<&str>, timeout: &str) -> ShimResult {
+        assert!(self.shell_cmd(script, cwd, timeout).status().unwrap().success());
+        self.result()
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_job_runs_with_e_in_the_work_dir() {
+    if !have_python() {
+        return;
+    }
+    let j = Job::new("");
+    let r = j.run_shell(
+        "echo \"in $(basename \"$PWD\")\"; echo \"$HOME\" >&2\nls helper.py\nfalse\necho not-reached\n",
+        None,
+        "10",
+    );
+    // `sh -e` stops at the first failing command, and its status is the job's.
+    assert_eq!(r.exit_code, Some(1), "{}", j.read("stderr.txt"));
+    assert_eq!(j.read("stdout.txt"), "in work\nhelper.py\n");
+    assert!(j.read("stderr.txt").trim_end().ends_with("/work"), "{}", j.read("stderr.txt"));
+    assert!(!j.exists("work/job.sh"), "the script must not be written into the work dir");
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_job_gets_the_sandbox_path_and_a_scrubbed_environment() {
+    if !have_python() {
+        return;
+    }
+    let j = Job::new("");
+    // What the shim itself runs with is what the sandbox gave it.
+    let sandbox_path = format!("{}:/sandbox/tools", std::env::var("PATH").unwrap_or_default());
+    let mut c = j.shell_cmd("echo \"$PATH\"; env | grep -c AWS || true; echo \"$TMPDIR\"", None, "10");
+    assert!(c.env("PATH", &sandbox_path).env("AWS_SECRET_ACCESS_KEY", "should-not-leak").status().unwrap().success());
+    let r = j.result();
+    assert_eq!(r.exit_code, Some(0), "{}", j.read("stderr.txt"));
+    let out = j.read("stdout.txt");
+    let mut lines = out.lines();
+    // (A version manager's python3 shim may add to it before the shim runs.)
+    assert!(lines.next().unwrap().ends_with(":/sandbox/tools"), "PATH is the sandbox's own");
+    assert_eq!(lines.next(), Some("0"));
+    assert!(lines.next().unwrap().ends_with("/work/.airlox-tmp"));
+}
+
+#[cfg(unix)]
+#[test]
+fn cwd_is_relative_to_the_work_dir_for_shell_and_python_jobs() {
+    if !have_python() {
+        return;
+    }
+    let j = Job::new(
+        "import os, sys\nprint(os.path.basename(os.getcwd()))\n\
+         print(sys.path[0] == os.path.dirname(os.path.abspath(__file__)))\n",
+    );
+    std::fs::create_dir_all(j.root.join("work/services/api")).unwrap();
+    let r = j.run_shell("pwd", Some("services/api"), "10");
+    assert_eq!(r.exit_code, Some(0));
+    assert!(j.read("stdout.txt").trim_end().ends_with("/work/services/api"));
+    // A Python job's entry stays in the work dir; the job starts below it.
+    let r = j.run("job.py", "10", &["--cwd", "services/api"]);
+    assert_eq!(r.exit_code, Some(0), "{}", j.read("stderr.txt"));
+    assert_eq!(j.read("stdout.txt"), "api\nTrue\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_bad_cwd_is_a_clear_error_and_nothing_runs() {
+    if !have_python() {
+        return;
+    }
+    let j = Job::new("");
+    std::os::unix::fs::symlink("/", j.root.join("work/rootlink")).unwrap();
+    for (cwd, why) in [
+        ("missing/dir", "does not exist"),
+        ("../x", "not a relative path"),
+        ("/etc", "not a relative path"),
+        ("a//b", "not a relative path"),
+        ("rootlink/etc", "outside the work dir"),
+    ] {
+        let r = j.run_shell("touch RAN", Some(cwd), "10");
+        let e = r.error.unwrap_or_default();
+        assert!(e.contains(why), "{cwd}: {e}");
+        assert_eq!(r.exit_code, None);
+    }
+    assert!(!j.exists("work/RAN"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_shell_job_that_overruns_is_killed_with_its_children() {
+    if !have_python() {
+        return;
+    }
+    let j = Job::new("");
+    let started = Instant::now();
+    let r = j.run_shell("(sleep 1.5; touch ../SURVIVED) &\nsleep 60", None, "1");
+    assert!(r.timed_out);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(!j.exists("SURVIVED"), "a background process outlived the timeout");
+}
+
+#[test]
+fn the_shim_needs_exactly_one_kind_of_job() {
+    if !have_python() {
+        return;
+    }
+    let j = Job::new("print(1)\n");
+    let both = j.cmd("job.py", "5", &["--shell", "sh", "--script", "x"]).output().unwrap();
+    assert!(!both.status.success());
+    let neither = Command::new("python3")
+        .arg(j.root.join("shim.py"))
+        .args(["--work", "w", "--timeout", "5", "--result", "r.json"])
+        .output()
+        .unwrap();
+    assert!(!neither.status.success());
+}
+
+#[test]
+fn tmpdir_starts_empty_for_every_job() {
+    if !have_python() {
+        return;
+    }
+    let j = Job::new(
+        "import os\nprint(os.listdir(os.environ['TMPDIR']))\n\
+         open(os.path.join(os.environ['TMPDIR'], 'junk'), 'w').write('x')\n",
+    );
+    j.run("job.py", "10", &[]);
+    assert_eq!(j.read("stdout.txt").trim(), "[]");
+    j.run("job.py", "10", &[]);
+    assert_eq!(j.read("stdout.txt").trim(), "[]", "TMPDIR kept the last job's files");
+}
