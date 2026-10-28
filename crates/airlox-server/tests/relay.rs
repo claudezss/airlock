@@ -937,3 +937,28 @@ async fn delivery_reports_who_stored_the_authors_items() {
     // Only the author learns this.
     assert_eq!(delivery(&owner).await, json!({}));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn health_counts_open_sessions_and_nothing_more() {
+    let env = Env::new().await;
+    let health = || async {
+        env.http.get(env.url("/v1/health")).send().await.unwrap().json::<serde_json::Value>().await.unwrap()
+    };
+    assert_eq!(health().await["sessions"], 0);
+    let (a, b) = (new_session(Mode::Relay, 3_600_000), new_session(Mode::Relay, 3_600_000));
+    create(&env, &a).await;
+    create(&env, &b).await;
+    let h = health().await;
+    assert_eq!(h["sessions"], 2);
+    // A count only: no ids.
+    assert!(!h.to_string().contains(&a.id) && !h.to_string().contains(&b.id));
+    let owner = join(&env, &a, Role::Owner, "owner").await;
+    let r = env
+        .http
+        .post(env.url(&format!("/v1/sessions/{}/close", a.id)))
+        .bearer_auth(&owner.token)
+        .send()
+        .await;
+    assert_eq!(r.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(health().await["sessions"], 1);
+}

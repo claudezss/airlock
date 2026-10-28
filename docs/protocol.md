@@ -636,7 +636,7 @@ sends nothing for 30 seconds is answered with `408`.
 
 | Method and path | Auth | Body | Success |
 |---|---|---|---|
-| `GET /v1/health` | none | none | `200 {"ok": true, "protocol": 1, "max_item_bytes": 104857600}`; clients default a new session's `max_item_bytes` to it |
+| `GET /v1/health` | none | none | `200 {"ok": true, "protocol": 1, "max_item_bytes": 104857600, "sessions": 12}`; clients default a new session's `max_item_bytes` to it; `sessions` is how many sessions the relay holds (open, not yet expired or closed) |
 | `POST /v1/sessions` | none | signed manifest | `201 {"session_id", "expires_at_ms"}` |
 | `GET /v1/sessions/{id}` | none | none | `200 {"signed_manifest"}` |
 | `POST /v1/sessions/{id}/participants` | none | signed join request | `201 {"token", "participant_pub", "role", "seq"}` |

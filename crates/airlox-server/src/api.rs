@@ -146,6 +146,8 @@ pub async fn health(State(st): State<AppState>) -> Json<Value> {
         "ok": true,
         "protocol": airlox_core::PROTOCOL_VERSION,
         "max_item_bytes": st.store.cfg.max_item_bytes,
+        // How many sessions the relay holds: a count, never which.
+        "sessions": st.store.count(),
     }))
 }
 

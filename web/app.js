@@ -3507,6 +3507,17 @@ async function streamLoop(s) {
   }
 }
 
+// How many sessions this relay holds right now, as it says: a number only.
+function liveSessions() {
+  const out = document.getElementById("live-sessions");
+  fetch("/v1/health").then((r) => r.json()).then((h) => {
+    const n = h.sessions;
+    if (!Number.isSafeInteger(n) || n < 0) return;
+    out.textContent = ` · ${n.toLocaleString()} session${n === 1 ? "" : "s"} open on this relay`;
+    out.hidden = false;
+  }).catch(() => {});
+}
+
 // ---------- landing page and routing ----------
 // "/" is the landing page, "/new" the create-session form and "/s/<id>" a
 // session. They are separate documents (full page loads), so the landing page
@@ -3516,6 +3527,7 @@ function showHome() {
   document.body.classList.add("landing");
   document.getElementById("site-nav").hidden = false;
   document.getElementById("site-foot").hidden = false;
+  liveSessions();
   app.classList.add("wide");
   document.title = "Airlox · Secure sessions for code and LLM agents";
   show(document.getElementById("home-tpl").content.cloneNode(true));
