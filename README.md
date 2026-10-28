@@ -5,8 +5,9 @@
 <h1 align="center">Airlox</h1>
 
 <p align="center">
-  End-to-end encrypted, short-lived sessions where AI agents exchange messages,
-  files and runnable code.
+  A sandboxed job slot on machines you own, for any coding agent: run tests
+  and commands there instead of handing the model an SSH login. End-to-end
+  encrypted sessions for messages, files and code between agents, too.
 </p>
 
 <p align="center">
@@ -105,23 +106,32 @@ files back. The relay in the middle only ever sees ciphertext.
 
 ## Features
 
-- **End-to-end encryption.** Every item is encrypted with AES-256-GCM under its
-  own key and signed with Ed25519. Keys travel only in the invite link's
-  fragment, which browsers never send to the server.
+- **A job slot, not a login.** A headless runner on your machine executes
+  signed shell or Python jobs, one process each, in a Docker container (no
+  network unless allowed, read-only root, dropped capabilities, time and
+  memory limits) or, on Linux, a namespace and Landlock sandbox, and posts
+  back a signed result with the output, exit code and any files the job
+  wrote. No LLM runs on the machine.
+- **Your working tree, warm.** `--tree` sends the checkout as it is, uncommitted
+  changes included and credential-named files refused; the runner keeps a
+  workspace per sender, so dependencies and build output survive between
+  runs and only changed files are uploaded after the first.
+- **Works where SSH does not.** Both ends make outbound HTTPS to the relay:
+  machines behind NAT or a firewall, and hosted agents (Claude Code on the
+  web, Codex cloud) whose sandboxes have no SSH client and no key store.
+- **The relay never sees content.** Every item is encrypted with AES-256-GCM
+  under its own key and signed with Ed25519, on your relay or ours. Keys
+  travel only in the invite link's fragment, which browsers never send to the
+  server; the relay keeps no database and nothing after a session ends.
 - **Roles, not accounts.** Owner, sender, observer and runner invites grant
-  exactly what each participant may do. A participant proves its role with a
-  certificate signed by that role's key, and the role keys are fixed in the
-  session manifest the owner signed. Every client verifies both.
-- **Transit, not storage.** Sessions expire, or last until closed if you ask
-  for that, and files leave the relay once every recipient has stored them. There is no database, and the relay keeps
-  nothing after a session ends.
-- **Remote execution without an LLM on the other side.** A headless runner
-  executes signed Python jobs in a Docker sandbox (no network, read-only root,
-  dropped capabilities, resource limits) or, on Linux, a namespace and
-  Landlock sandbox, and posts back a signed result with any files the job
-  wrote.
-- **Owner approval.** Execute sessions can require the owner to approve each
-  runner before it receives work.
+  exactly what each participant may do, proven by a certificate signed with
+  that role's key and fixed in the manifest the owner signed. A sender invite
+  handed to a hosted agent can submit sandboxed jobs to approved runners and
+  nothing else; the owner approves each runner before it receives work.
+- **Also a room for agents.** The same session carries messages, Markdown,
+  ZIPs and images between agents and people: hand a review to a bot on another
+  machine, let a lead observe, or have two agents wake each other with
+  addressed messages.
 - **One protocol core.** Cryptography, wire formats and input validation live
   in a single Rust crate, used natively by the relay and runner, by Python
   through PyO3 and by the browser through WebAssembly, and checked against
@@ -145,8 +155,10 @@ files back. The relay in the middle only ever sees ciphertext.
 3. Participants join with a certificate for their role, then post encrypted,
    signed items. Every participant verifies every item locally; the relay
    checks signatures and limits but cannot read content.
-4. In an execute session a sender targets a runner by name or label. The
-   runner verifies the job, runs it in its sandbox and returns a signed result
+4. In an execute session a sender targets a runner by name or label and sends
+   a shell command or Python file, with its working tree or other inputs. The
+   runner verifies the job, syncs the tree into that sender's workspace, runs
+   the job in its sandbox, streams its output and returns a signed result
    bound to that job.
 
 The full design is in [docs/DESIGN.md](docs/DESIGN.md) and the wire format in
