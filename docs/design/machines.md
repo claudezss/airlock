@@ -385,9 +385,10 @@ restarts, because the identity cache makes the job still "mine". Changes:
 - **Machines keep an owner invite on disk**, in a directory the MCP server
   cannot read, as `--owner-invite-dir` does today. A sender invite handed
   to a hosted agent is a secret with a bounded blast radius: submit
-  sandboxed jobs to approved runners until `machine rm`. Rotation is
-  `machine invite --rotate`, which revokes the sender role (DESIGN.md §4,
-  revocation) and issues a new one; runners are unaffected.
+  sandboxed jobs to approved runners until `machine rm`. There is no
+  rotation in place: revoking a role is permanent (DESIGN.md §4, revocation)
+  and the sender invite is derived from the owner seed, so a leaked sender
+  invite is answered by `machine rm` and a new `machine add`.
 - **Streaming reveals timing** of output to the relay (when chunks were
   posted and how large), as items always have. No plaintext.
 
