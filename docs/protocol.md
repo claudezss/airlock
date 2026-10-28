@@ -62,7 +62,8 @@ links pin the manifest only through the session id, which is why it carries
     "job_limits": null | {
       "runtime": "python3.12", "timeout_s": 30, "memory_mb": 512,
       "network": false, "packages": ["numpy", "pandas"],
-      "return_out": true, "approve_runners": true
+      "return_out": true, "approve_runners": true,
+      "kinds": ["python", "shell"], "workspace": true
     },
     "insecure_http_host": "airlox-relay.ns.svc"
   },
@@ -100,6 +101,18 @@ Validity rules (all enforced by `Manifest::validate`):
   as before. A verifier older than this rule rejects a manifest that pins a
   version, as a package name that is not valid. A job's `requirements` name
   packages only (the name part of an entry); the version is the session's.
+- `kinds` is optional: the kinds of job the session allows, a non-empty
+  list without repeats drawn from `python` (Python run by the session's
+  runtime) and `shell` (a script run by the runner's shell with the
+  sandbox's own tools, §7). Absent means `["python"]`, so every manifest
+  from before shell jobs keeps its meaning; clients leave it out for python
+  alone. `runtime` and `packages` apply to `python` jobs only, but a manifest
+  with `kinds: ["shell"]` still carries a valid `runtime`.
+- `workspace` is optional and left out when false: runners that opt in
+  (`--workspace`) may keep each sender's work directory between jobs (§8,
+  workspaces).
+- `sh` is a job subkind (§6), never a content type: it may not appear in
+  `allowed_types`.
 - `insecure_http_host` is optional and left out (not `null`) when unset, so
   manifests without it are unchanged. When present it is a lowercase DNS name
   or IPv4 address, without scheme, port or path, and not a loopback name: the
@@ -261,7 +274,7 @@ Every message, file, job, result and event is an item: a plaintext
     "session_id": "…",
     "author": "<participant public key>",
     "kind": "text|file|job|result|event|progress",
-    "subkind": null | "py|md|zip|image",
+    "subkind": null | "py|md|zip|image|sh",
     "size": 31,
     "created_at_ms": 0,
     "refs": [{"id": "<item id>", "blob_sha256": "<b64 SHA-256 of that item's blob>"}, …]
@@ -277,7 +290,8 @@ sig      = Ed25519(author, "item", canonical(header) || SHA-256(blob))
 ```
 
 - `subkind` rules: `text`, `result`, `event`, `progress` → `null`; `file` → one of
-  `py|md|zip|image`; `job` → `py`.
+  `py|md|zip|image`; `job` → `py` (a `python` job) or `sh` (a `shell` job).
+  The relay learns the kind of a job, and nothing else about it.
 - `size` is the plaintext payload length; `len(blob) == size + 28`.
 - `id` must decode (strict base64url) to exactly 16 bytes.
 - `refs` holds at most 64 **item references**. A reference is
@@ -306,10 +320,10 @@ meta. Only `file` carries a non-empty `body`.
 |---|---|
 | `text` | `text`, and optionally `to` (absent, never `null` or empty, for a message to everyone): 1 to 64 distinct participant public keys the message is addressed to |
 | `file` | `name` (bare file name, ≤ 255 bytes), `mime` |
-| `job` | `filename`, `code`, `runtime`, `timeout_s`, `memory_mb` (nullable), `files` (item references), `requirements` (package names), `target`, and optionally `progress_file` (absent, never `null`, when not given) |
+| `job` | `filename`, `code`, `runtime`, `timeout_s`, `memory_mb` (nullable), `files` (item references), `requirements` (package names), `target`, and optionally `kind` (`python` or `shell`), `progress_file`, `cwd`, `tree` (an item reference) and `fresh` (`true`); each optional field is absent, never `null` or `false`, when not given |
 | `result` | `job` (item reference), `exit_code` (nullable), `status`, `reason` (nullable), `wall_ms`, `peak_mem_mb`, `stdout`, `stderr`, `stdout_truncated`, `stderr_truncated`, `out_files` [`{name, size, item}`] where `item` is an item reference, `code_sha256`, `input_sha256` (lowercase hex), and optionally `env` (absent, never `null`, when not reported) |
 | `event` | tagged by `event`: `runner_approve {participant_pub}`, `runner_reject {participant_pub, reason}`, `job_cancel {job}` (item reference), `session_close` |
-| `progress` | `job` (item reference), `elapsed_ms`, `tail` (nullable), `tail_truncated` |
+| `progress` | `job` (item reference), `elapsed_ms`, `tail` (nullable), `tail_truncated`, and, for an output chunk, `stream`, `offset`, `data` and optionally `truncated` (`true`) |
 
 A `progress` item is a runner's signed note that a job is still running:
 the time since it started and, if the job named a `progress_file` (a
@@ -317,6 +331,38 @@ relative `/`-separated path in its work dir, such as a simulator's log), the
 end of that file as text (at most 64 KiB, starting at a line).
 `progress_file` follows the component rules of §9, no component may start
 with `.`, at most 8 components and 255 bytes.
+
+**Job kinds.** A job's `kind` is `python` (absent means `python`, so a Python
+job is byte-for-byte what 0.1 clients send) or `shell`. A `shell` job's
+`code` is a script of at most 64 KiB, run by the runner's POSIX shell as
+`sh -e -c "$code"` (Windows runners: `pwsh -NoProfile -Command`), with the
+tools of the sandbox: the operator's image under docker, the host's system
+directories otherwise. Its `filename` is for display (e.g. `job.sh`; any name
+that passes the file name rules), it has no `requirements`, and its
+`runtime` is still the session's. `code_sha256` is SHA-256 of `code` either
+way. `cwd`, when given, is where in the work dir the job starts: a relative
+path under the rules of `progress_file`.
+
+**Output chunks.** While a job runs, its runner may stream its output as
+`progress` items carrying `stream` (`stdout` or `stderr`), `offset` (the
+byte position of `data` in that stream) and `data` (at most 64 KiB of the
+stream as text, cut at a UTF-8 boundary); such a chunk has `tail: null` and
+`tail_truncated: false`. A runner caps what it streams; the chunk where it
+stops says `truncated: true` (its `data` may be empty). Chunks pass through
+the same path replacement as results, one at a time, so a path split across
+two chunks may escape it. Chunks are for display: the signed result's
+`stdout` and `stderr` are the authority, and a client that showed chunks
+shows the result's text, not a stitch of chunks.
+
+**Trees.** A job that sends a working tree names it in `tree`: one of its
+`files`, a `zip` named `tree.zip` holding the files and `.airlox/tree.json`
+= `{root_name, head, branch, dirty, files: [{path, sha256, mode}], count,
+bytes}` (`head` the commit as hex, or `null` outside a repository; `sha256`
+hex of each file; `mode` `0o100644` or `0o100755`). A runner without a
+workspace unpacks it like any zip; one with a workspace syncs it (§8). A
+result's `env.tree` is `{head, dirty, count, sha256}`, copied from
+`tree.json` with `sha256` the hex SHA-256 of `tree.zip`, so an observer sees
+which tree each result ran against without opening the job.
 
 A result's `env` says where the job ran, as its runner measured it once for
 the runtime (not per job), so a sender can check it without trusting the
@@ -329,7 +375,10 @@ interpreter came from: `uv-runtime` (built by the runner from the
 allowlist), `--python` (the operator's own), or `docker:<image>`. It holds no
 file system paths. `python` and `airlox` are 1 to 32 printable characters,
 `interpreter` 1 to 128, each version 1 to 64, and at most 256 packages are
-listed.
+listed. Runners since shell jobs add `kinds` (the kinds of job they accept,
+one or two), `shell` (`sh` or `pwsh`, 1 to 32 printable characters) when
+they accept `shell` jobs, and `tree` (above) for a job that sent one; each is
+absent when not reported.
 A runner reports it on a job that ran; a `refused` result has none. A runner
 shortens the digest of a digest-pinned image (`repo@sha256:` plus 12 hex
 digits), cuts `interpreter` to fit, and leaves out a package whose version it
@@ -379,7 +428,13 @@ safety net against accidental loops, not a security boundary.
 **Compatibility.** Clients 0.1.0 and 0.1.1 reject text items that carry `to`,
 job results that carry `env`, and manifests whose allowlist pins package
 versions (`name==1.2.3`); there is no
-protocol flag: use 0.1.2 or later in a session that uses them.
+protocol flag: use 0.1.2 or later in a session that uses them. Likewise
+clients before 0.2 reject manifests with `kinds` or `workspace`, jobs with
+`kind`, `cwd`, `tree` or `fresh`, `sh` jobs, progress items with `stream`,
+and results whose `env` carries `kinds`, `shell` or `tree`: a session that
+uses any of them needs 0.2 clients throughout. A `python` job without a tree
+in a manifest without `kinds` is what 0.1 sends, so a 0.2 sender and a 0.1
+runner still work together for what 0.1 could do.
 
 ## 8. Policy
 
@@ -398,8 +453,9 @@ Never from relay metadata or caller input.
 
 Plus: runners may post only in execute mode; `size ≤ max_item_bytes`;
 `created_at_ms` within the session lifetime; `text` needs `text` allowed;
-`file` needs its subkind allowed; `job` needs execute mode and `py` allowed;
-`result` and `progress` need execute mode.
+`file` needs its subkind allowed; a `job` needs execute mode and its kind in
+the manifest's `kinds` (a `py` job also needs `py` allowed); `result` and
+`progress` need execute mode.
 
 **Client and runner** (after decryption): payload type equals header kind;
 file rules from §7; a text's `to`, when present, holds 1 to 64 distinct keys;
@@ -414,9 +470,14 @@ the job item, and, for a `runner` target, only if its author is that runner's
 participant key. Clients accept the first valid result per job. Progress
 items follow the same binding (their `job` reference matches, a `runner`
 target's key authored them, the runner is approved) and carry a `tail` of at
-most 64 KiB.
-A runner additionally refuses a job unless: entry file is a bare `.py` name;
-code ≤ 1 MiB; `runtime` equals the manifest runtime;
+most 64 KiB, or are output chunks (`stream`, `offset` and `data` together,
+`data` at most 64 KiB, no tail). A job's kind must match its header subkind.
+A runner additionally refuses a job unless: its kind is in the manifest's
+`kinds` and is one this runner runs (else the reason starts
+`kind_not_supported:`); for `python`, the entry file is a bare `.py` name and
+code ≤ 1 MiB; for `shell`, code ≤ 64 KiB and no `requirements`; `cwd`, if
+set, follows the `progress_file` rules; `tree`, if set, is one of `files`;
+`runtime` equals the manifest runtime;
 `1 ≤ timeout_s ≤ limit`; `memory_mb` (if set) `≤ limit`; at most 32 `files`,
 each fetched and matched against its reference; every requirement,
 PEP 503-normalized, names the package of an entry in `packages`; the target

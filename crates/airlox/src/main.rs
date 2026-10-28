@@ -10,6 +10,7 @@ mod machine;
 mod mcp;
 mod runner;
 mod sandbox;
+mod serve;
 #[cfg(windows)]
 mod service;
 mod session;
@@ -70,6 +71,13 @@ enum Cmd {
 enum RunnerCmd {
     /// Join a session with a runner invite and run its jobs until it ends.
     Join(Box<runner::JoinArgs>),
+    /// `join`, started again after a failure (with backoff), optionally
+    /// logging to a file: for a runner that stays up.
+    Serve(Box<serve::ServeArgs>),
+    /// Run the runner as a service of this user that starts at login and
+    /// after failures: a systemd --user unit (Linux) or a launchd agent
+    /// (macOS) running `serve`. Takes the `join` flags.
+    InstallService(Box<serve::InstallArgs>),
     /// Run a runner as a Windows service: install or uninstall it.
     #[cfg(windows)]
     #[command(subcommand)]
@@ -149,7 +157,24 @@ fn main() -> std::process::ExitCode {
             };
         }
     }
-    tracing_subscriber::fmt().with_env_filter(filter()).with_writer(std::io::stderr).init();
+    let log_file = match &cli.cmd {
+        Cmd::Runner(RunnerCmd::Serve(a)) => a.log_file.clone(),
+        _ => None,
+    };
+    match log_file {
+        Some(path) => {
+            let f = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("airlox: could not open --log-file {}: {e}", path.display());
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            let f = std::sync::Mutex::new(f);
+            tracing_subscriber::fmt().with_env_filter(filter()).with_ansi(false).with_writer(f).init();
+        }
+        None => tracing_subscriber::fmt().with_env_filter(filter()).with_writer(std::io::stderr).init(),
+    }
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
@@ -172,6 +197,8 @@ fn main() -> std::process::ExitCode {
             Cmd::Delivery(c) => cli::delivery(c).await.map(|()| 0),
             Cmd::Receive(a) => cli::receive(a).await.map(|()| 0),
             Cmd::Runner(RunnerCmd::Join(args)) => runner::run(*args).await.map(|()| 0),
+            Cmd::Runner(RunnerCmd::Serve(a)) => serve::serve(*a).await.map(|()| 0),
+            Cmd::Runner(RunnerCmd::InstallService(a)) => serve::install(*a).await.map(|()| 0),
             #[cfg(windows)]
             Cmd::Runner(RunnerCmd::Service(service::ServiceCmd::Install(a))) => {
                 service::install(*a).await.map(|()| 0)

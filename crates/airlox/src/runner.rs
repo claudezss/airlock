@@ -49,7 +49,7 @@ pub enum SandboxArg {
     Process,
 }
 
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args, Debug, Clone)]
 #[command(group(
     clap::ArgGroup::new("source").args(["invite", "code", "invite_file"]).required(true).multiple(true)
 ))]
@@ -213,7 +213,8 @@ fn seed_from_hex(s: &str) -> Result<[u8; 32]> {
     b.try_into().map_err(|_| anyhow::anyhow!("bad identity seed length"))
 }
 
-/// Join as a new runner participant; returns `(keypair, token)`.
+/// Join as a new runner participant, with `kp` (the key a code was claimed
+/// for) or a new key; returns `(keypair, token)`.
 async fn join(
     http: &reqwest::Client,
     base_url: &str,
@@ -221,8 +222,9 @@ async fn join(
     args: &JoinArgs,
     backend: &Backend,
     python: Option<&str>,
+    kp: Option<Keypair>,
 ) -> Result<(Keypair, String)> {
-    let kp = Keypair::generate();
+    let kp = kp.unwrap_or_else(Keypair::generate);
     let sid = &invite.session_id;
     let cert = issue_cert(&invite.role_keypair(), sid, Role::Runner, kp.public(), now_ms())?;
     let j = sign_join(
@@ -355,6 +357,58 @@ fn read_invite_file(path: &std::path::Path) -> Result<String> {
     Ok(text)
 }
 
+/// Where a runner that claimed a code keeps the key it told the relay it
+/// would join with, until it has joined with it.
+fn pending_key_path(dir: &std::path::Path, name: &str) -> PathBuf {
+    dir.join(format!("pending-key-runner-{name}.txt"))
+}
+
+/// Claim `--code` for a key this runner will join with, telling the relay
+/// that key (so `airlox machine add` approves exactly this runner), and keep
+/// the invite and the key in the session's directory under `root`. Returns
+/// the invite link and where it was saved.
+pub(crate) async fn claim_code(
+    http: &reqwest::Client,
+    args: &JoinArgs,
+    root: &std::path::Path,
+) -> Result<(String, PathBuf)> {
+    let code = args.code.as_deref().context("no --code")?;
+    if args.invite.is_some() {
+        eprintln!("note: using --code; ignoring the invite from --invite or AIRLOX_INVITE");
+    }
+    let env = std::env::var("AIRLOX_RELAY").ok().filter(|r| !r.is_empty());
+    let relay = args.relay.clone().or(env).unwrap_or_else(|| DEFAULT_RELAY.into());
+    let kp = Keypair::generate();
+    let link = client::receive_code_as(http, &relay, code, args.allow_insecure_http, Some(&kp.public().to_b64()))
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "{e:#}\nA code works once. If this runner already used it, restart it with the invite it saved:\n  \
+                 airlox runner join --invite-file '{}' --name {} ...",
+                root.join("<session>").join("invite-runner.txt").display(),
+                args.name
+            )
+        })?;
+    let invite = Invite::parse(&link).context("not a valid invite link")?;
+    let dir = root.join(&invite.session_id);
+    // A code works once: save what it carried before anything else can fail,
+    // so neither a failed start nor a restart needs a new code.
+    let saved = save_invite(&dir, &invite, &link)?;
+    if invite.role == Role::Runner {
+        let seed: String = kp.seed().iter().map(|b| format!("{b:02x}")).collect();
+        write_atomic(&pending_key_path(&dir, &args.name), seed.as_bytes(), 0o600)?;
+    }
+    let quoted = format!("'{}'", saved.display().to_string().replace('\'', r"'\''"));
+    eprintln!("Saved the {} invite to {quoted}.", invite.role.as_str());
+    if invite.role == Role::Runner {
+        eprintln!(
+            "To restart this runner later:\n  airlox runner join --invite-file {quoted} --name {} ...",
+            args.name
+        );
+    }
+    Ok((link, saved))
+}
+
 /// The invite link, from wherever the operator put it.
 pub(crate) async fn invite_link(
     http: &reqwest::Client,
@@ -392,23 +446,13 @@ pub async fn run(args: JoinArgs) -> Result<()> {
     check_args(&args)?;
     let http = client::http()?;
     let root = args.cache_dir.clone().unwrap_or_else(default_cache_root);
-    let link = invite_link(&http, &args, &root).await?;
+    let link = match (&args.code, &args.invite_file) {
+        (Some(_), None) => claim_code(&http, &args, &root).await?.0,
+        _ => invite_link(&http, &args, &root).await?,
+    };
     let invite = Invite::parse(&link).context("not a valid invite link")?;
     let sid = invite.session_id.clone();
     let dir = root.join(&sid);
-    // A code works once: save what it carried before anything else can fail,
-    // so neither a failed start nor a restart needs a new code.
-    if args.code.is_some() {
-        let saved = save_invite(&dir, &invite, &link)?;
-        let quoted = format!("'{}'", saved.display().to_string().replace('\'', r"'\''"));
-        eprintln!("Saved the {} invite to {quoted}.", invite.role.as_str());
-        if invite.role == Role::Runner {
-            eprintln!(
-                "To restart this runner later:\n  airlox runner join --invite-file {quoted} --name {} ...",
-                args.name
-            );
-        }
-    }
     if invite.role != Role::Runner {
         bail!("this is a {} invite; runners need the runner invite", invite.role.as_str());
     }
@@ -506,9 +550,15 @@ pub async fn run(args: JoinArgs) -> Result<()> {
     };
     // Join before preparing the sandbox, and say how that goes: a runner
     // that cannot start then shows as failed, with why, rather than missing.
+    // A code this runner claimed named the key it joins with.
+    let pending = pending_key_path(&dir, &args.name);
+    let claimed = std::fs::read_to_string(&pending)
+        .ok()
+        .and_then(|s| seed_from_hex(s.trim()).ok())
+        .map(|s| Keypair::from_seed(&s));
     let (kp, token) = match saved {
         Some(i) => (Keypair::from_seed(&seed_from_hex(&i.participant_seed)?), i.token),
-        None => join(&http, &url, &invite, &args, &backend, python.as_deref()).await?,
+        None => join(&http, &url, &invite, &args, &backend, python.as_deref(), claimed).await?,
     };
     // A job this runner started before it last stopped and still owes an
     // answer for: named in the setup heartbeats, so the relay keeps it
@@ -520,7 +570,7 @@ pub async fn run(args: JoinArgs) -> Result<()> {
     let (kp, relay) = match relay.report("preparing", None, owed).await {
         Err(e) if status_of(&e) == Some(401) => {
             tracing::info!("saved identity is no longer valid; joining again");
-            let (kp, token) = join(&http, &url, &invite, &args, &backend, python.as_deref()).await?;
+            let (kp, token) = join(&http, &url, &invite, &args, &backend, python.as_deref(), None).await?;
             relay = Relay::new(http.clone(), &url, &sid, &token);
             save_identity(&id_path, &kp, &token, &base)?;
             relay.report("preparing", None, owed).await?;
@@ -532,6 +582,7 @@ pub async fn run(args: JoinArgs) -> Result<()> {
             (kp, relay)
         }
     };
+    let _ = std::fs::remove_file(&pending);
     tracing::info!(
         session = %sid, name = %args.name, participant = %kp.public().fingerprint(),
         sandbox = ?backend.kind(), "joined as a runner"
