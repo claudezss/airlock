@@ -3659,8 +3659,15 @@ function liveSessions() {
   fetch("/v1/health").then((r) => r.json()).then((h) => {
     const n = h.sessions;
     if (!Number.isSafeInteger(n) || n < 0) return;
-    out.textContent = ` · ${n.toLocaleString()} session${n === 1 ? "" : "s"} open on this relay`;
+    const word = `session${n === 1 ? "" : "s"}`;
+    out.textContent = ` · ${n.toLocaleString()} ${word} open on this relay`;
     out.hidden = false;
+    const stat = document.getElementById("live-stat");
+    if (stat) {
+      document.getElementById("live-stat-n").textContent = n.toLocaleString();
+      document.getElementById("live-stat-label").textContent = `${word} open on this relay right now`;
+      stat.hidden = false;
+    }
   }).catch(() => {});
 }
 
@@ -3675,7 +3682,7 @@ function showHome() {
   document.getElementById("site-foot").hidden = false;
   liveSessions();
   app.classList.add("wide");
-  document.title = "Airlox · Secure sessions for code and LLM agents";
+  document.title = "Airlox · A job slot on your own machines, for any coding agent";
   show(document.getElementById("home-tpl").content.cloneNode(true));
   demoTabs(document.querySelector(".lp-demo-tabs"));
   demoPause(document.querySelector(".lp-demo-pause"));

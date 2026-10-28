@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "airlox"
-description = "Python SDK for Airlox: secure sessions where agents share messages, files and runnable code"
+description = "Python SDK for Airlox: run jobs on your own machines from any agent, and exchange files and messages in end-to-end encrypted sessions"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 license-files = ["LICENSE-MIT", "LICENSE-APACHE"]

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<meta name="description" content="End-to-end encrypted, short-lived sessions where AI agents exchange messages, files and runnable code.">
+<meta name="description" content="Give your coding agent a sandboxed job slot on machines you own, not an SSH login: run tests and commands there from any agent, local or hosted, end-to-end encrypted.">
 <title>Airlox</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 28 28' fill='none' stroke='%23f2a93b' stroke-width='2'%3E%3Crect x='3' y='3' width='22' height='22' rx='3'/%3E%3Cpath d='M10 3v22M18 3v22'/%3E%3Ccircle cx='14' cy='14' r='2' fill='%23f2a93b' stroke='none'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/assets/style.css">
@@ -19,10 +19,10 @@
   <nav id="site-nav" class="site-nav" aria-label="Primary" hidden>
     <div class="nav-links">
       <a href="#modes">How it works</a>
+      <a href="#ssh">Why not SSH</a>
       <a href="#demos">Examples</a>
-      <a href="#types">File types</a>
       <a href="#security">Security</a>
-      <a href="#api">API</a>
+      <a href="#api">Get started</a>
     </div>
     <a class="button primary" href="/new">Open a session</a>
   </nav>
@@ -41,47 +41,46 @@
 <section id="top" class="lp-section lp-hero">
   <div class="lp-inner lp-hero-grid">
     <div class="lp-hero-copy">
-      <p class="lp-eyebrow accent">Secure sessions for code &amp; LLM agents</p>
-      <h1>A sealed room where agents hand off files, and code that runs itself.</h1>
-      <p class="lp-lede">Open a short-lived, end-to-end encrypted session. One agent drops in messages, Markdown, ZIPs, images or Python. The other side reads them, or headless runners on the receiver's own machines execute the code in a sandbox and post the result back. No LLM needed on the receiving end.</p>
+      <p class="lp-eyebrow accent">A job slot on your own machines, for any coding agent</p>
+      <h1>Give your agent a job slot, not a login.</h1>
+      <p class="lp-lede">Pair a machine once. Your coding agent, local or hosted, runs tests, builds and scripts on it in a sandbox with signed limits, through NAT and firewalls where SSH cannot reach. Output streams back, the result is signed by the machine that ran it, and the relay in between sees only ciphertext.</p>
       <div class="row lp-actions">
-        <a class="button primary cta" href="/new">Open a session <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></a>
-        <a class="button cta" href="#api">Read the API</a>
+        <a class="button primary cta" href="#api">Pair a machine <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></a>
+        <a class="button cta" href="/new">Open a session</a>
       </div>
-      <p class="lp-install mono"><span class="accent" aria-hidden="true">$</span> <span class="sr-only">Install the Python SDK with </span>pip install airlox <span class="muted">· Python SDK</span></p>
+      <p class="lp-install mono"><span class="accent" aria-hidden="true">$</span> <span class="sr-only">Install with </span>npm install -g airlox <span class="muted">· or</span> pip install airlox</p>
+      <p class="lp-live mono" id="live-stat" hidden><span class="dot" aria-hidden="true"></span><span><strong id="live-stat-n">0</strong> <span id="live-stat-label">sessions open on this relay right now</span></span></p>
       <p class="lp-join">Have an invite link? Open it in this browser to join that session. The key stays in the part of the link after the <code>#</code>, which is never sent to the relay. Have a code like <code>7-guitar-orbit</code> instead? <a href="/receive">Enter it here</a>.</p>
     </div>
 
     <figure class="lp-mock" aria-labelledby="mock-cap">
-      <figcaption id="mock-cap" class="sr-only">Example session: a planner agent sends a ZIP and a script, and a runner posts back the output.</figcaption>
+      <figcaption id="mock-cap" class="sr-only">Example: a coding agent sends its working tree and a test command to the paired machine gpu-box, output streams back, and the signed result reports the exit code.</figcaption>
       <div class="lp-mock-bar mono">
-        <div class="lp-mock-id"><span class="dot" aria-hidden="true"></span><span>session ax_7f3e</span></div>
-        <div class="lp-mock-meta"><span>E2E · sealed</span><span>expires 58:12</span></div>
+        <div class="lp-mock-id"><span class="dot" aria-hidden="true"></span><span>machine gpu-box</span></div>
+        <div class="lp-mock-meta"><span>E2E · sealed</span><span>docker · no network</span></div>
       </div>
       <div class="lp-mock-body">
         <div class="lp-msg">
-          <div class="lp-who mono">planner-agent · sender</div>
-          <div class="lp-bubble">Cleaned dataset attached. Running a summary on your side.</div>
+          <div class="lp-who mono">claude-code · sender</div>
+          <div class="lp-bubble">Running the suite on gpu-box before I open the PR.</div>
         </div>
         <div class="lp-file">
-          <div class="lp-file-ic mono" aria-hidden="true">ZIP</div>
-          <div class="lp-file-text"><span class="lp-file-name">dataset.zip</span><span class="muted">2.4 MB · 3 files · checked</span></div>
+          <div class="lp-file-ic mono" aria-hidden="true">TREE</div>
+          <div class="lp-file-text"><span class="lp-file-name">working tree</span><span class="muted">412 files · 3.1 MB · 18 changed · uncommitted included</span></div>
         </div>
         <div class="lp-code">
-          <div class="lp-code-head mono"><span>exec · summarize.py</span><span class="accent">python 3.12</span></div>
-          <pre role="region" tabindex="0" aria-label="summarize.py">import pandas as pd
-df = pd.read_csv("dataset/orders.csv")
-print(df.groupby("region").total.sum())</pre>
+          <div class="lp-code-head mono"><span>shell · services/api</span><span class="accent">ghcr.io/me/ci@sha256:9f3a…</span></div>
+          <pre role="region" tabindex="0" aria-label="job command">pytest -x tests/</pre>
         </div>
         <div class="lp-result">
           <div class="lp-result-head mono">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M5 12l5 5 9-10"></path></svg>
-            <span>runner-01 · exit 0 · 1.84 s</span>
+            <span>gpu-box · exit 1 · 41.2 s · signed</span>
           </div>
-          <pre class="lp-out" role="region" tabindex="0" aria-label="runner output">region
-east     48210.50
-north    39977.25
-west     52104.00</pre>
+          <pre class="lp-out" role="region" tabindex="0" aria-label="streamed output">collected 212 items
+tests/test_median.py ....F
+FAILED test_median_even — assert 3.5 == 3
+1 failed, 4 passed in 40.9s</pre>
         </div>
       </div>
     </figure>
@@ -92,17 +91,34 @@ west     52104.00</pre>
   <div class="lp-inner lp-stack-lg">
     <div class="lp-head">
       <p class="lp-eyebrow">01 · How it works</p>
-      <h2>Two modes, one session.</h2>
-      <p class="lp-sub">Every session is a private channel with a key only its participants hold. Choose what the other side does with what arrives.</p>
+      <h2>One command on the machine. One from the agent.</h2>
+      <p class="lp-sub">The runner joins with a one-time code. The agent sends a shell command and its working tree; output streams back, and the result is signed by the machine that ran it. Both ends talk outbound HTTPS to the relay, so nothing needs an open port.</p>
     </div>
 
     <div class="lp-cards two">
       <article class="lp-card big">
         <div class="lp-card-title">
-          <div class="lp-ic info"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 7h13l-3-3M20 17H7l3 3"></path></svg></div>
-          <h3>Relay</h3>
+          <div class="lp-ic tint"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M8 6l-5 6 5 6M16 6l5 6-5 6"></path></svg></div>
+          <h3>Machine</h3>
         </div>
-        <p>Agents, or a human watching, exchange messages and files. Images preview and ZIPs list their contents. Markdown and Python arrive as text and are never run.</p>
+        <p>A box you own, paired once: the GPU workstation, the build server behind the firewall, the laptop with the licensed toolchain. Each job is one sandboxed process with the limits the session signed; the runner keeps a warm workspace per sender, so <code>node_modules</code> and <code>target/</code> survive between runs.</p>
+        <div class="lp-flow long mono" role="img" aria-label="An agent sends pytest and its working tree to the machine gpu-box, and a signed result comes back">
+          <span class="node">agent</span>
+          <svg class="flow" width="28" height="16" viewBox="0 0 28 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2 8h22l-4-4M24 8l-4 4"></path></svg>
+          <span class="node accent">pytest + tree</span>
+          <svg class="flow" width="28" height="16" viewBox="0 0 28 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2 8h22l-4-4M24 8l-4 4"></path></svg>
+          <span class="node">gpu-box</span>
+          <svg class="flow ok" width="28" height="16" viewBox="0 0 28 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M26 8H4l4-4M4 8l4 4"></path></svg>
+          <span class="node ok">signed result</span>
+        </div>
+      </article>
+
+      <article class="lp-card big">
+        <div class="lp-card-title">
+          <div class="lp-ic info"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 7h13l-3-3M20 17H7l3 3"></path></svg></div>
+          <h3>Room</h3>
+        </div>
+        <p>The same session also carries messages and files between agents, or between an agent and a person watching. Hand a review to a bot on another machine, let a lead observe, or have two agents wake each other with addressed messages. Markdown and Python arrive as text and are never run.</p>
         <div class="lp-flow mono" role="img" aria-label="Agent A and agent B exchange items through the session">
           <span class="node">agent A</span>
           <svg class="flow" width="40" height="16" viewBox="0 0 40 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2 5h34l-4-4M38 11H4l4 4"></path></svg>
@@ -111,52 +127,50 @@ west     52104.00</pre>
           <span class="node">agent B</span>
         </div>
       </article>
-
-      <article class="lp-card big">
-        <div class="lp-card-title">
-          <div class="lp-ic tint"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M8 6l-5 6 5 6M16 6l5 6-5 6"></path></svg></div>
-          <h3>Execute</h3>
-        </div>
-        <p>Receivers start one or more headless runners on their own machines and join them to the session by hand. The sending agent picks a runner for each job (by name, by label, or any idle one) and gets back stdout, stderr, exit code and anything written to <code>$AIRLOX_OUT</code>.</p>
-        <div class="lp-flow mono" role="img" aria-label="A code agent sends job.py to runner-01 (cpu) or runner-02 (gpu), and the result comes back">
-          <span class="node">code agent</span>
-          <svg class="flow" width="28" height="16" viewBox="0 0 28 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2 8h22l-4-4M24 8l-4 4"></path></svg>
-          <span class="node accent">job.py</span>
-          <svg class="flow" width="28" height="16" viewBox="0 0 28 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2 8h22l-4-4M24 8l-4 4"></path></svg>
-          <span class="nodes"><span class="node">runner-01 · cpu</span><span class="node">runner-02 · gpu</span></span>
-          <svg class="flow ok" width="28" height="16" viewBox="0 0 28 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M26 8H4l4-4M4 8l4 4"></path></svg>
-          <span class="node ok">result</span>
-        </div>
-      </article>
     </div>
 
     <ol class="lp-steps">
-      <li><span class="num mono" aria-hidden="true">1</span><strong>Open a session</strong><span>Pick a mode, expiry and allowed types. A key is generated in your browser or SDK.</span></li>
-      <li><span class="num mono" aria-hidden="true">2</span><strong>Hand out invites</strong><span>One link per role: sender, runner, observer. Each receiving machine starts its runner by hand and joins with the runner link; the owner can require approving it before it gets any work. The key rides in the URL fragment and never reaches the server.</span></li>
-      <li><span class="num mono" aria-hidden="true">3</span><strong>Agents exchange</strong><span>Text, files and jobs are encrypted and signed client-side, then posted to the session.</span></li>
-      <li><span class="num mono" aria-hidden="true">4</span><strong>Session seals</strong><span>At expiry or when the owner closes it, the relay purges everything it held. Nothing is left on the relay.</span></li>
+      <li><span class="num mono" aria-hidden="true">1</span><strong>Pair</strong><span><code>airlox machine add gpu-box</code> prints one command for the machine. The runner joins with a one-time code; you see its key and approve exactly that runner. Keys ride in invite fragments and never reach the relay.</span></li>
+      <li><span class="num mono" aria-hidden="true">2</span><strong>Run</strong><span><code>airlox run --on gpu-box --tree -- pytest</code> sends the command and the working tree as it is right now, uncommitted changes included, ignored paths and credential-named files left out. After the first run only changed files go.</span></li>
+      <li><span class="num mono" aria-hidden="true">3</span><strong>Stream</strong><span>stdout and stderr arrive as the job runs, encrypted and signed like everything else. The job is one process in the sandbox: no login, no persistence outside its workspace, no network unless you allow it.</span></li>
+      <li><span class="num mono" aria-hidden="true">4</span><strong>Signed result</strong><span>Exit code, timing, output files, the image digest and the tree's commit, signed by the runner and bound to the job. The relay purges a session when it ends; machines last until you remove them.</span></li>
     </ol>
   </div>
 </section>
 
-<section id="demos" class="lp-section">
+<section id="ssh" class="lp-section">
   <div class="lp-inner lp-stack-md">
     <div class="lp-head">
-      <p class="lp-eyebrow">02 · Real runs</p>
+      <p class="lp-eyebrow">02 · Why not SSH</p>
+      <h2>A login is more than an agent needs, and less than a hosted one can use.</h2>
+      <p class="lp-sub">For a trusted local agent and a machine you can already reach, SSH is fine. The difference shows in what you hand the model, what it can do with it, and where it works at all.</p>
+    </div>
+    <div class="lp-tiles">
+      <div class="lp-tile"><h3>What you hand the agent</h3><p><strong>SSH:</strong> a private key, long-lived, reusable from anywhere, until you notice and revoke it. <strong>Airlox:</strong> a role in a session that submits sandboxed jobs to runners you approved, and does nothing else. Leaked, it is a job slot until you remove the machine, not a login.</p></div>
+      <div class="lp-tile"><h3>What it can do</h3><p><strong>SSH:</strong> a shell, your filesystem, your network, your other keys, agent forwarding, lateral movement. <strong>Airlox:</strong> one process per job in a container or namespace sandbox with declared time, memory and network limits, and a workspace of its own. The restrictions you would bolt onto SSH for a model, built in.</p></div>
+      <div class="lp-tile"><h3>Where it works</h3><p><strong>SSH:</strong> needs an inbound path: a public port, a VPN, a bastion, Tailscale on both ends. <strong>Airlox:</strong> outbound HTTPS from both ends. It reaches a laptop behind NAT, a box behind the corporate firewall, and it works from hosted agents (Claude Code on the web, Codex cloud) whose sandboxes have no SSH client, no key store and HTTPS-only egress.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="demos" class="lp-section lp-alt">
+  <div class="lp-inner lp-stack-md">
+    <div class="lp-head">
+      <p class="lp-eyebrow">03 · Real runs</p>
       <h2>Five sessions, recorded as they happened.</h2>
       <p class="lp-sub">Each recording shows what every participant did next to this site's session view, opened with the observer link. Every run is also an end-to-end test.</p>
     </div>
     <div class="lp-demo-bar">
       <div class="lp-demo-tabs" role="tablist" aria-label="Use cases">
-        <button type="button" role="tab" id="demo-tab-code-review" aria-controls="demo-code-review" aria-selected="true">Code review</button>
-        <button type="button" role="tab" id="demo-tab-remote-tests" aria-controls="demo-remote-tests" aria-selected="false" tabindex="-1">Remote CI</button>
-        <button type="button" role="tab" id="demo-tab-fan-out" aria-controls="demo-fan-out" aria-selected="false" tabindex="-1">Fan-out</button>
+        <button type="button" role="tab" id="demo-tab-remote-tests" aria-controls="demo-remote-tests" aria-selected="true">Remote CI</button>
         <button type="button" role="tab" id="demo-tab-live-agent" aria-controls="demo-live-agent" aria-selected="false" tabindex="-1">Live agent</button>
+        <button type="button" role="tab" id="demo-tab-fan-out" aria-controls="demo-fan-out" aria-selected="false" tabindex="-1">Fan-out</button>
+        <button type="button" role="tab" id="demo-tab-code-review" aria-controls="demo-code-review" aria-selected="false" tabindex="-1">Code review</button>
         <button type="button" role="tab" id="demo-tab-agent-conversation" aria-controls="demo-agent-conversation" aria-selected="false" tabindex="-1">Agents talking</button>
       </div>
       <button type="button" class="lp-demo-pause" aria-pressed="false"><span class="glyph" aria-hidden="true">❚❚</span>Pause recordings</button>
     </div>
-    <div class="lp-demo" role="tabpanel" id="demo-code-review" aria-labelledby="demo-tab-code-review">
+    <div class="lp-demo" role="tabpanel" id="demo-code-review" aria-labelledby="demo-tab-code-review" hidden>
       <figure class="lp-demo-media">
         <a href="/assets/demos/code-review.gif" title="Open full size"><picture>
           <source media="(prefers-reduced-motion: reduce)" srcset="/assets/demos/code-review.webp">
@@ -174,7 +188,7 @@ west     52104.00</pre>
         <p class="lp-demo-run mono"><span class="accent" aria-hidden="true">$</span> python examples/code-review/run.py <a href="https://github.com/claudezss/airlox/blob/main/examples/code-review/run.py">source</a></p>
       </div>
     </div>
-    <div class="lp-demo" role="tabpanel" id="demo-remote-tests" aria-labelledby="demo-tab-remote-tests" hidden>
+    <div class="lp-demo" role="tabpanel" id="demo-remote-tests" aria-labelledby="demo-tab-remote-tests">
       <figure class="lp-demo-media">
         <a href="/assets/demos/remote-tests.gif" title="Open full size"><picture>
           <source media="(prefers-reduced-motion: reduce)" srcset="/assets/demos/remote-tests.webp">
@@ -249,17 +263,18 @@ west     52104.00</pre>
   </div>
 </section>
 
-<section id="types" class="lp-section lp-alt">
+<section id="types" class="lp-section">
   <div class="lp-inner lp-stack-md">
     <div class="lp-head">
-      <p class="lp-eyebrow">03 · What v1 carries</p>
-      <h2>Four types, handled properly.</h2>
+      <p class="lp-eyebrow">04 · Also a room for agents</p>
+      <h2>Hand off files and messages too.</h2>
+      <p class="lp-sub">Beyond jobs, a session carries four content types between agents and people, each checked on arrival: images preview, ZIPs list their contents, and nothing is ever run on the way through.</p>
     </div>
     <div class="lp-cards four">
       <article class="lp-card">
-        <p class="lp-ext mono accent">.py</p>
-        <h3>Python</h3>
-        <p>Shared as code, or submitted as a job in Execute mode. Jobs carry a timeout, attached files and package requirements from the session's allowlist.</p>
+        <p class="lp-ext mono accent">.sh .py</p>
+        <h3>Jobs and code</h3>
+        <p>A shell command with your working tree, or a Python file, submitted as a job with a timeout, memory limit and the session's package allowlist. Shared without running, they arrive as text.</p>
       </article>
       <article class="lp-card">
         <p class="lp-ext mono link">.md</p>
@@ -280,12 +295,12 @@ west     52104.00</pre>
   </div>
 </section>
 
-<section id="api" class="lp-section">
+<section id="api" class="lp-section lp-alt">
   <div class="lp-inner lp-api-grid">
     <div class="lp-api-copy">
-      <p class="lp-eyebrow">04 · Built for agents</p>
-      <h2>One command for your coding agent. One for the runner.</h2>
-      <p class="lp-sub">People can open sessions and join from the browser. Codex and Claude Code join through the <code>airlox</code> MCP server, other agents through the Python SDK or plain HTTPS, and the same binary runs the headless runner.</p>
+      <p class="lp-eyebrow">05 · Built for agents</p>
+      <h2>Pair once. Then any agent, any checkout.</h2>
+      <p class="lp-sub">The <code>airlox</code> binary is the CLI, the runner and the MCP server. Coding agents with a shell use the CLI (a skill teaches them); Codex and Claude Code can also use the MCP server; other agents use the Python SDK or plain HTTPS. A hosted agent gets the machine's sender invite in <code>AIRLOX_INVITE</code> and nothing else.</p>
       <ul class="lp-endpoints mono">
         <li>POST /v1/sessions/:id/items</li>
         <li>POST /v1/sessions/:id/jobs <span class="muted">(runner | labels | any)</span></li>
@@ -295,37 +310,33 @@ west     52104.00</pre>
     </div>
     <div class="lp-api-code">
       <div class="lp-codecard">
-        <div class="lp-codecard-head mono">Codex or Claude Code · once, in your project</div>
-        <pre role="region" tabindex="0" aria-label="coding agent setup"><span class="accent">$</span> codex mcp add airlox -- npx -y airlox mcp
-<span class="accent">$</span> claude mcp add airlox -- npx -y airlox mcp
-<span class="muted"># then, in the agent:</span>
-<span class="accent">&gt;</span> Join the Airlox session <span class="s">https://airlox.app/s/ax_7f3e#k=…</span>
-  and send it summarize.py</pre>
+        <div class="lp-codecard-head mono">pair · once, on your side</div>
+        <pre role="region" tabindex="0" aria-label="pairing a machine"><span class="accent">$</span> airlox machine add gpu-box --image ghcr.io/me/ci:latest
+<span class="muted">On the machine, run:</span>
+  airlox runner join --code 7-guitar-orbit --name gpu-box \
+    --sandbox docker --image ghcr.io/me/ci:latest --workspace
+<span class="muted">Waiting for it to join… gpu-box joined (key 3kQv…). Approve? [y/N]</span> y</pre>
       </div>
       <div class="lp-codecard">
-        <div class="lp-codecard-head mono">sender_agent.py</div>
-        <pre role="region" tabindex="0" aria-label="sender_agent.py"><span class="k">from</span> airlox <span class="k">import</span> Session
+        <div class="lp-codecard-head mono">run · from any checkout, or inside your coding agent</div>
+        <pre role="region" tabindex="0" aria-label="running a job"><span class="accent">$</span> airlox run --on gpu-box --tree -- pytest -x tests/
+<span class="muted">gpu-box · job 7Qk… · tree 412 files, 3.1 MB (18 changed)</span>
+collected 212 items
+tests/test_median.py ....F
+<span class="muted">── completed · exit 1 · 41.2 s · signed by runner gpu-box</span>
+
+<span class="muted"># a hosted agent: the machine's sender invite, nothing more</span>
+<span class="accent">$</span> AIRLOX_INVITE='&lt;sender link&gt;' airlox run --tree -- pytest</pre>
+      </div>
+      <div class="lp-codecard">
+        <div class="lp-codecard-head mono">sdk · the same from Python</div>
+        <pre role="region" tabindex="0" aria-label="sdk example"><span class="k">from</span> airlox <span class="k">import</span> Session
 
 s = Session.join(<span class="s">"https://airlox.app/s/ax_7f3e#k=…"</span>)
-s.send_text(<span class="s">"Cleaned data attached."</span>)
-data = s.send_file(<span class="s">"dataset.zip"</span>)
-
-<span class="c"># pick a runner by name, by label, or any idle one;</span>
-<span class="c"># fails right away if no matching runner is online</span>
-print(s.runners())
-job = s.run_python(open(<span class="s">"summarize.py"</span>).read(),
-                   filename=<span class="s">"summarize.py"</span>, files=[data],
-                   runner=<span class="s">"runner-01"</span>, timeout=30)
-result = job.wait()
-print(result.exit_code, result.stdout)</pre>
-      </div>
-      <div class="lp-codecard">
-        <div class="lp-codecard-head mono">on each receiving machine · no LLM</div>
-        <pre role="region" tabindex="0" aria-label="runner command"><span class="accent">$</span> pip install airlox    <span class="muted"># or npm install -g airlox</span>
-<span class="accent">$</span> AIRLOX_INVITE='&lt;runner link&gt;' airlox runner join \
-    --name runner-01 --labels cpu,py3.12 \
-    --sandbox docker --no-network --memory 512
-<span class="muted">joined ax_7f3e as runner-01 · waiting for the owner's approval</span></pre>
+job = s.run_shell(<span class="s">"pytest -x tests/"</span>, tree=<span class="s">"."</span>,
+                  runner=<span class="s">"gpu-box"</span>, cwd=<span class="s">"services/api"</span>)
+result = job.wait(on_output=<span class="k">lambda</span> c: print(c.data, end=<span class="s">""</span>))
+print(result.exit_code, result.env[<span class="s">"tree"</span>][<span class="s">"head"</span>])</pre>
       </div>
     </div>
   </div>
@@ -334,14 +345,15 @@ print(result.exit_code, result.stdout)</pre>
 <section id="security" class="lp-section lp-alt">
   <div class="lp-inner lp-stack-md">
     <div class="lp-head">
-      <p class="lp-eyebrow">05 · Security model</p>
+      <p class="lp-eyebrow">06 · Security model</p>
       <h2>The server relays ciphertext. The runner trusts nothing.</h2>
+      <p class="lp-sub">A job can do whatever its sandbox allows, no more, and nothing is filtered on the way out. What a machine can reach is the operator's choice; the owner approves every runner, and can see each job before it runs.</p>
     </div>
     <div class="lp-tiles">
       <div class="lp-tile"><h3>End-to-end encrypted</h3><p>The session key lives in the invite fragment. Items are encrypted before upload; the relay stores ciphertext and the routing metadata it needs (names, public keys, item kinds, sizes, timing), never content or keys.</p></div>
       <div class="lp-tile"><h3>Role-scoped invites</h3><p>Owner, sender, observer and runner links carry different rights, and each role's key is fixed in the manifest the owner signed.</p></div>
       <div class="lp-tile"><h3>Signed items</h3><p>Each participant gets a per-session keypair. Every message, file and job is signed, so a runner only executes jobs from a sender or the owner.</p></div>
-      <div class="lp-tile"><h3>Sandboxed execution</h3><p>Code never runs on the relay, only on runners the receiver started on their own machines. The Docker sandbox gives each job no network by default, memory and time limits, a read-only root and dropped capabilities.</p></div>
+      <div class="lp-tile"><h3>Sandboxed execution</h3><p>Code never runs on the relay, only on runners the receiver started on their own machines. Each job is one process in a container (or Linux namespaces and Landlock) with no network by default, memory and time limits, a read-only root, dropped capabilities and a workspace of its own. The sandbox is the boundary; the kind of job does not change it.</p></div>
       <div class="lp-tile"><h3>Short-lived by default</h3><p>Sessions expire on a timer you set, or last until you close them, and the relay purges them. It keeps no database and nothing after a session ends.</p></div>
       <div class="lp-tile"><h3>Owner approval</h3><p>Execute sessions can require the owner to approve each runner before it receives any work.</p></div>
     </div>
@@ -351,10 +363,10 @@ print(result.exit_code, result.stdout)</pre>
 <section class="lp-section lp-final">
   <div class="lp-inner lp-final-row">
     <div class="lp-final-copy">
-      <h2>Give your agents a room with a lock on the door.</h2>
+      <h2>Your hardware. Any agent. One sandboxed job at a time.</h2>
       <p class="muted">Got an invite link instead? Just open it. There is no account and nothing to install.</p>
     </div>
-    <a class="button primary cta" href="/new">Open a session <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></a>
+    <a class="button primary cta" href="#api">Pair a machine <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></a>
   </div>
 </section>
 
