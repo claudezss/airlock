@@ -1055,9 +1055,10 @@ stderr, exit code, env with the tree and image it ran against) is returned at th
         Parameters(p): Parameters<ShellRunParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (code, filename) = match (&p.script, p.command.is_empty()) {
-            (Some(s), true) => (s.clone(), "job.sh".to_string()),
-            (None, false) => (format!("{}\n", crate::cli::shell_line(&p.command)), "job.sh".to_string()),
+        // A command is quoted once the runners it could go to are known.
+        let (script, filename) = match (&p.script, p.command.is_empty()) {
+            (Some(s), true) => (Some(s.clone()), "job.sh".to_string()),
+            (None, false) => (None, "job.sh".to_string()),
             _ => return fail("give either command or script"),
         };
         let tree = match &p.tree_dir {
@@ -1091,6 +1092,13 @@ stderr, exit code, env with the tree and image it ran against) is returned at th
             (Some(r), _) => Target::Runner(r.clone()),
             (None, false) => Target::Labels(labels),
             (None, true) => Target::Any,
+        };
+        let code = match script {
+            Some(s) => s,
+            None => {
+                let mut g = slot.lock().await;
+                tool_try!(crate::cli::command_script(&mut g.s, &target, &p.command).await)
+            }
         };
         let mut inputs = Vec::new();
         let spec = |files: Vec<Value>, tree_ref: Option<Value>| JobSpec {

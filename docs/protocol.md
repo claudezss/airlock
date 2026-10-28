@@ -391,7 +391,10 @@ which tree each result ran against without opening the job. A job that ran
 in a workspace adds `changed`: the tree's paths that were no longer as
 listed when it finished (edited or removed by the job or by its other
 inputs), at most 256, each under the rules of §9; it is absent when there is
-no workspace or more changed.
+no workspace or more changed. `changed` is a hint for the next delta, not a
+boundary: the job may also have written outside the tree's paths (that is
+what a workspace keeps), and a wrong `changed` costs at most one `tree_stale`
+refusal, since the runner checks every file a delta leaves out.
 
 **Delta trees.** `tree.json` may say `"delta": true` (absent otherwise).
 `files` still lists every file of the tree, but the zip holds only some of

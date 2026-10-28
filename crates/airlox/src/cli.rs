@@ -940,10 +940,52 @@ pub(crate) fn shell_line(argv: &[String]) -> String {
     argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")
 }
 
+/// `argv` as a PowerShell script: the call operator and each word bare or
+/// single-quoted, then the command's own exit code (`pwsh -Command` turns
+/// any failure into 1).
+pub(crate) fn pwsh_script(argv: &[String]) -> String {
+    // A bare word PowerShell passes on as written: no `$`, quotes, braces,
+    // commas or `@`; `--` it would take as its own marker, and a switch with
+    // `.` or `:` in it it may split.
+    let bare = |s: &str| {
+        let word = |c: char| c.is_ascii_alphanumeric() || "-_./\\:=+".contains(c);
+        match s.strip_prefix('-') {
+            _ if s.is_empty() || s == "--" || !s.chars().all(word) => false,
+            Some(rest) => rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            None => true,
+        }
+    };
+    let words: Vec<String> = argv
+        .iter()
+        .map(|a| if bare(a) { a.clone() } else { format!("'{}'", a.replace('\'', "''")) })
+        .collect();
+    format!(
+        "& {}\nif (-not $?) {{ exit $(if ($LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 1 }}) }}\n",
+        words.join(" ")
+    )
+}
+
+/// The shell job that runs `argv`, quoted for the shell of the runners
+/// `target` reaches (their signed joins say): PowerShell's quoting for
+/// `pwsh` runners, a POSIX shell's otherwise.
+pub(crate) async fn command_script(s: &mut Session, target: &Target, argv: &[String]) -> Result<String> {
+    let shells = s.target_shells(target).await?;
+    match shells.as_slice() {
+        [sh] if sh == "pwsh" => Ok(pwsh_script(argv)),
+        [_, _, ..] => bail!(
+            "the runners this job could go to run different shells ({}), and a command is quoted for one; \
+             pick a runner, or send a script for its shell",
+            shells.join(" and ")
+        ),
+        _ => Ok(format!("{}\n", shell_line(argv))),
+    }
+}
+
 /// Exit status for a job: its own exit code, or 1 if it produced none.
 pub async fn run(a: RunArgs) -> Result<i32> {
     let json_out = a.conn.json || a.stream_json;
-    let (kind, code, filename) = if let Some(f) = &a.file {
+    // A command is quoted once the runners it could go to are known.
+    let (kind, mut code, filename) = if let Some(f) = &a.file {
         let code = std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?;
         let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("main.py").to_string();
         (JobKind::Python, code, name)
@@ -952,7 +994,7 @@ pub async fn run(a: RunArgs) -> Result<i32> {
         let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("job.sh").to_string();
         (JobKind::Shell, code, name)
     } else {
-        (JobKind::Shell, format!("{}\n", shell_line(&a.command)), "job.sh".to_string())
+        (JobKind::Shell, String::new(), "job.sh".to_string())
     };
     if kind == JobKind::Shell && !a.requirements.is_empty() {
         bail!("--requirement is for python jobs; a shell job uses the tools on the runner");
@@ -979,6 +1021,9 @@ pub async fn run(a: RunArgs) -> Result<i32> {
         (None, false) => Target::Labels(labels),
         (None, true) => Target::Any,
     };
+    if a.file.is_none() && a.shell.is_none() {
+        code = command_script(&mut s, &target, &a.command).await?;
+    }
     // The tree goes whole, or as a delta against what this client last left
     // in its workspace on the runner.
     let sending = match &tree {
@@ -1009,7 +1054,7 @@ pub async fn run(a: RunArgs) -> Result<i32> {
     let target_name = a.conn.on.as_deref().map(|on| crate::machine::split_on(on).0.to_string());
     let what = match kind {
         JobKind::Python => filename.clone(),
-        JobKind::Shell if a.shell.is_none() => clean_line(code.trim_end()),
+        JobKind::Shell if a.shell.is_none() => clean_line(code.lines().next().unwrap_or_default()),
         JobKind::Shell => format!("sh {filename}"),
     };
     // `delta`: the files and bytes a delta tree sent.
@@ -2887,6 +2932,17 @@ mod tests {
         assert_eq!(shell_quote("http://relay.ns.svc:8080"), "http://relay.ns.svc:8080");
         assert_eq!(shell_quote("https://x/$(id)"), "'https://x/$(id)'");
         assert_eq!(shell_quote("a'b"), r"'a'\''b'");
+    }
+
+    #[test]
+    fn a_command_for_pwsh_is_quoted_for_pwsh() {
+        let argv = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let line = |w: &[&str]| pwsh_script(&argv(w)).lines().next().unwrap().to_string();
+        assert_eq!(line(&["pytest", "-x", "tests/a.py", r"C:\x"]), r"& pytest -x tests/a.py C:\x");
+        assert_eq!(line(&["echo", "$HOME", "it's", "a,b", "@x", ""]), "& echo '$HOME' 'it''s' 'a,b' '@x' ''");
+        assert_eq!(line(&["my tool", "--", "-D.x=1", "--flag"]), "& 'my tool' '--' '-D.x=1' --flag");
+        assert!(pwsh_script(&argv(&["x"]))
+            .ends_with("exit $(if ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }) }\n"));
     }
 
     fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {

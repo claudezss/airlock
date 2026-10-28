@@ -25,6 +25,77 @@
 
 ---
 
+## A machine for your agent
+
+Give a coding agent a job slot on hardware you own (the GPU box, the build
+server behind the firewall) instead of an SSH login. With the `airlox` binary
+[installed](#install), on the agent's side:
+
+```bash
+airlox machine add gpu-box --image ghcr.io/me/ci:latest
+```
+
+It prints one command to run on the machine, waits for that runner to join,
+and approves exactly it (at a terminal it shows the runner's key first and
+asks; `--yes` skips that):
+
+```bash
+airlox runner join --code 7-guitar-orbit --name gpu-box --sandbox docker --image ghcr.io/me/ci:latest --workspace
+```
+
+Then, from any checkout, as often as you like:
+
+```bash
+airlox run --on gpu-box --tree -- pytest -x tests/
+```
+
+```text
+gpu-box · job 7Qk… · pytest -x tests/ · tree 412 files, 3.1 MB (18 changed)
+============================= test session starts ==============================
+collected 212 items
+…
+── completed · exit 1 · 41.2 s · peak 318 MB · signed by runner gpu-box
+```
+
+The job is a shell command run with the image's tools (or, with `--sandbox
+local`, the machine's own), sandboxed, without network unless you add the
+machine with `--network`. `--tree` sends the working tree as it is right now,
+uncommitted and untracked files included and ignored ones left out (it
+refuses files named like credentials, such as `.env` or `*.pem`, unless
+`--tree-allow` names them; `--tree-exclude` and `.airloxignore` leave files
+out; Git LFS files go as their pointers, so leave large fixtures out and send
+them with `--input`), and the job starts in your current directory within it. The runner
+keeps a workspace per sender, syncing each tree into it, so `node_modules`,
+`target/` and `.venv` survive and the second run of the afternoon is fast
+(`--fresh` starts over); after the first run, only the files that changed
+are uploaded. Output streams as it happens; the signed result is
+the authority. `airlox run --shell ci.sh` sends a script, and `airlox run
+file.py` still sends Python.
+
+A hosted agent (Claude Code on the web, Codex cloud) gets the machine's
+sender invite in `AIRLOX_INVITE` (`airlox machine invite gpu-box`, or
+`--code` for a one-time code) and runs `airlox run --tree -- pytest`. `airlox
+run --no-wait` hands back a job id; `airlox result --wait 2h -- <job>` or
+`airlox listen --once` picks it up later, and `airlox job ls` lists jobs.
+`airlox machine ls` shows each machine's runners, kinds, image and last job;
+`airlox machine approve` adds a second box to a pool (`--on pool/gpu` targets
+a label); `airlox machine rm` closes it. On the machine, `airlox runner serve`
+restarts the runner after failures, and `airlox runner install-service --code
+…` installs it as a systemd user unit or a launchd agent, with the PATH you
+install it from.
+
+The image needs `python3`, since the job shim is a Python script: the
+official `node`, `rust` and `golang` images lack it, so add it to yours (the
+runner checks at startup and says so).
+
+Machines are sessions underneath (below), with their invites kept under
+`~/.cache/airlox/machines/`. A machine is a job slot, not a login: jobs run
+in the sandbox with the limits the session signed, and the sender invite can
+do nothing else. For a trusted local agent and a machine you can already SSH
+into, SSH is fine.
+
+## What a session is
+
 Airlox gives two or more agents (or an agent and a person) a private, temporary
 place to work together. One party creates a session and hands out invite
 links; each link carries the keys for one role. Participants share text,
@@ -100,70 +171,6 @@ so any distribution) and Windows (x64), also on the
 ([docs/windows-runner.md](docs/windows-runner.md)). Elsewhere (and wherever pip finds no wheel, such
 as Alpine, so installs the SDK without the command), build it with
 `cargo install --git https://github.com/claudezss/airlox airlox`.
-
-### A machine for your agent
-
-Give a coding agent a job slot on hardware you own (the GPU box, the build
-server behind the firewall) instead of an SSH login. On the agent's side:
-
-```bash
-airlox machine add gpu-box --image ghcr.io/me/ci:latest
-```
-
-It prints one command to run on the machine, waits for that runner to join,
-and approves exactly it (at a terminal it shows the runner's key first and
-asks; `--yes` skips that):
-
-```bash
-airlox runner join --code 7-guitar-orbit --name gpu-box --sandbox docker --image ghcr.io/me/ci:latest --workspace
-```
-
-Then, from any checkout, as often as you like:
-
-```bash
-airlox run --on gpu-box --tree -- pytest -x tests/
-```
-
-```text
-gpu-box · job 7Qk… · pytest -x tests/ · tree 412 files, 3.1 MB (18 changed)
-============================= test session starts ==============================
-collected 212 items
-…
-── completed · exit 1 · 41.2 s · peak 318 MB · signed by runner gpu-box
-```
-
-The job is a shell command run with the image's tools (or, with `--sandbox
-local`, the machine's own), sandboxed, without network unless you add the
-machine with `--network`. `--tree` sends the working tree as it is right now,
-uncommitted and untracked files included and ignored ones left out (it
-refuses files named like credentials, such as `.env` or `*.pem`, unless
-`--tree-allow` names them; `--tree-exclude` and `.airloxignore` leave files
-out; Git LFS files go as their pointers, so leave large fixtures out and send
-them with `--input`), and the job starts in your current directory within it. The runner
-keeps a workspace per sender, syncing each tree into it, so `node_modules`,
-`target/` and `.venv` survive and the second run of the afternoon is fast
-(`--fresh` starts over); after the first run, only the files that changed
-are uploaded. Output streams as it happens; the signed result is
-the authority. `airlox run --shell ci.sh` sends a script, and `airlox run
-file.py` still sends Python.
-
-A hosted agent (Claude Code on the web, Codex cloud) gets the machine's
-sender invite in `AIRLOX_INVITE` (`airlox machine invite gpu-box`, or
-`--code` for a one-time code) and runs `airlox run --tree -- pytest`. `airlox
-run --no-wait` hands back a job id; `airlox result --wait 2h -- <job>` or
-`airlox listen --once` picks it up later, and `airlox job ls` lists jobs.
-`airlox machine ls` shows each machine's runners, kinds, image and last job;
-`airlox machine approve` adds a second box to a pool (`--on pool/gpu` targets
-a label); `airlox machine rm` closes it. On the machine, `airlox runner serve`
-restarts the runner after failures, and `airlox runner install-service --code
-…` installs it as a systemd user unit or a launchd agent, with the PATH you
-install it from.
-
-Machines are sessions underneath (below), with their invites kept under
-`~/.cache/airlox/machines/`. A machine is a job slot, not a login: jobs run
-in the sandbox with the limits the session signed, and the sender invite can
-do nothing else. For a trusted local agent and a machine you can already SSH
-into, SSH is fine.
 
 ### From the command line
 

@@ -1311,6 +1311,31 @@ impl Session {
         }
     }
 
+    /// The shells (`sh`, `pwsh`) of the runners a shell job for `target`
+    /// could go to, from their signed joins: the online ones, or all of them
+    /// when none is online. Empty when none matches.
+    pub async fn target_shells(&mut self, target: &Target) -> Result<Vec<String>> {
+        let runners: Vec<Runner> = match target {
+            Target::Runner(which) => match self.runner(which).await {
+                Ok(r) => vec![r],
+                // `run_job` says why.
+                Err(_) => vec![],
+            },
+            Target::Labels(l) => {
+                self.runners().await?.into_iter().filter(|r| l.iter().all(|l| r.labels.contains(l))).collect()
+            }
+            Target::Any => self.runners().await?,
+        };
+        let runners: Vec<Runner> =
+            runners.into_iter().filter(|r| !r.rejected && r.kinds.iter().any(|k| k == "shell")).collect();
+        let online = runners.iter().any(|r| r.online);
+        let mut shells: Vec<String> =
+            runners.into_iter().filter(|r| r.online || !online).filter_map(|r| r.shell).collect();
+        shells.sort();
+        shells.dedup();
+        Ok(shells)
+    }
+
     /// Let a runner take jobs (owner only): the relay's approval, then a
     /// signed `runner_approve` event for runners and senders to verify. In
     /// that order: a runner awaiting approval is not a recipient, so the relay

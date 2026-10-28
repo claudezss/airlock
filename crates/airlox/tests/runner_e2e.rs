@@ -518,6 +518,61 @@ async fn output_past_the_cap_is_cut_off_with_a_truncated_chunk() {
     assert!(r.stdout.len() >= (1 << 20) - 1);
 }
 
+/// Unprivileged user namespaces are on (Ubuntu's AppArmor can turn them off).
+#[cfg(target_os = "linux")]
+fn userns_allowed() -> bool {
+    let read = |p: &str| std::fs::read_to_string(p).map(|s| s.trim().to_string()).ok();
+    read("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").as_deref() != Some("1")
+        && read("/proc/sys/user/max_user_namespaces").as_deref() != Some("0")
+}
+
+/// `--sandbox local` on Linux, the one platform where it is a boundary: a
+/// shell job runs the host's tools in namespaces of its own, with no network,
+/// none of the runner's processes, no host files but the system's, and only
+/// its work dir writable; its tree, cwd, exit code and workspace work as under
+/// `process`. Skipped where user namespaces are off, except on CI.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_linux_sandbox_runs_shell_jobs_confined() {
+    if !userns_allowed() {
+        assert!(std::env::var_os("CI").is_none(), "CI must allow unprivileged user namespaces");
+        eprintln!("skipped: unprivileged user namespaces are off");
+        return;
+    }
+    let Some(python) = python312() else { return };
+    let sandbox = ["--sandbox", "local", "--python", python.to_str().unwrap()];
+    let Some(rig) = rig_with(&sandbox, &["--workspace"]).await else { return };
+    let host = tempfile::tempdir().unwrap();
+    std::fs::write(host.path().join("secret"), "s3cret\n").unwrap();
+    let runner_pid = rig._runner.id().unwrap();
+    let zip = tree_zip("abc", &[("t/test.sh", "echo from-tree\n", 0o100755)]);
+    let job = Job {
+        cwd: Some("t"),
+        tree: Some(zip),
+        ..shell(&format!(
+            "./test.sh; uname -s\n\
+             tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d ' '\n\
+             test -e /proc/{runner_pid} && echo runner-seen || echo runner-hidden\n\
+             cat '{dir}/secret' 2>/dev/null || echo secret-hidden\n\
+             touch '{dir}/escaped' 2>/dev/null && echo escaped || echo confined\n\
+             echo cached > ../cache\n\
+             exit 3\n",
+            dir = host.path().display()
+        ))
+    };
+    let r = rig.run(&rig.sender, job).await;
+    assert_eq!((r.status, r.exit_code), (JobStatus::Completed, Some(3)), "{:?} {}", r.reason, r.stderr);
+    assert_eq!(r.stdout, "from-tree\nLinux\nlo\nrunner-hidden\nsecret-hidden\nconfined\n", "{}", r.stderr);
+    assert!(!host.path().join("escaped").exists());
+    let env = r.env.unwrap();
+    assert_eq!((env.kinds, env.shell.as_deref()), (Some(vec![JobKind::Python, JobKind::Shell]), Some("sh")));
+    // The workspace outlives the job; --fresh empties it.
+    let r = rig.run(&rig.sender, shell("cat cache; ls t\n")).await;
+    assert_eq!(r.stdout, "cached\ntest.sh\n", "{:?} {}", r.reason, r.stderr);
+    let r = rig.run(&rig.sender, Job { fresh: true, ..shell("ls\n") }).await;
+    assert_eq!((r.status, r.stdout.as_str()), (JobStatus::Completed, ""), "{:?} {}", r.reason, r.stderr);
+}
+
 /// With a Docker daemon and an image that has python3, named by
 /// AIRLOX_TEST_DOCKER_IMAGE (any local one will do): shell jobs run in it,
 /// the result names it by digest, and a workspace is bind-mounted.
