@@ -10,7 +10,10 @@ import time
 
 import pytest
 
-from airlox import PolicyError, Runner, RunnerBusy, RunnerFailed, Session
+import io
+import zipfile
+
+from airlox import PolicyError, Runner, RunnerBusy, RunnerFailed, Session, TreeRefused
 
 from test_execute import LIMITS, wait_runner
 
@@ -250,6 +253,84 @@ def test_shell_jobs_run_with_a_kept_workspace(relay, caches, start_runner):
     assert res.ok and res.stdout.strip() == "42", (res, runner.output())
 
 
+def _git_repo(root):
+    root.mkdir()
+    (root / "sub").mkdir()
+    (root / "a.txt").write_text("one\n")
+    (root / "sub" / "b.txt").write_text("two\n")
+    (root / "big.bin").write_bytes(os.urandom(200_000))
+    (root / ".gitignore").write_text("node_modules/\n")
+    git = lambda *a: subprocess.run(["git", "-C", str(root), *a], check=True, capture_output=True)
+    git("init", "-q")
+    git("add", "-A")
+    git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init")
+
+
+def _sent_tree(agent, job):
+    """The files in the zip a job sent as its tree, and whether it was a delta."""
+    agent.sync()
+    body = agent._items[job.meta["tree"]["id"]].body
+    with zipfile.ZipFile(io.BytesIO(body)) as z:
+        desc = json.loads(z.read(".airlox/tree.json"))
+        return sorted(n for n in z.namelist() if not n.startswith(".airlox/")), desc.get("delta", False)
+
+
+@posix_only
+def test_trees_go_whole_then_as_deltas_and_output_streams(relay, caches, start_runner, runner_cache, tmp_path):
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    owner = Session.create(relay.url, mode="execute", job_limits=SHELL_LIMITS, cache_dir=caches("owner"))
+    agent = Session.join(owner.invites["sender"], cache_dir=caches("agent"))
+    runner = start_process_runner(owner, start_runner, "proc-08", "--accept-network-gap", "--workspace")
+    wait_runner(owner, "proc-08", lambda r: r.online, proc=runner)
+    owner.approve_runner("proc-08")
+    agent.wait_for_runner("proc-08", approved=True)
+
+    # Untracked files go along, ignored ones do not, and credentials are refused.
+    (repo / "node_modules").mkdir()
+    (repo / "node_modules" / "dep.js").write_text("x")
+    (repo / ".env").write_text("SECRET=1")
+    with pytest.raises(TreeRefused, match=r"\.env"):
+        agent.run_shell("true", tree=repo)
+    (repo / "new.txt").write_text("new\n")
+
+    # The first tree goes whole; the job starts where the tree was built from.
+    job = agent.run_shell("pwd | sed 's|.*/||'; cat b.txt ../new.txt", tree=repo / "sub", tree_exclude=[".env"])
+    res = job.wait(timeout=60)
+    assert res.ok and res.stdout == "sub\ntwo\nnew\n", (res, runner.output())
+    assert _sent_tree(agent, job) == ([".gitignore", "a.txt", "big.bin", "new.txt", "sub/b.txt"], False)
+    assert res.env["tree"]["count"] == 5 and res.env["tree"]["changed"] == []
+
+    # Then only what changed; a file the job edits is reported and sent again.
+    (repo / "a.txt").write_text("uno\n")
+    job = agent.run_shell("cat a.txt; echo edited > sub/b.txt", tree=repo, tree_exclude=[".env"])
+    res = job.wait(timeout=60)
+    assert res.ok and res.stdout == "uno\n", (res, runner.output())
+    assert _sent_tree(agent, job) == (["a.txt"], True)
+    assert res.env["tree"]["changed"] == ["sub/b.txt"]
+    job = agent.run_shell("cat sub/b.txt", tree=repo, tree_exclude=[".env"])
+    assert job.wait(timeout=60).stdout == "two\n"
+    assert _sent_tree(agent, job) == (["sub/b.txt"], True)
+
+    # A workspace that is not as this client left it: refused, then sent whole.
+    [work] = (runner_cache / "workspaces" / owner.session_id).glob("*/work")
+    (work / "big.bin").write_bytes(b"tampered")
+    job = agent.run_shell("wc -c < big.bin", tree=repo, tree_exclude=[".env"])
+    first = job.id
+    res = job.wait(timeout=60)
+    assert res.ok and res.stdout.strip() == "200000", (res, runner.output())
+    assert job.id != first and _sent_tree(agent, job)[1] is False
+
+    # Output arrives while the job runs, each stream in order.
+    seen = []
+    job = agent.run_shell("echo one; sleep 2.5; echo two >&2; sleep 1.5; echo three", runner="proc-08")
+    res = job.wait(timeout=60, on_output=seen.append)
+    assert res.ok, (res, runner.output())
+    assert "".join(c.data for c in seen if c.stream == "stdout").startswith("one\n"), seen
+    assert [c.data for c in seen if c.stream == "stderr"] == ["two\n"], seen
+    assert job.output("stderr") == "two\n"
+
+
 def test_shell_jobs_are_refused_before_they_leave_the_sender(relay, caches):
     # A session that names no kinds allows Python only.
     owner = Session.create(relay.url, mode="execute", job_limits=PROCESS_LIMITS, cache_dir=caches("owner"))
@@ -261,7 +342,7 @@ def test_shell_jobs_are_refused_before_they_leave_the_sender(relay, caches):
         owner.run_shell("x" * (64 * 1024 + 1))
     # A runner that did not declare shell is not asked to run it.
     py_only = Runner(participant_pub="k", name="py-only", labels=[], host="h", sandbox="docker", network_unblocked=False,
-                     approved=True, rejected=False, online=True, job=None, kinds=["python"])
+                     approved=True, rejected=False, online=True, kinds=["python"])
     owner.runners = lambda: [py_only]
     with pytest.raises(PolicyError, match="py-only does not run shell jobs"):
         owner.run_shell("echo hi", runner="py-only")

@@ -34,6 +34,22 @@ tools, as `airlox run -- make test` does. Runners say which kinds they take in
 `Runner.kinds` and `Runner.shell`; `cwd=` and `fresh=True` are for sessions
 with `"workspace": True`.
 
+`tree=` sends a working tree along, as `airlox run --tree` does:
+
+```python
+job = s.run_shell("pytest -x", runner="ci-box", tree=".", tree_exclude=["*.sqlite"])
+result = job.wait(timeout=None, on_output=lambda c: print(c.data, end=""))
+```
+
+The tree is the repository's tracked and untracked files (ignored ones left
+out), and files named like credentials (`.env`, `*.pem`) are refused unless
+`tree_allow=` names them. The job starts in the directory you gave, within
+the tree. In a session with workspaces, later jobs to the same runner send
+only the files that changed. `on_output` sees output as it streams;
+`job.chunks()` and `job.output("stderr")` read it so far. Runners started
+with `--concurrency N` take N jobs at once: `Runner.jobs`, `Runner.slots`
+and `Runner.busy` (every slot taken).
+
 Creating a session returns its owner. **Save the owner invite
 (`session.invites["owner"]`) somewhere private right away**, such as a file
 only you can read (mode 0600, outside any repository): it is the only way to
