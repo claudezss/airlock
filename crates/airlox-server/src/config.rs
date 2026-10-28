@@ -43,7 +43,8 @@ pub struct Config {
     /// Session log size (joins and item envelopes). Bounds per-session memory.
     #[arg(long, env = "AIRLOX_MAX_LOG_BYTES", default_value = "4MiB", value_parser = parse_size)]
     pub max_log_bytes: u64,
-    /// Purge a session after this long without joins, items, acks or downloads.
+    /// Purge a session after this long without joins, items, acks or
+    /// downloads, while nobody holds a stream to it.
     #[arg(long = "idle-ttl", env = "AIRLOX_IDLE_TTL", default_value = "2h", value_parser = parse_duration_ms)]
     pub idle_ttl_ms: u64,
     /// The same, for sessions that never expire; `never` keeps them until

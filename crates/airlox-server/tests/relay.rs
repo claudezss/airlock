@@ -787,6 +787,29 @@ async fn sessions_that_never_expire_have_their_own_idle_limit() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_session_with_an_open_stream_is_not_idle() {
+    let env = Env::with(|c| c.idle_ttl_ms = 300).await;
+    let s = new_session(Mode::Relay, 3_600_000);
+    create(&env, &s).await;
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let stream = env
+        .http
+        .get(env.url(&format!("/v1/sessions/{}/stream", s.id)))
+        .bearer_auth(&owner.token)
+        .send()
+        .await
+        .unwrap();
+    let info =
+        || async { env.http.get(env.url(&format!("/v1/sessions/{}", s.id))).send().await.unwrap().status() };
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    // Well past the idle limit with nothing posted: the open stream keeps it.
+    assert_eq!(info().await, StatusCode::OK);
+    drop(stream);
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(info().await, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn uploads_from_one_address_share_a_storage_cap_across_sessions() {
     let mut env = Env::with(|c| c.max_bytes_per_ip = 6_000).await;
     let a = new_session(Mode::Relay, 3_600_000);

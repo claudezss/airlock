@@ -1450,9 +1450,15 @@ impl Store {
                 Some(_) => self.cfg.idle_ttl_ms,
                 None => self.cfg.idle_ttl_unexpiring_ms,
             };
+            // Idle: no upload in progress, nobody holding a stream (a paired
+            // machine's runner waits on one between jobs), and nothing done
+            // for the idle limit.
             let idle = {
                 let g = s.lock();
-                g.pending.is_empty() && now.saturating_sub(g.last_activity_ms) >= idle_ttl
+                g.pending.is_empty()
+                    && g.streams.is_empty()
+                    && !g.presence.values().any(|p| p.streams > 0)
+                    && now.saturating_sub(g.last_activity_ms) >= idle_ttl
             };
             if idle {
                 self.purge(&s.id, "idle");
