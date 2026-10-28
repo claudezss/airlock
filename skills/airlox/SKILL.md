@@ -29,7 +29,7 @@ project's commands there from the checkout:
 ```bash
 airlox machine ls                                    # the user's machines: runners online, kinds, image
 airlox run --on gpu-box --tree -- pytest -x tests/   # the working tree goes along; output streams
-airlox run --on gpu-box --tree --fresh -- npm ci && … # --fresh: start from an empty workspace
+airlox run --on gpu-box --tree --fresh -- sh -c 'npm ci && npm test'   # --fresh: empty workspace first
 airlox run --on pool/gpu --tree -- make test          # name/label: any runner of the pool with that label
 airlox run --on gpu-box --tree --no-wait --json -- make bench   # {"job": …}; then:
 airlox result --on gpu-box --wait 2h --json -- <job>
@@ -48,7 +48,9 @@ you, e.g. in a hosted agent) does the same: `airlox run --tree -- pytest`.
 - The job runs in the same directory relative to the repository root as
   you are. The runner keeps a workspace per sender, so installed
   dependencies and build output stay warm between runs; install them in the
-  job (`npm ci && npm test`) and later runs reuse them.
+  job (`-- sh -c 'npm ci && npm test'`) and later runs reuse them. The words
+  after `--` are quoted for the runner's shell, so `&&`, pipes and
+  redirections go inside `sh -c '…'` (or a script sent with `--shell`).
 - Output streams while the job runs; the signed result at the end is the
   authority. The exit status is the job's. `ran on …` under the summary
   shows where it ran, including the image digest and the tree's commit.
