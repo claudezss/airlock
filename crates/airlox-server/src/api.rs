@@ -328,6 +328,41 @@ pub async fn participants(
     Ok(Json(json!({"participants": list.iter().map(|p| p.public.clone()).collect::<Vec<_>>()})))
 }
 
+/// `GET /v1/sessions/:id/delivery` — for each item the caller posted, the
+/// participants that have stored it (`delivered`) and those the relay is
+/// still holding it for (`waiting`). Only the author's own items: who
+/// fetched what is the relay's bookkeeping, not something to share widely.
+/// Fetching is all it means; nothing here says an item was read.
+pub async fn delivery(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let s = session(&st, &id)?;
+    let (who, _) = auth(&s, &headers)?;
+    let g = s.lock();
+    let mut mine: Vec<(&String, &crate::store::ItemRec)> =
+        g.items.iter().filter(|(_, r)| r.author == who).collect();
+    mine.sort_by_key(|(_, r)| r.seq);
+    let items: serde_json::Map<String, Value> = mine
+        .iter()
+        .rev()
+        .take(DELIVERY_ITEMS)
+        .map(|(item, r)| {
+            let mut delivered: Vec<&String> = r.acked.iter().collect();
+            delivered.sort();
+            let mut waiting: Vec<&String> =
+                r.recipients.iter().filter(|p| !r.acked.contains(*p) && g.is_live(p)).collect();
+            waiting.sort();
+            ((*item).clone(), json!({"seq": r.seq, "delivered": delivered, "waiting": waiting}))
+        })
+        .collect();
+    Ok(Json(json!({"items": items})))
+}
+
+/// The most recent own items `delivery` reports on.
+const DELIVERY_ITEMS: usize = 500;
+
 #[derive(Deserialize)]
 pub struct After {
     after: Option<u64>,

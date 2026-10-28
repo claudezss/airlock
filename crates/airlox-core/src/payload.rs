@@ -6,8 +6,11 @@
 //! body    = raw file bytes for "file"; empty for every other type
 //! ```
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
+use crate::cert::SandboxKind;
 use crate::encoding::canonical_json;
 use crate::item::{ItemKind, ItemRef};
 use crate::keys::PublicKey;
@@ -18,6 +21,10 @@ pub const MAX_META_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_STDIO_BYTES: usize = 1024 * 1024;
 pub const MAX_OUT_FILES: usize = 64;
 pub const MAX_REASON_CHARS: usize = 4096;
+/// Most participants one message may be addressed to.
+pub const MAX_RECIPIENTS: usize = 64;
+/// Most packages a result's `env` lists.
+pub const MAX_ENV_PACKAGES: usize = 256;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -99,6 +106,29 @@ pub struct JobResult {
     /// Hex SHA-256 of the job code and of the concatenated input blobs.
     pub code_sha256: String,
     pub input_sha256: String,
+    /// Where the job ran. Absent from the canonical form when the runner
+    /// does not report it (older runners, or a job that never ran).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<JobEnv>,
+}
+
+/// The environment a job ran in, as its runner measured it once for the
+/// runtime. Signed with the result, so a sender can check where a job ran
+/// without trusting the job's own output. Holds no paths.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct JobEnv {
+    /// The interpreter's version, e.g. "3.12.4".
+    pub python: String,
+    /// Installed version of each allowlisted package, by normalized name.
+    pub packages: BTreeMap<String, String>,
+    /// The runner's airlox version.
+    pub airlox: String,
+    /// How the job was isolated.
+    pub sandbox: SandboxKind,
+    /// Where the interpreter came from: `uv-runtime` (built by the runner
+    /// from the allowlist), `--python` (the operator's), or `docker:<image>`.
+    pub interpreter: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,8 +153,17 @@ pub enum Event {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Meta {
-    Text { text: String },
-    File { name: String, mime: String },
+    Text {
+        text: String,
+        /// The participants this message is addressed to: the ones whose
+        /// listeners it wakes. Absent (never empty) for a message to everyone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<Vec<PublicKey>>,
+    },
+    File {
+        name: String,
+        mime: String,
+    },
     Job(JobSpec),
     Result(JobResult),
     Event(Event),
@@ -152,7 +191,7 @@ pub struct Payload {
 
 impl Payload {
     pub fn text(text: impl Into<String>) -> Self {
-        Payload { meta: Meta::Text { text: text.into() }, body: vec![] }
+        Payload { meta: Meta::Text { text: text.into(), to: None }, body: vec![] }
     }
 
     pub fn file(name: impl Into<String>, mime: impl Into<String>, body: Vec<u8>) -> Self {
@@ -259,6 +298,18 @@ mod tests {
         let mut raw = (meta.len() as u32).to_be_bytes().to_vec();
         raw.extend_from_slice(meta);
         assert!(Payload::decode(&raw).is_err());
+    }
+
+    #[test]
+    fn text_to_is_absent_unless_given() {
+        // A message to everyone keeps the canonical form older clients accept.
+        let meta = canonical_json(&Payload::text("hi").meta).unwrap();
+        assert_eq!(meta, br#"{"text":"hi","type":"text"}"#);
+        let pk = crate::keys::Keypair::from_seed(&[1u8; 32]).public();
+        let p = Payload { meta: Meta::Text { text: "hi".into(), to: Some(vec![pk]) }, body: vec![] };
+        let enc = p.encode().unwrap();
+        assert_eq!(Payload::decode(&enc).unwrap(), p);
+        assert!(String::from_utf8(canonical_json(&p.meta).unwrap()).unwrap().contains("\"to\":["));
     }
 
     #[test]

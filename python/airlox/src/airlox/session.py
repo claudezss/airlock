@@ -7,6 +7,7 @@ module is HTTP plumbing, the local cache, and ergonomics.
 from __future__ import annotations
 
 import json
+import logging
 import random
 import re
 import struct
@@ -20,6 +21,8 @@ import httpx
 
 from .cache import Cache, default_root
 from .execute import Job, NoRunnerAvailable, Runner, RunnerBusy, RunnerFailed, signed_approvals
+
+log = logging.getLogger(__name__)
 
 DEFAULT_TYPES = ("text", "py", "md", "zip", "image")
 # The item limit for a relay that does not say what it allows, and the
@@ -120,6 +123,20 @@ class Item:
     def mime(self) -> Optional[str]:
         return self.meta.get("mime") if self.meta and self.kind == "file" else None
 
+    @property
+    def to(self) -> Optional[List[str]]:
+        """The participant keys a message is addressed to; ``None`` for everyone."""
+        to = self.meta.get("to") if self.meta and self.kind == "text" else None
+        return list(to) if isinstance(to, list) else None
+
+    @property
+    def reply_to(self) -> Optional[str]:
+        """The id of the item this one answers: a message's or file's first
+        reference, a result's job."""
+        if self.kind in ("text", "file", "result") and self.refs:
+            return self.refs[0].get("id")
+        return None
+
 
 #: Largest believable gap between consecutive event sequence numbers.
 MAX_SEQ_JUMP = 10_000
@@ -160,6 +177,11 @@ class Session:
         self._participants: Dict[str, dict] = {}
         self._items: Dict[str, Item] = {}
         self._order: List[str] = []
+        #: Cursor of the batch ``wait_for_messages`` last returned, not yet marked handled.
+        self._uncommitted: Optional[int] = None
+        #: When (monotonic) each pending item was first seen so, and which were given up on.
+        self._pending_since: Dict[int, float] = {}
+        self._pending_skipped: set = set()
         self._envelopes: Dict[str, str] = {}
         self._evicted: set = set()
         self._wanted: Dict[str, float] = {}  # evicted items this client asked holders for → when
@@ -167,6 +189,8 @@ class Session:
         self._reseeded: set = set()  # evicted items back on the relay, to fetch
         self._unacked: set = set()
         self._last_seq = -1
+        #: When this client last heard from the relay (ms since the epoch).
+        self.synced_at_ms: Optional[int] = None
         self.closed: Optional[str] = None
         cached = list(cache.events())
         # Which blobs the relay lacks now, so replayed items without a cached
@@ -202,7 +226,19 @@ class Session:
 
         ``max_item_bytes`` defaults to the largest item the relay allows, up
         to 100 MB (25 MB if the relay does not say). Package names in ``job_limits`` are PEP 503
-        normalized (``"pyPowerGEM"`` becomes ``"pypowergem"``).
+        normalized (``"pyPowerGEM"`` becomes ``"pypowergem"``). An entry may also pin
+        versions with a PEP 440 specifier (``"cugrid==0.1.0"``, ``"numpy>=1.26,<3"``): runners
+        install that version, or, with ``--python``, refuse to join an interpreter that has
+        another. Jobs still name the package alone in ``requirements``, and each result's
+        ``env`` says which versions it ran with.
+
+        **Save the owner invite.** ``session.invites["owner"]`` is the only way to approve
+        runners, mint more invites, revoke a role or close the session later: it holds the
+        owner key, and nothing else in the cache or on the relay can stand in for it. Write
+        it to a private file (mode 0600, outside any repository) as soon as the session
+        exists, like the CLI's ``--owner-invite-file``, and treat it as a secret: anyone
+        with it controls the session. ``Session.join(invite)`` with it reopens the session
+        as owner.
 
         ``insecure_http_host`` lets participants reach the relay over plain
         ``http://`` at that host, such as ``"airlox-relay.ns.svc"`` inside a
@@ -406,19 +442,79 @@ class Session:
             self._cache.delete()
 
     # sending ----------------------------------------------------------
-    def send_text(self, text: str, *, refs: Iterable[dict] = ()) -> dict:
-        """Send a message. Returns its item reference."""
-        return self._send("text", None, {"type": "text", "text": text}, b"", refs)
+    def send_text(
+        self,
+        text: str,
+        *,
+        to: Iterable[str] = (),
+        reply_to: Union[Item, str, None] = None,
+        refs: Iterable[dict] = (),
+    ) -> dict:
+        """Send a message. Returns its item reference.
+
+        ``to`` addresses it: participant names, keys or ``"role:owner"``
+        (see :meth:`resolve_recipients`); their listeners wake for it. A
+        message without ``to`` goes to everyone: the owner's wakes every
+        listener, anyone else's only the author of the item it replies to. ``reply_to`` (an item or its id) links it to
+        the item it answers."""
+        meta: dict = {"type": "text", "text": text}
+        to = list(to)
+        if to:
+            meta["to"] = self.resolve_recipients(to)
+        return self._send("text", None, meta, b"", self._reply_refs(reply_to) + list(refs))
+
+    def _reply_refs(self, reply_to: Union[Item, str, None]) -> List[dict]:
+        if reply_to is None:
+            return []
+        item_id = reply_to.id if isinstance(reply_to, Item) else reply_to
+        if item_id not in self._items:
+            self.sync()
+        item = self._items.get(item_id)
+        if item is None:
+            raise ValueError(f"no item {item_id} in this session to reply to")
+        return [item.ref]
+
+    def resolve_recipients(self, specs: Iterable[str]) -> List[str]:
+        """Participant keys for ``specs``: keys, display names (``@``
+        optional; a shared name addresses everyone with it) or
+        ``role:<owner|sender|observer|runner>``. Never yourself."""
+        if not self._participants:
+            self.sync()
+        live = [p for p in self._participants.values() if not p["left"]]
+        out: List[str] = []
+        for spec in specs:
+            spec = spec.strip()
+            if spec.startswith("role:"):
+                found = [p for p in live if p["role"] == spec[5:]]
+            else:
+                found = [p for p in live if p["participant_pub"] == spec] or [
+                    p for p in live if p["display_name"] == spec.removeprefix("@")]
+            found = [p for p in found if p["participant_pub"] != self.participant_pub]
+            if not found:
+                names = sorted({p["display_name"] for p in live if p["participant_pub"] != self.participant_pub})
+                raise ValueError(f"no other participant matches {spec!r}; participants: {', '.join(names)}")
+            out += [p["participant_pub"] for p in found if p["participant_pub"] not in out]
+        if len(out) > 64:
+            raise ValueError("a message can be addressed to at most 64 participants")
+        return out
+
+    def delivery(self) -> Dict[str, dict]:
+        """For your own recent items, by id: ``delivered`` (participants
+        whose client fetched it) and ``waiting`` (still held for them).
+        Fetched, not read."""
+        return self._req("GET", "/delivery").json()["items"]
 
     def send_file(
         self,
         src: Union[str, Path, bytes],
         *,
         name: Optional[str] = None,
+        reply_to: Union[Item, str, None] = None,
         refs: Iterable[dict] = (),
     ) -> dict:
-        """Send a .py, .md, .zip, .png, .jpg or .webp file. Images are
-        re-encoded first to strip metadata. Returns the item reference."""
+        """Send a .py, .md, .zip, .png, .jpg or .webp file, as a reply to
+        ``reply_to`` if given. Images are re-encoded first to strip metadata.
+        Returns the item reference."""
         if isinstance(src, (str, Path)):
             path = Path(src)
             data = path.read_bytes()
@@ -435,6 +531,7 @@ class Session:
             mime, data = ac.sanitize_image(data)
         elif subkind == "zip":
             ac.inspect_zip(data)
+        refs = self._reply_refs(reply_to) + list(refs)
         return self._send("file", subkind, {"type": "file", "name": name, "mime": mime}, data, refs)
 
     def _seal(self, kind: str, subkind: Optional[str], meta: dict, body: bytes, refs: Iterable[dict]):
@@ -668,6 +765,7 @@ class Session:
                 self.closed = self.closed or _gone_reason(e.status)
                 return out
             raise
+        self.synced_at_ms = _now_ms()
         out += [i for i in (self._apply(e) for e in evs) if i is not None and i.status != "pending"]
         self._trade_blobs()
         if self._reseeded:
@@ -681,6 +779,186 @@ class Session:
 
     def participants(self) -> List[dict]:
         return list(self._participants.values())
+
+    @property
+    def latest_seq(self) -> Optional[int]:
+        """The highest event sequence number this client has seen."""
+        return self._last_seq if self._last_seq >= 0 else None
+
+    def wake_reason(self, item: Item) -> Optional[str]:
+        """Why ``item`` concerns you, if it does: ``"addressed"`` (its ``to``
+        names you), ``"reply"`` (it answers one of your items, a job result
+        included) or ``"owner"`` (the owner's message to everyone). Your own
+        items, progress, items addressed to others and other participants'
+        broadcasts concern no one."""
+        if item.mine or item.status != "ok" or item.kind == "progress":
+            return None
+        if item.to is not None and self.participant_pub in item.to:
+            return "addressed"
+        # A reply reaches the author of what it answers, whoever else it names.
+        parent = self._items.get(item.reply_to) if item.reply_to else None
+        if parent is not None and parent.mine:
+            return "reply"
+        if item.to is not None:
+            return None
+        if item.author_role == "owner" and item.kind in ("text", "file"):
+            return "owner"
+        return None
+
+    def agent_hops(self, item: Item) -> int:
+        """How many items in a row came from programs (anything but the web
+        client): up ``item``'s reply chain or, for an addressed item that
+        replies to nothing, among the text items just before it since a web
+        participant last spoke, whichever is more. Long agent-only exchanges
+        are how agents end up answering each other forever. Participant kind
+        is self-declared, so this is a safety net against accidental loops,
+        not a security boundary."""
+
+        def web(author: str) -> bool:
+            return (self._participants.get(author) or {}).get("kind") == "web"
+
+        chain, cur = 0, item
+        while cur is not None and chain <= 1000 and not web(cur.author):
+            chain += 1
+            cur = self._items.get(cur.reply_to) if cur.reply_to else None
+        run = 0
+        if item.to is not None and item.reply_to is None:
+            run = 1
+            for item_id in reversed(self._order):
+                i = self._items[item_id]
+                if i.seq >= item.seq:
+                    continue
+                if web(i.author) or run > 1000:
+                    break
+                if i.kind == "text":
+                    run += 1
+        return max(chain, run)
+
+    def _author_in(self, item: Item, specs: List[str]) -> bool:
+        if not specs:
+            return True
+        p = self._participants.get(item.author)
+        if p is None:
+            return False
+        for spec in specs:
+            spec = spec.strip()
+            if spec == "owner":
+                ok = p["role"] == "owner"
+            elif spec.startswith("role:"):
+                ok = p["role"] == spec[5:]
+            else:
+                ok = p["participant_pub"] == spec or p["display_name"] == spec.removeprefix("@")
+            if ok:
+                return True
+        return False
+
+    @property
+    def handled_seq(self) -> Optional[int]:
+        """The local cursor :meth:`mark_handled` keeps (shared with ``airlox listen``)."""
+        return self._cache.handled(self.role)
+
+    def mark_handled(self, seq: Optional[int] = None) -> None:
+        """Record that items up to ``seq`` were handled. Only moves forward.
+        Without ``seq``, commit the batch :meth:`wait_for_messages` last
+        returned."""
+        if seq is None:
+            seq, self._uncommitted = self._uncommitted, None
+            if seq is None:
+                return
+        if (self.handled_seq or -1) < seq:
+            self._cache.save_handled(self.role, seq)
+
+    def _settled_seq(self, pending_timeout: Optional[float] = None) -> int:
+        """The highest sequence number below every item still being fetched.
+        An item pending longer than ``pending_timeout`` seconds (if given) is
+        skipped with a warning, so one that never arrives holds nothing up."""
+        now = time.monotonic()
+        pending = [i.seq for i in self._items.values() if i.status == "pending"]
+        self._pending_since = {seq: self._pending_since.get(seq, now) for seq in pending}
+        waiting = []
+        for seq in pending:
+            if pending_timeout and now - self._pending_since[seq] >= pending_timeout:
+                if seq not in self._pending_skipped:
+                    self._pending_skipped.add(seq)
+                    log.warning(
+                        "skipping #%d: still not fetched after %gs; waking for later items", seq, pending_timeout
+                    )
+            else:
+                waiting.append(seq)
+        if waiting:
+            return min(waiting) - 1
+        return max((i.seq for i in self._items.values()), default=0)
+
+    def wait_for_messages(
+        self,
+        timeout: Optional[float] = None,
+        *,
+        include_all: bool = False,
+        from_: Union[str, Iterable[str], None] = None,
+        max_hops: int = 8,
+        settle: float = 2.0,
+        pending_timeout: Optional[float] = 60.0,
+    ) -> List[Item]:
+        """Block until items for you arrive (see :meth:`wake_reason`; every
+        item from others with ``include_all``) after the handled cursor, and
+        return them as one batch. A burst that lands within ``settle``
+        seconds comes as one batch. Reply chains with more than ``max_hops``
+        program-authored items in a row are skipped (0: no limit; see
+        :meth:`agent_hops`). ``from_`` limits who can wake you: ``"owner"``,
+        ``"role:<role>"``, display names or keys (default: anyone). An item
+        still being fetched after ``pending_timeout`` seconds is skipped with
+        a warning (``None`` or 0: wait forever); if it arrives later you are
+        woken for it then (not if the process restarts in between). Returns
+        ``[]`` on timeout or when the session closes.
+
+        The batch is acknowledged late: it is marked handled when you next
+        call this method, or when you call :meth:`mark_handled` with no
+        argument, so a crash while handling it wakes you for it again."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        specs = [from_] if isinstance(from_, str) else list(from_ or [])
+
+        def wakes(i: Item) -> bool:
+            if include_all:
+                ok = not i.mine and i.status == "ok" and i.kind not in ("progress", "event")
+            else:
+                ok = self.wake_reason(i) is not None
+            return ok and self._author_in(i, specs) and (max_hops <= 0 or self.agent_hops(i) <= max_hops)
+
+        self.mark_handled()  # the previous batch was handled if we are asked again
+        self.sync()
+        cursor = self.handled_seq or 0
+        while True:
+            upto = self._settled_seq(pending_timeout)
+            # Items given up on that have arrived since sit behind the cursor: wake for them too.
+            late = {i.seq for i in self._items.values() if i.seq in self._pending_skipped and i.status != "pending"}
+            self._pending_skipped -= late
+            batch = [self._items[i] for i in self._order]
+            batch = [i for i in batch if (cursor < i.seq <= upto or i.seq in late) and wakes(i)]
+            cursor = max(cursor, upto)
+            if batch:
+                self._uncommitted = cursor
+                return batch
+            self.mark_handled(cursor)
+            left = None if deadline is None else deadline - time.monotonic()
+            if self.closed or (left is not None and left <= 0):
+                return []
+            wait = 300.0 if left is None else min(left, 300.0)
+            if pending_timeout:  # come back when a pending item is due to be skipped
+                now = time.monotonic()
+                due = [pending_timeout - (now - t) for q, t in self._pending_since.items() if q not in self._pending_skipped]
+                if due:
+                    wait = min(wait, max(0.1, min(due)))
+            woke = False
+            known = max((i.seq for i in self._items.values()), default=0)
+            for item in self.stream(timeout=wait):
+                if item.seq > cursor and wakes(item):
+                    woke = True
+                    break
+                if item.seq <= known:
+                    break  # a pending item arrived: it may free a held one, or be a late one to wake for
+            if woke:
+                time.sleep(settle if left is None else max(0.0, min(settle, deadline - time.monotonic())))
+            self.sync()
 
     def stream(self, timeout: Optional[float] = None) -> Iterator[Item]:
         """Yield items as they arrive over SSE, reconnecting and resuming
@@ -710,6 +988,7 @@ class Session:
                         r.read()
                         _check(r)
                     for ev in _sse_events(r.iter_lines()):
+                        self.synced_at_ms = _now_ms()
                         item = None if ev is None else self._apply(ev)
                         if item is not None and item.status != "pending":
                             yield item

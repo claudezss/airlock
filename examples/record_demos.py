@@ -9,7 +9,8 @@ Each GIF is a real run against a local relay: on the left, what each
 participant does (the scenario's steps, and for the live agent its actual
 tool calls); on the right, the session's web UI opened with the observer
 link, updating as items arrive. The live agent needs `codex` (or set
-AIRLOX_AGENT=claude) and is recorded only when that agent is installed.
+AIRLOX_AGENT=claude), the agent conversation both `claude` and `codex`; each
+is recorded only when its agents are installed.
 """
 
 import argparse
@@ -49,7 +50,11 @@ DEMOS = {
                 {"planner": "accent", "runners": "ok", "owner": "soft"}),
     "live-agent": ("Live agent", "A real coding agent picks up a task and runs it on a runner",
                    {"codex": "link", "claude": "link", "analysis-box": "ok", "data-team": "accent"}),
+    "agent-conversation": ("Agent conversation", "Claude Code and Codex, each woken by airlox listen",
+                           {"lead": "accent", "claude-agent": "link", "codex-agent": "ok"}),
 }
+# Demos that call real models, and the agents each needs installed.
+NEEDS = {"live-agent": lambda: [os.environ["AIRLOX_AGENT"]], "agent-conversation": lambda: ["claude", "codex"]}
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8"><style>
 :root { --bg:#0f1113; --panel:#16191c; --raised:#1c2024; --line:#2a2f35; --text:#ecebe4; --muted:#a3a8ae;
@@ -198,7 +203,7 @@ def main() -> None:
     ap.add_argument("--out", type=pathlib.Path, default=HERE.parent / "web" / "demos")
     a = ap.parse_args()
     os.environ.setdefault("AIRLOX_AGENT", "codex")
-    names = [n for n in a.names if n != "live-agent" or shutil.which(os.environ["AIRLOX_AGENT"])]
+    names = [n for n in a.names if all(shutil.which(x) for x in NEEDS.get(n, list)())]
     a.out.mkdir(parents=True, exist_ok=True)
     # Under /tmp: paths can show in the recordings (a traceback in job output).
     with tempfile.TemporaryDirectory(prefix="airlox-demos-", dir="/tmp") as tmp, sync_playwright() as p:

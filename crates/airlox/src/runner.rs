@@ -119,6 +119,16 @@ pub struct JoinArgs {
     /// Session cache and runtime directory (default: ~/.cache/airlox).
     #[arg(long, env = "AIRLOX_CACHE_DIR")]
     pub cache_dir: Option<PathBuf>,
+    /// Put the jobs' directories under this directory (created if needed),
+    /// not the system temporary directory. A job run as a plain process
+    /// (--sandbox process, or local off Linux) sees its real paths in
+    /// tracebacks and os.getcwd(); on Windows the temporary directory is
+    /// under the user's profile (C:\Users\<name>\AppData\Local\Temp), which
+    /// names the account. Choose a neutral place such as C:\airlox-work. The
+    /// jobs' stdout and stderr also have the job's directories replaced by
+    /// $WORK and $AIRLOX_OUT before the result is signed.
+    #[arg(long, env = "AIRLOX_WORK_ROOT")]
+    pub work_root: Option<PathBuf>,
     /// docker: use this image instead of building one from the allowlist.
     #[arg(long)]
     pub docker_image: Option<String>,
@@ -302,9 +312,14 @@ fn check_args(args: &JoinArgs) -> Result<()> {
 }
 
 /// Text from a file a Windows tool may have written: UTF-8 with or without
-/// a byte-order mark, or UTF-16 with one (PowerShell 5's `>`).
+/// a byte-order mark, or UTF-16 (PowerShell 5's `>` writes little-endian
+/// with a mark; a file with no mark is taken as UTF-16 when its first
+/// character is ASCII, whose other byte is then zero).
 fn decode_text(bytes: &[u8]) -> Result<String> {
     let utf16 = |b: &[u8], le: bool| {
+        if b.len() % 2 != 0 {
+            bail!("a UTF-16 file has an odd number of bytes; it was cut short");
+        }
         let units = b.chunks_exact(2).map(|c| {
             if le {
                 u16::from_le_bytes([c[0], c[1]])
@@ -314,12 +329,30 @@ fn decode_text(bytes: &[u8]) -> Result<String> {
         });
         String::from_utf16(&units.collect::<Vec<_>>()).map_err(anyhow::Error::from)
     };
-    match bytes {
-        [0xFF, 0xFE, rest @ ..] => utf16(rest, true),
-        [0xFE, 0xFF, rest @ ..] => utf16(rest, false),
-        [0xEF, 0xBB, 0xBF, rest @ ..] => Ok(String::from_utf8(rest.to_vec())?),
-        _ => Ok(String::from_utf8(bytes.to_vec())?),
+    let text = match bytes {
+        [0xFF, 0xFE, rest @ ..] => utf16(rest, true)?,
+        [0xFE, 0xFF, rest @ ..] => utf16(rest, false)?,
+        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8(rest.to_vec())?,
+        [a, 0, ..] if *a != 0 => utf16(bytes, true)?,
+        [0, b, ..] if *b != 0 => utf16(bytes, false)?,
+        _ => String::from_utf8(bytes.to_vec())?,
+    };
+    // A second mark (a file converted twice) is not part of the text either.
+    Ok(text.trim_start_matches('\u{feff}').to_string())
+}
+
+/// The runner invite link in a file, however a Windows tool wrote it.
+fn read_invite_file(path: &std::path::Path) -> Result<String> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("could not read the invite file {}", path.display()))?;
+    let text = decode_text(&bytes)
+        .with_context(|| format!("the invite file {} is not text", path.display()))?
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        bail!("the invite file {} is empty", path.display());
     }
+    Ok(text)
 }
 
 /// The invite link, from wherever the operator put it.
@@ -332,12 +365,7 @@ pub(crate) async fn invite_link(
         if args.invite.is_some() {
             eprintln!("note: using --invite-file; ignoring the invite from --invite or AIRLOX_INVITE");
         }
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("could not read the invite file {}", path.display()))?;
-        return Ok(decode_text(&bytes)
-            .with_context(|| format!("the invite file {} is not text", path.display()))?
-            .trim()
-            .to_string());
+        return read_invite_file(path);
     }
     match (&args.code, &args.invite) {
         (Some(code), invite) => {
@@ -575,13 +603,33 @@ pub async fn run(args: JoinArgs) -> Result<()> {
             if no_network { " (this session says network: false)" } else { "" }
         );
     }
+    let ctx_env = job::checked_env(backend.env());
     relay.report("ready", None, owed).await?;
 
     // Unsandboxed jobs see their real paths (in tracebacks, os.getcwd()):
-    // under the system temp directory those do not name this user or where
-    // the runner keeps its cache. Sandboxed jobs see /work.
-    let temp_jobs =
-        if unsandboxed { Some(tempfile::Builder::new().prefix("airlox-jobs-").tempdir()?) } else { None };
+    // under the system temp directory those do not say where the runner
+    // keeps its cache (but on Windows they name the user: --work-root).
+    // Sandboxed jobs see /work.
+    let work_root = match &args.work_root {
+        Some(r) => {
+            std::fs::create_dir_all(r)
+                .with_context(|| format!("could not create --work-root {}", r.display()))?;
+            Some(std::path::absolute(r)?)
+        }
+        None => None,
+    };
+    let temp_jobs = if unsandboxed || work_root.is_some() {
+        let mut b = tempfile::Builder::new();
+        b.prefix("airlox-jobs-");
+        Some(match &work_root {
+            Some(r) => {
+                b.tempdir_in(r).with_context(|| format!("could not use --work-root {}", r.display()))?
+            }
+            None => b.tempdir()?,
+        })
+    } else {
+        None
+    };
     let jobs_dir = match &temp_jobs {
         Some(t) => t.path().to_path_buf(),
         None => dir.join("jobs"),
@@ -600,6 +648,7 @@ pub async fn run(args: JoinArgs) -> Result<()> {
         progress_tail: args.progress_tail as usize,
         outbox,
         exit_before_posting: args.exit_before_posting,
+        env: ctx_env,
     });
     job::report_interrupted(&ctx, &view).await;
     let outcome = serve(&ctx, &view, &relay, args.exit_after).await;
@@ -884,4 +933,87 @@ async fn serve(
         t.abort();
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LINK: &str = "https://airlox.example/s#ax_abcdefghijklmnopqrstuvwxyz/AbC-_123=";
+
+    fn utf16(text: &str, le: bool, bom: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        if bom {
+            out.extend(if le { [0xFF, 0xFE] } else { [0xFE, 0xFF] });
+        }
+        for u in text.encode_utf16() {
+            out.extend(if le { u.to_le_bytes() } else { u.to_be_bytes() });
+        }
+        out
+    }
+
+    fn file(bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runner-invite.txt");
+        std::fs::write(&path, bytes).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn an_invite_file_reads_as_utf8_with_or_without_a_mark() {
+        for bytes in [
+            LINK.as_bytes().to_vec(),
+            [&[0xEF, 0xBB, 0xBF][..], LINK.as_bytes()].concat(),
+            [&[0xEF, 0xBB, 0xBF][..], LINK.as_bytes(), b"\r\n"].concat(),
+        ] {
+            let (_dir, path) = file(&bytes);
+            assert_eq!(read_invite_file(&path).unwrap(), LINK);
+        }
+    }
+
+    #[test]
+    fn an_invite_file_reads_as_utf16_either_way_round() {
+        // PowerShell 5's `>`: little-endian, a mark, CRLF after the line.
+        for text in [LINK.to_string(), format!("{LINK}\r\n"), format!("  {LINK} \t\r\n\r\n")] {
+            for le in [true, false] {
+                let (_dir, path) = file(&utf16(&text, le, true));
+                assert_eq!(read_invite_file(&path).unwrap(), LINK, "le={le} {text:?}");
+            }
+        }
+        // No mark: ASCII text shows itself by its zero bytes.
+        for le in [true, false] {
+            let (_dir, path) = file(&utf16(&format!("{LINK}\r\n"), le, false));
+            assert_eq!(read_invite_file(&path).unwrap(), LINK, "le={le}");
+        }
+        // A mark is not part of the text, however many bytes precede it.
+        assert_eq!(decode_text(&utf16("\u{feff}x", true, true)).unwrap(), "x");
+    }
+
+    #[test]
+    fn trailing_whitespace_of_every_kind_is_dropped() {
+        for tail in ["", "\n", "\r\n", " \r\n", "\r\n\r\n", "\t \n \n"] {
+            let (_dir, path) = file(format!("{LINK}{tail}").as_bytes());
+            assert_eq!(read_invite_file(&path).unwrap(), LINK, "{tail:?}");
+        }
+    }
+
+    #[test]
+    fn a_bad_invite_file_says_what_is_wrong() {
+        let (_dir, path) = file(b"");
+        assert!(read_invite_file(&path).unwrap_err().to_string().contains("is empty"));
+        let (_dir, path) = file(&[0xEF, 0xBB, 0xBF, b'\r', b'\n']);
+        assert!(read_invite_file(&path).unwrap_err().to_string().contains("is empty"));
+        // Not text at all.
+        let (_dir, path) = file(&[0x80, 0x81, 0x82]);
+        assert!(format!("{:#}", read_invite_file(&path).unwrap_err()).contains("is not text"));
+        // UTF-16 cut in the middle of a character, or with a lone surrogate.
+        let mut cut = utf16(LINK, true, true);
+        cut.pop();
+        let (_dir, path) = file(&cut);
+        assert!(format!("{:#}", read_invite_file(&path).unwrap_err()).contains("cut short"));
+        let (_dir, path) = file(&[0xFF, 0xFE, 0x00, 0xD8, 0x41, 0x00]);
+        assert!(read_invite_file(&path).is_err());
+        let gone = path.with_file_name("missing.txt");
+        assert!(read_invite_file(&gone).unwrap_err().to_string().contains("could not read the invite file"));
+    }
 }

@@ -704,13 +704,26 @@ keeps the v2 pinned-origin UI (fixed hashes, reproducible build) simple.
   cache), and offers "Clear local history" per session, which also leaves the
   session on the relay. Browser storage quotas apply; when
   one is hit, the oldest sessions' blobs are dropped first.
-- Viewers: Markdown and Python as plain text (never rendered as HTML, so
-  nothing a participant writes can run in the page), image preview
-  (re-encoded on send), ZIP listing (checked by the wasm core's zip
-  validator), job detail (status, signature, hashes, result bundle).
-- Composer: message, or "Send as job" with a runner/label/any picker. The
-  owner can submit jobs only if they also hold the sender role (they do by
-  construction: the owner mints all role keys).
+- Viewers: messages and `.md` files render as Markdown, built element by
+  element from text (no `innerHTML`, so nothing a participant writes can run
+  in the page): raw HTML is shown as text, only `http(s)` and `mailto` links
+  are live and show their real host when the link text says otherwise, and
+  remote images are never fetched. A Source toggle shows the exact characters
+  that were sent; very large input falls back to plain text. Python files and
+  job code are highlighted code blocks; image preview (re-encoded on send),
+  ZIP listing (checked by the wasm core's zip validator), job detail (status,
+  signature, hashes, result bundle).
+- Layout: an app shell. The header and composer stay put, the timeline column
+  and the details rail scroll on their own, and below 900 px the rail is a
+  drawer. The timeline opens at the newest item and follows it while the
+  reader is near the end; a reader who scrolled up gets an "N new messages"
+  pill and a "New" divider and is never moved. Messages from the same author
+  within five minutes share one header.
+- Composer: message, or "Send as job" with a runner/label/any picker. Enter
+  sends and Shift+Enter breaks the line (in job mode, where the box holds
+  code, and on touch screens, Enter breaks the line and Ctrl/Cmd+Enter or the
+  button sends). The owner can submit jobs only if they also hold the sender
+  role (they do by construction: the owner mints all role keys).
 
 ---
 

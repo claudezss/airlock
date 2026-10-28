@@ -380,3 +380,148 @@ def test_plain_http_only_to_the_host_the_session_names(relay, caches, monkeypatc
     # Hosts URL parsers read as IPv4 must be plain dotted quads.
     with pytest.raises(airlox.ValidationError, match="four decimal numbers"):
         Session.create(url, insecure_http_host="2130706433", cache_dir=caches("numeric"))
+
+
+def test_addressed_messages_replies_and_waking(relay, caches):
+    owner = Session.create(relay.url, display_name="lead", cache_dir=caches("owner"))
+    planner = Session.join(owner.invites["sender"], display_name="planner", cache_dir=caches("planner"))
+    coder = Session.join(owner.invites["sender"], display_name="coder", cache_dir=caches("coder"))
+    planner.sync()
+
+    planner.send_text("FYI only")  # to everyone: wakes no one
+    ask = planner.send_text("@coder write the parser", to=["coder"])
+    with pytest.raises(ValueError, match="no other participant"):
+        planner.send_text("hi", to=["nobody"])
+    with pytest.raises(ValueError, match="no other participant"):
+        planner.send_text("hi", to=["planner"])  # never yourself
+
+    batch = coder.wait_for_messages(timeout=10, settle=0.2)
+    assert [(i.text, coder.wake_reason(i)) for i in batch] == [("@coder write the parser", "addressed")]
+    assert batch[0].to == [coder.participant_pub]
+    # The cursor is saved: nothing more until something new arrives.
+    assert coder.wait_for_messages(timeout=1, settle=0) == []
+    assert coder.handled_seq >= batch[0].seq
+
+    done = coder.send_text("done", reply_to=ask["id"])
+    got = planner.wait_for_messages(timeout=10, settle=0.2)
+    assert [(i.text, i.reply_to, planner.wake_reason(i)) for i in got] == [("done", ask["id"], "reply")]
+
+    # The owner's broadcasts concern everyone; another sender's do not.
+    owner.send_text("wrap up by noon")
+    assert [i.text for i in coder.wait_for_messages(timeout=10, settle=0.2)] == ["wrap up by noon"]
+
+    # Agent-only reply chains stop waking past max_hops.
+    planner.send_text("thanks", reply_to=done["id"])
+    assert coder.wait_for_messages(timeout=2, settle=0, max_hops=2) == []
+
+    # A reply wakes the author of what it answers even when it names others.
+    q = coder.send_text("which branch?")
+    owner.send_text("main; @planner please merge", to=["planner"], reply_to=q["id"])
+    assert [coder.wake_reason(i) for i in coder.wait_for_messages(timeout=10, settle=0.2)] == ["reply"]
+
+    # Delivery: the author sees who fetched its items; fetched, not read.
+    assert wait_for(lambda: coder.participant_pub in planner.delivery()[ask["id"]]["delivered"])
+    assert planner.synced_at_ms and planner.latest_seq
+
+
+def test_wait_for_messages_acknowledges_late(relay, caches):
+    owner = Session.create(relay.url, display_name="lead", cache_dir=caches("owner"))
+    coder = Session.join(owner.invites["sender"], display_name="coder", cache_dir=caches("coder"))
+    first = owner.send_text("one", to=["coder"])
+    [got] = coder.wait_for_messages(timeout=10, settle=0.2)
+    assert got.id == first["id"]
+    # Not marked handled yet: a crash here would wake the next process for it.
+    assert (coder.handled_seq or 0) < got.seq
+    again = Session.join(owner.invites["sender"], display_name="coder", cache_dir=caches("coder"))
+    assert [i.id for i in again.wait_for_messages(timeout=10, settle=0.2)] == [first["id"]]
+    # Committing explicitly, or by asking again, moves the cursor.
+    coder.mark_handled()
+    assert coder.handled_seq >= got.seq
+    second = owner.send_text("two", to=["coder"])
+    [got2] = coder.wait_for_messages(timeout=10, settle=0.2)
+    assert got2.id == second["id"] and coder.handled_seq < got2.seq
+    assert coder.wait_for_messages(timeout=1, settle=0) == []
+    assert coder.handled_seq >= got2.seq
+
+
+def test_wait_for_messages_can_limit_who_wakes_it(relay, caches):
+    owner = Session.create(relay.url, display_name="lead", cache_dir=caches("owner"))
+    planner = Session.join(owner.invites["sender"], display_name="planner", cache_dir=caches("planner"))
+    coder = Session.join(owner.invites["sender"], display_name="coder", cache_dir=caches("coder"))
+    planner.send_text("do the thing", to=["coder"])
+    assert coder.wait_for_messages(timeout=2, settle=0, from_="owner") == []
+    owner.send_text("wrap up")
+    assert [i.text for i in coder.wait_for_messages(timeout=10, settle=0.2, from_=["role:owner"])] == ["wrap up"]
+    planner.send_text("again", to=["coder"])
+    assert [i.text for i in coder.wait_for_messages(timeout=10, settle=0.2, from_=["@planner"])] == ["again"]
+    planner.send_text("by key", to=["coder"])
+    assert [i.text for i in coder.wait_for_messages(timeout=10, settle=0.2, from_=planner.participant_pub)] == ["by key"]
+
+
+def test_agents_addressing_each_other_without_replying_hit_the_hop_limit(relay, caches):
+    owner = Session.create(relay.url, display_name="lead", cache_dir=caches("owner"))
+    a = Session.join(owner.invites["sender"], display_name="a", cache_dir=caches("a"))
+    b = Session.join(owner.invites["sender"], display_name="b", cache_dir=caches("b"))
+    for n in range(6):
+        who, other = (a, "b") if n % 2 == 0 else (b, "a")
+        who.send_text(f"ping {n}", to=[other])  # no reply_to: no chain to follow
+    b.sync()
+    hops = [b.agent_hops(i) for i in b.items() if i.kind == "text"]
+    assert hops == [1, 2, 3, 4, 5, 6]
+    # b is the addressee of pings 0, 2 and 4, at 1, 3 and 5 hops.
+    assert [i.text for i in b.wait_for_messages(timeout=10, settle=0.2, max_hops=3)] == ["ping 0", "ping 2"]
+    # A person speaking resets the run (participant kind is self-declared).
+    b._participants[owner.participant_pub]["kind"] = "web"
+    owner.send_text("carry on")
+    a.send_text("next", to=["b"])
+    b.sync()
+    [nxt] = [i for i in b.items() if i.text == "next"]
+    assert b.agent_hops(nxt) == 1
+    assert [i.text for i in b.wait_for_messages(timeout=10, settle=0.2, max_hops=3)] == ["carry on", "next"]
+
+
+def test_an_item_that_never_arrives_stops_holding_up_later_ones(relay, caches, caplog):
+    owner = Session.create(relay.url, display_name="lead", cache_dir=caches("owner"))
+    coder = Session.join(owner.invites["sender"], display_name="coder", cache_dir=caches("coder"))
+    lost = owner.send_text("lost", to=["coder"])
+    later = owner.send_text("later", to=["coder"])
+    coder.sync()
+    stuck = coder._items[lost["id"]]
+    stuck.status = "pending"  # as if its blob could not be fetched
+    coder._retry = lambda only=None: []  # and nobody can supply it
+    assert coder._settled_seq(None) == stuck.seq - 1
+    assert coder._settled_seq(0.3) == stuck.seq - 1
+    time.sleep(0.4)
+    with caplog.at_level("WARNING", logger="airlox.session"):
+        assert coder._settled_seq(0.3) == coder._items[later["id"]].seq
+        coder._settled_seq(0.3)
+    assert [r.getMessage() for r in caplog.records if f"#{stuck.seq}" in r.getMessage()] == [
+        f"skipping #{stuck.seq}: still not fetched after 0.3s; waking for later items"
+    ]
+    assert [i.text for i in coder.wait_for_messages(timeout=10, settle=0, pending_timeout=0.3)] == ["later"]
+
+
+def test_an_item_given_up_on_wakes_you_when_it_arrives_after_all(relay, caches):
+    owner = Session.create(relay.url, display_name="lead", cache_dir=caches("owner"))
+    coder = Session.join(owner.invites["sender"], display_name="coder", cache_dir=caches("coder"))
+    lost = owner.send_text("lost", to=["coder"])
+    owner.send_text("later", to=["coder"])
+    coder.sync()
+    stuck = coder._items[lost["id"]]
+    stuck.status = "pending"  # as if its blob could not be fetched
+    coder._retry = lambda only=None: []
+    apply, gone = coder._apply, [True]
+
+    def still_missing(ev, **kw):  # the relay says it is evicted: here it stays unfetched
+        got = apply(ev, **kw)
+        if gone[0]:
+            stuck.status = "pending"
+        return got
+
+    coder._apply = still_missing
+    assert [i.text for i in coder.wait_for_messages(timeout=10, settle=0, pending_timeout=0.3)] == ["later"]
+    coder.mark_handled()
+    # It turns up after the cursor went past it: it is not lost.
+    gone[0], stuck.status = False, "ok"
+    assert [i.text for i in coder.wait_for_messages(timeout=10, settle=0, pending_timeout=0.3)] == ["lost"]
+    assert coder.wait_for_messages(timeout=1, settle=0, pending_timeout=0.3) == []

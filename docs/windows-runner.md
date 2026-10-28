@@ -37,8 +37,15 @@ containers), and is the one to use for code you don't trust.
   Object with the job's cap, and warns when that alone comes near the cap.
   Sessions created from the CLI, the MCP server or the web UI default to
   2048 MB.
-- **A fresh work folder per job**, under the system temp directory, deleted
-  afterwards.
+- **A fresh work folder per job**, deleted afterwards. By default it is under
+  the system temp directory, which on Windows is under your profile
+  (`C:\Users\<name>\AppData\Local\Temp`) and so shows your account name in
+  any traceback the job prints. `--work-root C:\airlox-work` (or
+  `AIRLOX_WORK_ROOT`) puts the folders in a directory you choose; the runner
+  creates it, so the account it runs as needs write access to its parent. Either
+  way, the runner replaces the folder's path in the job's stdout, stderr and
+  progress tail with `$WORK` (and `$AIRLOX_OUT` for the output folder, `$RUNTIME`
+  for its runtime and cache, `~` for your profile) before it signs the result.
 - **A scrubbed environment.** A job sees only `PATH` (its interpreter and
   the Windows system folders), `SYSTEMROOT`, `TEMP`/`TMP` inside its work
   folder, `HOME` and `USERPROFILE` (the work folder), `LANG`, `MPLBACKEND`,

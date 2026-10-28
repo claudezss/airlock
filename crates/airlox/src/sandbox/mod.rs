@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use airlox_core::cert::SandboxKind;
 use airlox_core::encoding::{hex, sha256};
+use airlox_core::payload::JobEnv;
 use airlox_core::shim::ShimResult;
 use anyhow::{Context, Result};
 use tokio::sync::watch;
@@ -32,23 +33,96 @@ pub const KILL_GRACE: Duration = Duration::from_secs(10);
 /// After a polite stop (SIGTERM), how long before a hard kill.
 pub const STOP_GRACE: Duration = Duration::from_secs(5);
 
+/// The `env` a runner reports, shaped so that every client accepts it
+/// (`check_env`): control characters out, the interpreter label at most 128
+/// characters with a digest-pinned image's digest cut to 12 hex digits, and
+/// a package whose version is empty or too long left out rather than
+/// reported wrongly.
+pub fn job_env(
+    python: &str,
+    packages: impl IntoIterator<Item = (String, String)>,
+    sandbox: SandboxKind,
+    interpreter: &str,
+) -> JobEnv {
+    let plain = |s: &str| -> String { s.chars().filter(|c| !c.is_control()).collect() };
+    let mut label = plain(interpreter);
+    if let Some(at) = label.rfind("@sha256:") {
+        let digest = &label[at + 8..];
+        if digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            label.truncate(at + 8 + 12);
+        }
+    }
+    let label: String = label.chars().take(128).collect();
+    JobEnv {
+        python: plain(python),
+        packages: packages
+            .into_iter()
+            .filter(|(_, v)| !v.is_empty() && v.chars().count() <= 64 && !v.chars().any(char::is_control))
+            .take(airlox_core::payload::MAX_ENV_PACKAGES)
+            .collect(),
+        airlox: env!("CARGO_PKG_VERSION").to_string(),
+        sandbox,
+        interpreter: if label.is_empty() { "unknown".into() } else { label },
+    }
+}
+
 /// The interpreter and package allowlist a session's jobs run with. Built
 /// once, with network, before the runner takes jobs.
 #[derive(Clone, Debug)]
 pub struct RuntimeSpec {
     /// e.g. "python3.12"
     pub runtime: String,
-    /// Normalized package names.
+    /// The manifest's allowlist entries: normalized names, each optionally
+    /// with a version specifier (`cugrid==0.1.0`).
     pub packages: Vec<String>,
 }
 
 impl RuntimeSpec {
+    /// The allowlisted package names, without version specifiers.
+    pub fn names(&self) -> Vec<String> {
+        self.packages.iter().map(|p| airlox_core::policy::allowlist_name(p).to_string()).collect()
+    }
+
+    /// The entries that carry a version specifier, parsed.
+    pub fn pins(&self) -> Vec<airlox_core::policy::AllowedPackage> {
+        self.packages
+            .iter()
+            .filter_map(|p| airlox_core::policy::AllowedPackage::parse(p).ok())
+            .filter(|p| p.specifier.is_some())
+            .collect()
+    }
+
+    /// What the session's pins say about the installed `packages`: one line
+    /// for each pinned package that is installed at a version its entry does
+    /// not allow, such as "--python has cugrid 0.2.1, but the session pins
+    /// cugrid==0.1.0". (A package that is not installed at all is not a
+    /// conflict here; the backends check for missing ones.)
+    pub fn pin_conflicts(&self, what: &str, installed: &[local::PackageInfo]) -> Vec<String> {
+        let mut out = Vec::new();
+        for pin in self.pins() {
+            if let Some(i) = installed.iter().find(|i| i.name == pin.name) {
+                if !pin.allows_version(&i.version) {
+                    out.push(format!(
+                        "{what} has {} {}, but the session pins {}",
+                        pin.name,
+                        if i.version.is_empty() { "(no version)" } else { &i.version },
+                        pin.canonical()
+                    ));
+                }
+            }
+        }
+        out
+    }
+
     /// "3.12" from "python3.12".
     pub fn python_version(&self) -> &str {
         self.runtime.strip_prefix("python").unwrap_or(&self.runtime)
     }
 
-    /// Identifies a built runtime: `sha256(runtime + sorted(packages))`.
+    /// Identifies a built runtime: `sha256(runtime + sorted(packages))`, the
+    /// entries with their version specifiers, so a different pin is a
+    /// different runtime (and an allowlist of bare names hashes as it always
+    /// did).
     pub fn hash(&self) -> String {
         let mut p = self.packages.clone();
         p.sort();
@@ -121,10 +195,28 @@ impl Backend {
         }
     }
 
+    /// The runner's own runtime and cache directories, which job output
+    /// must not name (none for Docker, whose jobs see the image).
+    pub fn runtime_dirs(&self) -> Vec<PathBuf> {
+        match self {
+            Backend::Local(b) => b.runtime_dirs(),
+            Backend::Docker(_) => vec![],
+        }
+    }
+
     pub async fn prepare(&mut self, spec: &RuntimeSpec) -> Result<()> {
         match self {
             Backend::Local(b) => b.prepare(spec).await,
             Backend::Docker(b) => b.prepare(spec).await,
+        }
+    }
+
+    /// Where jobs run, as measured when the runtime was prepared (not per
+    /// job); `None` if it could not be.
+    pub fn env(&self) -> Option<JobEnv> {
+        match self {
+            Backend::Local(b) => b.env(),
+            Backend::Docker(b) => b.env(),
         }
     }
 
@@ -262,5 +354,43 @@ pub fn make_removable(path: &std::path::Path) {
 pub(crate) fn signal_group(pid: Option<u32>, sig: nix::sys::signal::Signal) {
     if let Some(pid) = pid {
         let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid as i32), sig);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env(interpreter: &str, packages: &[(&str, &str)]) -> JobEnv {
+        let pkgs = packages.iter().map(|(n, v)| (n.to_string(), v.to_string()));
+        job_env("3.12.4", pkgs, SandboxKind::Docker, interpreter)
+    }
+
+    #[test]
+    fn a_digest_pinned_image_is_named_by_a_short_digest() {
+        let digest = "0123456789abcdef".repeat(4);
+        let long =
+            format!("registry.example.com/team/some-long-repository-name:3.12-slim-bookworm@sha256:{digest}");
+        let e = env(&format!("docker:{long}"), &[]);
+        assert!(e.interpreter.ends_with("@sha256:0123456789ab"), "{}", e.interpreter);
+        assert!(airlox_core::policy::check_env(&e).is_ok());
+        // Not a 64-digit digest: left alone.
+        assert_eq!(env("docker:repo@sha256:abc", &[]).interpreter, "docker:repo@sha256:abc");
+    }
+
+    #[test]
+    fn any_interpreter_label_is_capped_on_a_char_boundary_and_printable() {
+        let e = env(&"é".repeat(300), &[]);
+        assert_eq!(e.interpreter.chars().count(), 128);
+        assert!(airlox_core::policy::check_env(&e).is_ok());
+        assert_eq!(env("a\nb\x1b", &[]).interpreter, "ab");
+        assert_eq!(env("", &[]).interpreter, "unknown");
+    }
+
+    #[test]
+    fn a_package_without_a_usable_version_is_left_out() {
+        let e = env("uv-runtime", &[("numpy", "2.1.0"), ("nover", ""), ("long", &"1".repeat(65))]);
+        assert_eq!(e.packages.keys().collect::<Vec<_>>(), ["numpy"]);
+        assert!(airlox_core::policy::check_env(&e).is_ok());
     }
 }

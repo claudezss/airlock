@@ -17,11 +17,13 @@
     <span>Airlox</span>
   </a>
   <nav id="site-nav" class="site-nav" aria-label="Primary" hidden>
-    <a href="#modes">How it works</a>
-    <a href="#demos">Examples</a>
-    <a href="#types">File types</a>
-    <a href="#security">Security</a>
-    <a href="#api">API</a>
+    <div class="nav-links">
+      <a href="#modes">How it works</a>
+      <a href="#demos">Examples</a>
+      <a href="#types">File types</a>
+      <a href="#security">Security</a>
+      <a href="#api">API</a>
+    </div>
     <a class="button primary" href="/new">Open a session</a>
   </nav>
   <div id="title" class="title" hidden><span id="title-name"></span><span id="title-sub" class="mono muted"></span></div>
@@ -141,7 +143,7 @@ west     52104.00</pre>
   <div class="lp-inner lp-stack-md">
     <div class="lp-head">
       <p class="lp-eyebrow">02 · Real runs</p>
-      <h2>Four sessions, recorded as they happened.</h2>
+      <h2>Five sessions, recorded as they happened.</h2>
       <p class="lp-sub">Each recording shows what every participant did next to this site's session view, opened with the observer link. Every run is also an end-to-end test.</p>
     </div>
     <div class="lp-demo-bar">
@@ -150,6 +152,7 @@ west     52104.00</pre>
         <button type="button" role="tab" id="demo-tab-remote-tests" aria-controls="demo-remote-tests" aria-selected="false" tabindex="-1">Remote CI</button>
         <button type="button" role="tab" id="demo-tab-fan-out" aria-controls="demo-fan-out" aria-selected="false" tabindex="-1">Fan-out</button>
         <button type="button" role="tab" id="demo-tab-live-agent" aria-controls="demo-live-agent" aria-selected="false" tabindex="-1">Live agent</button>
+        <button type="button" role="tab" id="demo-tab-agent-conversation" aria-controls="demo-agent-conversation" aria-selected="false" tabindex="-1">Agents talking</button>
       </div>
       <button type="button" class="lp-demo-pause" aria-pressed="false"><span class="glyph" aria-hidden="true">❚❚</span>Pause recordings</button>
     </div>
@@ -165,7 +168,7 @@ west     52104.00</pre>
         <ol class="lp-demo-steps">
           <li>The IDE agent creates a session through the <code>airlox</code> MCP server.</li>
           <li>It sends <code>discounts.py</code> and asks for a review.</li>
-          <li>The review bot (Python SDK) replies with <code>review-discounts.md</code>: an <code>eval</code> and a <code>shell=True</code>.</li>
+          <li>The review bot (Python SDK) replies to it with <code>review-discounts.md</code>: an <code>eval</code> and a <code>shell=True</code>.</li>
           <li>The IDE agent saves the report under a fresh name, inside the one folder its tools may touch.</li>
         </ol>
         <p class="lp-demo-run mono"><span class="accent" aria-hidden="true">$</span> python examples/code-review/run.py <a href="https://github.com/claudezss/airlox/blob/main/examples/code-review/run.py">source</a></p>
@@ -223,6 +226,24 @@ west     52104.00</pre>
           <li>It posts the totals; the data team checks them and the runner's signature.</li>
         </ol>
         <p class="lp-demo-run mono"><span class="accent" aria-hidden="true">$</span> python examples/live-agent/run.py <a href="https://github.com/claudezss/airlox/blob/main/examples/live-agent/run.py">source</a></p>
+      </div>
+    </div>
+    <div class="lp-demo" role="tabpanel" id="demo-agent-conversation" aria-labelledby="demo-tab-agent-conversation" hidden>
+      <figure class="lp-demo-media">
+        <a href="/assets/demos/agent-conversation.gif" title="Open full size"><picture>
+          <source media="(prefers-reduced-motion: reduce)" srcset="/assets/demos/agent-conversation.webp">
+          <img src="/assets/demos/agent-conversation.gif" width="1280" height="720" loading="lazy" alt="Claude Code, woken by airlox listen, asks Codex for a fix; Codex, woken in turn, replies; Claude sends the lead a summary in the thread"></picture></a>
+      </figure>
+      <p class="lp-demo-hint">Tap the recording to open it full size.</p>
+      <div class="lp-demo-copy">
+        <p>Two real coding agents talk to each other. Each one is started by <code>airlox listen</code> only when a message is for it.</p>
+        <ol class="lp-demo-steps">
+          <li>The lead posts <code>discounts.py</code> and asks <code>@claude-agent</code> to review it with <code>@codex-agent</code>.</li>
+          <li>Claude Code is woken, reads the thread and asks Codex, addressing it by name.</li>
+          <li>Codex is woken, answers as a reply, and that reply wakes Claude again.</li>
+          <li>Claude replies to the lead with a summary. Each listener takes wakes only from the lead and the other agent, by key.</li>
+        </ol>
+        <p class="lp-demo-run mono"><span class="accent" aria-hidden="true">$</span> python examples/agent-conversation/run.py <a href="https://github.com/claudezss/airlox/blob/main/examples/agent-conversation/run.py">source</a></p>
       </div>
     </div>
   </div>

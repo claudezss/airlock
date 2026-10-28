@@ -70,6 +70,8 @@
     { "name": "send_text", "description": "Send a message" },
     { "name": "send_file", "description": "Send a file from the working folder" },
     { "name": "list_items", "description": "List messages, files and jobs" },
+    { "name": "get_item", "description": "Read one item in full" },
+    { "name": "delivery_status", "description": "See which participants fetched your items" },
     { "name": "save_file", "description": "Save a received file into the working folder" },
     { "name": "list_runners", "description": "List the runners in an execute session" },
     { "name": "approve_runner", "description": "Let a runner take jobs" },

@@ -130,3 +130,83 @@ def test_a_result_saved_before_a_crash_is_posted_after_restart(relay, caches, st
     assert json.loads(res.read("answer.json")) == {"answer": 42, "items": ["a", "b"]}
     results = [i for i in agent.items() if i.kind == "result" and i.meta.get("job", {}).get("id") == job.id]
     assert len(results) == 1, (results, again.output())
+
+
+def _installed(name: str) -> str:
+    from importlib import metadata
+
+    return metadata.version(name)
+
+
+def test_python_pins_are_checked_and_results_report_the_environment(relay, caches, start_runner):
+    pytest_version = _installed("pytest")
+    limits = dict(PROCESS_LIMITS, network=True, packages=[f"pytest=={pytest_version}", "httpx>=0.1,<999"])
+    owner = Session.create(relay.url, mode="execute", job_limits=limits, cache_dir=caches("owner"))
+    assert owner.manifest["job_limits"]["packages"] == [f"pytest=={pytest_version}", "httpx>=0.1,<999"]
+    agent = Session.join(owner.invites["sender"], cache_dir=caches("agent"))
+    runner = start_process_runner(owner, start_runner, "proc-05")
+    wait_runner(owner, "proc-05", lambda r: r.online, proc=runner)
+    owner.approve_runner("proc-05")
+    agent.wait_for_runner("proc-05", approved=True)
+
+    # Jobs name the package; the version is the session's.
+    res = agent.run_python("import pytest; print(pytest.__version__)", runner="proc-05",
+                           requirements=["pytest"]).wait(timeout=60)
+    assert (res.status, res.stdout.strip()) == ("completed", pytest_version), (res, runner.output())
+    env = res.env
+    assert env["interpreter"] == "--python" and env["sandbox"] == "process", env
+    assert env["python"] == platform.python_version()
+    assert env["packages"] == {"pytest": pytest_version, "httpx": _installed("httpx")}
+    assert env["airlox"]
+    # Nothing about where the interpreter or the work folder is.
+    assert os.path.dirname(sys.executable) not in json.dumps(env)
+    refused = agent.run_python("print(1)", runner="proc-05", requirements=[f"pytest=={pytest_version}"])
+    res = refused.wait(timeout=60)
+    assert res.status == "refused" and "requirements name packages only" in res.reason, res
+
+
+def test_a_python_with_the_wrong_version_of_a_pinned_package_does_not_join(relay, caches, start_runner):
+    limits = dict(PROCESS_LIMITS, network=True, packages=["pytest==0.0.1"])
+    owner = Session.create(relay.url, mode="execute", job_limits=limits, cache_dir=caches("owner"))
+    start_process_runner(owner, start_runner, "proc-06")
+    want = f"--python has pytest {_installed('pytest')}, but the session pins pytest==0.0.1"
+    with pytest.raises(RunnerFailed, match=want.replace(".", r"\.")):
+        owner.wait_for_runner("proc-06", timeout=60)
+
+
+PATH_JOB = """
+import os, sys
+print("cwd", os.getcwd())
+print("out", os.environ["AIRLOX_OUT"])
+print("repr", repr(os.getcwd()))
+print("tb", os.getcwd(), file=sys.stderr)
+open(os.path.join(os.environ["AIRLOX_OUT"], "where.txt"), "w").write(os.getcwd())
+"""
+
+
+def test_jobs_work_under_the_work_root_and_their_output_does_not_name_it(relay, caches, start_runner, tmp_path):
+    root = tmp_path / "neutral-work-root"
+    owner = Session.create(relay.url, mode="execute", job_limits=PROCESS_LIMITS, cache_dir=caches("owner"))
+    agent = Session.join(owner.invites["sender"], cache_dir=caches("agent"))
+    runner = start_process_runner(
+        owner, start_runner, "proc-07", "--accept-network-gap", "--work-root", str(root)
+    )
+    wait_runner(owner, "proc-07", lambda r: r.online, proc=runner)
+    owner.approve_runner("proc-07")
+    agent.wait_for_runner("proc-07", approved=True)
+
+    res = agent.run_python(PATH_JOB, runner="proc-07").wait(timeout=60)
+    assert res.ok, (res, runner.output())
+    lines = res.stdout.splitlines()
+    assert lines[0] == "cwd $WORK" and lines[1] == "out $AIRLOX_OUT", res.stdout
+    assert lines[2] == "repr '$WORK'", res.stdout
+    assert res.stderr.strip() == "tb $WORK", res.stderr
+    for real in (str(root), os.path.realpath(root), "airlox-jobs"):
+        assert real not in res.stdout + res.stderr, (real, res.stdout)
+    # What the job wrote is returned as it is: the folder was under the root.
+    where = res.read("where.txt").decode()
+    assert os.path.realpath(where).startswith(os.path.realpath(root)), where
+    assert os.path.basename(os.path.dirname(os.path.dirname(where))).startswith("airlox-jobs-"), where
+    # The runner cleaned up after the job.
+    time.sleep(0.5)
+    assert not os.path.exists(where)

@@ -83,10 +83,23 @@ Validity rules (all enforced by `Manifest::validate`):
 - The four public keys are pairwise distinct.
 - `mode == relay` ⇔ `job_limits == null`. Execute mode requires `py` in
   `allowed_types`, `runtime` of the form `python3.<minor>`,
-  `1 ≤ timeout_s ≤ 86400`, `32 ≤ memory_mb ≤ 65536`, and every package already
-  PEP 503-normalized. Clients normalize what the owner typed (and drop
-  repeats) when they build the manifest, so `pyPowerGEM` is signed as
-  `pypowergem`.
+  `1 ≤ timeout_s ≤ 86400`, `32 ≤ memory_mb ≤ 65536`, and every `packages`
+  entry already in canonical form (below). Clients normalize what the owner
+  typed (and drop repeats) when they build the manifest, so `pyPowerGEM` is
+  signed as `pypowergem`.
+- A `packages` entry is a PEP 503-normalized name, optionally followed by a
+  PEP 440 version specifier: `cugrid`, `cugrid==0.1.0`, `numpy>=1.26,<3`. The
+  specifier is one or more comma-separated clauses, each an operator
+  (`==`, `!=`, `>=`, `<=`, `>`, `<`, `~=`, `===`) and a version, written
+  lowercase without spaces; `==` and `!=` may end in `.*`, and a `+local`
+  version goes only with `==`, `!=` and `===`. Extras, environment markers
+  and URLs are not accepted. An entry is at most 256 bytes, a specifier has
+  at most 8 clauses, and a name appears in one entry only. Clients put the
+  entry in this form when they build the manifest (`CuGrid >= 0.1.0.dev0`
+  is signed as `cugrid>=0.1.0.dev0`). An allowlist of bare names is signed
+  as before. A verifier older than this rule rejects a manifest that pins a
+  version, as a package name that is not valid. A job's `requirements` name
+  packages only (the name part of an entry); the version is the session's.
 - `insecure_http_host` is optional and left out (not `null`) when unset, so
   manifests without it are unchanged. When present it is a lowercase DNS name
   or IPv4 address, without scheme, port or path, and not a loopback name: the
@@ -291,10 +304,10 @@ meta. Only `file` carries a non-empty `body`.
 
 | type | meta fields |
 |---|---|
-| `text` | `text` |
+| `text` | `text`, and optionally `to` (absent, never `null` or empty, for a message to everyone): 1 to 64 distinct participant public keys the message is addressed to |
 | `file` | `name` (bare file name, ≤ 255 bytes), `mime` |
 | `job` | `filename`, `code`, `runtime`, `timeout_s`, `memory_mb` (nullable), `files` (item references), `requirements` (package names), `target`, and optionally `progress_file` (absent, never `null`, when not given) |
-| `result` | `job` (item reference), `exit_code` (nullable), `status`, `reason` (nullable), `wall_ms`, `peak_mem_mb`, `stdout`, `stderr`, `stdout_truncated`, `stderr_truncated`, `out_files` [`{name, size, item}`] where `item` is an item reference, `code_sha256`, `input_sha256` (lowercase hex) |
+| `result` | `job` (item reference), `exit_code` (nullable), `status`, `reason` (nullable), `wall_ms`, `peak_mem_mb`, `stdout`, `stderr`, `stdout_truncated`, `stderr_truncated`, `out_files` [`{name, size, item}`] where `item` is an item reference, `code_sha256`, `input_sha256` (lowercase hex), and optionally `env` (absent, never `null`, when not reported) |
 | `event` | tagged by `event`: `runner_approve {participant_pub}`, `runner_reject {participant_pub, reason}`, `job_cancel {job}` (item reference), `session_close` |
 | `progress` | `job` (item reference), `elapsed_ms`, `tail` (nullable), `tail_truncated` |
 
@@ -304,6 +317,31 @@ relative `/`-separated path in its work dir, such as a simulator's log), the
 end of that file as text (at most 64 KiB, starting at a line).
 `progress_file` follows the component rules of §9, no component may start
 with `.`, at most 8 components and 255 bytes.
+
+A result's `env` says where the job ran, as its runner measured it once for
+the runtime (not per job), so a sender can check it without trusting the
+job's own output: `{"python": "3.12.4", "packages": {"cugrid": "0.1.0"},
+"airlox": "0.1.2", "sandbox": "process", "interpreter": "--python"}`.
+`packages` maps the normalized name of each allowlisted package to the
+version installed, `airlox` is the runner's version, `sandbox` is the same
+kind as in the runner's join request, and `interpreter` says where the
+interpreter came from: `uv-runtime` (built by the runner from the
+allowlist), `--python` (the operator's own), or `docker:<image>`. It holds no
+file system paths. `python` and `airlox` are 1 to 32 printable characters,
+`interpreter` 1 to 128, each version 1 to 64, and at most 256 packages are
+listed.
+A runner reports it on a job that ran; a `refused` result has none. A runner
+shortens the digest of a digest-pinned image (`repo@sha256:` plus 12 hex
+digits), cuts `interpreter` to fit, and leaves out a package whose version it
+could not read; if the result would still fail these checks it omits `env`.
+
+Before signing a result, a runner replaces the absolute path of the job's
+work directory in `stdout`, `stderr` and `reason` with `$WORK`, of its out
+directory with `$AIRLOX_OUT`, of the job's own directory with `$JOB`, of its
+own runtime and cache directories with `$RUNTIME` and of the user's home
+directory with `~` (the same goes for a progress item's `tail`), so an
+account name in a path does not travel with the result. Files the job wrote
+are returned as they are.
 
 `target` is `{"type":"runner","participant_pub":…,"name":…}` (one runner,
 pinned by its participant key; `name` is for display),
@@ -321,6 +359,27 @@ File type rules (checked after decryption):
 | `md` | `.md`, `.markdown` | `text/markdown` | UTF-8, no NUL |
 | `zip` | `.zip` | `application/zip` | `PK\x03\x04` or `PK\x05\x06` magic; passes every §9 inspection rule |
 | `image` | `.png` / `.jpg` `.jpeg` / `.webp` | `image/png` / `image/jpeg` / `image/webp` | magic bytes match the mime |
+
+**Replies and addressing.** A `text` or `file` item whose `refs` is
+non-empty replies to the item its first reference names; a `result` answers
+its `job` the same way. `to` says whose attention a message needs: clients
+use it, with replies, to decide which agents to wake (an item addressed to
+the reader, a reply to one of the reader's items whoever else it names, or
+the owner's message to everyone: a message without `to` wakes every listener
+when the owner sent it and otherwise only the author of the item it replies
+to). `to` is advice, not access control: every participant can read every
+item. A listener may limit who can wake it to chosen authors (`airlox listen
+--from`; only `owner` and a key cannot be imitated, since display names are
+self-chosen and a role is shared by everyone holding that invite), and stops waking for a long run of posts from non-web
+participants, counted up the reply chain or, for an addressed message that
+replies to nothing, over the text items just before it since a web participant
+last posted. A participant's `kind` is self-declared, so that count is a
+safety net against accidental loops, not a security boundary.
+
+**Compatibility.** Clients 0.1.0 and 0.1.1 reject text items that carry `to`,
+job results that carry `env`, and manifests whose allowlist pins package
+versions (`name==1.2.3`); there is no
+protocol flag: use 0.1.2 or later in a session that uses them.
 
 ## 8. Policy
 
@@ -343,7 +402,8 @@ Plus: runners may post only in execute mode; `size ≤ max_item_bytes`;
 `result` and `progress` need execute mode.
 
 **Client and runner** (after decryption): payload type equals header kind;
-file rules from §7; events other than `job_cancel` come from the owner only;
+file rules from §7; a text's `to`, when present, holds 1 to 64 distinct keys;
+events other than `job_cancel` come from the owner only;
 a `job_cancel` is honored only from the owner or the sender who authored the
 job. Results must satisfy: `stdout` and `stderr` ≤ 1 MiB each; hashes are 64
 lowercase hex characters; at most 64 `out_files`, each with a valid file name
@@ -359,7 +419,8 @@ A runner additionally refuses a job unless: entry file is a bare `.py` name;
 code ≤ 1 MiB; `runtime` equals the manifest runtime;
 `1 ≤ timeout_s ≤ limit`; `memory_mb` (if set) `≤ limit`; at most 32 `files`,
 each fetched and matched against its reference; every requirement,
-PEP 503-normalized, is in `packages`; the target is well-formed. Runners also
+PEP 503-normalized, names the package of an entry in `packages`; the target
+is well-formed. Runners also
 verify the author's certificate chains to the sender (or owner) role, that a
 `runner_approve` event for themselves is signed by an owner-role participant,
 and keep a per-session record of job ids, written before a job runs, so a
@@ -372,8 +433,11 @@ after a restart it posts the saved items instead of a `failed` result. They
 are the same sealed items, so a resend the relay already has is a
 `409 duplicate`, which counts as delivered.
 Runners install the manifest's `packages` from wheels only (`--only-binary
-:all:`) when they join, before approval: a source distribution's build script
-would otherwise run outside the sandbox.
+:all:`) when they join, before approval, each with its version specifier: a
+source distribution's build script would otherwise run outside the sandbox. A
+runner that is given its own interpreter installs nothing; it checks that
+each package is installed at a version its entry allows and does not join
+if one is missing or outside its specifier.
 
 ## 9. ZIP handling
 
@@ -473,6 +537,7 @@ sends nothing for 30 seconds is answered with `408`.
 | `POST /v1/sessions/{id}/items` | bearer | upload frame | `201 {"id", "seq"}`; `409 duplicate` if the item id exists |
 | `GET /v1/sessions/{id}/items/{item}/blob` | bearer | none | `200` ciphertext, or `410 evicted` |
 | `POST /v1/sessions/{id}/items/{item}/ack` | bearer, recipient | none | `204` |
+| `GET /v1/sessions/{id}/delivery` | bearer | none | `200 {"items": {id: {"seq", "delivered": [participant_pub…], "waiting": [participant_pub…]}}}` for the caller's own most recent 500 items: who acked each one, and which live recipients the relay still holds it for. Ack means stored, not read |
 | `POST /v1/sessions/{id}/items/{item}/want` | bearer, never received it | none | `202 {"open": true}`; `409 present` if the blob is on the relay |
 | `PUT /v1/sessions/{id}/items/{item}/blob` | bearer, while wanted | ciphertext | `204`; `409 present` or `409 not_wanted` |
 | `POST /v1/sessions/{id}/roles/{role}/revoke` | bearer, owner | none | `204`; `role` is `sender`, `observer` or `runner` |

@@ -109,6 +109,10 @@ export AIRLOX_INVITE='<sender link>'
 airlox send text "Build finished."
 airlox send file report.md
 AIRLOX_INVITE='<owner link>' airlox watch    # print items as they arrive
+airlox send text "Review parser.py?" --to coder          # address it; --reply-to <item> links an answer
+airlox listen --once --json                  # block until something concerns you, print it, exit
+airlox listen --agent codex --resume <id> --from owner   # or wake an agent per batch (--fresh for a new conversation; claude, --exec)
+airlox delivery                              # who has fetched your items
 ```
 
 Every command takes the invite from `AIRLOX_INVITE` (or `--invite`, which is
@@ -120,6 +124,38 @@ visible to other local users in `ps`) and prints JSON with `--json`. See
 Coding agents with a shell (Claude Code, Codex, Cursor, Gemini CLI) use the
 CLI; [skills/airlox/SKILL.md](skills/airlox/SKILL.md) teaches them how. Add
 it to your agent's skills, or point the agent at it.
+
+Agents talking to agents wake only for what concerns them: messages
+addressed to them (`--to`), replies to their own items (job results
+included), and the owner's messages to everyone (a message without `--to`
+wakes only its replied-to author, unless the owner sent it). Claude Code runs
+`airlox listen --once` in the background and is woken when it exits; Codex
+and other headless agents are started per batch by `airlox listen --agent
+codex|claude --resume <id>` (or `--fresh`; one is required, so the folder's
+most recent conversation is never woken by accident) or `--exec`, which pass
+only item ids, never message text. The woken agent reads them with its
+`airlox` MCP server, which joins as the listener (`listen` hands it
+`AIRLOX_INVITE`, `AIRLOX_NAME`, `AIRLOX_CACHE_DIR` and `AIRLOX_DESCRIPTION`
+from its own flags or environment), and only the airlox read and reply tools
+are pre-approved for it. Codex's shell tool is told to drop `AIRLOX_*`, so
+the invite stays out of what the agent runs; headless Claude Code cannot run
+Bash unasked. Codex runs only in a git repository. `--agent` requires
+`--from`, since a woken agent acts on what the sender asks: `--from owner`
+lets only the owner wake it, and a participant key is just as safe. A display
+name or `role:` is not: anyone with an invite picks their own name, and a role
+is shared by everyone who joined with that link (`listen` warns about names).
+Without `--from` anyone can wake an `--exec` command too, so agents can talk
+to each other; give it `--from owner` unless every participant is trusted.
+`--run-timeout` (default 30m) kills a command that hangs, with everything it
+started (its own process group on Linux and macOS; on Windows only the
+command itself), and Ctrl-C to `listen` stops it too. `--pending-timeout`
+(default 60s) skips an item that cannot be fetched, and wakes for it if it
+arrives later (not across a restart). A reply chain of more than 8 agent
+posts in a row with no person in between
+stops waking anyone (`--max-hops`); participant kinds are self-declared, so
+this is a safety net against accidental loops, not a security boundary.
+Clients 0.1.0 and 0.1.1 reject messages with `to`, results with `env` and
+version-pinned packages: upgrade them to use these.
 
 Chat apps and IDEs use the MCP server, which runs locally so session keys
 never leave your machine. It reads and writes files only inside the
@@ -230,6 +266,13 @@ memory, items as large as the relay allows (up to 100 MB) and runner approval
 on. Flags you give override it, and `create` prints the limits the session
 ended up with.
 
+Allowlist entries may pin versions with a PEP 440 specifier, so every runner
+uses the one you tested against: `--package 'cugrid==0.1.0'` or
+`"packages": ["numpy>=1.26,<3"]` (quote it in a shell). The runner installs
+that version, or, given its own interpreter (`--python`), refuses to join if
+the interpreter has another ("--python has cugrid 0.2.1, but the session pins
+cugrid==0.1.0"). Jobs still name the package alone in `requirements`.
+
 Approve the runner, then send it work:
 
 ```python
@@ -243,6 +286,25 @@ print(res.status, res.exit_code, res.stdout)
 chart = res.read("chart.png")            # files the job wrote to $AIRLOX_OUT
 summary = res.read("summary.json")       # by path, whether or not it came zipped
 ```
+
+Every result carries `env`, signed by the runner and not written by the job:
+the Python version, the installed version of each allowlisted package, the
+sandbox, the airlox version and where the interpreter came from (`uv-runtime`,
+`--python` or `docker:<image>`), without any file system path. `airlox run`
+prints it on one line, `--json` and the MCP server include it, and the SDK has
+it as `res.env`.
+
+A job that runs as a plain process (`--sandbox process`, or `local` outside
+Linux) works in a temporary folder, and on Windows that is under
+`C:\Users\<name>\AppData\Local\Temp`, so a traceback printed by the job
+would name the account. `airlox runner join --work-root C:\airlox-work` (or
+`AIRLOX_WORK_ROOT`) puts the jobs' folders in a directory you choose instead.
+Whichever you use, the runner replaces the job's work folder in its stdout,
+stderr, failure reason and progress tail with `$WORK`, its output folder with
+`$AIRLOX_OUT`, the job's own folder with `$JOB`, its runtime and cache folders
+(the venv, the Python install behind it) with `$RUNTIME` and your home folder
+with `~` before it signs the result; files the job writes are returned as
+written.
 
 The runner builds its job image once (`python:3.12-slim` plus the session's
 package allowlist) and refuses any job not signed by a sender or the owner.

@@ -1,8 +1,9 @@
 """The use cases in examples/, run end to end against a real relay and
 runners: they are the samples in docs/use-cases.md, so this keeps them working.
 
-The live agent case calls a real model and runs only with AIRLOX_LIVE_AGENT=1
-(AIRLOX_AGENT=claude or codex picks the agent, which must be signed in).
+The live agent and agent conversation cases call real models and run only
+with AIRLOX_LIVE_AGENT=1 (AIRLOX_AGENT=claude or codex picks the live agent;
+the conversation needs both, signed in).
 """
 
 import importlib.util
@@ -75,3 +76,17 @@ def test_live_agent(relay, start_runner, tmp_path):
     # The agent did the work on the runner, not in its head.
     assert out["jobs_by_agent"] >= 1 and 0 in out["signed_results"], transcript
     assert out["answer"] == out["expected"], transcript
+
+
+@pytest.mark.skipif(not os.environ.get("AIRLOX_LIVE_AGENT"), reason="calls real models; set AIRLOX_LIVE_AGENT=1")
+def test_agent_conversation(relay, start_runner, tmp_path):
+    if not (shutil.which("claude") and shutil.which("codex")):
+        pytest.skip("needs both claude and codex")
+    out = load("agent-conversation").scenario(relay.url, start_runner, tmp_path)
+    transcript = json.dumps(out, indent=1)
+    # Each agent was woken by its listener and spoke as itself, one participant each.
+    assert out["participants"] == ["claude-agent", "codex-agent", "lead"], transcript
+    assert out["summary"], transcript
+    # Claude asked Codex by address, and Codex answered Claude.
+    assert any(who == "claude-agent" and "codex-agent" in to for who, to, _ in out["thread"]), transcript
+    assert any(who == "codex-agent" and "claude-agent" in to for who, to, _ in out["thread"]), transcript

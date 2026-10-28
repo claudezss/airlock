@@ -116,6 +116,7 @@ fn seal_result(s: &Sess, runner: &Member, job: &SealedItem) -> SealedItem {
         out_files: vec![],
         code_sha256: "a".repeat(64),
         input_sha256: "b".repeat(64),
+        env: None,
     };
     seal_kind(s, runner, ItemKind::Result, None, vec![job_ref], Payload::result(r))
 }

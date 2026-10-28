@@ -15,6 +15,7 @@
 //! reports, exactly once.
 
 mod outbox;
+mod redact;
 
 use std::fs;
 use std::io::Write;
@@ -26,7 +27,7 @@ use airlox_core::encoding::{b64e, canonical_json, hex, sha256};
 use airlox_core::item::{new_item_id, seal, ItemKind, ItemRef, NewItem};
 use airlox_core::keys::Keypair;
 use airlox_core::payload::{
-    JobProgress, JobResult, JobSpec, JobStatus, Meta, OutFile, Payload, MAX_PROGRESS_TAIL_BYTES,
+    JobEnv, JobProgress, JobResult, JobSpec, JobStatus, Meta, OutFile, Payload, MAX_PROGRESS_TAIL_BYTES,
     MAX_STDIO_BYTES,
 };
 use airlox_core::policy::{check_file_name, target_matches};
@@ -69,6 +70,9 @@ pub struct Ctx {
     pub outbox: PathBuf,
     /// Tests: exit once an answer is saved, before posting any of it.
     pub exit_before_posting: bool,
+    /// Where jobs run, measured once when the runtime was prepared; every
+    /// result of a job that ran carries it.
+    pub env: Option<JobEnv>,
 }
 
 fn now_ms() -> u64 {
@@ -642,6 +646,37 @@ impl Drop for AbortOnDrop {
 
 /// The tail of `file` (relative), found in the job's work dir or, failing
 /// that, its out dir (`$AIRLOX_OUT`, where a tool may write its log).
+/// `env` if clients accept it (`check_env`), else none: a result whose
+/// `env` fails the check is rejected whole, so it goes without.
+pub(crate) fn checked_env(env: Option<JobEnv>) -> Option<JobEnv> {
+    let env = env?;
+    match airlox_core::policy::check_env(&env) {
+        Ok(()) => Some(env),
+        Err(e) => {
+            tracing::warn!("not reporting where jobs run in results, clients would reject it: {e}");
+            None
+        }
+    }
+}
+
+/// The directories a job's output must not name, and what stands for each:
+/// its own (`$WORK`, `$AIRLOX_OUT`, `$JOB`), the runner's runtime and cache
+/// (`$RUNTIME`) and the user's home (`~`).
+fn hidden_dirs(ctx: &Ctx, job: &PreparedJob) -> Vec<(PathBuf, &'static str)> {
+    let mut dirs =
+        vec![(job.work_dir(), "$WORK"), (job.out_dir(), "$AIRLOX_OUT"), (job.root.clone(), "$JOB")];
+    dirs.extend(ctx.backend.runtime_dirs().into_iter().map(|d| (d, redact::RUNTIME)));
+    dirs.extend(redact::home_dirs().into_iter().map(|h| (h, redact::HOME)));
+    dirs
+}
+
+/// Take the directories in `hidden` out of everything a result says in text.
+fn hide_dirs(result: &mut JobResult, hidden: &[(PathBuf, &'static str)]) {
+    result.stdout = redact::hide(&result.stdout, hidden);
+    result.stderr = redact::hide(&result.stderr, hidden);
+    result.reason = result.reason.take().map(|r| redact::hide(&r, hidden));
+}
+
 fn read_progress_file(roots: &[PathBuf], file: &str, max: usize) -> (Option<String>, bool) {
     roots
         .iter()
@@ -658,6 +693,7 @@ fn spawn_progress(
     job_ref: &ItemRef,
     roots: Vec<PathBuf>,
     file: Option<String>,
+    hidden: Arc<Vec<(PathBuf, &'static str)>>,
 ) -> Option<AbortOnDrop> {
     if ctx.progress_interval.is_zero() {
         return None;
@@ -682,6 +718,7 @@ fn spawn_progress(
                     .unwrap_or_default(),
                 None => (None, false),
             };
+            let tail = tail.map(|t| redact::hide(&t, &hidden));
             let p = JobProgress {
                 job: job_ref.clone(),
                 elapsed_ms: start.elapsed().as_millis() as u64,
@@ -728,6 +765,7 @@ pub async fn handle(
         out_files: vec![],
         code_sha256: hex(&sha256(b"")),
         input_sha256: hex(&sha256(b"")),
+        env: None,
     };
     let mut refs = vec![job_ref.clone()];
     let poster = Poster::of(&*view.lock().await);
@@ -763,6 +801,7 @@ pub async fn handle(
         Verdict::Run(a) => {
             result.code_sha256 = hex(&sha256(a.spec.code.as_bytes()));
             result.input_sha256 = a.input_sha256.clone();
+            result.env = ctx.env.clone();
             let memory_mb =
                 a.spec.memory_mb.unwrap_or(limits.memory_mb).min(ctx.memory_cap_mb.unwrap_or(u32::MAX));
             let dir = tempfile::Builder::new().prefix("job-").tempdir_in(&ctx.jobs_dir)?;
@@ -790,6 +829,10 @@ pub async fn handle(
                     v.ack(&r.id).await;
                 }
             }
+            // A job run as a plain process saw its real directories; what it
+            // prints (and reports as progress) must not carry where the
+            // runner keeps them, nor whose home they are in.
+            let hidden = Arc::new(hidden_dirs(&ctx, &job));
             if let Err(e) = stage_inputs(&job.root, &job.work_dir(), &a) {
                 result.reason = Some(format!("could not stage inputs: {e:#}"));
             } else {
@@ -800,6 +843,7 @@ pub async fn handle(
                     &job_ref,
                     vec![job.work_dir(), job.out_dir()],
                     a.spec.progress_file.clone(),
+                    hidden.clone(),
                 );
                 let raw = ctx.backend.run(&job, cancel).await.unwrap_or_else(|e| RawResult {
                     error: Some(format!("the sandbox could not run the job: {e:#}")),
@@ -847,6 +891,10 @@ pub async fn handle(
                     }
                 }
             }
+            // One pass over everything that leaves: the job's own output,
+            // and the reason and notes the runner wrote, whose errors name
+            // the work directories. (Redacting never lengthens text.)
+            hide_dirs(&mut result, &hidden);
             crate::sandbox::make_removable(dir.path());
             drop(dir);
         }
@@ -870,6 +918,59 @@ pub async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_the_runner_wrote_names_no_directory_either() {
+        let (root, home) = ("/tmp/airlox-jobs-a1b2c3/job-x9", "/home/ann");
+        let hidden = vec![
+            (PathBuf::from(format!("{root}/work")), "$WORK"),
+            (PathBuf::from(root), "$JOB"),
+            (PathBuf::from(home), redact::HOME),
+        ];
+        let r#ref = ItemRef { id: "i".into(), blob_sha256: "h".into() };
+        let mut result = JobResult {
+            job: r#ref,
+            exit_code: None,
+            status: JobStatus::Failed,
+            reason: Some(format!("could not stage inputs: {root}/work/a.csv: File exists (os error 17)")),
+            wall_ms: 0,
+            peak_mem_mb: 0,
+            stdout: format!("in {home}/x"),
+            // A note the runner appended, with its error.
+            stderr: format!("\n[airlox] could not keep out/a.png for upload: {root}/out/a.png: disk full"),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            out_files: vec![],
+            code_sha256: String::new(),
+            input_sha256: String::new(),
+            env: None,
+        };
+        hide_dirs(&mut result, &hidden);
+        let said = format!("{:?} {} {}", result.reason, result.stdout, result.stderr);
+        assert!(!said.contains("airlox-jobs") && !said.contains("ann"), "{said}");
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("could not stage inputs: $WORK/a.csv: File exists (os error 17)")
+        );
+    }
+
+    #[test]
+    fn an_env_clients_would_reject_is_dropped_not_the_result() {
+        let mut env = JobEnv {
+            python: "3.12.4".into(),
+            packages: [("numpy".to_string(), "2.1.0".to_string())].into(),
+            airlox: "0.1.2".into(),
+            sandbox: airlox_core::cert::SandboxKind::Docker,
+            interpreter: "docker:python".into(),
+        };
+        assert_eq!(checked_env(Some(env.clone())).unwrap().interpreter, "docker:python");
+        env.interpreter = "x".repeat(129);
+        assert!(checked_env(Some(env.clone())).is_none());
+        env.interpreter = "docker:python".into();
+        env.packages.insert("pandas".into(), String::new());
+        assert!(checked_env(Some(env)).is_none());
+        assert!(checked_env(None).is_none());
+    }
 
     #[test]
     fn out_dir_becomes_images_and_one_zip() {
@@ -973,6 +1074,7 @@ mod tests {
                 out_files: vec![],
                 code_sha256: "a".repeat(64),
                 input_sha256: "b".repeat(64),
+                env: None,
             };
             airlox_core::policy::check_result(&r).unwrap();
         }
