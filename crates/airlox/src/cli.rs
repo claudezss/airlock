@@ -1273,6 +1273,14 @@ fn env_line(e: &airlox_core::payload::JobEnv) -> String {
     if !packages.is_empty() {
         parts.push(packages);
     }
+    if let Some(sh) = &e.shell {
+        parts.push(format!("shell {sh}"));
+    }
+    if let Some(t) = &e.tree {
+        let head = t.head.as_deref().map(|h| &h[..h.len().min(12)]).unwrap_or("no commit");
+        let changes = if t.dirty { " + changes" } else { "" };
+        parts.push(format!("tree {head}{changes}, {} files", t.count));
+    }
     parts.push(format!("{} sandbox", format!("{:?}", e.sandbox).to_lowercase()));
     parts.push(format!("airlox {}", e.airlox));
     clean_line(&parts.join(" · "))
@@ -2736,11 +2744,29 @@ mod tests {
         let bare = airlox_core::payload::JobEnv {
             packages: Default::default(),
             interpreter: "uv-runtime\x1b[2J\nforged".into(),
-            ..env
+            ..env.clone()
         };
         let line = env_line(&bare);
         assert!(!line.contains('\x1b') && !line.contains('\n'), "{line:?}");
         assert!(line.starts_with("Python 3.12.4 (uv-runtime"));
+        let shell = airlox_core::payload::JobEnv {
+            packages: Default::default(),
+            interpreter: "docker:ci@sha256:0123456789ab".into(),
+            kinds: Some(vec![JobKind::Python, JobKind::Shell]),
+            shell: Some("sh".into()),
+            tree: Some(airlox_core::payload::TreeInfo {
+                head: Some("0123456789abcdef0123".into()),
+                dirty: true,
+                count: 412,
+                sha256: "c".repeat(64),
+            }),
+            ..env
+        };
+        assert_eq!(
+            env_line(&shell),
+            "Python 3.12.4 (docker:ci@sha256:0123456789ab) · shell sh · tree 0123456789ab + changes, 412 files · \
+             process sandbox · airlox 0.1.2"
+        );
     }
 
     #[test]

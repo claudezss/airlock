@@ -1,6 +1,12 @@
 # Machines: a job slot on your own hardware, for any agent
 
-Status: proposal. Builds on [DESIGN.md](../DESIGN.md) §6 (runner) and
+Status: implemented (M-A to M-D) in 0.2; M-E (delta trees, beyond `job ls`)
+remains. Where the implementation differs: a sender invite cannot be rotated
+in place, because revoking a role is permanent and its invite is derived from
+the owner seed, so there is no `machine invite --rotate` (`machine rm` and
+`machine add` start over); and runners report their `kinds` in signed results
+only, so `machine ls` shows them after a runner's first job. Originally a
+proposal. Builds on [DESIGN.md](../DESIGN.md) §6 (runner) and
 [protocol.md](../protocol.md) §7, §11 and §13. Nothing here changes the
 cryptography, the roles or the relay's blindness; it changes what a job may
 be, how its output arrives, what the runner keeps between jobs, and how a

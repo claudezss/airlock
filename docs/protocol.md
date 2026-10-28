@@ -504,6 +504,31 @@ runner that is given its own interpreter installs nothing; it checks that
 each package is installed at a version its entry allows and does not join
 if one is missing or outside its specifier.
 
+**Streaming.** A runner tails the job's `stdout.txt` and `stderr.txt` while
+it runs and posts output chunks (§7) when 64 KiB are pending, or every second
+while anything is, at most `--progress-rate` chunks a minute (default 120,
+coalescing beyond that; 0 turns streaming off) and at most `--stream-max-mb`
+(default 16) for both streams together, ending with a `truncated` chunk. A
+job that ends within a second may stream nothing; its result has the output.
+
+**Workspaces.** With `workspace: true` in the manifest and `--workspace` on
+the runner, a runner keeps one work directory per session and sender
+participant key (`<cache-dir>/workspaces/<session_id>/<hex key>/work`) instead
+of a fresh one per job; `/out` and the meta directory stay fresh. A job's
+tree is synced into it, not unpacked: files whose `sha256` in `tree.json`
+matches what is on disk are left alone, others are written (with the exec
+bit from `mode`), paths the previous tree placed but this one lacks are
+deleted, and nothing else is touched, so ignored directories such as
+`node_modules/` survive. The sync never follows a link or writes through a
+non-directory parent the previous job left. `fresh: true` empties the
+workspace first. A workspace over `--workspace-max-mb` (default 10 240) after
+a job refuses its sender's next job with a reason starting `workspace_full:`
+until one asks for `fresh`; workspaces idle for `--workspace-ttl` (default 14
+days) are removed, and closing the session removes them all. Two senders
+never share a workspace, and one sender's jobs run one at a time. A job can
+leave something for the next job of the same sender: the same trust domain as
+the job that planted it.
+
 ## 9. ZIP handling
 
 Inspection reads only the central directory. Path components must be
@@ -540,10 +565,19 @@ Senders sanitize before upload; receivers still treat images as untrusted.
 All sandbox backends run the embedded `shim.py`:
 
 ```text
-python3 shim.py --work DIR --entry FILE --timeout SECONDS --result PATH
-                [--out DIR] [--fsize-mb N] [--memory-mb N] [--nproc N]
-                [--pass-env NAME ...]
+python3 shim.py --work DIR (--entry FILE | --shell sh|pwsh --script PATH)
+                --timeout SECONDS --result PATH
+                [--cwd REL] [--shell-bin PATH] [--out DIR] [--fsize-mb N]
+                [--memory-mb N] [--nproc N] [--pass-env NAME ...]
 ```
+
+- **Kinds.** A `python` job runs `FILE` from the work dir. A `shell` job
+  runs the script at `PATH`, which the runner keeps in the meta directory,
+  outside the work dir, as `sh -e -c "$code"` (Windows: `pwsh -NoProfile
+  -Command`), with the sandbox's own `PATH` (the image's under docker, the
+  host's system directories otherwise). Either starts in `--cwd`, a
+  directory inside the work dir that must exist. `TMPDIR` is emptied at the
+  start of every job, since a workspace outlives its jobs.
 
 - **Environment.** Only a fixed `PATH` (the interpreter's directory plus
   `/usr/local/bin:/usr/bin:/bin`), `LANG=C.UTF-8`, `HOME` (the work dir),

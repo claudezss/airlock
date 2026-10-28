@@ -216,7 +216,13 @@ pub fn build(dir: &Path, opts: &TreeOpts) -> Result<Tree> {
     let mut files = Vec::new();
     let mut flagged = Vec::new();
     for rel in listed {
-        if rel == TREE_JSON || excludes.iter().any(|p| pattern_matches(p, &rel)) {
+        if excludes.iter().any(|p| pattern_matches(p, &rel)) {
+            continue;
+        }
+        // The tree's own description lives there; runners refuse a tree
+        // that has anything else in it.
+        if rel.starts_with(".airlox/") {
+            notes.push(format!("left out {rel}: .airlox/ is reserved for the tree's description"));
             continue;
         }
         let path = root.join(&rel);
